@@ -206,11 +206,11 @@ $ review sessions
 [in flight] codex / turn in flight since 6m
        session: 019f5f70-b2ca-7590-8a61-be66d9d7cf07
 
-[14m] claude / bugs (run) / 3 touches
+[14m ago] claude / bugs (run) / 3 touches
        session: 019deabc-0def-7000-8000-abcdef012345
        opened:  review the new sync code
 
-[1h12m] codex / security (run) / 1 touch
+[1h12m ago] codex / security (run) / 1 touch
        session: 019d0123-...
        opened:  check OAuth handling on the IMAP path
 ```
@@ -444,7 +444,8 @@ If you're hitting rate limits, increase the stagger. If you're only running 1-2 
 
 ## Concurrency
 
-A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
+A global file lock (`launch.lock` in review's data directory,
+`~/.local/share/review/` by default) serializes provider **launches**, not
 whole runs. An invocation holds it until its providers have been spawned (the
 fan-out path through its staggered launches, a `review resume` through the
 single spawn), then releases it and lets the runs proceed concurrently.

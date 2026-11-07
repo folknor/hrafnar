@@ -197,6 +197,16 @@ pub(super) async fn run_grok(
         {
             break;
         }
+        // A signal can arrive after this turn but before we wake it. Do not
+        // start another turn just to have the keeper shut it down. Preserve
+        // the answer, but fail the run because its background results stayed
+        // unread.
+        if *runtime.stop.borrow() {
+            let reason = "grok wake-up not launched: review was signalled to stop".to_string();
+            eprintln!("grok: {reason}");
+            out.digest = Some(wake_failure_digest(reason, out.digest.take()));
+            break;
+        }
         let names: Vec<String> = pending.iter().map(state::Unread::id).collect();
         if wakes == GROK_MAX_WAKES {
             let reason = format!(
@@ -420,6 +430,12 @@ async fn run_grok_turn(
     // shrinks the window from the whole setup to the time grok takes to start.
     if trust && let Some(ref g) = grok {
         g.check_trust(project_root)?;
+    }
+    // Check the runner's stop channel immediately before launch. The keeper
+    // gate below also checks process-wide shutdown under its registry lock,
+    // closing the race between this check and spawn.
+    if *runtime.stop.borrow() {
+        anyhow::bail!("not launched: review was signalled to stop");
     }
     let label = match &oneshot_id {
         Some(id) => format!("the grok run of session {id}"),
@@ -715,13 +731,29 @@ pub(super) enum GrokWrite {
 /// refuses any other.
 pub(super) fn grok_write_launch(oneshot: bool, sandbox: Option<&str>) -> Option<GrokWrite> {
     match sandbox {
-        Some(name) if name.starts_with(state::PROFILE_PREFIX) => {
+        // A fresh run only gets a generated profile through the `workspace`
+        // path below. A named profile, including one with our prefix, is the
+        // operator's profile and must pass through unchanged.
+        Some(name) if !oneshot && is_generated_profile_name(name) => {
             Some(GrokWrite::Resume(name.to_string()))
         }
         Some("workspace") if oneshot => Some(GrokWrite::Fresh),
-        Some("workspace") => Some(GrokWrite::BuiltinWorkspace),
+        Some("workspace") if !oneshot => Some(GrokWrite::BuiltinWorkspace),
         _ => None,
     }
+}
+
+/// Generated profiles use exactly the stable suffix emitted by
+/// `state::profile_name`. Other names sharing the prefix belong to the
+/// operator and are passed to Grok as native profiles.
+pub(super) fn is_generated_profile_name(name: &str) -> bool {
+    name.strip_prefix(state::PROFILE_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 16
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
 }
 
 /// What `prepare_grok_write` decided.

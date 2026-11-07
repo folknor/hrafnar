@@ -188,7 +188,9 @@ fn announcement_is_empty_when_an_override_grants_nothing() {
 fn persisted_sandbox_levels_normalize_known_grok_names() {
     for (native, level) in [
         ("workspace", "workspace-write"),
-        ("review-ws-abc", "workspace-write"),
+        ("review-ws-cbf29ce484222325", "workspace-write"),
+        // Only the generated shape is ours; another prefixed name is native.
+        ("review-ws-abc", "review-ws-abc"),
         ("none", "danger-full-access"),
         ("read-only", "read-only"),
         ("custom", "custom"),

@@ -171,6 +171,9 @@ pub(super) async fn run_codex(
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    // The helper returns the exclusively-created path needed in argv. Cleanup
+    // transfers to run_codex_json, which handles its pre-guard stop and guards
+    // every fallible launch path after that.
     let last_msg_path = new_output_file()?;
 
     // Exec-level options shared by both paths.
@@ -431,6 +434,7 @@ pub async fn run_codex_json(
     // A run still waiting on the lock or its stagger when `review` was told to
     // stop would otherwise start a turn nobody will see the end of.
     if *runtime.stop.borrow() {
+        // The cleanup guard is installed below, so remove the file on this path.
         let _ = std::fs::remove_file(last_msg_path);
         anyhow::bail!("not launched: review was signalled to stop");
     }
@@ -449,8 +453,8 @@ pub async fn run_codex_json(
             runtime.data_root.as_deref(),
         )
     });
-    // Clean up the `-o` temp file on every exit path, including an error
-    // before the read below.
+    // The explicit stop path above is the only pre-guard return. This covers
+    // every later return, including spawn errors before the normal read.
     let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
     let label = match known_session_id.as_deref() {
         Some(sid) => format!("the codex run of session {sid}"),
@@ -863,6 +867,10 @@ pub async fn run_codex_json(
     // scoped evidence that licensed our kill even if the rollout later changes.
     let recovered =
         watchdog_answer.or_else(|| transcript.as_ref().and_then(|t| t.final_answer.clone()));
+    // The bundle's answer flag must agree with recovery: a trailing phantom
+    // turn resets the summary's `final_answer`, but the watchdog's scoped
+    // answer still proves this run produced one.
+    let answer_in_scope = recovered.is_some();
     let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
     let final_message = final_from_file.or(recovered).or(stream_message);
 
@@ -907,6 +915,8 @@ pub async fn run_codex_json(
             stdout: &stdout_buf,
             stderr: &stderr_buf,
             transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
+            transcript_offset: recovery_scope,
+            final_answer_present: transcript.as_ref().map(|_| answer_in_scope),
             duration_ms,
             data_root: runtime.data_root.as_deref(),
             captured,

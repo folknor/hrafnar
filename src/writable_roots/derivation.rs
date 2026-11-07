@@ -4,6 +4,40 @@ use super::dependencies::path_dependency_repos;
 use super::filter::push_root;
 use super::{GrantedRoot, Host};
 
+/// Resolve an environment-derived root through its final `..` component
+/// before `push_root` applies its spelling check. The suffix after that
+/// component may name a directory the build has not created yet.
+fn push_environment_root(
+    out: &mut Vec<GrantedRoot>,
+    cwd: &Path,
+    host: &impl Host,
+    path: &Path,
+    why: &'static str,
+) {
+    let components: Vec<_> = path.components().collect();
+    let Some(last_parent) = components
+        .iter()
+        .rposition(|component| *component == std::path::Component::ParentDir)
+    else {
+        push_root(out, cwd, host, path, why);
+        return;
+    };
+
+    let mut prefix = PathBuf::new();
+    for component in &components[..=last_parent] {
+        prefix.push(component.as_os_str());
+    }
+    let Some(mut resolved) = host.canonicalize(&prefix) else {
+        // Leave unresolved parent components for push_root to refuse.
+        push_root(out, cwd, host, path, why);
+        return;
+    };
+    for component in &components[last_parent + 1..] {
+        resolved.push(component.as_os_str());
+    }
+    push_root(out, cwd, host, &resolved, why);
+}
+
 /// Paths outside `cwd` that a build needs write access to.
 ///
 /// Returns an empty vec when nothing is needed - a workspace whose build stays
@@ -44,7 +78,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(home) = host.var("HOME") {
         let path = PathBuf::from(home).join(".brokkr");
         if path.is_absolute() {
-            push_root(
+            push_environment_root(
                 &mut out,
                 cwd,
                 host,
@@ -76,7 +110,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
         .map(PathBuf::from)
         .or_else(|| host.var("HOME").map(|h| PathBuf::from(h).join(".cargo")));
     if let Some(path) = cargo_home.filter(|p| p.is_absolute()) {
-        push_root(&mut out, cwd, host, &path, "cargo home ($CARGO_HOME)");
+        push_environment_root(&mut out, cwd, host, &path, "cargo home ($CARGO_HOME)");
     }
 
     // Brokkr's command history (`history.db`, SQLite, so its journal files
@@ -98,7 +132,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
                 .map(|h| PathBuf::from(h).join(".local").join("share"))
         });
     if let Some(path) = data_home.filter(|p| p.is_absolute()) {
-        push_root(
+        push_environment_root(
             &mut out,
             cwd,
             host,
@@ -111,7 +145,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(dir) = host.var("CARGO_TARGET_DIR") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
-            push_root(
+            push_environment_root(
                 &mut out,
                 cwd,
                 host,

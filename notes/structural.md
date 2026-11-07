@@ -241,15 +241,6 @@ claude and grok, so the column is not comparable across providers. Proposed:
 claude-style cache-creation tokens; `Vec<String>` joined only at
 serialisation.
 
-## STR-009 - A `TempFile` guard
-
-Reported by: providers.
-
-`new_output_file` and `new_temp_file` return `String` paths, and
-`RemoveOnDrop(String)` is created separately from the file it removes:
-`run_codex` creates the file, `run_codex_json` installs the cleanup and also
-removes it by hand on the stop path. Proposed: a guard that owns both.
-
 ## STR-010 - In-flight marker fields
 
 Reported by: lifecycle.
@@ -307,15 +298,17 @@ NotAbsolute }`.
 
 ## STR-013 - Typed forensic lookups
 
-Reported by: forensics.
+Reported by: forensics. Narrowed: `transcript::Lookup<T>` (found, absent,
+unreadable) and typed counterparts of the transcript lookups now exist beside
+the old `Option` helpers.
 
-`write_bundle` returns `Option<PathBuf>` and `eprintln!`s each failure;
-`find_transcript_path` and `summarize_session` return `Option`; `list_recent`
-returns `Vec` with errors swallowed. A caller cannot tell "no rollout exists"
-from "unreadable" from "codex home unknown"; the custom `CODEX_HOME` defect in
-`notes/bugs.md` is that confusion.
-Proposed: `enum Lookup { Found(PathBuf), Absent, Unreadable(io::Error) }`, so
-the baseline code can say which happened instead of the generic warning.
+What remains: move the callers onto the typed helpers, in the codex runner
+(`src/provider/codex.rs`, for the baseline warning) and in `src/app/history.rs`
+(`review sessions <id>`), then drop the `Option` helpers; and give
+`incident::write_bundle` (today `Option<PathBuf>`, warning on each failure and
+able to return a path after some artifact writes failed) and
+`incident::list_recent` (today a `Vec` that swallows read and parse errors)
+typed outcomes too.
 
 ## STR-014 - Keeper `Spec` durations flattened for JSON
 
@@ -340,24 +333,6 @@ newtype with a validated format (with `generate_short_id` beside it), and one
 `LogScope { audit_id: AuditId, private: bool }` (or
 `enum LogScope { Public(AuditId), Private(AuditId) }`) resolved once from
 config, so no call site can pair a private project's id with the public log.
-
-## STR-016 - Row kind as an enum
-
-Reported by: orchestration.
-
-`SessionRecord.kind: String` and `SessionEntry.kind: &'static str` are written
-as `"run"` or `"session"` (their doc comments are stale, in `notes/bugs.md`),
-and the auto-resume inside a fan-out is recorded as `kind = "run"` though it is
-a resume. Proposed: an enum.
-
-## STR-017 - Optional epochs and an `Age` type
-
-Reported by: orchestration.
-
-`SessionRecord.epoch_secs` defaults to 0 and every reader re-checks `== 0`
-(`age_secs`, `run_session_show`, `run_sessions`). Proposed: `Option<u64>` with
-a serde default, or an `Epoch` newtype, under the `Age` type from the ages
-entry in `notes/consolidations.md`.
 
 ## STR-018 - `ProjectRoot` and the resume target
 

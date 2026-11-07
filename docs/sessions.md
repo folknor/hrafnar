@@ -11,6 +11,7 @@ find a session's provider, project and settings.
 first (`--limit`, default 20; `--all` for every project). `-C` lists another
 project's. Each entry shows its age, provider, archetype, how many times it was
 touched, and the first line of the prompt that opened it.
+Ages use `just now`, `<age> ago`, or `?` when the timestamp is unknown.
 
 Two kinds of entry come before the list:
 
@@ -30,6 +31,8 @@ A run whose `review` process has died is not shown in flight.
 provider, archetype, project, model, effort, sandbox and writable roots, the
 digest, and the response. A deleted project still shows. With `-C`, the
 session must belong to the selected project.
+Fresh runs are recorded as `run`; resumes, including automatic resumes, are
+recorded as `session`.
 
 For codex it also reads the session's transcript, under the `CODEX_HOME` of
 the `review sessions` command itself: its path, whether the turn completed,

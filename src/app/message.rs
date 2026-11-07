@@ -166,12 +166,19 @@ fn message_target(
         && !rec.audit_id.is_empty()
         && cfg.audit.id.as_deref() != Some(rec.audit_id.as_str())
     {
+        // An empty configured id is absent, as it is to `ensure_audit_id`.
+        let current_audit_id = cfg
+            .audit
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or("none");
         bail!(
             "session {session_id} was recorded under audit id {} but {} now has {}\n  \
              The checkout at that path is not the project the session was started in.",
             rec.audit_id,
             root.display(),
-            cfg.audit.id.as_deref().unwrap_or("none")
+            current_audit_id
         );
     }
     Ok((cfg, root))
@@ -338,20 +345,16 @@ async fn run_session_resume(
     // cost. Resuming is the *warm* follow-up path, so a cold resume is refused:
     // do a fresh run with restated context instead. A row with no usable
     // timestamp leaves the age unknown, and the resume proceeds rather than blocks.
-    if let Some(age) = sessions::age_secs(&record) {
-        if age > timings::stale_session(provider_name).as_secs() {
+    let age = sessions::Age::since_epoch(record.epoch_secs);
+    if let Some(elapsed) = age.elapsed_secs() {
+        if elapsed > timings::stale_session(provider_name).as_secs() {
             bail!(
-                "session last touched {} ago - its prompt cache is cold.\n  \
+                "session last touched {age} - its prompt cache is cold.\n  \
                  Resuming would reprocess the whole session prefix at full cost.\n  \
-                 Start a fresh run with restated context instead.",
-                sessions::format_age(age)
+                 Start a fresh run with restated context instead."
             );
         }
-        if age < 60 {
-            eprintln!("session last touched just now");
-        } else {
-            eprintln!("session last touched {} ago", sessions::format_age(age));
-        }
+        eprintln!("session last touched {age}");
     }
 
     // Global lock: serialize the *launch* against other `review` invocations,
@@ -372,8 +375,7 @@ async fn run_session_resume(
     // limiting the lock exists to provide.
     // Held to the end, past the sidecar row: see `run_launch`.
     let _unrecorded = provider::Unrecorded::for_provider(provider_name);
-    let lock_path = std::env::temp_dir().join("review.lock");
-    let lock_file = lock::open_lock_file(&lock_path)?;
+    let lock_file = lock::open_global_lock()?;
     lock::acquire_blocking(&lock_file)?;
     // Persist an id before launching so every concurrent resume records the
     // same project identity, and a write failure cannot leave an unidentifiable

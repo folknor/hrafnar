@@ -587,7 +587,7 @@ pub(crate) fn recorded_sandbox<'a>(provider: &str, sandbox: Option<&'a str>) -> 
     match (provider, sandbox) {
         ("grok", Some("workspace")) => Some("workspace-write"),
         ("grok", Some("none")) => Some("danger-full-access"),
-        ("grok", Some(name)) if name.starts_with("review-ws-") => Some("workspace-write"),
+        ("grok", Some(name)) if grok::is_generated_profile_name(name) => Some("workspace-write"),
         _ => sandbox,
     }
 }

@@ -86,14 +86,11 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
     }
 
     let now = provider::now_epoch_secs();
-    // `format_age` says "now" under a minute, which does not take "ago".
-    let last = if latest.epoch_secs == 0 {
-        "at an unknown time".to_string()
-    } else {
-        match sessions::format_age(now.saturating_sub(latest.epoch_secs)).as_str() {
-            "now" => "just now".to_string(),
-            age => format!("{age} ago"),
-        }
+    // A bare `?` reads poorly in prose; the listing keeps it as its column.
+    let age = sessions::Age::at_epoch(latest.epoch_secs, now);
+    let last = match age.elapsed_secs() {
+        Some(_) => age.to_string(),
+        None => "at an unknown time".to_string(),
     };
 
     println!("session: {session_id}");
@@ -283,10 +280,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
     // nothing was happening at all.
     let mut live = inflight::read_live(None);
     live.retain(|m| in_filter(&m.project));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = provider::now_epoch_secs();
     if !live.is_empty() {
         live.sort_by_key(|m| m.started_epoch);
         for m in &live {
@@ -348,7 +342,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
     }
 
     struct Row {
-        latest_secs: u64,
+        latest_secs: Option<u64>,
         opener: sessions::SessionRecord,
         latest: sessions::SessionRecord,
         touches: usize,
@@ -377,11 +371,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
     rows.truncate(limit);
 
     for row in &rows {
-        let age = if row.latest_secs == 0 {
-            "?".to_string()
-        } else {
-            sessions::format_age(now.saturating_sub(row.latest_secs))
-        };
+        let age = sessions::Age::at_epoch(row.latest_secs, now);
         let touches_label = if row.touches == 1 { "touch" } else { "touches" };
         println!(
             "[{age}] {} / {} ({}) / {} {touches_label}",

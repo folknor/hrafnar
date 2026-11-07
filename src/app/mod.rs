@@ -221,6 +221,8 @@ pub async fn run() -> Result<()> {
                             .map(|(n, p)| (n.clone(), p.value.clone())),
                     );
                 } else if let Some(group) = cfg.groups.get(name) {
+                    // Config resolution removes cross-layer losers and rejects
+                    // same-layer clashes, so group-first lookup is not precedence.
                     for member in &group.value {
                         // Resolution checked every member exists.
                         let prime = cfg.archetype(member).unwrap_or_default();
@@ -286,14 +288,7 @@ pub async fn run() -> Result<()> {
     // layer. Validate up front so we fail before spawning.
     if let Some(ref profile) = cli.profile {
         for prov in &providers_to_run {
-            if cfg.resolve_profile(prov, profile).is_none() {
-                bail!(
-                    "profile '{profile}' not defined for provider '{prov}'\n  \
-                     looked for [{prov}.{profile}] and [{}.{prov}.{profile}] in {}",
-                    config::toml_key(&cfg.hostname),
-                    cfg.searched()
-                );
-            }
+            cfg.require_profile(prov, profile)?;
         }
     }
 
@@ -338,8 +333,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Global lock
-    let lock_path = std::env::temp_dir().join("review.lock");
-    let lock_file = lock::open_lock_file(&lock_path)?;
+    let lock_file = lock::open_global_lock()?;
     lock::acquire_blocking(&lock_file)?;
 
     // Re-read under the lock: cfg was loaded before waiting, so its audit id

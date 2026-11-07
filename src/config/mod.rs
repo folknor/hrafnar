@@ -225,6 +225,44 @@ impl ReviewConfig {
             .map(|e| &e.effective.profile)
     }
 
+    /// The effective profile, or an error describing the tables searched in
+    /// precedence order. Keep the lookup and its explanation together so the
+    /// app does not need to restate the config resolver's search rules.
+    pub(crate) fn require_profile(
+        &self,
+        provider: &str,
+        profile: &str,
+    ) -> anyhow::Result<&Profile> {
+        self.resolve_profile(provider, profile).ok_or_else(|| {
+            let host_table = format!("[{}.{provider}.{profile}]", toml_key(&self.hostname));
+            let common_table = format!("[{provider}.{profile}]");
+            let mut searched = Vec::new();
+
+            if let Some(local) = &self.files.local {
+                searched.push(format!("{host_table} in {}", local.display()));
+                searched.push(format!("{common_table} in {}", local.display()));
+            }
+            if let Some(global) = &self.files.global {
+                let absent = if self.files.global_loaded {
+                    ""
+                } else {
+                    " (absent)"
+                };
+                searched.push(format!("{host_table} in {}{absent}", global.display()));
+                searched.push(format!("{common_table} in {}{absent}", global.display()));
+            }
+
+            let searched = if searched.is_empty() {
+                "no config file paths were available".to_string()
+            } else {
+                searched.join(", ")
+            };
+            anyhow::anyhow!(
+                "profile '{profile}' not defined for provider '{provider}'\n  looked for {searched}"
+            )
+        })
+    }
+
     pub fn archetype(&self, name: &str) -> Option<&str> {
         self.archetypes.get(name).map(|s| s.value.as_str())
     }

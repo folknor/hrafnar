@@ -44,6 +44,11 @@ pub struct Incident<'a> {
     pub stdout: &'a [u8],
     pub stderr: &'a [u8],
     pub transcript_path: Option<&'a str>,
+    /// The same scope passed to transcript recovery. An offset beyond EOF
+    /// means no bytes can safely be attributed to this run.
+    pub transcript_offset: Option<u64>,
+    /// Whether the runner's scoped transcript summary found a final answer.
+    pub final_answer_present: Option<bool>,
     pub duration_ms: u128,
     /// Overrides the XDG data root the bundle is written under. `None` in
     /// production; set by tests so a stub run cannot write into the operator's
@@ -107,8 +112,8 @@ struct Meta {
     stderr_bytes: usize,
     stdout_truncated: bool,
     transcript_path: Option<String>,
-    /// codex records this on `task_complete`; `Some(false)` means the turn ended
-    /// with no final answer (a death signature), `Some(true)` means it did.
+    /// Whether the shared transcript summary found a final-answer phase in the
+    /// scoped bytes. `Some(false)` means it found none.
     final_answer_present: Option<bool>,
     /// Rate-limit snapshot from the last `token_count` event (raw JSON), so a
     /// limit-driven stop is visible without re-reading the transcript.
@@ -201,20 +206,20 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
     write_file(&dir, "stdout.jsonl", stdout_slice);
 
-    // Transcript tail (the full rollout stays at transcript_path) plus the two
-    // scalars worth surfacing without a re-parse. The provider has a byte
-    // baseline for scoped transcript recovery, but Incident currently carries
-    // only the path, so this excerpt and scan cover the whole rollout.
-    let mut final_answer_present = None;
+    // The excerpt and metadata must describe this invocation, not an earlier
+    // turn in the same resumed session. Use the exact byte baseline that scoped
+    // recovery; an untrusted baseline is represented by an offset beyond EOF.
     let mut rate_limits = None;
     if let Some(path) = inc.transcript_path
         && let Ok(bytes) = std::fs::read(path)
     {
-        let content = String::from_utf8_lossy(&bytes);
+        let scoped = crate::transcript::slice_from_offset(&bytes, inc.transcript_offset);
+        let content = String::from_utf8_lossy(scoped);
         let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
         write_file(&dir, "transcript.tail.jsonl", tail.as_bytes());
-        (final_answer_present, rate_limits) = scan_transcript(&content);
+        rate_limits = scan_rate_limits(&content);
     }
+    let final_answer_present = inc.final_answer_present;
 
     let env = inc
         .env
@@ -303,13 +308,9 @@ fn tail_lines(content: &str, max: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Extract the two scalars worth promoting into meta: whether the final
-/// `task_complete` carried a non-null `last_agent_message`, and the last
-/// `token_count` rate-limit snapshot. This consumes the whole rollout; it cannot
-/// establish run-local completion until the caller supplies the run's byte
-/// baseline.
-fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
-    let mut final_answer_present = None;
+/// Extract the last non-null rate-limit snapshot from an already run-scoped
+/// rollout excerpt. Answer recognition belongs to `transcript::summarize`.
+fn scan_rate_limits(content: &str) -> Option<serde_json::Value> {
     let mut rate_limits = None;
     for line in content.lines() {
         let val: serde_json::Value = match serde_json::from_str(line) {
@@ -317,26 +318,14 @@ fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
             Err(_) => continue,
         };
         let payload = val.get("payload");
-        match payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) {
-            // Reset per turn so a resumed turn that freezes before task_complete
-            // reports "unknown", not the prior turn's completion (which would
-            // mislabel the death as "completed" in `review incidents`).
-            Some("task_started") => final_answer_present = None,
-            Some("task_complete") => {
-                let msg = payload.and_then(|p| p.get("last_agent_message"));
-                final_answer_present = Some(msg.is_some_and(|m| !m.is_null()));
-            }
-            Some("token_count") => {
-                if let Some(rl) = payload.and_then(|p| p.get("rate_limits"))
-                    && !rl.is_null()
-                {
-                    rate_limits = Some(rl.clone());
-                }
-            }
-            _ => {}
+        if payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("token_count")
+            && let Some(rl) = payload.and_then(|p| p.get("rate_limits"))
+            && !rl.is_null()
+        {
+            rate_limits = Some(rl.clone());
         }
     }
-    (final_answer_present, rate_limits)
+    rate_limits
 }
 
 /// Build a copy-pasteable shell command that reproduces the run: `cd` to the
@@ -538,38 +527,29 @@ mod tests {
     }
 
     #[test]
-    fn scan_flags_null_final_answer_as_death() {
-        // task_complete with last_agent_message=null == no final answer produced.
-        let died = concat!(
+    fn scan_keeps_the_last_non_null_rate_limit_snapshot() {
+        let rollout = concat!(
             r#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":31.0}}}}"#,
             "\n",
-            r#"{"payload":{"type":"task_complete","last_agent_message":null}}"#,
+            r#"{"payload":{"type":"token_count","rate_limits":null}}"#,
         );
-        let (final_answer_present, rate_limits) = scan_transcript(died);
-        assert_eq!(final_answer_present, Some(false));
-        assert!(rate_limits.is_some(), "rate_limits should be captured");
+        assert_eq!(
+            scan_rate_limits(rollout),
+            Some(serde_json::json!({"primary":{"used_percent":31.0}}))
+        );
     }
 
     #[test]
-    fn scan_flags_real_answer_as_present() {
-        let ok = r#"{"payload":{"type":"task_complete","last_agent_message":"All done."}}"#;
-        let (final_answer_present, _) = scan_transcript(ok);
-        assert_eq!(final_answer_present, Some(true));
-    }
-
-    #[test]
-    fn scan_resets_final_answer_on_new_turn() {
-        // Turn 1 completed with an answer; turn 2 started and froze (no complete).
-        // The frozen turn must read as "unknown", not inherit turn 1's success.
+    fn scan_skips_malformed_lines() {
         let rollout = concat!(
-            r#"{"payload":{"type":"task_started"}}"#,
+            "not json\n",
+            r#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":31.0}}}}"#,
             "\n",
-            r#"{"payload":{"type":"task_complete","last_agent_message":"Turn one answer."}}"#,
-            "\n",
-            r#"{"payload":{"type":"task_started"}}"#,
         );
-        let (final_answer_present, _) = scan_transcript(rollout);
-        assert_eq!(final_answer_present, None);
+        assert_eq!(
+            scan_rate_limits(rollout),
+            Some(serde_json::json!({"primary":{"used_percent":31.0}}))
+        );
     }
 
     #[test]

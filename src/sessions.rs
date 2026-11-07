@@ -1,6 +1,112 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
+use std::fmt;
 use std::path::Path;
+
+/// How this session-log row was produced. Known legacy spellings remain
+/// readable, and unrecognized strings round-trip without losing their value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionKind {
+    Run,
+    Resume,
+    Prime,
+    Oneshot,
+    Other(String),
+}
+
+impl SessionKind {
+    fn from_value(value: String) -> Self {
+        match value.as_str() {
+            "run" => Self::Run,
+            "session" => Self::Resume,
+            "prime" => Self::Prime,
+            "oneshot" => Self::Oneshot,
+            _ => Self::Other(value),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Run => "run",
+            Self::Resume => "session",
+            Self::Prime => "prime",
+            Self::Oneshot => "oneshot",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl From<&'static str> for SessionKind {
+    fn from(value: &'static str) -> Self {
+        Self::from_value(value.to_string())
+    }
+}
+
+impl Default for SessionKind {
+    fn default() -> Self {
+        Self::Other(String::new())
+    }
+}
+
+impl fmt::Display for SessionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SessionKind {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self::from_value(String::deserialize(deserializer)?))
+    }
+}
+
+/// Elapsed time since an optional UNIX timestamp. The display is shared by
+/// session listings and the session artifact view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Age(Option<u64>);
+
+impl Age {
+    /// Build an age against a caller's shared clock snapshot.
+    pub fn at_epoch(epoch_secs: Option<u64>, now_epoch_secs: u64) -> Self {
+        Self(
+            epoch_secs
+                .filter(|epoch| *epoch != 0)
+                .map(|epoch| now_epoch_secs.saturating_sub(epoch)),
+        )
+    }
+
+    /// Build an age using the process-wide epoch clock.
+    pub fn since_epoch(epoch_secs: Option<u64>) -> Self {
+        Self::at_epoch(epoch_secs, crate::provider::now_epoch_secs())
+    }
+
+    /// The elapsed seconds, or `None` when the timestamp was absent or zero.
+    pub fn elapsed_secs(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl fmt::Display for Age {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => f.write_str("?"),
+            Some(secs) if secs < 60 => f.write_str("just now"),
+            Some(secs) => write!(f, "{} ago", format_age(secs)),
+        }
+    }
+}
 
 #[derive(Serialize)]
 struct SessionEntry<'a> {
@@ -14,8 +120,8 @@ struct SessionEntry<'a> {
     provider: &'a str,
     archetype: &'a str,
     session_id: &'a str,
-    /// "oneshot" for --oneshot creation events, "session" for `review resume` resumes.
-    kind: &'static str,
+    /// "run" for a fresh run, "session" for a resume.
+    kind: SessionKind,
     model: Option<&'a str>,
     /// Reasoning effort the run launched with. Recorded alongside `model`
     /// because a `review resume` inherits both from this row, and a resume
@@ -73,10 +179,9 @@ struct SessionEntry<'a> {
 pub struct SessionRecord {
     #[allow(dead_code)]
     pub timestamp: String,
-    /// Older records may not have this field; default to 0 and treat as
-    /// "age unknown" if so.
-    #[serde(default)]
-    pub epoch_secs: u64,
+    /// Missing and legacy zero epochs mean the time is unknown.
+    #[serde(default, deserialize_with = "deserialize_epoch_secs")]
+    pub epoch_secs: Option<u64>,
     pub project: String,
     #[allow(dead_code)]
     pub hostname: String,
@@ -85,10 +190,9 @@ pub struct SessionRecord {
     pub provider: String,
     pub archetype: String,
     pub session_id: String,
-    /// "oneshot", "session", or "prime"; "" for entries written before this
-    /// field existed (none in practice - included for forward compat).
+    /// The row kind, preserving historical and future string values.
     #[serde(default)]
-    pub kind: String,
+    pub kind: SessionKind,
     /// Read back by `app::message::inherited_settings` so a `review resume` launches
     /// on the session's own model rather than the provider's default.
     pub model: Option<String>,
@@ -124,6 +228,13 @@ pub struct SessionRecord {
     pub digest: Option<crate::provider::DigestSummary>,
 }
 
+fn deserialize_epoch_secs<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<u64>::deserialize(deserializer)?.filter(|epoch| *epoch != 0))
+}
+
 fn sessions_path(private: bool) -> Option<std::path::PathBuf> {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
@@ -138,13 +249,6 @@ fn sessions_path(private: bool) -> Option<std::path::PathBuf> {
         "sessions.jsonl"
     };
     Some(base.join(name))
-}
-
-fn now_epoch_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Read every well-formed entry from both the public and private sidecar logs.
@@ -187,13 +291,6 @@ pub fn latest_for_session(session_id: &str) -> Option<SessionRecord> {
         .max_by(|a, b| a.epoch_secs.cmp(&b.epoch_secs))
 }
 
-pub fn age_secs(record: &SessionRecord) -> Option<u64> {
-    if record.epoch_secs == 0 {
-        return None;
-    }
-    Some(now_epoch_secs().saturating_sub(record.epoch_secs))
-}
-
 pub fn format_age(secs: u64) -> String {
     if secs < 60 {
         return "now".to_string();
@@ -223,6 +320,58 @@ pub fn record(
     provider: &str,
     session_id: &str,
     kind: &'static str,
+    // UNIX seconds when the run finished (from ProviderResult.completed_epoch),
+    // so the recorded time reflects completion rather than collection order.
+    epoch_secs: u64,
+    model: Option<&str>,
+    effort: Option<&str>,
+    env_keys: Vec<String>,
+    // The filesystem permissions the run launched with. Recorded because a
+    // profile's advertised guarantee is worth nothing if what a run actually
+    // received is only visible in the terminal that launched it.
+    sandbox: Option<&str>,
+    writable_roots: Vec<String>,
+    served: &crate::provider::Served,
+    grok_trust: Option<&str>,
+    operator_prompt: &str,
+    assembled_prompt: &str,
+    result: &Result<String>,
+    digest: Option<&crate::provider::DigestSummary>,
+    leftovers: &crate::contained::Leftovers,
+) {
+    record_with_kind(
+        project_root,
+        private,
+        audit_id,
+        archetype,
+        provider,
+        session_id,
+        SessionKind::from(kind),
+        epoch_secs,
+        model,
+        effort,
+        env_keys,
+        sandbox,
+        writable_roots,
+        served,
+        grok_trust,
+        operator_prompt,
+        assembled_prompt,
+        result,
+        digest,
+        leftovers,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_with_kind(
+    project_root: &Path,
+    private: bool,
+    audit_id: &str,
+    archetype: &str,
+    provider: &str,
+    session_id: &str,
+    kind: SessionKind,
     // UNIX seconds when the run finished (from ProviderResult.completed_epoch),
     // so the recorded time reflects completion rather than collection order.
     epoch_secs: u64,

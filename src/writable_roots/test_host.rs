@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::Host;
 
@@ -52,10 +52,16 @@ impl Host for FakeHost {
     fn read_link(&self, path: &Path) -> Option<PathBuf> {
         self.links.get(path).cloned()
     }
-    /// Unmapped paths resolve to themselves, matching the common case of a
-    /// directory with no symlink components.
+    /// Unmapped paths model an existing path with no symlink components.
+    /// Normalize dot components; paths whose symlink resolution matters use
+    /// `resolves` to provide the destination explicitly.
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
-        Some(self.canon.get(path).cloned().unwrap_or(path.to_path_buf()))
+        Some(
+            self.canon
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| lexical_normalize(path)),
+        )
     }
     fn read_to_string(&self, path: &Path) -> Option<String> {
         self.files.get(path).cloned()
@@ -63,6 +69,28 @@ impl Host for FakeHost {
     fn is_dir(&self, path: &Path) -> bool {
         self.dirs.iter().any(|d| d == path)
     }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let previous_is_normal = matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                );
+                if previous_is_normal {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 pub(super) fn cwd() -> PathBuf {

@@ -114,6 +114,19 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
     Some(data_dir.join("review").join("inflight"))
 }
 
+/// Path of the host-wide launch lock, beside the review data and independent
+/// of `TMPDIR`. A fixed `/tmp` fallback preserves launches when neither XDG
+/// data home nor `HOME` is available.
+pub(crate) fn global_lock_path(data_root: Option<&Path>) -> PathBuf {
+    let Some(inflight_dir) = dir(data_root) else {
+        return PathBuf::from("/tmp/review.lock");
+    };
+    inflight_dir
+        .parent()
+        .map(|review_dir| review_dir.join("launch.lock"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/review.lock"))
+}
+
 /// Is `id` safe to use as a path component for a session?
 ///
 /// The session id reaches here straight from `review resume <id>` on the command

@@ -132,6 +132,9 @@ pub fn resolve(
         hidden.insert(name);
     }
 
+    // The resolved maps are disjoint, so the app's group-first lookup cannot
+    // override an archetype with a same-name group.
+
     for (name, group) in &groups {
         for member in &group.value {
             if !archetypes.contains_key(member) {

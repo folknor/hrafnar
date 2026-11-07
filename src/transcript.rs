@@ -8,7 +8,31 @@
 //! terminal `function_call` with no matching output (the tool that was running
 //! when it died).
 
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
+
+/// Result of looking for or reading a rollout artifact.
+///
+/// The compatibility `Option` helpers below intentionally keep returning
+/// `None` for both absence and I/O failure. New callers that need to report
+/// those cases separately should use the corresponding lookup helper.
+#[derive(Debug)]
+pub enum Lookup<T> {
+    Found(T),
+    Absent,
+    Unreadable(io::Error),
+}
+
+impl<T> Lookup<T> {
+    fn into_option(self) -> Option<T> {
+        match self {
+            Self::Found(value) => Some(value),
+            Self::Absent | Self::Unreadable(_) => None,
+        }
+    }
+}
 
 pub struct TranscriptSummary {
     pub path: String,
@@ -48,50 +72,114 @@ pub(crate) fn codex_home(override_home: Option<&str>) -> PathBuf {
 /// filename suffix (the id is a UUID, so this is unambiguous). Bounded
 /// recursive walk of the date-nested `sessions/` tree.
 pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
-    find_transcript_path_in_home(session_id, &codex_home(override_home))
+    find_transcript_path_lookup(session_id, override_home).into_option()
+}
+
+/// Typed counterpart to `find_transcript_path`.
+///
+/// A missing override means the current process environment/default home. It
+/// does not recover a profile-specific home used by an older session; callers
+/// need a persisted rollout path for that case.
+pub fn find_transcript_path_lookup(
+    session_id: &str,
+    override_home: Option<&str>,
+) -> Lookup<PathBuf> {
+    find_transcript_path_in_home_lookup(session_id, &codex_home(override_home))
 }
 
 /// Locate a rollout under an already resolved home without re-reading the environment.
 pub(crate) fn find_transcript_path_in_home(session_id: &str, home: &Path) -> Option<PathBuf> {
+    find_transcript_path_in_home_lookup(session_id, home).into_option()
+}
+
+/// Typed counterpart to `find_transcript_path_in_home`.
+pub(crate) fn find_transcript_path_in_home_lookup(
+    session_id: &str,
+    home: &Path,
+) -> Lookup<PathBuf> {
     let sessions = home.join("sessions");
     let needle = format!("-{session_id}.jsonl");
     let mut stack = vec![(sessions, 0u32)];
+    let mut unreadable = None;
     while let Some((dir, depth)) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            // If the root cannot be opened, no part of the tree can be searched.
-            // A nested directory can disappear or be unreadable independently;
-            // skip it and keep searching the remaining branches.
-            Err(_) if depth == 0 => return None,
-            Err(_) => continue,
+            // A missing root or a directory that disappeared during the walk
+            // is absence. Other errors mean the search may be incomplete.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                if unreadable.is_none() {
+                    unreadable = Some(error);
+                }
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    if unreadable.is_none() {
+                        unreadable = Some(error);
+                    }
+                    continue;
+                }
+            };
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    // A matching filename is still locatable even when its
+                    // metadata cannot be read. The later file read reports
+                    // whether its contents are unavailable.
+                    if has_transcript_name(&path, &needle) {
+                        return Lookup::Found(path);
+                    }
+                    if unreadable.is_none() {
+                        unreadable = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
                 // sessions/YYYY/MM/DD/file.jsonl -> cap the descent.
                 if depth < 5 {
                     stack.push((path, depth + 1));
                 }
-            } else if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(&needle))
-            {
-                return Some(path);
+            } else if has_transcript_name(&path, &needle) {
+                return Lookup::Found(path);
             }
         }
     }
-    None
+    match unreadable {
+        Some(error) => Lookup::Unreadable(error),
+        None => Lookup::Absent,
+    }
+}
+
+fn has_transcript_name(path: &Path, needle: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(needle))
 }
 
 pub(crate) fn summarize(path: &Path, from_offset: Option<u64>) -> Option<TranscriptSummary> {
-    let bytes = std::fs::read(path).ok()?;
+    summarize_lookup(path, from_offset).into_option()
+}
+
+/// Typed counterpart to `summarize`.
+pub(crate) fn summarize_lookup(path: &Path, from_offset: Option<u64>) -> Lookup<TranscriptSummary> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Lookup::Absent,
+        Err(error) => return Lookup::Unreadable(error),
+    };
     // Lossy is safe: an offset landing mid-line leaves one unparseable fragment,
     // which is skipped like any other malformed line.
     let content = String::from_utf8_lossy(slice_from_offset(&bytes, from_offset));
     let mut summary = parse(&content);
     summary.path = path.to_string_lossy().into_owned();
-    Some(summary)
+    Lookup::Found(summary)
 }
 
 /// Slice a rollout's raw bytes to the region a run appended, given the file's
@@ -130,6 +218,8 @@ pub fn slice_from_offset(bytes: &[u8], from_offset: Option<u64>) -> &[u8] {
 ///   text in the `output_text` items of `content` (codex 0.157.0, which no
 ///   longer writes an `agent_message` event at all).
 ///
+/// Empty text is not a report for either representation.
+///
 /// Missing the second made every clean 0.157.0 turn look like a death to
 /// `review sessions <id>` and left the stall watchdog blind to the answer.
 pub fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
@@ -140,6 +230,7 @@ pub fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
         Some("agent_message") => payload
             .get("message")
             .and_then(|m| m.as_str())
+            .filter(|text| !text.is_empty())
             .map(str::to_string),
         Some("message") if payload.get("role").and_then(|r| r.as_str()) == Some("assistant") => {
             let text: String = payload
@@ -332,8 +423,20 @@ pub fn summarize_session(
     override_home: Option<&str>,
     from_offset: Option<u64>,
 ) -> Option<TranscriptSummary> {
-    let path = find_transcript_path(session_id, override_home)?;
-    summarize(&path, from_offset)
+    summarize_session_lookup(session_id, override_home, from_offset).into_option()
+}
+
+/// Typed counterpart to `summarize_session`.
+pub fn summarize_session_lookup(
+    session_id: &str,
+    override_home: Option<&str>,
+    from_offset: Option<u64>,
+) -> Lookup<TranscriptSummary> {
+    match find_transcript_path_lookup(session_id, override_home) {
+        Lookup::Found(path) => summarize_lookup(&path, from_offset),
+        Lookup::Absent => Lookup::Absent,
+        Lookup::Unreadable(error) => Lookup::Unreadable(error),
+    }
 }
 
 #[cfg(test)]

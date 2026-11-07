@@ -50,6 +50,7 @@ fn record_run(
     operator_prompt: &str,
     prompt: &str,
     result: &provider::ProviderResult,
+    kind: sessions::SessionKind,
 ) {
     let session_for_log = result.session_id.as_deref().unwrap_or("");
     let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
@@ -66,14 +67,14 @@ fn record_run(
         &result.leftovers,
     );
     if let Some(ref sid) = result.session_id {
-        sessions::record(
+        sessions::record_with_kind(
             project_root,
             private,
             audit_id,
             archetype,
             &result.provider,
             sid,
-            "run",
+            kind,
             result.completed_epoch,
             // From the result, not from the caller's profile: the recorded
             // model must be the one the run launched with, for the same reason
@@ -108,6 +109,10 @@ pub(super) struct RecordCtx {
 
 impl RecordCtx {
     pub(super) fn record(&self, result: &provider::ProviderResult) {
+        self.record_as(result, sessions::SessionKind::Run);
+    }
+
+    fn record_as(&self, result: &provider::ProviderResult, kind: sessions::SessionKind) {
         record_run(
             &self.project_root,
             self.private,
@@ -117,6 +122,7 @@ impl RecordCtx {
             &self.operator_prompt,
             &self.prompt,
             result,
+            kind,
         );
     }
 }
@@ -169,6 +175,8 @@ impl Launch {
 pub(super) struct TaskOutcome {
     pub(super) result: provider::ProviderResult,
     also: Option<provider::ProviderResult>,
+    result_kind: sessions::SessionKind,
+    also_kind: Option<sessions::SessionKind>,
 }
 
 /// What to do about a fresh run that has just ended.
@@ -229,12 +237,16 @@ fn after_auto_resume(
         return TaskOutcome {
             result: second,
             also: Some(first),
+            result_kind: sessions::SessionKind::Resume,
+            also_kind: Some(sessions::SessionKind::Run),
         };
     }
     if second.digest.as_ref().is_some_and(|d| d.interrupted) {
         return TaskOutcome {
             result: second,
             also: Some(first),
+            result_kind: sessions::SessionKind::Resume,
+            also_kind: Some(sessions::SessionKind::Run),
         };
     }
     // Resume didn't help: keep the death as the result, but still persist the
@@ -242,6 +254,8 @@ fn after_auto_resume(
     TaskOutcome {
         result: first,
         also: Some(second),
+        result_kind: sessions::SessionKind::Run,
+        also_kind: Some(sessions::SessionKind::Resume),
     }
 }
 
@@ -250,7 +264,8 @@ fn after_auto_resume(
 /// Recorded here, as each run ends, rather than once every run in the fan-out
 /// has: `review resume` needs the sidecar row, and `review interrupt` waits for
 /// it, so a run must not stay unresumable until its slowest sibling finishes.
-/// The other invocation goes first, so the reported one is the session's latest.
+/// Rows are written in launch order, so the most recent invocation also wins a
+/// same-second timestamp tie.
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
     // Held until the rows below are written, so a signalled `review` does not
     // exit with this session unrecorded (see `provider::install_signal_supervisor`).
@@ -264,12 +279,16 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
         AfterRun::Report => TaskOutcome {
             result: first,
             also: None,
+            result_kind: sessions::SessionKind::Run,
+            also_kind: None,
         },
         AfterRun::Interrupted => {
             eprintln!("{prov} run interrupted - not auto-resuming");
             TaskOutcome {
                 result: first,
                 also: None,
+                result_kind: sessions::SessionKind::Run,
+                also_kind: None,
             }
         }
         AfterRun::LeftRunning => {
@@ -280,6 +299,8 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
             TaskOutcome {
                 result: first,
                 also: None,
+                result_kind: sessions::SessionKind::Run,
+                also_kind: None,
             }
         }
         AfterRun::StatedFailure(why) => {
@@ -288,6 +309,8 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
             TaskOutcome {
                 result: first,
                 also: None,
+                result_kind: sessions::SessionKind::Run,
+                also_kind: None,
             }
         }
         AfterRun::AutoResume(sid) => {
@@ -296,8 +319,8 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
             after_auto_resume(first, second)
         }
     };
-    // Both runs are recorded only now, after any auto-resume - and that order
-    // is what keeps a `review message` from launching beside the auto-resume.
+    // Both runs are recorded only now, after any auto-resume. Keep paired rows
+    // in launch order so the resume remains latest when their epoch seconds tie.
     // Between the first run ending and the auto-resume spawning, the session
     // has no in-flight marker; it has no sidecar row either, so a message
     // arriving then is refused ("no record") instead of launching. Recording
@@ -305,8 +328,20 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
     // and the message would start a second turn on the session. A message
     // arriving while the auto-resume runs finds its marker (written before its
     // spawn) and interrupts it, as for any run.
-    for run in outcome.also.iter().chain(std::iter::once(&outcome.result)) {
-        ctx.record(run);
+    if let Some(other) = &outcome.also {
+        let other_kind = outcome
+            .also_kind
+            .clone()
+            .expect("an additional run has a row kind");
+        if outcome.result_kind == sessions::SessionKind::Run {
+            ctx.record_as(&outcome.result, outcome.result_kind.clone());
+            ctx.record_as(other, other_kind);
+        } else {
+            ctx.record_as(other, other_kind);
+            ctx.record_as(&outcome.result, outcome.result_kind.clone());
+        }
+    } else {
+        ctx.record_as(&outcome.result, outcome.result_kind.clone());
     }
     // A signalled `review` exits once every codex run is recorded, before the
     // results are printed, so say here how to continue this one.

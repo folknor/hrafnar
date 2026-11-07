@@ -515,15 +515,6 @@ config entry while the positional does not (both in `notes/bugs.md`). Owner
 proposed: the archetype resolver in config, returning
 `Archetype { label, prime: Option<Prime> }`.
 
-## CON-023 - Which wins, a group or an archetype of the same name?
-
-Reported by: config.
-
-`config::resolve` removes clashes by layer, and `app` checks groups before
-archetypes. They agree because `resolve` removed the loser. Owner proposed:
-the archetype resolver in config, so `app` does no lookup ordering. The
-resolver move is in `notes/structural.md`.
-
 ## CON-026 - What is a project root's canonical identity?
 
 Reported by: config.
@@ -534,14 +525,6 @@ parent; `project::canonical` does the same; `project::same_project` compares.
 both came from `project_root_of`. Owner proposed: a `ProjectRoot` newtype
 mintable only by those constructors (see `notes/structural.md`).
 
-## CON-027 - Which tables does a profile lookup search?
-
-Reported by: config, orchestration.
-
-`config::resolve` defines the order; the `--profile` "not defined" error in
-`app` restates it (`looked for [{prov}.{profile}] and
-[{host}.{prov}.{profile}]`). Right today. Owner proposed: the resolver reports
-what it searched (`cfg.require_profile(provider, name)` owning the message).
 
 ## CON-029 - Is there a record for this session, and which project is it in?
 
@@ -721,13 +704,3 @@ Reported by: forensics.
 The 200-char truncation is done twice, differently: `truncate` in
 `provider.rs` adds `...`, `run_session_show` uses a bare `chars().take(200)`.
 Owner proposed: one display on an `InFlightTool` type.
-
-## CON-046 - Ages and "now"
-
-Reported by: orchestration.
-
-There are three `now_epoch_secs` (`sessions.rs`, `provider.rs`, inline in
-`run_sessions`), and the age rendering ("now" vs "just now" vs "?") is decided
-in `run_session_resume`, `run_session_show` and `run_sessions`. Every reader
-re-checks `epoch_secs == 0` for unknown. Owner proposed: an `Age` type with one
-`Display`, over an optional epoch (see `notes/structural.md`).

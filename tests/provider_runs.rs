@@ -160,6 +160,23 @@ impl Scratch {
             .join("sessions/2026/01/01")
             .join(format!("rollout-2026-01-01T00-00-00-{STUB_SESSION}.jsonl"))
     }
+
+    /// Seed one completed prior turn and a rate-limit snapshot for resume tests.
+    fn seed_previous_rollout(&self) {
+        let rollout = self.rollout_path();
+        std::fs::create_dir_all(rollout.parent().expect("rollout parent"))
+            .expect("create rollout directory");
+        std::fs::write(
+            rollout,
+            concat!(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"OLD PREVIOUS ANSWER\",\"phase\":\"final_answer\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"OLD PREVIOUS ANSWER\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":99.0}}}}\n",
+            ),
+        )
+        .expect("seed previous rollout turn");
+    }
 }
 
 impl Drop for Scratch {
@@ -292,6 +309,47 @@ async fn run_stub_with(
         &project,
         None,
         runtime,
+    )
+    .await
+}
+
+/// Resume an existing stub session so the runner scopes its transcript from
+/// the rollout's pre-launch byte length.
+async fn run_resume_stub(scratch: &Scratch, script: &str) -> Result<RunOutput> {
+    let out_file = new_output_file().expect("create -o file");
+    let mut env = BTreeMap::new();
+    env.insert(
+        "CODEX_HOME".to_string(),
+        scratch.codex_home().to_string_lossy().into_owned(),
+    );
+    env.insert("LAST_MSG".to_string(), out_file.clone());
+    env.insert(
+        "LINGER_PID".to_string(),
+        scratch
+            .root
+            .join("linger.pid")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let project = scratch.project();
+    let runtime = fast_runtime(scratch);
+    run_codex_json(
+        vec![
+            script.to_string(),
+            "exec".to_string(),
+            "resume".to_string(),
+            STUB_SESSION.to_string(),
+            "--json".to_string(),
+            "-o".to_string(),
+            out_file.clone(),
+        ],
+        &out_file,
+        Some(STUB_SESSION.to_string()),
+        Some(&env),
+        "continue review",
+        &project,
+        None,
+        &runtime,
     )
     .await
 }
@@ -505,6 +563,115 @@ sleep 3600
         scratch.incident_dirs().len(),
         1,
         "a stalled run must leave exactly one forensic bundle"
+    );
+}
+
+/// A resumed run's incident excerpt and metadata must use the same byte scope
+/// and final-answer recognizer as recovery. Previous turns must not leak into
+/// this bundle, commentary is not an answer, and a trailing Codex phantom turn
+/// must not erase a real answer from the current run.
+#[tokio::test]
+async fn incident_bundle_scopes_resumed_rollout_and_uses_phase_aware_answers() {
+    let cases = [
+        (
+            "commentary-only",
+            r#"printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"CURRENT COMMENTARY","phase":"commentary"}}' >> "$ROLL"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"CURRENT COMMENTARY"}}' >> "$ROLL"
+"#,
+            false,
+            "CURRENT COMMENTARY",
+        ),
+        (
+            "answer-before-phantom",
+            r#"printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"CURRENT FINAL","phase":"final_answer"}}' >> "$ROLL"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"CURRENT FINAL"}}' >> "$ROLL"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"task_started"}}' >> "$ROLL"
+printf '%s\n' '{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>"}]}}' >> "$ROLL"
+printf '%s\n' '{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}' >> "$ROLL"
+"#,
+            true,
+            "CURRENT FINAL",
+        ),
+    ];
+
+    for (case, current_events, expected_answer, current_marker) in cases {
+        let scratch = Scratch::new();
+        scratch.seed_previous_rollout();
+        let stub = scratch.write_stub(&format!(
+            "{preamble}\n{current_events}\nsleep 3600\n",
+            preamble = stub_preamble(),
+        ));
+
+        let run = run_resume_stub(&scratch, &stub)
+            .await
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        let digest = run.digest.expect("codex digest");
+        if expected_answer {
+            assert!(digest.recovered_from_transcript, "{case}: answer recovered");
+        } else {
+            assert!(
+                !digest.recovered_from_transcript,
+                "{case}: no answer recovered"
+            );
+        }
+
+        let dirs = scratch.incident_dirs();
+        assert_eq!(dirs.len(), 1, "{case}: one incident bundle");
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dirs[0].join("meta.json")).expect("read meta.json"),
+        )
+        .expect("parse meta.json");
+        assert_eq!(
+            meta["final_answer_present"].as_bool(),
+            Some(expected_answer),
+            "{case}: answer classification belongs to the resumed run"
+        );
+        assert!(
+            meta["rate_limits"].is_null(),
+            "{case}: old rate-limit data must not be copied into this run"
+        );
+        let tail = std::fs::read_to_string(dirs[0].join("transcript.tail.jsonl"))
+            .expect("read transcript tail");
+        assert!(
+            tail.contains(current_marker),
+            "{case}: current lines retained"
+        );
+        assert!(
+            !tail.contains("OLD PREVIOUS ANSWER"),
+            "{case}: previous turn must not appear in the excerpt"
+        );
+    }
+}
+
+#[tokio::test]
+async fn incident_bundle_excludes_previous_turn_when_resume_adds_no_rollout_bytes() {
+    let scratch = Scratch::new();
+    scratch.seed_previous_rollout();
+    let stub = scratch.write_stub(&format!(
+        r#"
+cat > /dev/null
+printf '%s\n' '{{"type":"thread.started","thread_id":"{STUB_SESSION}"}}'
+sleep 3600
+"#
+    ));
+
+    let run = run_resume_stub(&scratch, &stub)
+        .await
+        .expect("resume completes after watchdog kill");
+    let digest = run.digest.expect("codex digest");
+    assert!(!digest.recovered_from_transcript);
+
+    let dirs = scratch.incident_dirs();
+    assert_eq!(dirs.len(), 1, "one incident bundle");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dirs[0].join("meta.json")).expect("read meta.json"))
+            .expect("parse meta.json");
+    assert_eq!(meta["final_answer_present"].as_bool(), Some(false));
+    assert!(meta["rate_limits"].is_null());
+    assert_eq!(
+        std::fs::read_to_string(dirs[0].join("transcript.tail.jsonl"))
+            .expect("read transcript tail"),
+        ""
     );
 }
 
