@@ -106,16 +106,16 @@ pub fn resolve(
         }
     }
 
-    // A group and an archetype share the one positional name the CLI resolves.
-    // Across files the project wins, as it does for every other name: adding a
-    // group to the global file must not break a project that happens to have an
-    // archetype of that name. Within one file there is no winner to pick.
     let clashes: Vec<String> = groups
         .keys()
         .filter(|n| archetypes.contains_key(*n))
         .cloned()
         .collect();
     let mut hidden = std::collections::BTreeSet::new();
+    // A same-file clash has no layer winner. Across files the project value
+    // wins, whether that means hiding the global group or archetype, so that
+    // adding a group to the global file cannot break a project that happens
+    // to have an archetype of that name.
     for name in clashes {
         let (g, a) = (groups[&name].layer, archetypes[&name].layer);
         if g == a {

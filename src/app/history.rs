@@ -177,9 +177,8 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
         if let Some(ref last) = t.last_event {
             println!("  last_event: {last}");
         }
-        if let Some((ref name, ref args)) = t.last_in_flight_tool {
-            let shown: String = args.chars().take(200).collect();
-            println!("  last_in_flight_tool: {name} {shown}");
+        if let Some(ref tool) = t.last_in_flight_tool {
+            println!("  last_in_flight_tool: {tool}");
         }
     }
 

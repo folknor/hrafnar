@@ -23,8 +23,8 @@ const BARE: &str = "bare";
 
 /// Format the wall-clock runtime printed when `review` returns: sub-minute runs
 /// get a decimal second (short runs differ by fractions), longer ones roll up to
-/// m/s then h/m/s. `sessions::format_age` is deliberately not reused - it floors
-/// anything under a minute to "now", which is most of a resume's runtime.
+/// m/s then h/m/s. `sessions::format_age` is deliberately not reused because it
+/// shows whole seconds below a minute and omits seconds at longer durations.
 fn format_runtime(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -337,8 +337,8 @@ pub async fn run() -> Result<()> {
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
-    // Re-read under the lock: cfg was loaded before waiting, so its audit id
-    // may be stale if another first run persisted one while this run queued.
+    // Refresh the cached audit id from the project file. ensure_audit_id locks
+    // and rereads that file, so concurrent first runs share the persisted id.
     let local_config_path = cfg
         .files
         .local

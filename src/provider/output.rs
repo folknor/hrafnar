@@ -119,8 +119,8 @@ fn print_digest(d: &Digest) {
         if let Some(ref last) = t.last_event {
             println!("  last_event: {last}");
         }
-        if let Some((ref name, ref args)) = t.last_in_flight_tool {
-            println!("  last_in_flight_tool: {name} {}", truncate(args, 200));
+        if let Some(ref tool) = t.last_in_flight_tool {
+            println!("  last_in_flight_tool: {tool}");
         }
     }
     if let Some(ref path) = d.incident_path {

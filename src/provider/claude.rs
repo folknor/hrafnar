@@ -242,8 +242,9 @@ pub async fn run_claude(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
-    // Named for codex, whose runner it was written for; claude uses only the
-    // stop channel, the data root and the two grace periods.
+    // Named for codex, whose runner it was written for; claude uses its
+    // command, stop channel, data root, teardown settings, orphan log, and
+    // drain grace.
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
     // In oneshot mode, generate a UUID up front and pass it via --session-id

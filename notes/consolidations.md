@@ -697,10 +697,3 @@ it should be derived from, so a caller can pass a name for a different set and
 `merge_profile` creates it. Owner proposed: a `RootSet` type (sorted and
 deduped by construction), making `profile_name(&RootSet)` total.
 
-## CON-045 - Display truncation of the in-flight tool
-
-Reported by: forensics.
-
-The 200-char truncation is done twice, differently: `truncate` in
-`provider.rs` adds `...`, `run_session_show` uses a bare `chars().take(200)`.
-Owner proposed: one display on an `InFlightTool` type.

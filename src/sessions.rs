@@ -36,12 +36,6 @@ impl SessionKind {
     }
 }
 
-impl From<&'static str> for SessionKind {
-    fn from(value: &'static str) -> Self {
-        Self::from_value(value.to_string())
-    }
-}
-
 impl Default for SessionKind {
     fn default() -> Self {
         Self::Other(String::new())
@@ -163,9 +157,9 @@ struct SessionEntry<'a> {
     response: Option<String>,
     error: Option<String>,
     review_version: &'static str,
-    /// Flat run digest (codex): exit/signal/captured/turns/task_complete/usage,
-    /// so a truncated/errored run is greppable instead of masquerading as a
-    /// clean short `response`. Absent for claude (no machine-readable stream).
+    /// Flat run digest when available: exit/signal/captured/turns/task_complete/
+    /// usage, so a truncated or errored run is searchable instead of
+    /// masquerading as a clean short `response`.
     #[serde(skip_serializing_if = "Option::is_none")]
     digest: Option<crate::provider::DigestSummary>,
     /// What the run's processes left behind: the ones its keeper killed, and
@@ -299,9 +293,10 @@ pub fn latest_for_session(session_id: &str) -> Option<SessionRecord> {
         .max_by(|a, b| a.epoch_secs.cmp(&b.epoch_secs))
 }
 
+/// Compact elapsed time for session listings, with second precision below a minute.
 pub fn format_age(secs: u64) -> String {
     if secs < 60 {
-        return "now".to_string();
+        return format!("{secs}s");
     }
     let mins = secs / 60;
     if mins < 60 {
@@ -317,60 +312,6 @@ pub fn format_age(secs: u64) -> String {
     }
     let days = hours / 24;
     format!("{days}d")
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn record(
-    project_root: &Path,
-    private: bool,
-    audit_id: &str,
-    archetype: &str,
-    provider: &str,
-    session_id: &str,
-    kind: &'static str,
-    // UNIX seconds when the run finished (from ProviderResult.completed_epoch),
-    // so the recorded time reflects completion rather than collection order.
-    epoch_secs: u64,
-    model: Option<&str>,
-    effort: Option<&str>,
-    env_keys: Vec<String>,
-    // The filesystem permissions the run launched with. Recorded because a
-    // profile's advertised guarantee is worth nothing if what a run actually
-    // received is only visible in the terminal that launched it.
-    sandbox: Option<&str>,
-    writable_roots: Vec<String>,
-    served: &crate::provider::Served,
-    grok_trust: Option<&str>,
-    operator_prompt: &str,
-    assembled_prompt: &str,
-    result: &Result<String>,
-    digest: Option<&crate::provider::DigestSummary>,
-    leftovers: &crate::contained::Leftovers,
-    codex_home: Option<&str>,
-) {
-    record_with_kind(
-        project_root,
-        private,
-        audit_id,
-        archetype,
-        provider,
-        session_id,
-        SessionKind::from(kind),
-        epoch_secs,
-        model,
-        effort,
-        env_keys,
-        sandbox,
-        writable_roots,
-        served,
-        grok_trust,
-        operator_prompt,
-        assembled_prompt,
-        result,
-        digest,
-        leftovers,
-        codex_home,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -472,5 +413,17 @@ pub(crate) fn record_with_kind(
     use std::io::Write;
     if let Err(e) = file.write_all(format!("{line}\n").as_bytes()) {
         eprintln!("warning: failed to write session entry: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_age;
+
+    #[test]
+    fn subminute_age_shows_elapsed_seconds() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(12), "12s");
+        assert_eq!(format_age(59), "59s");
     }
 }

@@ -474,14 +474,14 @@ async fn run_session_resume(
     // still doesn't refresh.
     let resume_ran = result.output.is_ok();
     if resume_ran {
-        sessions::record(
+        sessions::record_with_kind(
             &project_root,
             private,
             &audit_id,
             archetype,
             &result.provider,
             session_id,
-            "session",
+            sessions::SessionKind::Resume,
             result.completed_epoch,
             // Recorded, not `None`: a resume now launches with an inherited
             // model and effort, and leaving them out of its own row would break

@@ -10,10 +10,34 @@
 
 use std::{
     ffi::CStr,
-    io,
+    fmt, io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
+
+/// A tool call with no matching output in the Codex rollout.
+#[derive(Clone)]
+pub struct InFlightTool {
+    pub name: String,
+    pub arguments: String,
+}
+
+impl fmt::Display for InFlightTool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ", self.name)?;
+        let mut chars = self.arguments.chars();
+        for _ in 0..200 {
+            let Some(ch) = chars.next() else {
+                return Ok(());
+            };
+            write!(f, "{ch}")?;
+        }
+        if chars.next().is_some() {
+            f.write_str("...")?;
+        }
+        Ok(())
+    }
+}
 
 /// Result of looking for or reading a rollout artifact.
 ///
@@ -35,8 +59,8 @@ pub struct TranscriptSummary {
     pub stream_error: bool,
     /// `type/payload.type` of the final transcript event.
     pub last_event: Option<String>,
-    /// The last tool call with no matching output: `(name, arguments)`.
-    pub last_in_flight_tool: Option<(String, String)>,
+    /// The last tool call with no matching output.
+    pub last_in_flight_tool: Option<InFlightTool>,
     /// The last `final_answer`-phase agent message this turn, if any. codex
     /// tags interim progress notes `phase="commentary"` and the real report
     /// `phase="final_answer"`. When a shutdown-exit truncates the `--json`
@@ -329,7 +353,7 @@ fn parse(content: &str) -> TranscriptSummary {
         final_answer: Option<String>,
         /// Optional call_id -> (name, arguments), preserving insertion order
         /// and distinct id-less calls via a Vec.
-        in_flight: Vec<(Option<String>, (String, String))>,
+        in_flight: Vec<(Option<String>, InFlightTool)>,
     }
 
     let mut cur = TurnState::default();
@@ -447,7 +471,13 @@ fn parse(content: &str) -> TranscriptSummary {
                         .or_else(|| p.get("input"))
                         .map(ToString::to_string)
                         .unwrap_or_default();
-                    cur.in_flight.push((call_id, (name, args)));
+                    cur.in_flight.push((
+                        call_id,
+                        InFlightTool {
+                            name,
+                            arguments: args,
+                        },
+                    ));
                 }
             }
             Some(pt) if pt.ends_with("_call_output") => {
@@ -466,7 +496,7 @@ fn parse(content: &str) -> TranscriptSummary {
         }
     }
 
-    let last_in_flight_tool = cur.in_flight.pop().map(|(_, nt)| nt);
+    let last_in_flight_tool = cur.in_flight.pop().map(|(_, tool)| tool);
 
     TranscriptSummary {
         path: String::new(),
@@ -519,9 +549,25 @@ mod tests {
         assert!(!s.task_complete);
         assert!(s.stream_error);
         assert_eq!(s.last_event.as_deref(), Some("event_msg/stream_error"));
-        let (name, args) = s.last_in_flight_tool.expect("in-flight tool");
-        assert_eq!(name, "exec_command");
-        assert!(args.contains("sleep 999"), "args were: {args}");
+        let tool = s.last_in_flight_tool.expect("in-flight tool");
+        assert_eq!(tool.name, "exec_command");
+        assert!(
+            tool.arguments.contains("sleep 999"),
+            "args were: {}",
+            tool.arguments
+        );
+    }
+
+    #[test]
+    fn in_flight_tool_display_truncates_long_arguments_with_ellipsis() {
+        let tool = InFlightTool {
+            name: "exec_command".to_string(),
+            arguments: "a".repeat(201),
+        };
+        assert_eq!(
+            format!("{tool}"),
+            format!("exec_command {}...", "a".repeat(200))
+        );
     }
 
     #[test]
@@ -651,8 +697,8 @@ mod tests {
         let s = parse(resumed);
         assert!(!s.task_complete, "second turn must not report complete");
         assert!(s.stream_error);
-        let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
-        assert_eq!(name, "exec_command");
+        let tool = s.last_in_flight_tool.expect("in-flight tool from turn 2");
+        assert_eq!(tool.name, "exec_command");
     }
 
     // codex-cli 0.147.0 opens a turn at `codex exec` teardown and aborts it
@@ -760,8 +806,8 @@ mod tests {
             !s.task_complete,
             "a real aborted turn must not inherit the prior turn's completion"
         );
-        let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
-        assert_eq!(name, "exec_command");
+        let tool = s.last_in_flight_tool.expect("in-flight tool from turn 2");
+        assert_eq!(tool.name, "exec_command");
     }
 
     // A prior turn completed with a real final_answer; a later resume died

@@ -24,7 +24,7 @@ pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
 /// cannot collide with a subcommand, but the legacy positional form can: `review
 /// sessions` runs the subcommand, silently, rather than the archetype. So they
 /// stay reserved while that alias exists. Keep in step with `cli::Command` and the
-/// "Reserved words" table in CLAUDE.md.
+/// "Reserved words" table in `docs/config.md`.
 pub const RESERVED_NAMES: &[&str] = &[
     "all",
     "message",
