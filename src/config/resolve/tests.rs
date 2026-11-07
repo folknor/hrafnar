@@ -1,6 +1,6 @@
 //! Resolution tests across the local and global config layers.
 //!
-//! `config.rs`'s own `mod tests` covers parsing a single file; everything here
+//! `config::parse`'s own `mod tests` covers parsing a single file; everything here
 //! is about how two files combine: which one wins, whether a winner replaces or
 //! merges, and whether the provenance (`layer`, `table`) that `review config`
 //! reports is the provenance of the value actually used.
@@ -8,6 +8,7 @@
 #[allow(clippy::unwrap_used)]
 mod layering {
     use crate::config::*;
+    use anyhow::Result;
 
     fn local(raw: &str) -> ConfigFile {
         parse_file(raw, "local.toml", Layer::Local).unwrap()

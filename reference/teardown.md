@@ -2,7 +2,7 @@
 
 Provider-agnostic: every provider process `review` starts - codex, claude and
 grok runs, auto-resumes, grok wake turns, `review message`, and the incident
-bundle's version probe - runs under a **keeper** (`src/keeper.rs`), launched
+bundle's version probe - runs under a **keeper** (`src/keeper/mod.rs`), launched
 through `contained::spawn` (`src/contained.rs`). There is no other spawn site
 for a provider.
 

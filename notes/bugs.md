@@ -170,9 +170,8 @@ Reported by: orchestration, grok-man, providers, and wave fixers.
 - `config::RESERVED_NAMES`'s doc comment says to keep it in step with "the
   Reserved words table in CLAUDE.md"; the table is in `docs/config.md` and is
   tested.
-- The doc for `config_writable_roots_override` ("The writable roots a profile
-  `config` entry sets...") sits directly above `announcement_lines`, whose own
-  doc follows; the override function itself has no doc.
+- `src/timings.rs` names `provider_tests` as the suite that drives the long
+  timings; that suite is `tests/provider_runs.rs`.
 - `run_claude`'s `runtime` parameter comment says claude uses only the stop
   channel, the data root and the two grace periods; it also uses
   `claude_command`, `teardown` and `orphan_log`.
@@ -234,6 +233,14 @@ Reported by: a wave reviewer (lateral).
 `message_target` compares `cfg.audit.id` with the session record before
 `ensure_audit_id` runs, so a project whose file holds `id = ""` reports a
 mismatch with an empty id in the text rather than a clear message.
+
+## BUG-046 - `push_root` checks `..` only after canonicalizing
+
+Reported by: a wave fixer (lateral).
+
+`writable_roots`' `push_root` canonicalizes a root before it checks for `..`,
+although its comments say every filter runs against both the spelled and the
+resolved path. A spelled `..` is therefore never seen as such.
 
 ## BUG-043 - `contained::spawn` records keeper pid 0 when the id is missing
 

@@ -465,7 +465,10 @@ Reported by: grok-man.
 
 ## STR-024 - Split `provider.rs` into a lifecycle driver and per-provider adapters
 
-Reported by: providers, forensics, grok-man, orchestration.
+Reported by: providers, forensics, grok-man, orchestration. Narrowed: the file
+has been split mechanically into `src/provider/` (one runner per provider,
+results, runtime, output) with every path kept; what remains is the design
+below, the shared lifecycle driver and adapters.
 
 `provider.rs` is about 3600 lines that the providers hunter reads as five
 modules: process I/O plumbing, the signal supervisor, the permission front end
@@ -627,7 +630,9 @@ to match for every provider.
 
 ## STR-029 - Split `config.rs` and fix its dependency edges
 
-Reported by: config.
+Reported by: config. Narrowed: the file has been split mechanically into
+`src/config/` (parse, resolve, load, sandbox, ids) with every path kept; what
+remains is the moves and edge fixes below.
 
 `config.rs` does six jobs: the file format (`parse_file`), the layered
 resolver, filesystem discovery (`Selection`, `locate_config`, `load*`), the
@@ -694,7 +699,9 @@ messages.
 
 ## STR-032 - Split `app.rs` along its seams
 
-Reported by: orchestration.
+Reported by: orchestration. Narrowed: the file has been split mechanically into
+`src/app/` (dispatch, launch, message, history) with every path kept; what
+remains is the provider knowledge, vestigial optionality and bookkeeping below.
 
 `app.rs` (about 2100 lines) does five jobs: top-level dispatch; the fan-out
 (archetype expansion, provider selection, profile validation, launch
@@ -802,7 +809,10 @@ Reported by: forensics.
 
 ## STR-035 - Split `grok_home.rs` and give grok a module of its own
 
-Reported by: grok-man.
+Reported by: grok-man. Narrowed: the file has been split mechanically into
+`src/grok_home/` (trust, sandbox, events, background) with every path kept.
+Moving it under the grok runner is the separate easy entry below; what remains
+here is the `prepare` hook, the `fsutil` move and resolving `Grok` once.
 
 `grok_home.rs` is four modules in one file: the trust store mirror and
 decision; sandbox profile naming, TOML merge and the locked atomic write; the
@@ -891,3 +901,31 @@ Reported by: providers, lifecycle.
 - Effort via maki's config would mean writing maki's config per run, another
   `prepare_grok_write`-style setup inside `invoke` unless the `prepare` hook
   exists.
+
+## STR-038 - Move `grok_home` under the grok runner
+
+Reported by: the operator, during the split wave.
+
+`src/grok_home/` now holds trust decisions, sandbox profiles, session events,
+and background-work analysis with the wake prompt, not just grok's home
+directory, so the name no longer fits. Its caller is effectively the grok
+runner, which the split placed at `src/provider/grok.rs`. Proposed: move it to
+`src/provider/grok/` as children of the runner (the runner becoming
+`src/provider/grok/mod.rs` or similar), update the callers to the new paths,
+and narrow visibility so nothing outside the grok runner sees its internals
+such as `PROFILE_PREFIX`. A top-level `src/grok/` beside `src/provider/grok.rs`
+was considered and rejected: two modules named grok. This is a move and a
+rename of paths, with no behaviour change.
+
+## STR-039 - Module file layout that hides the module graph after the split
+
+Reported by: a wave reviewer.
+
+- `src/keeper/runtime.rs` declares `events`, `launch` and `teardown` with
+  `#[path = "..."]`, so they sit flat in `src/keeper/` while being children of
+  `runtime`. Moving them to `src/keeper/runtime/` would make the tree say what
+  the module graph says.
+- `src/provider/mod.rs` declares its dispatch tests as
+  `#[path = "tests.rs"] mod provider_tests;`, and the per-runner test files
+  reach its `exited` helper through `super::super::provider_tests::exited`;
+  the file name and module name differ for no visible reason.

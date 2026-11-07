@@ -86,7 +86,7 @@ pub struct SessionRecord {
     /// field existed (none in practice - included for forward compat).
     #[serde(default)]
     pub kind: String,
-    /// Read back by `app::inherited_settings` so a `review resume` launches
+    /// Read back by `app::message::inherited_settings` so a `review resume` launches
     /// on the session's own model rather than the provider's default.
     pub model: Option<String>,
     /// Absent on rows written before this was recorded, and on any run that

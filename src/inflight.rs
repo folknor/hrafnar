@@ -17,7 +17,7 @@
 //!
 //! # Why a file rather than a sidecar row
 //!
-//! The row would have to be written from `provider.rs`, which has the session id
+//! The row would have to be written from `provider`, which has the session id
 //! but none of the audit metadata (`audit_id`, `private`, archetype) that a
 //! sidecar row requires - threading all of it down just to mark liveness is a
 //! lot of plumbing for a fact that is worthless once the run ends. A marker file
