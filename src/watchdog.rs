@@ -120,6 +120,8 @@ pub enum Kind {
 /// Verdict handed back to the runner when the watchdog fires.
 pub struct Verdict {
     pub kind: Kind,
+    /// Exact answer that licensed a stranded kill, scoped to this run.
+    pub final_answer: Option<String>,
     /// Operator-facing explanation, printed before we kill the child.
     pub reason: String,
     /// How long the rollout had been unchanged when we decided. Recorded on the
@@ -131,8 +133,7 @@ pub struct Verdict {
     pub last_event: Option<String>,
 }
 
-/// Does the region of the rollout written by *this* run contain a real final
-/// answer?
+/// Last real final answer in the region of the rollout written by *this* run.
 ///
 /// `bytes` must already be sliced to start at the run's baseline offset (see
 /// `scan_from_baseline`), which is how "this run" is delimited. A byte offset is
@@ -153,26 +154,16 @@ pub struct Verdict {
 /// Requires the answer to be phase-tagged `final_answer`; codex tags interim
 /// progress notes `commentary`, and killing a live run on the strength of an
 /// "I am now doing X" note would be exactly wrong.
-fn has_final_answer(bytes: &[u8]) -> bool {
+fn final_answer(bytes: &[u8]) -> Option<String> {
     // Lossy is safe here: a baseline that lands mid-line leaves one unparseable
     // fragment, which is skipped like any other malformed line.
     let content = String::from_utf8_lossy(bytes);
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if event
+    content.lines().rev().find_map(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).ok()?;
+        event
             .get("payload")
             .and_then(crate::transcript::final_answer_text)
-            .is_some()
-        {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// Slice a rollout's raw bytes to the region this run appended. Shares
@@ -195,7 +186,7 @@ fn scan_from_baseline(bytes: &[u8], baseline: u64) -> &[u8] {
 /// scopes the answer scan to this run's own events.
 pub async fn wait_for_stranded_completion(
     mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
-    codex_home: Option<String>,
+    codex_home: PathBuf,
     baseline: Option<u64>,
     timings: Timings,
 ) -> Verdict {
@@ -228,7 +219,7 @@ pub async fn wait_for_stranded_completion(
             Some((cached_id, path)) if cached_id == &session_id => (path.clone(), true),
             _ => {
                 let Some(path) =
-                    crate::transcript::find_transcript_path(&session_id, codex_home.as_deref())
+                    crate::transcript::find_transcript_path_in_home(&session_id, &codex_home)
                 else {
                     // No rollout yet, or a custom CODEX_HOME we cannot see
                     // into. Not an error - just nothing to judge.
@@ -275,13 +266,15 @@ pub async fn wait_for_stranded_completion(
         // parseable event would report the *previous* turn's last event as its
         // own activity. `None` here honestly means "this run wrote nothing".
         let ours = scan_from_baseline(&bytes, baseline);
-        let answered = has_final_answer(ours);
+        let answer = final_answer(ours);
+        let answered = answer.is_some();
         let quiet_secs = quiet.as_secs();
         let last_event = last_event(ours);
 
         if answered && quiet >= timings.quiet_grace {
             return Verdict {
                 kind: Kind::Stranded,
+                final_answer: answer,
                 reason: format!(
                     "codex has written a final answer to its rollout but has not exited, \
                      and the rollout has not advanced in {quiet_secs}s.\n  \
@@ -297,6 +290,7 @@ pub async fn wait_for_stranded_completion(
         if !answered && stall_due {
             return Verdict {
                 kind: Kind::Stalled,
+                final_answer: None,
                 reason: format!(
                     "stall timeout: codex has written nothing to its rollout in \
                      {quiet_secs}s and has produced no final answer.\n  \
@@ -327,7 +321,7 @@ pub async fn wait_for_stranded_completion(
 /// it did.
 ///
 /// `bytes` must already be sliced to this run's region (`scan_from_baseline`),
-/// exactly like `has_final_answer`. Scanning the whole rollout would make a
+/// exactly like `final_answer`. Scanning the whole rollout would make a
 /// resume that stalled before writing anything report the *previous* turn's
 /// last event as its own - the one case where this field is most needed and
 /// would be most misleading. `None` honestly means "this run wrote nothing".
@@ -354,7 +348,7 @@ mod tests {
     const COMMENTARY: &str = r#"{"timestamp":"2026-08-11T07:30:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}"#;
 
     fn scan(rollout: &str, baseline: u64) -> bool {
-        has_final_answer(scan_from_baseline(rollout.as_bytes(), baseline))
+        final_answer(scan_from_baseline(rollout.as_bytes(), baseline)).is_some()
     }
 
     #[test]
@@ -371,6 +365,14 @@ mod tests {
         let answer = r#"{"timestamp":"2026-09-29T06:28:09.406Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}],"phase":"final_answer"}}"#;
         let rollout = format!("{TASK_STARTED}\n{answer}\n");
         assert!(scan(&rollout, 0));
+    }
+
+    #[test]
+    fn latest_answer_survives_trailing_turns() {
+        let later = FINAL_ANSWER.replace("Done.", "Latest.");
+        let rollout =
+            format!("{FINAL_ANSWER}\n{TASK_STARTED}\n{later}\n{TASK_STARTED}\n{COMMENTARY}\n");
+        assert_eq!(final_answer(rollout.as_bytes()).as_deref(), Some("Latest."));
     }
 
     #[test]

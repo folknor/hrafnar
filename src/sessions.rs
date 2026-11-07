@@ -26,12 +26,15 @@ struct SessionEntry<'a> {
     /// Environment variable *names* configured for this provider entry; values
     /// are deliberately not recorded to avoid leaking secrets in the sidecar.
     env_keys: Vec<String>,
-    /// The sandbox level the run launched with, in the provider's own
-    /// vocabulary (`None` for claude, which has no filesystem sandbox). Makes
+    /// The sandbox level in review's vocabulary for known levels. Custom names
+    /// pass through; claude has no filesystem sandbox and records `None`. Makes
     /// "which runs could write?" a `jq` query rather than an inference from the
     /// profile name, which is only a claim about what was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     sandbox: Option<&'a str>,
+    /// Native selector retained separately because Grok pins it for the session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_sandbox: Option<&'a str>,
     /// Writable roots granted beyond the provider's defaults. Empty for every
     /// run that widened nothing, which is every read-only run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -101,6 +104,8 @@ pub struct SessionRecord {
     #[allow(dead_code)]
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub provider_sandbox: Option<String>,
     /// Writable roots granted beyond the provider's defaults.
     #[allow(dead_code)]
     #[serde(default)]
@@ -265,7 +270,8 @@ pub fn record(
         model,
         effort,
         env_keys,
-        sandbox,
+        sandbox: crate::provider::recorded_sandbox(provider, sandbox),
+        provider_sandbox: (provider == "grok").then_some(sandbox).flatten(),
         writable_roots,
         served_model: served.model.as_deref(),
         cost_usd: served.cost_usd,

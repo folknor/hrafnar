@@ -162,8 +162,9 @@ pub struct ProviderResult {
     /// (possibly much later) moment results are collected in launch order.
     pub completed_epoch: u64,
     /// The filesystem permissions this run actually launched with, in the
-    /// provider's own vocabulary. Recorded because the guarantee a profile
-    /// advertises is worth nothing if the permissions a run *received* are only
+    /// provider's own vocabulary. The sidecar normalizes known levels and saves
+    /// this native selector separately for exact resume. Recorded because the
+    /// guarantee a profile advertises is worth nothing if the permissions a run *received* are only
     /// visible in the launching terminal: `jq 'select(.sandbox=="read-only")'`
     /// has to be able to answer "which runs could not write?" after the fact.
     pub sandbox: Option<String>,

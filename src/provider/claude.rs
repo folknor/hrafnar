@@ -1,5 +1,121 @@
 use super::*;
 
+type SharedClaudeMetrics = std::sync::Arc<std::sync::Mutex<ClaudeMetrics>>;
+
+#[derive(Default, Clone)]
+struct ClaudeMetrics {
+    turns: u32,
+    usage: Usage,
+    models: std::collections::BTreeSet<String>,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ClaudeMetricEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    num_turns: u32,
+    usage: ClaudeMetricUsage,
+    #[serde(rename = "modelUsage")]
+    model_usage: Option<serde_json::Map<String, serde_json::Value>>,
+    total_cost_usd: Option<f64>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ClaudeMetricUsage {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+    output_tokens_details: Option<ClaudeMetricUsageDetails>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ClaudeMetricUsageDetails {
+    thinking_tokens: u64,
+}
+
+impl ClaudeMetrics {
+    fn record_line(&mut self, line: &[u8]) {
+        let Ok(event) = serde_json::from_slice::<ClaudeMetricEvent>(line) else {
+            return;
+        };
+        if event.kind != "result" {
+            return;
+        }
+        self.turns += event.num_turns;
+        self.usage.input_tokens += event.usage.input_tokens
+            + event.usage.cache_creation_input_tokens
+            + event.usage.cache_read_input_tokens;
+        self.usage.cached_input_tokens += event.usage.cache_read_input_tokens;
+        self.usage.output_tokens += event.usage.output_tokens;
+        self.usage.reasoning_output_tokens += event
+            .usage
+            .output_tokens_details
+            .map_or(0, |details| details.thinking_tokens);
+        if let Some(model_usage) = event.model_usage {
+            self.models
+                .extend(model_usage.into_iter().map(|(name, _)| name));
+        }
+        if let Some(cost) = event.total_cost_usd {
+            self.cost_usd = Some(self.cost_usd.unwrap_or_default() + cost);
+        }
+    }
+
+    fn served(&self) -> Served {
+        let models: Vec<&str> = self.models.iter().map(String::as_str).collect();
+        Served {
+            model: (!models.is_empty()).then(|| models.join(",")),
+            cost_usd: self.cost_usd,
+        }
+    }
+}
+
+/// Keep the event scanner bounded like stdout capture. A result line longer
+/// than this cannot survive the existing head/tail capture as a parseable line.
+const CLAUDE_METRIC_LINE_CAP: usize = STDOUT_CAPTURE_CAP;
+
+fn extend_claude_metric_line(pending: &mut Vec<u8>, too_long: &mut bool, bytes: &[u8]) {
+    if *too_long {
+        return;
+    }
+    if pending.len().saturating_add(bytes.len()) > CLAUDE_METRIC_LINE_CAP {
+        pending.clear();
+        *too_long = true;
+    } else {
+        pending.extend_from_slice(bytes);
+    }
+}
+
+fn record_claude_metric_line(metrics: &SharedClaudeMetrics, line: &[u8]) {
+    if let Ok(mut metrics) = metrics.lock() {
+        metrics.record_line(line);
+    }
+}
+
+fn record_claude_metric_bytes(
+    bytes: &[u8],
+    pending: &mut Vec<u8>,
+    too_long: &mut bool,
+    metrics: &SharedClaudeMetrics,
+) {
+    let mut start = 0;
+    while let Some(relative_end) = bytes[start..].iter().position(|&byte| byte == b'\n') {
+        let end = start + relative_end;
+        extend_claude_metric_line(pending, too_long, &bytes[start..end]);
+        if !*too_long {
+            record_claude_metric_line(metrics, pending);
+        }
+        pending.clear();
+        *too_long = false;
+        start = end + 1;
+    }
+    extend_claude_metric_line(pending, too_long, &bytes[start..]);
+}
+
 /// Read claude's stream like `read_capped`, with two differences.
 ///
 /// `first` flips once claude's `init` event has arrived: that event is what
@@ -10,20 +126,25 @@ use super::*;
 /// `tail` instead of being dropped. The stream *ends* in the result object,
 /// the one line `review` needs, so keeping only the head - right for codex,
 /// whose answer comes from `-o` - would lose the answer and the session id of
-/// any run that outgrew the cap. Both buffers are shared rather than returned,
-/// so what was read survives the reader being aborted.
+/// any run that outgrew the cap. Result metrics are accumulated as the stream
+/// arrives so result events trimmed from the middle remain accounted for. The
+/// buffers and metrics are shared rather than returned, so what was read
+/// survives the reader being aborted.
 async fn read_claude_stream<R>(
     mut r: R,
     cap: usize,
     tail_keep: usize,
     head: SharedBuf,
     tail: SharedBuf,
+    metrics: SharedClaudeMetrics,
     first: tokio::sync::watch::Sender<bool>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
     let mut chunk = [0u8; 16384];
+    let mut metric_line = Vec::new();
+    let mut metric_line_too_long = false;
     // Lines read so far while looking for claude's `init` event; `None` once
     // it has been seen. Only that event counts as claude having started: it
     // carries the session id, so from then on the session exists. A stray byte
@@ -34,6 +155,12 @@ async fn read_claude_stream<R>(
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                record_claude_metric_bytes(
+                    &chunk[..n],
+                    &mut metric_line,
+                    &mut metric_line_too_long,
+                    &metrics,
+                );
                 if let Some(pending) = scanning.as_mut() {
                     pending.extend_from_slice(&chunk[..n]);
                     let mut found = false;
@@ -72,6 +199,9 @@ async fn read_claude_stream<R>(
                 }
             }
         }
+    }
+    if !metric_line_too_long && !metric_line.is_empty() {
+        record_claude_metric_line(&metrics, &metric_line);
     }
 }
 
@@ -277,6 +407,7 @@ pub async fn run_claude(
 
     let stdout_shared = new_shared_buf();
     let stdout_tail = new_shared_buf();
+    let claude_metrics = std::sync::Arc::new(std::sync::Mutex::new(ClaudeMetrics::default()));
     let stderr_shared = new_shared_buf();
     let stdout_task = tokio::spawn(read_claude_stream(
         stdout_pipe,
@@ -284,6 +415,7 @@ pub async fn run_claude(
         CLAUDE_TAIL_KEEP,
         std::sync::Arc::clone(&stdout_shared),
         std::sync::Arc::clone(&stdout_tail),
+        std::sync::Arc::clone(&claude_metrics),
         first_tx,
     ));
     let stderr_task = tokio::spawn(read_capped(
@@ -367,9 +499,13 @@ pub async fn run_claude(
     let keep_id = |echoed: Option<String>| {
         invocation_session_id(oneshot, echoed, oneshot_id.clone(), session_id)
     };
-    let result_line = last_claude_result(&stdout).unwrap_or_default();
-    let served = result_served(result_line);
-    let (turns, usage) = claude_usage(&stdout);
+    let metrics = claude_metrics
+        .lock()
+        .map(|metrics| metrics.clone())
+        .unwrap_or_default();
+    let served = metrics.served();
+    let turns = metrics.turns;
+    let usage = metrics.usage;
     let with_usage = |digest: Digest| Digest {
         turns,
         usage: usage.clone(),
@@ -458,6 +594,9 @@ pub async fn run_claude(
             // still an answer, but the status is the only sign something went
             // wrong after the turn, so it is kept. `captured: true` keeps it out
             // of `died_without_answer`.
+            // Clean answers intentionally have no digest, as for grok. Digest
+            // usage is retained for abnormal runs; widening clean-run records
+            // changes the shared digest and sidecar contract.
             digest: answered_status_digest(status.as_ref()).map(with_usage),
         },
         ClaudeOutcome::NoAnswer {
@@ -499,8 +638,9 @@ fn last_claude_result(stdout: &str) -> Option<&str> {
 }
 
 /// The result object that ends claude's `--output-format stream-json` output:
-/// one per run, whatever the outcome. Only the fields that decide the outcome are modelled; usage and
-/// what served the run are read separately (`claude_usage`, `result_served`).
+/// one per run, whatever the outcome. Only the fields that decide the outcome
+/// are modelled here; `ClaudeMetrics` accumulates usage and served details while
+/// the full stream is read.
 #[derive(serde::Deserialize)]
 struct ClaudeResult {
     /// `"result"`. Checked so that some other JSON on stdout is not mistaken
@@ -599,14 +739,18 @@ fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> 
     if let Some(status) = result.api_error_status {
         facts.push(format!("API status {status}"));
     }
-    let mut reason = "claude reported an error".to_string();
+    let mut reason = if result.is_error.is_none() {
+        "review could not classify claude result".to_string()
+    } else {
+        "claude reported an error".to_string()
+    };
     if !facts.is_empty() {
         reason.push_str(&format!(" ({})", facts.join(", ")));
     }
     // On an error the result text is claude's own explanation (the unknown
     // model: "There's an issue with the selected model ..."). It is persisted
-    // with the provider reason; a missing `is_error` routes the diagnosis to
-    // `review_error` below.
+    // with the provider reason; a missing `is_error` is described as review's
+    // classification failure and routes to `review_error` below.
     if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
         reason.push_str(&format!(": {}", line.trim()));
     }
@@ -618,56 +762,28 @@ fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> 
     })
 }
 
-/// Turn count and token usage summed over claude's result objects, mapped onto the
-/// codex-shaped `Usage`: codex's `input_tokens` includes the cached part, while
-/// claude reports uncached input, cache writes and cache reads separately, so
-/// all three are summed and the reads are the cached share. Thinking tokens
-/// (inside `output_tokens`, as codex's reasoning tokens are) fill the reasoning
-/// field. Only result events contribute, so assistant events cannot double
-/// count usage. Missing fields contribute zero; the last result alone still
-/// decides the answer.
-fn claude_usage(stdout: &str) -> (u32, Usage) {
-    #[derive(serde::Deserialize, Default)]
-    #[serde(default)]
-    struct Details {
-        thinking_tokens: u64,
-    }
-    #[derive(serde::Deserialize, Default)]
-    #[serde(default)]
-    struct RawUsage {
-        input_tokens: u64,
-        cache_creation_input_tokens: u64,
-        cache_read_input_tokens: u64,
-        output_tokens: u64,
-        output_tokens_details: Option<Details>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Raw {
-        #[serde(rename = "type")]
-        kind: String,
-        #[serde(default)]
-        usage: RawUsage,
-        #[serde(default)]
-        num_turns: u32,
-    }
-    let mut turns = 0;
-    let mut usage = Usage::default();
+/// Sum claude's result-event metrics, mapped onto the codex-shaped `Usage`:
+/// codex's `input_tokens` includes the cached part, while claude reports
+/// uncached input, cache writes and cache reads separately, so all three are
+/// summed and the reads are the cached share. Only result events contribute.
+#[cfg(test)]
+fn summarize_claude_output(stdout: &str) -> ClaudeMetrics {
+    let mut metrics = ClaudeMetrics::default();
     for line in stdout.lines() {
-        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
-            continue;
-        };
-        if raw.kind != "result" {
-            continue;
-        }
-        let u = raw.usage;
-        turns += raw.num_turns;
-        usage.input_tokens +=
-            u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens;
-        usage.cached_input_tokens += u.cache_read_input_tokens;
-        usage.output_tokens += u.output_tokens;
-        usage.reasoning_output_tokens += u.output_tokens_details.map_or(0, |d| d.thinking_tokens);
+        metrics.record_line(line.as_bytes());
     }
-    (turns, usage)
+    metrics
+}
+
+#[cfg(test)]
+fn claude_usage(stdout: &str) -> (u32, Usage) {
+    let metrics = summarize_claude_output(stdout);
+    (metrics.turns, metrics.usage)
+}
+
+#[cfg(test)]
+fn claude_served(stdout: &str) -> Served {
+    summarize_claude_output(stdout).served()
 }
 
 #[cfg(test)]

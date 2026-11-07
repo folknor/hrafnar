@@ -524,15 +524,6 @@ archetypes. They agree because `resolve` removed the loser. Owner proposed:
 the archetype resolver in config, so `app` does no lookup ordering. The
 resolver move is in `notes/structural.md`.
 
-## CON-024 - Where does the project config live?
-
-Reported by: config.
-
-`config::CONFIG_FILENAME` is private, so `app.rs` spells out
-`project_root.join(".review.toml")` twice, plus the warning text and error
-strings. The path is already known as `ReviewConfig.files.local`; `app` should
-write to that.
-
 ## CON-026 - What is a project root's canonical identity?
 
 Reported by: config.
@@ -551,16 +542,6 @@ Reported by: config, orchestration.
 `app` restates it (`looked for [{prov}.{profile}] and
 [{host}.{prov}.{profile}]`). Right today. Owner proposed: the resolver reports
 what it searched (`cfg.require_profile(provider, name)` owning the message).
-
-## CON-028 - Is `[_projects]` checked once?
-
-Reported by: config.
-
-`parse_file` checks per layer; `resolve` (comment: "only the global layer can
-carry one") and `global_projects` (which re-parses the global file) each call
-`check_projects` independently. They agree. Owner proposed: `global_projects`
-reuses `load_layers(None)`, or `parse_file` runs `check_projects` for this
-host once.
 
 ## CON-029 - Is there a record for this session, and which project is it in?
 
@@ -611,8 +592,9 @@ Reported by: orchestration, forensics.
 override), `inflight` and `incident` (their own, with `data_root`), and
 `audit::audit_dir` (no override). Because only some honour the override, the
 sidecar cannot be redirected in tests and nothing in `tests/` exercises
-`sessions::record` round-trips with the runners (and see the audit-log entry
-in `notes/bugs.md`). Owner proposed: one `DataDir` resolved once at startup and
+`sessions::record` round-trips with the runners. (The stub runner tests were
+checked and cannot reach the audit log, because only the app layer writes it;
+an app-layer test that does not isolate `XDG_DATA_HOME` or `HOME` could.) Owner proposed: one `DataDir` resolved once at startup and
 passed in, which also answers the private-log routing.
 
 ## CON-032 - How is a run recorded?
@@ -641,14 +623,6 @@ The refusal `match` at the top of `app::run`, the `AFTER_HELP` paragraph, and
 the handling inside each verb (`message_target`, `run_session_show`,
 `run_sessions`). Owner proposed: `cli::Command::project_scope() -> Scope { None,
 Asserted, Selected }`, driving both the refusal and the verbs.
-
-## CON-034 - Is this a bare `review` with nothing piped?
-
-Reported by: orchestration.
-
-`app::run` re-reads `std::env::args_os().len() == 1` instead of asking the
-parsed `Cli`, a second parse of argv that can drift from clap's (for example a
-future default subcommand). Owner proposed: the parsed struct.
 
 ## CON-035 - How is the codex rollout format read?
 
@@ -695,17 +669,6 @@ skip scoping entirely. Owner proposed:
 `enum Scope { WholeFile, From(RolloutOffset), Untrusted }` passed to every
 rollout reader, with `slice` total over it.
 
-## CON-037 - Where is codex's home?
-
-Reported by: forensics.
-
-`env.and_then(|e| e.get("CODEX_HOME"))` is evaluated three times in
-`run_codex_json` (baseline, watchdog, recovery), then
-`transcript::codex_home` applies the parent env and the `HOME` fallback, and
-`run_session_show` passes `None`. Owner proposed: resolve the rollout path once
-per run and carry it (which also serves the custom `CODEX_HOME` defect in
-`notes/bugs.md`).
-
 ## CON-038 - Is this run suspicious, and is it an incident?
 
 Reported by: forensics.
@@ -750,15 +713,6 @@ site remembers. `ensure_profile(name, roots)` takes a name alongside the roots
 it should be derived from, so a caller can pass a name for a different set and
 `merge_profile` creates it. Owner proposed: a `RootSet` type (sorted and
 deduped by construction), making `profile_name(&RootSet)` total.
-
-## CON-043 - Grok's workspace trust key
-
-Reported by: grok-man.
-
-`workspace_key` is computed in `prepare_grok_write`, again in `check_trust`'s
-error, and in `untrusted_hint`; `GrokPrepared.trust_grant: Option<String>` is
-the key lossily stringified. Owner proposed: `check_trust -> (TrustKey,
-Trust)` with a `TrustKey(PathBuf)`, computed once.
 
 ## CON-045 - Display truncation of the in-flight tool
 

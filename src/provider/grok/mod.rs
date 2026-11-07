@@ -757,8 +757,8 @@ pub(super) fn prepare_grok_write(
 ) -> Result<GrokPrepared> {
     let grok = state::Grok::resolve(env)?;
     let mut prepared = GrokPrepared::default();
-    if grok.check_trust(project_root)? == state::Trust::Undecided {
-        let key = grok.workspace_key(project_root);
+    let (key, trust) = grok.check_trust(project_root)?;
+    if trust == state::Trust::Undecided {
         eprintln!(
             "grok: trusting {} permanently in {} - a write run's edits are cancelled in \
              an untrusted folder; grok will also run this repo's .grok MCP/LSP config \
@@ -809,7 +809,7 @@ pub(super) fn trust_landed(
     project_root: &Path,
 ) -> bool {
     state::Grok::resolve(env)
-        .is_ok_and(|g| matches!(g.check_trust(project_root), Ok(state::Trust::Trusted)))
+        .is_ok_and(|g| matches!(g.check_trust(project_root), Ok((_, state::Trust::Trusted))))
 }
 
 #[cfg(test)]

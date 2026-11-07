@@ -17,7 +17,8 @@ impl Grok {
     /// checkout it belongs to; and the canonical directory itself when there is
     /// no repo or the repo root is an unsafe root (a dotfiles repo at `$HOME`).
     ///
-    /// Used only to *read* the store. Where it cannot model grok - a grok-managed
+    /// Used to read the store and to name a grant; grok performs the actual
+    /// write itself. Where it cannot model grok - a grok-managed
     /// `-w` worktree, resolved through grok's sqlite registry - `check_trust`
     /// refuses rather than guess, because a wrong key here could let `--trust`
     /// overwrite a declined folder.
@@ -96,9 +97,8 @@ impl Grok {
     /// only entry that can decide is the one for the key itself. (A
     /// `trusted = false` on a subdirectory therefore does not block a run keyed
     /// on the repo root - grok never consults it.)
-    fn decision(&self, doc: &TrustDocument, dir: &Path) -> Trust {
-        let key = self.workspace_key(dir);
-        if self.unsafe_root(&key) {
+    fn decision(&self, doc: &TrustDocument, key: &Path) -> Trust {
+        if self.unsafe_root(key) {
             return Trust::Undecided;
         }
         match key.to_str().and_then(|k| doc.folders.get(k)) {
@@ -108,9 +108,11 @@ impl Grok {
         }
     }
 
-    /// Pre-launch trust check for a write run, returning the decision grok
-    /// would reach. `Err` where grok's `--trust` would do the wrong thing or
-    /// could not work:
+    /// Pre-launch trust check for a write run, returning its resolved key and
+    /// the decision grok would reach. `Err` where grok's `--trust` would do the
+    /// wrong thing or could not work:
+    /// - an unsafe key (filesystem root, user home, relative path), which grok
+    ///   never trusts even with `--trust`;
     /// - an explicit `trusted = false` covering the project (grok's grant would
     ///   overwrite it - automating the yes must not overturn a recorded no);
     /// - a store grok cannot parse (it would trust nothing and cancel at the
@@ -120,7 +122,19 @@ impl Grok {
     ///   grant land on a declined source repo.
     ///
     /// A missing store is `Undecided`: `--trust` creates it.
-    pub(in crate::provider::grok) fn check_trust(&self, dir: &Path) -> anyhow::Result<Trust> {
+    pub(in crate::provider::grok) fn check_trust(
+        &self,
+        dir: &Path,
+    ) -> anyhow::Result<(PathBuf, Trust)> {
+        let key = self.workspace_key(dir);
+        // Grok refuses these keys even when --trust is explicit. An absent
+        // store must not turn a permanent refusal into a grant announcement.
+        if self.unsafe_root(&key) {
+            anyhow::bail!(
+                "grok never trusts {} (filesystem root, user home, or relative trust key)",
+                key.display()
+            );
+        }
         let path = self.home.join("trusted_folders.toml");
         let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         // `dir` is canonical, but GROK_HOME may contain `..`. Compare against
@@ -150,7 +164,9 @@ impl Grok {
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Trust::Undecided),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((key, Trust::Undecided));
+            }
             Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
         };
         let doc = parse_trust(&text).map_err(|e| {
@@ -159,30 +175,26 @@ impl Grok {
                 path.display()
             )
         })?;
-        let decision = self.decision(&doc, dir);
+        let decision = self.decision(&doc, &key);
         if decision == Trust::Declined {
             anyhow::bail!(
                 "{} is explicitly untrusted in {} - review will not override that; \
                  change it there if you mean to",
-                self.workspace_key(dir).display(),
+                key.display(),
                 path.display()
             );
         }
-        Ok(decision)
+        Ok((key, decision))
     }
 
     /// A hint for a cancelled turn when the project was not trusted, or `None`
     /// when it was or the store cannot be read (no false blame).
     pub(in crate::provider::grok) fn untrusted_hint(&self, dir: &Path) -> Option<String> {
+        let key = self.workspace_key(dir);
         let path = self.home.join("trusted_folders.toml");
         let doc = parse_trust(&std::fs::read_to_string(&path).ok()?).ok()?;
-        (self.decision(&doc, dir) != Trust::Trusted).then(|| {
-            format!(
-                "{} is not trusted in {}",
-                self.workspace_key(dir).display(),
-                path.display()
-            )
-        })
+        (self.decision(&doc, &key) != Trust::Trusted)
+            .then(|| format!("{} is not trusted in {}", key.display(), path.display()))
     }
 }
 
@@ -231,7 +243,7 @@ mod tests {
         let parent = root.parent().expect("parent").to_path_buf();
 
         assert_eq!(
-            grok.decision(&store(&[(&root, true)]), &src),
+            grok.decision(&store(&[(&root, true)]), &grok.workspace_key(&src)),
             Trust::Trusted
         );
         assert_eq!(grok.decision(&store(&[]), &root), Trust::Undecided);
@@ -243,11 +255,14 @@ mod tests {
         // Grok queries with the workspace key, so an entry below it is never
         // consulted - not even a `false` on the very directory the run is in.
         assert_eq!(
-            grok.decision(&store(&[(&root, true), (&src, false)]), &src),
+            grok.decision(
+                &store(&[(&root, true), (&src, false)]),
+                &grok.workspace_key(&src)
+            ),
             Trust::Trusted
         );
         assert_eq!(
-            grok.decision(&store(&[(&root, false)]), &src),
+            grok.decision(&store(&[(&root, false)]), &grok.workspace_key(&src)),
             Trust::Declined
         );
     }
@@ -308,7 +323,7 @@ mod tests {
         let grok = grok_at(&home);
         let dir = std::fs::canonicalize(scratch()).expect("project dir");
         assert_eq!(
-            grok.check_trust(&dir).expect("no store yet"),
+            grok.check_trust(&dir).expect("no store yet").1,
             Trust::Undecided,
             "--trust creates the store"
         );
@@ -336,7 +351,7 @@ mod tests {
 
         let trusted = format!("[folders.\"{}\"]\ntrusted = true\n", key.display());
         std::fs::write(home.join("trusted_folders.toml"), trusted).expect("seed");
-        assert_eq!(grok.check_trust(&dir).expect("trusted"), Trust::Trusted);
+        assert_eq!(grok.check_trust(&dir).expect("trusted").1, Trust::Trusted);
         assert_eq!(grok.untrusted_hint(&dir), None);
 
         // A grok-managed `-w` worktree: its key lives in grok's own registry.
@@ -361,6 +376,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn unsafe_keys_are_refused_before_a_missing_store_can_request_a_grant() {
+        let home = scratch();
+        let project = std::fs::canonicalize(scratch()).expect("project");
+        let grok = Grok {
+            home: home.clone(),
+            user_home: Some(project.clone()),
+        };
+        // Use the containing repo root as a dotfiles home, so the key itself
+        // is unsafe even though the directory exists and the store is missing.
+        let key = grok.workspace_key(&project);
+        let grok = Grok {
+            user_home: Some(key.clone()),
+            ..grok
+        };
+        assert!(
+            grok.check_trust(&key)
+                .expect_err("home is never trusted")
+                .to_string()
+                .contains("never trusts")
+        );
+        assert!(
+            grok.check_trust(Path::new("/"))
+                .expect_err("root is never trusted")
+                .to_string()
+                .contains("never trusts")
+        );
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
     #[test]
     fn only_trust_failures_are_surfaced_from_stderr() {
         let stderr = "some log line\nCouldn't save folder trust: the folder path changed. Start Grok again.\n";

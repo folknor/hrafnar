@@ -33,7 +33,7 @@ pub struct TranscriptSummary {
 /// run (e.g. a profile `env` override), which wins over the parent process's
 /// environment - otherwise a run pointed at a custom codex home would have its
 /// transcript written somewhere we never look.
-fn codex_home(override_home: Option<&str>) -> PathBuf {
+pub(crate) fn codex_home(override_home: Option<&str>) -> PathBuf {
     if let Some(dir) = override_home {
         return PathBuf::from(dir);
     }
@@ -48,7 +48,12 @@ fn codex_home(override_home: Option<&str>) -> PathBuf {
 /// filename suffix (the id is a UUID, so this is unambiguous). Bounded
 /// recursive walk of the date-nested `sessions/` tree.
 pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
-    let sessions = codex_home(override_home).join("sessions");
+    find_transcript_path_in_home(session_id, &codex_home(override_home))
+}
+
+/// Locate a rollout under an already resolved home without re-reading the environment.
+pub(crate) fn find_transcript_path_in_home(session_id: &str, home: &Path) -> Option<PathBuf> {
+    let sessions = home.join("sessions");
     let needle = format!("-{session_id}.jsonl");
     let mut stack = vec![(sessions, 0u32)];
     while let Some((dir, depth)) = stack.pop() {
@@ -79,7 +84,7 @@ pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Op
     None
 }
 
-fn summarize(path: &Path, from_offset: Option<u64>) -> Option<TranscriptSummary> {
+pub(crate) fn summarize(path: &Path, from_offset: Option<u64>) -> Option<TranscriptSummary> {
     let bytes = std::fs::read(path).ok()?;
     // Lossy is safe: an offset landing mid-line leaves one unparseable fragment,
     // which is skipped like any other malformed line.

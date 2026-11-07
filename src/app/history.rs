@@ -198,6 +198,11 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     if let Some(ref msg) = d.review_error {
         println!("review failed: {msg}");
     }
+    // Like the live digest, this status note can appear alongside the
+    // end-of-turn note below.
+    if d.captured && d.exit_code.is_none() && d.signal.is_none() {
+        println!("note: answer captured; process exit status could not be confirmed");
+    }
     if let Some(line) = digest_summary_note(d) {
         println!("{line}");
     }

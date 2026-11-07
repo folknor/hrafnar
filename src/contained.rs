@@ -443,6 +443,9 @@ pub fn spawn(
     // The keeper has its own copies now.
     drop(control_r);
     drop(events_w);
+    // Tokio returns None from Child::id only after this handle is polled to
+    // completion. This child is not polled between spawn and this read, so an
+    // already-exited keeper still has its pid here.
     let keeper_pid = child.id().unwrap_or(0);
     let (tx, rx) = tokio::sync::oneshot::channel();
     // SAFETY: fcntl on a descriptor we own.

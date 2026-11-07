@@ -60,14 +60,10 @@ fn resume_record(
 /// *this* host: a host fact like the build lock belongs to the machine the
 /// resume runs on, not to the one that recorded the row.
 ///
-/// Recorded levels are in the provider's own vocabulary, which `sandbox_for`
-/// maps identically for codex and passes through for grok's already-native
-/// names, so a round trip cannot change the level. A row predating these fields
-/// inherits nothing and leaves the default in place. (A session with no row at
-/// all never gets here - `resume_record` refuses it.) A row from another provider
-/// also inherits nothing: impossible today, since the provider is read from the
-/// same row, but a grok level fed to codex would be a widening nobody asked for,
-/// so the guard stays rather than being assumed upstream.
+/// Known levels are recorded in review's vocabulary. Grok also saves its
+/// native selector in `provider_sandbox`, since a session cannot change profiles.
+/// Old rows have only `sandbox`, already in Grok's native form, so that field
+/// remains the fallback. A row predating both fields inherits nothing.
 ///
 /// Model and effort carry forward for the same reason and were originally left
 /// out on the grounds that only `model` was recorded, so a partial restoration
@@ -92,7 +88,14 @@ fn inherited_settings(
         return InheritedSettings::default();
     };
     InheritedSettings {
-        sandbox: record.sandbox.clone(),
+        sandbox: if provider_name == "grok" {
+            record
+                .provider_sandbox
+                .clone()
+                .or_else(|| record.sandbox.clone())
+        } else {
+            record.sandbox.clone()
+        },
         // For grok these are exactly the roots the session's `review-ws-*`
         // profile is named for, and a resume uses them verbatim rather than
         // re-deriving - see `provider::grok::GrokWrite::Resume`.
@@ -544,6 +547,25 @@ mod tests {
     /// compile error the struct literal would have caught.
     fn record(json: serde_json::Value) -> sessions::SessionRecord {
         serde_json::from_value(json).expect("valid session record")
+    }
+
+    #[test]
+    fn grok_resume_prefers_native_selector_and_accepts_old_rows() {
+        for native in ["workspace", "none", "review-ws-abc", "custom"] {
+            let mut rec = minimal_row("grok");
+            rec.sandbox = Some(native.to_string());
+            assert_eq!(
+                inherited_settings(Some(&rec), "grok").sandbox.as_deref(),
+                Some(native)
+            );
+            rec.provider_sandbox = Some(native.to_string());
+            rec.sandbox =
+                crate::provider::recorded_sandbox("grok", Some(native)).map(str::to_string);
+            assert_eq!(
+                inherited_settings(Some(&rec), "grok").sandbox.as_deref(),
+                Some(native)
+            );
+        }
     }
 
     #[test]

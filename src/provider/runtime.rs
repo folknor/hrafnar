@@ -164,6 +164,8 @@ pub struct ProviderRuntime {
     /// resolved from the test process's real `HOME`/`XDG_DATA_HOME`, so without
     /// this the suite wrote stub incident bundles into the operator's real
     /// `~/.local/share/review/incidents`.
+    /// Audit logs are written by the app layer after provider calls return;
+    /// direct provider-runner tests do not reach that logging path.
     pub data_root: Option<std::path::PathBuf>,
     /// Flips when `review` is signalled to stop (see `install_signal_supervisor`).
     /// The process-wide channel in production; tests pass their own so a stop

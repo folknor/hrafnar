@@ -12,7 +12,8 @@ fn unknown_provider_hint() -> String {
 /// Parse one config file. `origin` names it in errors. Checks everything that
 /// can be checked within the file alone; cross-file checks (group members,
 /// group/archetype name clashes) happen in `resolve`, because a project's group
-/// may name a global archetype.
+/// may name a global archetype. Host-scoped `[_projects]` names are checked
+/// later, once the current host is known, by `resolve` or `global_projects`.
 pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
     // Parse to a table first, then peel off the reserved sections by name.
     // Everything left over is a provider table or a legacy host table. This

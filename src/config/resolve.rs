@@ -30,6 +30,8 @@ pub fn resolve(
 
     for (layer, mut file) in layers {
         // Only the global layer can carry one (`parse_file` refuses it locally).
+        // A named `-C` selection checks this same registry in `global_projects`
+        // before the full project config is loaded; both passes use this helper.
         if let Some(mine) = file.projects.remove(hostname) {
             check_projects(&mine, hostname, layer.as_str())?;
             projects = mine;

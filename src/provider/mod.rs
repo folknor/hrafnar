@@ -544,6 +544,8 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// session's record carries no level to inherit (a row written before levels
 /// were recorded). Claude has no filesystem sandbox on this axis, so it records
 /// none.
+// Keep the native selector here for launch and resume. `sessions::record`
+// normalizes the query field and saves this selector separately.
 pub(crate) fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
     match provider {
         "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
@@ -577,4 +579,15 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push_str("...");
     out
+}
+
+/// Normalize known Grok sandbox names for persisted queries, retaining custom
+/// names verbatim. The native name must also be saved for exact session resume.
+pub(crate) fn recorded_sandbox<'a>(provider: &str, sandbox: Option<&'a str>) -> Option<&'a str> {
+    match (provider, sandbox) {
+        ("grok", Some("workspace")) => Some("workspace-write"),
+        ("grok", Some("none")) => Some("danger-full-access"),
+        ("grok", Some(name)) if name.starts_with("review-ws-") => Some("workspace-write"),
+        _ => sandbox,
+    }
 }

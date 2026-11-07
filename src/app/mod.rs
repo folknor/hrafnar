@@ -176,6 +176,8 @@ pub async fn run() -> Result<()> {
     // flag given the operator meant to run something, so a missing stdin falls
     // through to `read_stdin`'s error, which says what is missing, rather than
     // answering with help that silently ignores the flags.
+    // `Cli` loses whether its defaulted `--stagger` was explicitly supplied,
+    // so argv presence preserves the rule that any argument requests a run.
     let early_stdin = if archetype_arg.is_none() && std::env::args_os().len() == 1 {
         match input::read_stdin_optional()? {
             Some(s) => Some(s),
@@ -342,7 +344,12 @@ pub async fn run() -> Result<()> {
 
     // Re-read under the lock: cfg was loaded before waiting, so its audit id
     // may be stale if another first run persisted one while this run queued.
-    let audit_id = config_write::ensure_audit_id(&project_root.join(".review.toml"))?;
+    let local_config_path = cfg
+        .files
+        .local
+        .as_deref()
+        .expect("config::load always resolves a local config path");
+    let audit_id = config_write::ensure_audit_id(local_config_path)?;
     cfg.audit.id = Some(audit_id.clone());
 
     // Codex run settings from project config: today just the stall timeout,
@@ -530,6 +537,8 @@ fn print_left_running() -> bool {
 fn selected_root(sel: &str) -> Result<std::path::PathBuf> {
     match project::select(Some(sel))? {
         config::Selection::Exact(dir) => Ok(dir),
+        // No ReviewConfig exists on this path, so there is no `files.local`
+        // value from which to take the filename for this diagnostic.
         discover => config::project_root(&discover)?.ok_or_else(|| {
             anyhow::anyhow!(
                 "-C {sel}: no .review.toml at or above {}",

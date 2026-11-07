@@ -396,14 +396,16 @@ pub async fn run_codex_json(
     // read would scope the scan to the entire session history, and an old
     // `final_answer` from a previous turn could then authorise killing a genuine
     // mid-turn wedge, or be recovered as this run's answer.
-    let codex_home_for_baseline = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
+    // Resolve once so baseline, watchdog and recovery search the same home.
+    let codex_home =
+        crate::transcript::codex_home(env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str));
     let rollout_baseline: Option<u64> = match known_session_id.as_deref() {
         // Fresh run: a new session id, so its rollout does not exist yet and
         // every byte in it will be ours. Zero is exact here, not a fallback.
         None => Some(0),
         // Resume: the rollout already holds earlier turns, so we must know
         // exactly where they end. If we cannot stat it, we do not guess.
-        Some(sid) => crate::transcript::find_transcript_path(sid, codex_home_for_baseline)
+        Some(sid) => crate::transcript::find_transcript_path_in_home(sid, &codex_home)
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len()),
     };
@@ -578,6 +580,7 @@ pub async fn run_codex_json(
     let mut terminated_by_review: Option<String> = None;
     // Forensics from the watchdog verdict, carried onto the digest and into the
     // incident bundle.
+    let mut watchdog_answer: Option<String> = None;
     let mut quiet_secs: Option<u64> = None;
     let mut last_rollout_event: Option<String> = None;
     // Set when `review` itself was signalled and ended this turn in response
@@ -601,7 +604,7 @@ pub async fn run_codex_json(
     {
         let watchdog = crate::watchdog::wait_for_stranded_completion(
             sid_rx,
-            env.and_then(|e| e.get("CODEX_HOME")).cloned(),
+            codex_home.clone(),
             rollout_baseline,
             runtime.timings,
         );
@@ -630,6 +633,7 @@ pub async fn run_codex_json(
                             format!("watchdog: stall timeout ({}s silent)", verdict.quiet_secs)
                         }
                     });
+                    watchdog_answer = verdict.final_answer;
                     quiet_secs = Some(verdict.quiet_secs);
                     last_rollout_event = verdict.last_event.clone();
                     contained.terminate();
@@ -831,7 +835,6 @@ pub async fn run_codex_json(
     // on disk (task_complete) yet exits non-zero and truncates both the `--json`
     // stream and the `-o` file, so the rollout is the authoritative record.
     let suspicious = !captured || exit_code != Some(0) || signal.is_some();
-    let codex_home = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
     // An untrustworthy baseline must not degrade to "scan everything": scope to
     // a point past the end of the file so nothing is attributed to this run.
     // `u64::MAX` is exact for that purpose - `slice_from_offset` yields an empty
@@ -845,7 +848,8 @@ pub async fn run_codex_json(
         // answer that also suppresses auto-resume.
         session_id
             .as_deref()
-            .and_then(|sid| crate::transcript::summarize_session(sid, codex_home, recovery_scope))
+            .and_then(|sid| crate::transcript::find_transcript_path_in_home(sid, &codex_home))
+            .and_then(|path| crate::transcript::summarize(&path, recovery_scope))
     } else {
         None
     };
@@ -855,7 +859,10 @@ pub async fn run_codex_json(
     //   2. the transcript's recovered `final_answer` - the real report salvaged
     //      when the stream/`-o` were truncated but the rollout reached the end.
     //   3. the last streamed message - interim commentary, a last resort.
-    let recovered = transcript.as_ref().and_then(|t| t.final_answer.clone());
+    // A trailing turn can reset the summary's answer. Preserve the exact
+    // scoped evidence that licensed our kill even if the rollout later changes.
+    let recovered =
+        watchdog_answer.or_else(|| transcript.as_ref().and_then(|t| t.final_answer.clone()));
     let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
     let final_message = final_from_file.or(recovered).or(stream_message);
 

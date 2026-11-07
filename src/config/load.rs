@@ -203,6 +203,9 @@ pub fn global_projects() -> Result<(BTreeMap<String, String>, Option<PathBuf>)> 
     let mut file = parse_file(&raw, &path.display().to_string(), Layer::Global)?;
     let host = hostname();
     let mine = file.projects.remove(&host).unwrap_or_default();
+    // This lookup must work before a registered project's config can be loaded.
+    // Resolving the whole global file here would validate unrelated settings,
+    // then the selected project's full load would parse it again anyway.
     check_projects(&mine, &host, "global")?;
     Ok((mine, Some(path)))
 }

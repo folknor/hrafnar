@@ -124,7 +124,16 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // A `target` symlink pointing at a shared cache. This is checked even when
     // `CARGO_TARGET_DIR` is set, because the two can disagree and the symlink
     // is what an unset-env build would use.
-    if let Some(target) = host.read_link(&cwd.join("target")) {
+    //
+    // The link target is resolved here, before the filter. A relative link
+    // (`target -> ../shared-target`) comes back from `read_link` joined to the
+    // link's directory, so it carries `..`, which `push_root` refuses on the
+    // spelling. Canonicalizing it resolves the `..` against the real directory
+    // the link sits in, which is exactly what the kernel does when cargo
+    // follows the link. A target that does not exist cannot be resolved and is
+    // passed on as spelled, so a dangling link with `..` stays refused.
+    if let Some(link) = host.read_link(&cwd.join("target")) {
+        let target = host.canonicalize(&link).unwrap_or(link);
         push_root(
             &mut out,
             cwd,
@@ -288,6 +297,37 @@ mod tests {
         let grants = derive(&cwd(), &host);
         assert_eq!(grants.len(), 1, "{grants:?}");
         assert_eq!(grants[0].path, "/media/disk/cargo");
+    }
+
+    /// The shared-cache layout several repos carry: a relative link to a
+    /// sibling directory. `read_link` hands back the target joined to the
+    /// link's directory, `..` and all; it must still be granted, by its
+    /// resolved path, rather than refused by the spelled-`..` filter.
+    #[test]
+    fn a_relative_target_symlink_through_a_parent_dir_is_granted() {
+        let host = FakeHost::new()
+            .link(
+                "/home/dev/project/target",
+                "/home/dev/project/../shared-target",
+            )
+            .resolves(
+                "/home/dev/project/../shared-target",
+                "/home/dev/shared-target",
+            );
+        let grants = derive(&cwd(), &host);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].path, "/home/dev/shared-target");
+        assert_eq!(grants[0].why, "cargo target (./target symlink)");
+    }
+
+    /// Resolving the link does not bypass the filters: a relative link that
+    /// climbs to an ancestor of the workspace is still refused.
+    #[test]
+    fn a_relative_target_symlink_to_an_ancestor_is_refused() {
+        let host = FakeHost::new()
+            .link("/home/dev/project/target", "/home/dev/project/..")
+            .resolves("/home/dev/project/..", "/home/dev");
+        assert!(derive(&cwd(), &host).is_empty());
     }
 
     /// The two can disagree - an exported var overriding a repo's own symlink.

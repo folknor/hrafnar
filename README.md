@@ -80,15 +80,15 @@ All output is plain text, for people and agents alike. There is no JSON mode.
 
 ### Archetypes
 
-Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except the reserved ones, which fail to parse: `all`, the subcommand names (`resume`, `config`, `sessions`, `incidents`, `init`, `help`), and `bare` for anything but an empty archetype (`bare = ""`).
+Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except reserved names, which fail to parse: `all`, the subcommand names (`message`, `resume`, `interrupt`, `config`, `sessions`, `incidents`, `init`, `man`, `help`), and `bare` for a group or any non-empty prompt. `bare` is the special no-prime selector: `-a bare` works even without a config entry, and an archetype definition is allowed only as `bare = ""`.
 
-Use `-a all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
+Use `-a all` to fan out to every configured archetype except the special `bare` entry, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `-a, --archetype <name>` | Archetype(s) to prime with: a name, a group, a comma-separated list, or `all`. Omit to send stdin unchanged. |
+| `-a, --archetype <name>` | Archetype(s) to prime with: a name, a group, a comma-separated list, `all` (every configured archetype except `bare`), or `bare` (one unprimed run, even without a config entry). Omit to send stdin unchanged. |
 | `-p, --profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved per launched provider from `[<provider>.<profile>]`, project config first, then global. |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--dry-run` | Print what would be sent instead of sending it |
@@ -424,7 +424,7 @@ echo "how to handle clipping?" | review -a competitors
 echo "full sweep" | review -a sweep
 ```
 
-Define groups in the `[_groups]` table. Within one file, group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
+Define groups in the `[_groups]` table. Within one file, group names must not conflict with archetype names. `all` is reserved and selects every configured archetype except `bare`.
 
 ## Rate limits and staggering
 

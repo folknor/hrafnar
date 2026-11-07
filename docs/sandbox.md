@@ -54,7 +54,9 @@ or grok is also granted these, when they lie outside the project:
 - brokkr's build lock and worktree directory, `$HOME/.brokkr`;
 - the cargo home, `$CARGO_HOME`, else `$HOME/.cargo`;
 - brokkr's command history, under `$XDG_DATA_HOME`, else `$HOME/.local/share`;
-- `$CARGO_TARGET_DIR`, and the target of a `./target` symlink;
+- `$CARGO_TARGET_DIR`, and the target of a `./target` symlink (a relative
+  link such as `target -> ../shared-target` is resolved from the project
+  directory first, so it is granted by its real path);
 - the `.git/lfs` store of a sibling checkout that holds a path dependency, when
   that store exists.
 
@@ -65,14 +67,15 @@ Every grant is printed at launch with its reason, and recorded with the run.
 
 A profile's `writable_roots` adds to these, never replaces them. Each entry,
 after expanding bare `~`, `~/...`, `$VAR` and `${VAR}`, must be an absolute
-path. `~user` expansion is unsupported. An entry that exists is resolved
-first - symlinks followed, `..` collapsed - and the filters apply to where it
-actually leads, so an alias cannot reach what its spelling would not; one that
-does not exist yet is checked, and granted, as written. Either way it is
-refused if it is `/`, still contains `..`, or is the project itself or one of
-its parents. A sibling of the project is allowed. An entry with an unset
-variable or unsupported `~user` form is dropped with a warning rather than
-expanded to an unintended path.
+path. `~user` expansion is unsupported. These entries use the same filters as
+the derived roots: a spelling containing `..` is refused before resolution.
+Otherwise, an existing entry is resolved first - symlinks followed - and the
+reachability filters apply to where it actually leads, so an alias cannot reach
+what its spelling would not; an entry that does not exist yet is checked, and
+granted, as written. Either way it is refused if it is `/` or is the project
+itself or one of its parents. A sibling of the project is allowed. An entry
+with an unset variable or unsupported `~user` form is dropped with a warning
+rather than expanded to an unintended path.
 
 The exception: a codex profile whose `config` sets
 `sandbox_workspace_write.writable_roots` **replaces** the whole set - derived

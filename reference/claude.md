@@ -63,13 +63,14 @@ launch still has a session: the result carries its ID and the transcript is on
 disk. Text output, which `review` used before, gave only the non-zero exit, and
 the ID was discarded with it (`invoke` sets none on an `Err`).
 
-The result object's `modelUsage` keys and `total_cost_usd` are recorded as the
-served model and cost (`result_served`, shared with grok), and its usage fills
-the digest (`claude_usage`). Usage and turn counts sum every result event in
-stream order; other event types do not contribute, and only the last result
-decides the answer. A clean run has no digest, as for grok. Claude has
-no auto-resume: that is codex's workaround for a death, and a claude turn that
-fails says why.
+The `modelUsage` keys from every result event are unioned into the served model
+(sorted and comma-joined), and `total_cost_usd`, usage and turn counts are summed
+across those events. The runner accumulates these metrics as it reads the stream,
+so the head-tail output cap does not discard result events from the middle.
+Other event types do not contribute, and only the last result decides the
+answer. Usage is attached to the digest when a run needs one. A clean run has no
+digest, as for grok. Claude has no auto-resume: that is codex's workaround for a
+death, and a claude turn that fails says why.
 
 ## Shell commands stay in the foreground
 

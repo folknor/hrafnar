@@ -367,6 +367,47 @@ sleep 3600
     );
 }
 
+/// A real trailing turn resets the summary, but must not erase the answer
+/// that licensed the watchdog kill or make the result eligible for auto-resume.
+#[tokio::test]
+async fn stranded_answer_survives_a_trailing_turn_with_content() {
+    for trailing in [
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"continue"}}"#,
+        r#"{"type":"response_item","payload":{"type":"reasoning"}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"tail"}}"#,
+    ] {
+        let scratch = Scratch::new();
+        let stub = scratch.write_stub(&format!(
+            r#"{preamble}
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"STRANDED ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete"}}}}' >> "$ROLL"
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$ROLL"
+printf '%s\n' '{trailing}' >> "$ROLL"
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete"}}}}' >> "$ROLL"
+sleep 3600
+"#,
+            preamble = stub_preamble()
+        ));
+        let run = run_stub(&scratch, stub).await.expect("run completes");
+        assert_eq!(run.text, "STRANDED ANSWER", "trailing event: {trailing}");
+        let digest = run.digest.expect("digest");
+        assert!(!digest.captured);
+        assert!(digest.recovered_from_transcript);
+        assert!(!digest.interrupted);
+        assert!(
+            digest
+                .terminated_by_review
+                .as_deref()
+                .is_some_and(|why| why.contains("stranded"))
+        );
+        assert!(
+            digest.transcript.expect("summary").final_answer.is_none(),
+            "the current-turn summary must still reflect the trailing turn"
+        );
+    }
+}
+
 /// The two verdicts are mutually exclusive on whether an answer exists, so
 /// `stall_grace` shorter than `quiet_grace` is not a misconfiguration: an
 /// answered run matches neither branch until `quiet_grace` and is then

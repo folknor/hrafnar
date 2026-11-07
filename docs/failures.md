@@ -20,7 +20,9 @@ continued. Read the digest top down:
 - `captured: false` with none of the above - the run **died** mid-turn without
   saying why.
 - `captured: true` - there is an answer; a non-zero exit after it is reported
-  but does not make the run a failure (a `review failed:` line does).
+  but does not make the run a failure (a `review failed:` line does). If the
+  exit is `-` with no signal, the note says the answer was captured but the
+  process exit status could not be confirmed.
 
 `review sessions <ID>` shows the same digest later (see `review man sessions`).
 

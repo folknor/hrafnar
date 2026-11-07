@@ -4,14 +4,16 @@ use super::{GrantedRoot, Host};
 
 /// Add one candidate root, applying every filter a grant must pass.
 ///
-/// Filters run against the **resolved** path as well as the spelled one. A
-/// lexical check answers "what does this say", and the sandbox binds "what does
-/// this reach": `/srv/cache` may be a symlink to `/`, in which case granting it
-/// grants the filesystem while passing every string test. The resolved form is
-/// what gets emitted, so the log names the directory that actually becomes
-/// writable. A path that does not exist yet cannot be resolved and is taken at
-/// its word - codex will fail on it if it is wrong, and refusing it outright
-/// would break granting a cache directory the build itself creates.
+/// Parent components are rejected on the spelling before resolution. The
+/// remaining reachability filters use the **resolved** path when possible: a
+/// lexical check answers "what does this say", and the sandbox binds "what
+/// does this reach". `/srv/cache` may be a symlink to `/`, in which case
+/// granting it grants the filesystem while passing every string test. The
+/// resolved form is what gets emitted, so the log names the directory that
+/// actually becomes writable. A path that does not exist yet cannot be
+/// resolved and is taken at its word - codex will fail on it if it is wrong,
+/// and refusing it outright would break granting a cache directory the build
+/// itself creates.
 pub(super) fn push_root(
     out: &mut Vec<GrantedRoot>,
     cwd: &Path,
@@ -19,13 +21,12 @@ pub(super) fn push_root(
     path: &Path,
     why: &'static str,
 ) {
-    let resolved = host.canonicalize(path);
-    let path: &Path = resolved.as_deref().unwrap_or(path);
     // `..` defeats every lexical check below - `/..` is absolute, is not a
     // prefix of cwd and is not empty, so it would sail through and codex would
-    // resolve it to `/`. Refuse rather than normalise: `/a/../b` and `/b` are
-    // the same path only when `/a` is not a symlink, and this module does not
-    // get to assume that.
+    // resolve it to `/`. Check the spelling before canonicalization, which
+    // removes `..` from paths it can resolve. Refuse rather than normalise:
+    // `/a/../b` and `/b` are the same path only when `/a` is not a symlink, and
+    // this module does not get to assume that.
     if path
         .components()
         .any(|c| c == std::path::Component::ParentDir)
@@ -36,6 +37,8 @@ pub(super) fn push_root(
         );
         return;
     }
+    let resolved = host.canonicalize(path);
+    let path: &Path = resolved.as_deref().unwrap_or(path);
     // An *ancestor* of the workspace is the mirror image of the check below and
     // just as wrong: `~` or a `$HOME` whose intended subdirectory was dropped
     // resolves to the home directory, and granting it hands over every repo,
@@ -185,6 +188,17 @@ mod tests {
             let grants = derive_with(&cwd(), &host, &[entry.to_string()]);
             assert!(grants.is_empty(), "{entry} produced {grants:?}");
         }
+    }
+
+    /// A `..` that *does* resolve must be refused too: the check runs on the
+    /// spelling, before canonicalization strips the `..` and lets the climb
+    /// out of the workspace pass as an ordinary absolute path.
+    #[test]
+    fn a_resolvable_parent_dir_profile_root_is_refused() {
+        let entry = "/home/dev/project/../../../../etc";
+        let host = FakeHost::new().resolves(entry, "/etc");
+        let grants = derive_with(&cwd(), &host, &[entry.to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
     }
 
     /// The mirror of the inside-the-workspace filter, and the likelier operator

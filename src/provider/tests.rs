@@ -183,3 +183,18 @@ fn announcement_is_empty_when_an_override_grants_nothing() {
         super::announcement_lines("codex", "profile config override", &granted, &[]).is_empty()
     );
 }
+
+#[test]
+fn persisted_sandbox_levels_normalize_known_grok_names() {
+    for (native, level) in [
+        ("workspace", "workspace-write"),
+        ("review-ws-abc", "workspace-write"),
+        ("none", "danger-full-access"),
+        ("read-only", "read-only"),
+        ("custom", "custom"),
+    ] {
+        assert_eq!(super::recorded_sandbox("grok", Some(native)), Some(level));
+        assert_eq!(super::recorded_sandbox("codex", Some(native)), Some(native));
+    }
+    assert_eq!(super::recorded_sandbox("grok", None), None);
+}

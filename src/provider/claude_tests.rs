@@ -4,16 +4,20 @@ use super::super::tests::exited;
 use super::*;
 
 #[tokio::test]
-async fn claude_output_past_the_cap_keeps_its_final_result() {
+async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() {
     // The stream ends in the result: keeping only the head would lose it.
     let mut stream = format!("{CLAUDE_INIT}\n");
-    for i in 0..200 {
+    let middle = r#"{"type":"result","subtype":"success","is_error":false,"result":"MIDDLE-ANSWER","session_id":"s","num_turns":3,"usage":{"input_tokens":10,"cache_creation_input_tokens":20,"cache_read_input_tokens":30,"output_tokens":40,"output_tokens_details":{"thinking_tokens":5}},"total_cost_usd":0.1,"modelUsage":{"claude-sonnet-4":{"costUSD":0.1}}}"#;
+    stream.push_str(middle);
+    stream.push('\n');
+    for i in 0..1000 {
         stream.push_str(&format!("{{\"type\":\"assistant\",\"n\":{i}}}\n"));
     }
     stream.push_str(CLAUDE_OK);
     stream.push('\n');
     let head = new_shared_buf();
     let tail = new_shared_buf();
+    let metrics = std::sync::Arc::new(std::sync::Mutex::new(super::ClaudeMetrics::default()));
     let (first_tx, first_rx) = tokio::sync::watch::channel(false);
     // The keep must exceed the result line, as production's 8 MiB does; the
     // stream is several times larger, so the tail really is trimmed.
@@ -25,6 +29,7 @@ async fn claude_output_past_the_cap_keeps_its_final_result() {
         keep,
         std::sync::Arc::clone(&head),
         std::sync::Arc::clone(&tail),
+        std::sync::Arc::clone(&metrics),
         first_tx,
     )
     .await;
@@ -42,8 +47,24 @@ async fn claude_output_past_the_cap_keeps_its_final_result() {
         String::from_utf8_lossy(&head),
         String::from_utf8_lossy(&tail)
     );
+    assert!(
+        !joined.contains("MIDDLE-ANSWER"),
+        "the head-tail capture trims the middle event"
+    );
     let outcome = super::interpret_claude_output(&joined, "").expect("the result survived");
     assert!(matches!(outcome, super::ClaudeOutcome::Answered { .. }));
+    let metrics = metrics.lock().expect("metrics").clone();
+    assert_eq!(metrics.turns, 5);
+    assert_eq!(metrics.usage.input_tokens, 10 + 20 + 30 + 4 + 25470 + 22520);
+    assert_eq!(metrics.usage.cached_input_tokens, 30 + 22520);
+    assert_eq!(metrics.usage.output_tokens, 40 + 149);
+    assert_eq!(metrics.usage.reasoning_output_tokens, 5);
+    assert_eq!(
+        metrics.served().model.as_deref(),
+        Some("claude-opus-5-5,claude-sonnet-4")
+    );
+    let cost = metrics.served().cost_usd.expect("cost");
+    assert!((cost - 0.31126).abs() < 1e-12);
 }
 
 #[test]
@@ -138,7 +159,7 @@ fn claude_result_without_is_error_fails_closed() {
     assert!(digest.turn_error.is_none());
     assert_eq!(
         digest.review_error.as_deref(),
-        Some("claude reported an error (no is_error flag): maybe")
+        Some("review could not classify claude result (no is_error flag): maybe")
     );
     assert!(digest.failed());
 }
@@ -204,13 +225,26 @@ fn claude_usage_and_served_are_read_from_the_result() {
     assert_eq!(usage.cached_input_tokens, 22520);
     assert_eq!(usage.output_tokens, 149);
     assert_eq!(
-        super::result_served(CLAUDE_OK),
+        super::claude_served(CLAUDE_OK),
         super::Served {
             model: Some("claude-opus-5-5".to_string()),
             cost_usd: Some(0.21126),
         }
     );
     assert_eq!(super::claude_usage("not json").0, 0);
+}
+
+#[test]
+fn claude_served_models_and_cost_sum_every_result() {
+    let second = r#"{"type":"result","modelUsage":{"claude-sonnet-4":{}},"total_cost_usd":0.05}"#;
+    let stdout = claude_stream(&[CLAUDE_OK, second]);
+    let served = super::claude_served(&stdout);
+    assert_eq!(
+        served.model.as_deref(),
+        Some("claude-opus-5-5,claude-sonnet-4")
+    );
+    let cost = served.cost_usd.expect("cost");
+    assert!((cost - 0.26126).abs() < 1e-12);
 }
 
 #[test]
