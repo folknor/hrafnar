@@ -1568,3 +1568,33 @@ async fn a_provider_that_cannot_exec_fails_the_launch() {
     };
     assert!(err.contains("failed to launch"), "{err}");
 }
+
+#[tokio::test]
+async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}\n{}\nexit 7",
+        claude_stub_result(
+            false,
+            r#",\"result\":\"LAUNCHED\",\"usage\":{\"input_tokens\":11,\"output_tokens\":13}"#,
+        ),
+        claude_stub_result(
+            false,
+            r#",\"result\":\"THE ANSWER\",\"usage\":{\"input_tokens\":17,\"output_tokens\":19}"#,
+        ),
+    );
+    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), None)
+        .await
+        .expect("the answer survives the exit");
+    assert_eq!(run.text, "THE ANSWER");
+    assert!(run.session_id.is_some());
+    let digest = run.digest.expect("nonzero status is recorded");
+    assert!(digest.captured);
+    assert_eq!(digest.exit_code, Some(7));
+    assert!(digest.turn_error.is_none());
+    assert!(digest.review_error.is_none());
+    assert!(!digest.failed());
+    assert_eq!(digest.turns, 2);
+    assert_eq!(digest.usage.input_tokens, 28);
+    assert_eq!(digest.usage.output_tokens, 32);
+}

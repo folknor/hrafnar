@@ -2,7 +2,7 @@
 #[path = "config_tests.rs"]
 mod config_tests;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -306,17 +306,14 @@ pub fn toml_key(key: &str) -> String {
     }
 }
 
-/// Generate a short 4-character hex ID for audit directory naming.
-pub fn generate_short_id() -> String {
-    let bytes = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| {
-            use std::io::Read;
-            let mut buf = [0u8; 2];
-            f.read_exact(&mut buf)?;
-            Ok(buf)
-        })
-        .unwrap_or([0x42, 0x42]);
-    format!("{:02x}{:02x}", bytes[0], bytes[1])
+/// Generate a random id: 128 bits from the system, as 32 lowercase hex
+/// characters. The audit id (`review init`, and the first run of a project
+/// without one) and the incident bundle suffix use it. Fallible so a missing
+/// entropy source surfaces through the caller's error path, never a panic.
+pub fn try_generate_short_id() -> Result<String> {
+    let bytes = system_random_bytes::<16>()
+        .context("failed to read system randomness from /dev/urandom")?;
+    Ok(hex_id(&bytes))
 }
 
 /// Generate a v4 UUID for provisioning a fresh, persistable session ID.
@@ -326,11 +323,9 @@ pub fn generate_uuid() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| {
             // Fallback: generate a v4 UUID from random bytes
-            let mut buf = [0u8; 16];
-            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-                use std::io::Read;
-                let _ = f.read_exact(&mut buf);
-            }
+            let mut buf = system_random_bytes::<16>().unwrap_or_else(|error| {
+                panic!("failed to read system randomness from /dev/urandom: {error}");
+            });
             buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
             buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
             format!(
@@ -342,6 +337,27 @@ pub fn generate_uuid() -> String {
                 buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
             )
         })
+}
+
+fn system_random_bytes<const N: usize>() -> std::io::Result<[u8; N]> {
+    let mut bytes = [0u8; N];
+    std::fs::File::open("/dev/urandom").and_then(|mut file| {
+        use std::io::Read;
+        file.read_exact(&mut bytes)
+    })?;
+    Ok(bytes)
+}
+
+fn hex_id(bytes: &[u8]) -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    let mut id = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        id.push(HEX[usize::from(*byte >> 4)]);
+        id.push(HEX[usize::from(*byte & 0x0f)]);
+    }
+    id
 }
 
 /// Where the operator's global config lives: `$XDG_CONFIG_HOME/review/config.toml`,
@@ -941,7 +957,7 @@ pub fn init(sel: &Selection) -> Result<()> {
         );
     }
 
-    let audit_id = generate_short_id();
+    let audit_id = try_generate_short_id()?;
     let mut content = INIT_TEMPLATE_PREFIX.to_string();
     content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
     std::fs::write(&path, content)

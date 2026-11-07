@@ -71,7 +71,10 @@
 //! off), and `quiet_secs` + `last_event` recorded on every verdict so a misfire
 //! shows exactly how close the call was and what codex was last doing.
 
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 /// Polling and patience settings, injectable so tests can drive the whole
 /// watchdog in milliseconds instead of minutes.
@@ -208,6 +211,9 @@ pub async fn wait_for_stranded_completion(
     // change was seen. Length alone is enough: the rollout is append-only.
     let mut last_len: u64 = 0;
     let mut last_change = Instant::now();
+    // Session rollouts keep a stable path. Locate it once, then poll that file
+    // directly instead of walking the full sessions tree on every interval.
+    let mut cached_transcript: Option<(String, PathBuf)> = None;
 
     loop {
         tokio::time::sleep(timings.poll_interval).await;
@@ -218,17 +224,31 @@ pub async fn wait_for_stranded_completion(
             continue;
         };
 
-        let Some(path) =
-            crate::transcript::find_transcript_path(&session_id, codex_home.as_deref())
-        else {
-            // No rollout yet, or a custom CODEX_HOME we cannot see into. Not an
-            // error - just nothing to judge.
-            continue;
+        let (path, cache_matches) = match cached_transcript.as_ref() {
+            Some((cached_id, path)) if cached_id == &session_id => (path.clone(), true),
+            _ => {
+                let Some(path) =
+                    crate::transcript::find_transcript_path(&session_id, codex_home.as_deref())
+                else {
+                    // No rollout yet, or a custom CODEX_HOME we cannot see
+                    // into. Not an error - just nothing to judge.
+                    continue;
+                };
+                (path, false)
+            }
         };
 
         let Ok(meta) = tokio::fs::metadata(&path).await else {
+            // If the path vanished after it was cached, allow the next poll to
+            // locate it again in case codex replaced the rollout.
+            if cache_matches {
+                cached_transcript = None;
+            }
             continue;
         };
+        if !cache_matches {
+            cached_transcript = Some((session_id, path.clone()));
+        }
         let len = meta.len();
         if len != last_len {
             last_len = len;

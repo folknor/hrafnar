@@ -48,6 +48,8 @@ line and the response:
   captured          true if a final answer was captured; false means the text
                     below is an interim note, not a conclusion
   turn failed       the reason the provider gave for ending the turn
+  review failed     review could not verify the run (grok background work);
+                    the run fails even if an answer was captured
   terminated by review
                     the stall watchdog killed a codex run that went silent
   recovered         the final answer was restored from codex's transcript
@@ -55,7 +57,8 @@ line and the response:
   transcript        codex's rollout file and its last events
   incident          a forensic bundle for the run (see `review incidents`)
 The output ends with a `runtime:` line. The exit status is 1 when no provider
-produced an answer, including runs that died, stalled or were interrupted.
+produced an answer, including runs that died, stalled or were interrupted, or
+every answer came with `review failed`.
 
 When a run ends, whatever its agent left running (background commands, daemons,
 shells in sessions of their own) is ended before `review` reports. That is
@@ -101,7 +104,8 @@ last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
 
-The exit status is 1 if the turn produced no answer, and 3 if anything it
+The exit status is 1 if the turn produced no answer (or `review failed` to
+verify it), and 3 if anything it
 started was left running (which outranks 1). A session whose earlier `review` is gone while that run's
 processes are still being torn down is refused until they are.";
 

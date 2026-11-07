@@ -125,7 +125,7 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
     let mut out = derive(cwd, host);
     for root in profile_roots {
         let Some(expanded) = expand(root, host) else {
-            // `expand` has already explained which variable was unset.
+            // `expand` has already explained why the configured path failed.
             continue;
         };
         let path = PathBuf::from(&expanded);
@@ -138,7 +138,8 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
     out
 }
 
-/// Expand `~`, `$VAR` and `${VAR}` in a configured root.
+/// Expand a configured root with the same grammar as project paths. Expansion
+/// errors are local to this optional grant, so report and drop the entry.
 ///
 /// One `.review.toml` is read on five machines whose layouts differ, so a
 /// literal path is often unwritable somewhere. Expansion is the deliberate,
@@ -150,55 +151,13 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
 /// named, and `$UNSET` alone would collapse to `/` - the one grant this module
 /// must never make.
 fn expand(raw: &str, host: &impl Host) -> Option<String> {
-    let raw = match raw.strip_prefix("~/") {
-        Some(rest) => {
-            let home = host.var("HOME").or_else(|| {
-                eprintln!("warning: ignoring writable_roots entry {raw}: HOME is not set");
-                None
-            })?;
-            format!("{}/{rest}", home.trim_end_matches('/'))
-        }
-        None if raw == "~" => host.var("HOME").or_else(|| {
-            eprintln!("warning: ignoring writable_roots entry ~: HOME is not set");
+    match crate::project::expand_path(raw, &|key| host.var(key)) {
+        Ok(expanded) => Some(expanded),
+        Err(error) => {
+            eprintln!("warning: ignoring writable_roots entry {raw}: {error}");
             None
-        })?,
-        None => raw.to_string(),
-    };
-
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw.as_str();
-    while let Some(idx) = rest.find('$') {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 1..];
-        let (name, tail) = if let Some(braced) = after.strip_prefix('{') {
-            match braced.find('}') {
-                Some(end) => (&braced[..end], &braced[end + 1..]),
-                None => {
-                    eprintln!("warning: ignoring writable_roots entry {raw}: unclosed '${{'");
-                    return None;
-                }
-            }
-        } else {
-            let end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            (&after[..end], &after[end..])
-        };
-        if name.is_empty() {
-            eprintln!("warning: ignoring writable_roots entry {raw}: empty variable name");
-            return None;
         }
-        match host.var(name) {
-            Some(value) => out.push_str(&value),
-            None => {
-                eprintln!("warning: ignoring writable_roots entry {raw}: ${name} is not set");
-                return None;
-            }
-        }
-        rest = tail;
     }
-    out.push_str(rest);
-    Some(out)
 }
 
 /// Paths outside `cwd` that a build needs write access to.

@@ -138,7 +138,7 @@ fn is_safe_filename_component(id: &str) -> bool {
 /// Is `pid` a live process? Signal 0 performs permission and existence checks
 /// without delivering anything. `ESRCH` means gone; `EPERM` means it exists but
 /// belongs to someone else, which still counts as alive.
-pub fn pid_alive(pid: u32) -> bool {
+fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
     };

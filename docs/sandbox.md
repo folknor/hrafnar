@@ -64,14 +64,15 @@ create them.
 Every grant is printed at launch with its reason, and recorded with the run.
 
 A profile's `writable_roots` adds to these, never replaces them. Each entry,
-after expanding `~`, `$VAR` and `${VAR}`, must be an absolute path. An entry
-that exists is resolved first - symlinks followed, `..` collapsed - and the
-filters apply to where it actually leads, so an alias cannot reach what its
-spelling would not; one that does not exist yet is checked, and granted, as
-written. Either way it is refused if it is `/`, still contains `..`, or is the
-project itself or one of its parents. A sibling of the project is allowed. An
-entry naming an unset variable is dropped with a warning rather than expanded
-to nothing.
+after expanding bare `~`, `~/...`, `$VAR` and `${VAR}`, must be an absolute
+path. `~user` expansion is unsupported. An entry that exists is resolved
+first - symlinks followed, `..` collapsed - and the filters apply to where it
+actually leads, so an alias cannot reach what its spelling would not; one that
+does not exist yet is checked, and granted, as written. Either way it is
+refused if it is `/`, still contains `..`, or is the project itself or one of
+its parents. A sibling of the project is allowed. An entry with an unset
+variable or unsupported `~user` form is dropped with a warning rather than
+expanded to an unintended path.
 
 The exception: a codex profile whose `config` sets
 `sandbox_workspace_write.writable_roots` **replaces** the whole set - derived

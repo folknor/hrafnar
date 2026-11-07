@@ -284,7 +284,7 @@ async fn read_capped_stdout<R>(
                             // A closed receiver just means nobody is watching.
                             let _ = sid_tx.send(Some(id.to_string()));
                             scanning = false;
-                            partial = Vec::new();
+                            partial.clear();
                             break;
                         }
                     }
@@ -511,6 +511,9 @@ pub struct Digest {
     /// that the cause is *known and stated*, so it must not be reported as a
     /// mystery death or retried - see `print_digest` and the auto-resume gate.
     pub turn_error: Option<String>,
+    /// A failure diagnosed by review, independent of whether a provider
+    /// produced an answer. Never a provider-stated reason or process status.
+    pub review_error: Option<String>,
     /// The operator ended this run with `review interrupt`. Its missing answer
     /// is therefore deliberate: no auto-resume, no incident bundle, and the
     /// output says how to continue the session instead of reporting a death.
@@ -559,12 +562,21 @@ pub struct DigestSummary {
     /// with the hang class: `jq 'select(.digest.turn_error != null)'`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_error: Option<String>,
+    /// Review could not verify the run, even if it captured an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_error: Option<String>,
     /// Ended by `review interrupt`: `jq 'select(.digest.interrupted)'`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
 }
 
 impl Digest {
+    /// An answer and successful verification are separate facts. Callers use
+    /// this verdict for exit status, retaining captured for answer/retry logic.
+    pub fn failed(&self) -> bool {
+        self.review_error.is_some() || (!self.captured && !self.recovered_from_transcript)
+    }
+
     pub fn summary(&self) -> DigestSummary {
         DigestSummary {
             exit_code: self.exit_code,
@@ -583,6 +595,7 @@ impl Digest {
             quiet_secs: self.quiet_secs,
             last_rollout_event: self.last_rollout_event.clone(),
             turn_error: self.turn_error.clone(),
+            review_error: self.review_error.clone(),
             interrupted: self.interrupted,
         }
     }
@@ -1522,7 +1535,7 @@ pub async fn run_claude(
     let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
     let result_line = last_claude_result(&stdout).unwrap_or_default();
     let served = result_served(result_line);
-    let (turns, usage) = claude_usage(result_line);
+    let (turns, usage) = claude_usage(&stdout);
     let with_usage = |digest: Digest| Digest {
         turns,
         usage: usage.clone(),
@@ -1611,20 +1624,7 @@ pub async fn run_claude(
             // still an answer, but the status is the only sign something went
             // wrong after the turn, so it is kept. `captured: true` keeps it out
             // of `died_without_answer`.
-            digest: (!status.is_some_and(|s| s.success())).then(|| {
-                with_usage(Digest {
-                    captured: true,
-                    ..no_answer_digest(
-                        if status.is_some() {
-                            "claude exited non-zero after producing an answer".to_string()
-                        } else {
-                            "claude's exit status is unknown: its teardown was not confirmed"
-                                .to_string()
-                        },
-                        status.as_ref(),
-                    )
-                })
-            }),
+            digest: answered_status_digest(status.as_ref()).map(with_usage),
         },
         ClaudeOutcome::NoAnswer {
             reason,
@@ -1773,12 +1773,14 @@ fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> 
     })
 }
 
-/// Turn count and token usage from claude's result object, mapped onto the
+/// Turn count and token usage summed over claude's result objects, mapped onto the
 /// codex-shaped `Usage`: codex's `input_tokens` includes the cached part, while
 /// claude reports uncached input, cache writes and cache reads separately, so
 /// all three are summed and the reads are the cached share. Thinking tokens
 /// (inside `output_tokens`, as codex's reasoning tokens are) fill the reasoning
-/// field. Record-only: a result without these fields records zeros.
+/// field. Only result events contribute, so assistant events cannot double
+/// count usage. Missing fields contribute zero; the last result alone still
+/// decides the answer.
 fn claude_usage(stdout: &str) -> (u32, Usage) {
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
@@ -1796,26 +1798,31 @@ fn claude_usage(stdout: &str) -> (u32, Usage) {
     }
     #[derive(serde::Deserialize)]
     struct Raw {
+        #[serde(rename = "type")]
+        kind: String,
         #[serde(default)]
         usage: RawUsage,
         #[serde(default)]
         num_turns: u32,
     }
-    let Ok(raw) = serde_json::from_str::<Raw>(stdout.trim()) else {
-        return (0, Usage::default());
-    };
-    let u = raw.usage;
-    (
-        raw.num_turns,
-        Usage {
-            input_tokens: u.input_tokens
-                + u.cache_creation_input_tokens
-                + u.cache_read_input_tokens,
-            cached_input_tokens: u.cache_read_input_tokens,
-            output_tokens: u.output_tokens,
-            reasoning_output_tokens: u.output_tokens_details.map_or(0, |d| d.thinking_tokens),
-        },
-    )
+    let mut turns = 0;
+    let mut usage = Usage::default();
+    for line in stdout.lines() {
+        let Ok(raw) = serde_json::from_str::<Raw>(line) else {
+            continue;
+        };
+        if raw.kind != "result" {
+            continue;
+        }
+        let u = raw.usage;
+        turns += raw.num_turns;
+        usage.input_tokens +=
+            u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens;
+        usage.cached_input_tokens += u.cache_read_input_tokens;
+        usage.output_tokens += u.output_tokens;
+        usage.reasoning_output_tokens += u.output_tokens_details.map_or(0, |d| d.thinking_tokens);
+    }
+    (turns, usage)
 }
 
 /// Grok's headless result object (`--output-format json`). One JSON object on
@@ -1971,7 +1978,10 @@ async fn run_grok(
         Err(e) => {
             let reason = format!("could not verify grok's background results: {e:#}");
             eprintln!("grok: {reason}");
-            first.digest = Some(wake_failure_digest(reason, first.digest.as_ref()));
+            let mut digest = wake_failure_digest(reason, first.digest.take());
+            digest.turns = first_turns;
+            digest.usage = first_usage;
+            first.digest = Some(digest);
             return Ok(first);
         }
     };
@@ -1992,7 +2002,7 @@ async fn run_grok(
             Err(e) => {
                 let reason = format!("could not verify grok's background results: {e}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+                out.digest = Some(wake_failure_digest(reason, out.digest.take()));
                 break;
             }
         };
@@ -2015,7 +2025,7 @@ async fn run_grok(
                 names.join(", ")
             );
             eprintln!("grok: {reason} - giving up on session {sid}");
-            out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+            out.digest = Some(wake_failure_digest(reason, out.digest.take()));
             break;
         }
         wakes += 1;
@@ -2050,7 +2060,7 @@ async fn run_grok(
                 // on `Err`, which would cost the sidecar row and any resume.
                 let reason = format!("wake-up turn for session {sid} failed: {e:#}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+                out.digest = Some(wake_failure_digest(reason, out.digest.take()));
                 break;
             }
         };
@@ -2091,19 +2101,17 @@ async fn run_grok(
     Ok(out)
 }
 
-/// The digest for a grok run the wake loop gave up on: a failure with the
-/// stated reason, keeping the turn and token counts the last turn reported
-/// rather than zeroing them. Exit 1 and no signal are stated outright - the
-/// failure is `review`'s verdict, not an observed process status.
-fn wake_failure_digest(reason: String, last: Option<&Digest>) -> Digest {
-    let (turns, usage) = last.map_or((0, Usage::default()), |d| (d.turns, d.usage.clone()));
-    Digest {
-        exit_code: Some(1),
-        signal: None,
-        turns,
-        usage,
-        ..no_answer_digest(reason, Some(&std::process::ExitStatus::default()))
-    }
+/// Mark a verification failure without rewriting the provider's answer,
+/// stated reason, or observed process status. No digest from run_grok_turn
+/// means it captured an answer and observed a successful exit.
+fn wake_failure_digest(reason: String, last: Option<Digest>) -> Digest {
+    let mut digest = last.unwrap_or_else(|| Digest {
+        captured: true,
+        turn_error: None,
+        ..no_answer_digest(String::new(), Some(&std::process::ExitStatus::default()))
+    });
+    digest.review_error = Some(reason);
+    digest
 }
 
 /// One grok process: a single headless turn.
@@ -2335,20 +2343,7 @@ async fn run_grok_turn(
             // than discarding - it is the only sign that something went wrong
             // after the turn finished. `captured: true` keeps it out of
             // `died_without_answer`, so the run does not fail on it.
-            digest: (!status.is_some_and(|s| s.success())).then(|| {
-                with_usage(Digest {
-                    captured: true,
-                    ..no_answer_digest(
-                        if status.is_some() {
-                            "grok exited non-zero after producing an answer".to_string()
-                        } else {
-                            "grok's exit status is unknown: its teardown was not confirmed"
-                                .to_string()
-                        },
-                        status.as_ref(),
-                    )
-                })
-            }),
+            digest: answered_status_digest(status.as_ref()).map(with_usage),
         },
         GrokOutcome::NoAnswer {
             reason,
@@ -2458,6 +2453,16 @@ struct GrokAnswer {
     session_id: Option<String>,
 }
 
+/// A post-answer process problem is an observed status, not a provider-stated
+/// turn failure. Both runners keep the answer and apply this same rule.
+fn answered_status_digest(status: Option<&std::process::ExitStatus>) -> Option<Digest> {
+    (!status.is_some_and(std::process::ExitStatus::success)).then(|| Digest {
+        captured: true,
+        turn_error: None,
+        ..no_answer_digest(String::new(), status)
+    })
+}
+
 /// A grok or claude turn that ran but produced no answer, expressed the same way
 /// codex's deaths are: `Ok` carrying a digest, never `Err`. Written for grok;
 /// claude reports its turns the same way (a result object that says whether it
@@ -2499,6 +2504,7 @@ fn no_answer_digest(reason: String, status: Option<&std::process::ExitStatus>) -
         quiet_secs: None,
         last_rollout_event: None,
         turn_error: Some(reason),
+        review_error: None,
         interrupted: false,
     }
 }
@@ -3442,6 +3448,7 @@ pub async fn run_codex_json(
         quiet_secs,
         last_rollout_event,
         turn_error,
+        review_error: None,
         interrupted,
     };
 
@@ -3545,6 +3552,12 @@ fn print_digest(d: &Digest) {
     // limit) follows from the message, not from the exit status.
     if let Some(ref msg) = d.turn_error {
         println!("turn failed: {msg}");
+    }
+    if let Some(ref msg) = d.review_error {
+        println!("review failed: {msg}");
+    }
+    if d.captured && d.exit_code.is_none() && d.signal.is_none() {
+        println!("note: answer captured; process exit status could not be confirmed");
     }
     // Print this before the notes below: it reframes the exit code/signal, which
     // otherwise read as codex dying on its own when in fact we killed it.

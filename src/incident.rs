@@ -72,6 +72,7 @@ pub struct Incident<'a> {
 const STDOUT_TAIL_BYTES: usize = 1 << 20;
 /// Raw transcript lines to keep in the tail (the full file stays on disk).
 const TRANSCRIPT_TAIL_LINES: usize = 80;
+const INCIDENT_SCHEMA: u32 = 1;
 
 #[derive(Serialize)]
 struct Meta {
@@ -158,12 +159,23 @@ fn looks_secret(name: &str) -> bool {
 /// success. Best-effort: warns and returns `None` on any IO failure.
 pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     let base = incidents_dir(inc.data_root)?;
-    let stamp = crate::audit::chrono_now().replace(':', "-");
+    let timestamp = crate::audit::chrono_now();
+    let stamp = timestamp.replace(':', "-");
     let sid = inc.session_id.unwrap_or("no-session");
-    // A short random suffix keeps two same-second failures (e.g. two
-    // `--stagger 0` deaths before `thread.started`, both "no-session") from
-    // colliding on the same dir and overwriting each other's artifacts.
-    let nonce = crate::config::generate_short_id();
+    // A random suffix keeps two same-second failures (e.g. two `--stagger 0`
+    // deaths before `thread.started`, both "no-session") from colliding on the
+    // same dir and overwriting each other's artifacts. It is the audit id's
+    // generator (32 hex characters), but this path is best-effort: without
+    // system randomness it falls back to pid and clock nanoseconds, which are
+    // still distinct between two failures of one `review`, rather than
+    // panicking or dropping the bundle.
+    let nonce = crate::config::try_generate_short_id().unwrap_or_else(|_| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos:09}", std::process::id())
+    });
     let dir = base.join(format!("{stamp}-{}-{sid}-{nonce}", inc.provider));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!(
@@ -188,12 +200,15 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     write_file(&dir, "stdout.jsonl", stdout_slice);
 
     // Transcript tail (the full rollout stays at transcript_path) plus the two
-    // scalars worth surfacing without a re-parse.
+    // scalars worth surfacing without a re-parse. The provider has a byte
+    // baseline for scoped transcript recovery, but Incident currently carries
+    // only the path, so this excerpt and scan cover the whole rollout.
     let mut final_answer_present = None;
     let mut rate_limits = None;
     if let Some(path) = inc.transcript_path
-        && let Ok(content) = std::fs::read_to_string(path)
+        && let Ok(bytes) = std::fs::read(path)
     {
+        let content = String::from_utf8_lossy(&bytes);
         let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
         write_file(&dir, "transcript.tail.jsonl", tail.as_bytes());
         (final_answer_present, rate_limits) = scan_transcript(&content);
@@ -212,8 +227,8 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         .unwrap_or_default();
 
     let meta = Meta {
-        schema: 1,
-        timestamp: crate::audit::chrono_now(),
+        schema: INCIDENT_SCHEMA,
+        timestamp,
         provider: inc.provider.to_string(),
         session_id: inc.session_id.map(str::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
@@ -288,7 +303,9 @@ fn tail_lines(content: &str, max: usize) -> String {
 
 /// Extract the two scalars worth promoting into meta: whether the final
 /// `task_complete` carried a non-null `last_agent_message`, and the last
-/// `token_count` rate-limit snapshot.
+/// `token_count` rate-limit snapshot. This consumes the whole rollout; it cannot
+/// establish run-local completion until the caller supplies the run's byte
+/// baseline.
 fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
     let mut final_answer_present = None;
     let mut rate_limits = None;
@@ -364,8 +381,9 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// A subset of `meta.json` read back for `review incidents`. All fields default
-/// so a partial or older bundle still lists.
+/// A subset of `meta.json` read back for `review incidents`. Fields default for
+/// deserialization, but `read_incident_summary` lists only a bundle whose
+/// `schema` matches and that carries a provider and a UTC timestamp.
 #[derive(Deserialize, Default)]
 pub struct IncidentSummary {
     #[serde(default)]
@@ -395,34 +413,75 @@ pub struct ListedIncident {
     pub meta: IncidentSummary,
 }
 
-/// Recent incident bundles, newest first. Bundle dir names are UTC-timestamped,
-/// so a reverse lexical sort is chronological. A dir whose `meta.json` is
-/// missing or unreadable still lists (with defaults) so nothing is hidden.
+/// Recent incident bundles, newest first, ordered by their recorded UTC time.
+/// Only directories with recognized incident metadata are included.
 pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
     // Always the real location: `review incidents` is an operator-facing view.
     let base = match incidents_dir(None) {
         Some(b) => b,
         None => return Vec::new(),
     };
-    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&base) {
-        Ok(rd) => rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(_) => return Vec::new(),
+    list_recent_from(&base, limit)
+}
+
+/// Read incident bundles from an explicit directory, so listing can be
+/// exercised without consulting the operator's data directory.
+fn list_recent_from(base: &Path, limit: usize) -> Vec<ListedIncident> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
     };
-    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    dirs.truncate(limit);
-    dirs.into_iter()
-        .map(|dir| {
-            let meta = std::fs::read_to_string(dir.join("meta.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            ListedIncident { dir, meta }
-        })
-        .collect()
+    let mut incidents = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let dir = entry.path();
+        let Some(meta) = read_incident_summary(&dir) else {
+            continue;
+        };
+        incidents.push(ListedIncident { dir, meta });
+    }
+    incidents.sort_by(|a, b| {
+        b.meta
+            .timestamp
+            .cmp(&a.meta.timestamp)
+            .then_with(|| b.dir.file_name().cmp(&a.dir.file_name()))
+    });
+    incidents.truncate(limit);
+    incidents
+}
+
+fn read_incident_summary(dir: &Path) -> Option<IncidentSummary> {
+    let content = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    if value.get("schema").and_then(serde_json::Value::as_u64) != Some(u64::from(INCIDENT_SCHEMA)) {
+        return None;
+    }
+    let meta: IncidentSummary = serde_json::from_value(value).ok()?;
+    if meta.provider.is_empty() || !is_utc_timestamp(&meta.timestamp) {
+        return None;
+    }
+    Some(meta)
+}
+
+fn is_utc_timestamp(timestamp: &str) -> bool {
+    let bytes = timestamp.as_bytes();
+    bytes.len() == 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'Z'
+        && bytes[0..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[14..16].iter().all(u8::is_ascii_digit)
+        && bytes[17..19].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]

@@ -1,14 +1,16 @@
 # Why a run failed
 
-A run exits `1` when no provider produced an answer, and `3` when something it
+A run exits `1` when no provider produced an answer `review` could accept (none
+answered, or every answer came with a `review failed:` line), and `3` when something it
 started was left running (see the section below), whatever the answers were. Most failures still print
 a session ID and a digest, because the session exists and can be inspected or
 continued. Read the digest top down:
 
-- `turn failed: <reason>` - usually the provider **stated** why it ended the
-  turn. For grok it can also be `review`'s own verdict: background results it
-  could not verify, or the wake limit (see the end of this page). The reason
-  says which.
+- `turn failed: <reason>` - the provider **stated** why it ended the turn.
+- `review failed: <reason>` - `review`'s own verdict, for grok: background
+  results it could not verify, a wake that could not launch, or the wake limit
+  (see the end of this page). It fails the run even when an answer was
+  captured, and is not retried.
 - `terminated by review` - `review` ended it: an interrupt, a signal, or the
   codex watchdog. Not always a failure: the watchdog also ends a codex process
   that finished its answer and then hung, and that answer is recovered.
@@ -18,7 +20,7 @@ continued. Read the digest top down:
 - `captured: false` with none of the above - the run **died** mid-turn without
   saying why.
 - `captured: true` - there is an answer; a non-zero exit after it is reported
-  but does not make the run a failure.
+  but does not make the run a failure (a `review failed:` line does).
 
 `review sessions <ID>` shows the same digest later (see `review man sessions`).
 
@@ -110,8 +112,10 @@ hint about folder trust in the reason, ran in a folder grok does not trust.
 
 Grok can end its turn while one of its commands is still running in the
 background, and never see the result. `review` waits for such work and resumes
-the session with the results it detects, printing each wake, until a turn ends
-with nothing unread. The run **fails** instead if grok still has unread results
+the session with the shell results it detects, printing each wake, until a
+turn ends with nothing unread. A finished subagent's result is not available to
+`review`, so its wake only tells the model to fetch it; a clean wake turn does
+not prove the model read it. The run **fails** instead if grok still has unread results
 after ten wakes, or if grok's own record of the session cannot be read or
 parsed. It does not wake after a stated failure. One gap is known: a background
 subagent that finishes while the turn is still running can go undetected.

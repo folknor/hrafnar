@@ -42,6 +42,9 @@ so a claude killed from outside or crashed mid-turn is `Ok` with a death digest
 deaths do. The error text for a missing result is claude's stderr, or else the
 stream's last line, truncated: the whole stream is every event of the run.
 
+An answer followed by a non-zero exit keeps `captured: true` and the observed
+exit code or signal. That status is not a provider-stated `turn_error`.
+
 The stream is buffered up to 64 MiB from the start and, past that, the last
 8 MiB or more, because the result is the *last* line: keeping only the head
 would lose the answer of any run that outgrew the cap.
@@ -56,7 +59,9 @@ the ID was discarded with it (`invoke` sets none on an `Err`).
 
 The result object's `modelUsage` keys and `total_cost_usd` are recorded as the
 served model and cost (`result_served`, shared with grok), and its usage fills
-the digest (`claude_usage`). A clean run has no digest, as for grok. Claude has
+the digest (`claude_usage`). Usage and turn counts sum every result event in
+stream order; other event types do not contribute, and only the last result
+decides the answer. A clean run has no digest, as for grok. Claude has
 no auto-resume: that is codex's workaround for a death, and a claude turn that
 fails says why.
 

@@ -14,7 +14,8 @@ A selector spelled as a path is a path: it starts with `/`, `./`, `../` or
 `~/`, or is `.`, `..` or `~`. It resolves against the current directory and is
 searched upward for `.review.toml` like the current directory would be.
 
-Anything else is a **registered name**, looked up in the global config:
+Tilde-prefixed forms other than `~` and `~/...` are rejected as invalid paths.
+All other selectors are **registered names**, looked up in the global config:
 
 ```toml
 [_projects.myhostname]
@@ -27,9 +28,9 @@ bz = "~/Programs/bz"
 - A name matches a key ignoring ASCII case, then by the part after a key's last
   `/`, so `piners` finds `folknor/piners`. A short name matching several keys
   is an error; use the full key.
-- The path may use `~`, `~/`, `$VAR` and `${VAR}`, and must be absolute after
-  expansion. An unset variable, a relative path or a missing directory is an
-  error.
+- The path may use bare `~`, `~/...`, `$VAR` and `${VAR}`. `~user` expansion is
+  unsupported. The result must be absolute; an unset variable, a relative path
+  or a missing directory is an error.
 - A registered path is the project root itself: its `.review.toml` must sit
   directly in it, never in a parent.
 - Registry keys may not be spelled like paths, and two keys may not differ

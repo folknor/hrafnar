@@ -664,3 +664,90 @@ fn announcement_is_empty_when_an_override_grants_nothing() {
         super::announcement_lines("codex", "profile config override", &granted, &[]).is_empty()
     );
 }
+
+#[test]
+fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
+    let digest = super::wake_failure_digest("unread background results".to_string(), None);
+    assert!(digest.captured, "verification cannot retract an answer");
+    assert_eq!(
+        digest.exit_code,
+        Some(0),
+        "the completed turn exited cleanly"
+    );
+    assert!(
+        digest.turn_error.is_none(),
+        "grok did not state this diagnosis"
+    );
+    assert!(digest.failed(), "unverified work still fails the run");
+    let summary = digest.summary();
+    assert_eq!(
+        summary.review_error.as_deref(),
+        Some("unread background results")
+    );
+    assert!(summary.captured);
+}
+
+#[test]
+fn review_verification_failure_preserves_provider_failure_and_usage() {
+    let mut last = super::no_answer_digest("cancelled".to_string(), Some(&exited(7)));
+    last.turns = 3;
+    last.usage.output_tokens = 42;
+    let digest = super::wake_failure_digest("cannot read update log".to_string(), Some(last));
+    assert!(!digest.captured);
+    assert_eq!(digest.exit_code, Some(7));
+    assert_eq!(digest.turn_error.as_deref(), Some("cancelled"));
+    assert_eq!(digest.turns, 3);
+    assert_eq!(digest.usage.output_tokens, 42);
+    assert!(digest.failed());
+}
+
+#[test]
+fn review_verification_failure_preserves_a_signal_after_an_answer() {
+    use std::os::unix::process::ExitStatusExt;
+    let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
+    let mut last = super::no_answer_digest(String::new(), Some(&status));
+    last.turn_error = None;
+    last.captured = true;
+    assert!(
+        !last.failed(),
+        "post-answer process status alone is not a failed turn"
+    );
+    let digest = super::wake_failure_digest("cannot verify results".to_string(), Some(last));
+    assert!(digest.captured);
+    assert_eq!(digest.exit_code, None);
+    assert_eq!(digest.signal.as_deref(), Some("SIGTERM"));
+    assert!(digest.turn_error.is_none());
+    assert!(digest.failed());
+}
+
+#[test]
+fn claude_usage_counts_every_result_and_ignores_other_events() {
+    let last = r#"{"type":"result","num_turns":1,"usage":{"input_tokens":2,"cache_creation_input_tokens":3,"cache_read_input_tokens":5,"output_tokens":7,"output_tokens_details":{"thinking_tokens":4}}}"#;
+    let assistant =
+        r#"{"type":"assistant","num_turns":99,"usage":{"input_tokens":999,"output_tokens":999}}"#;
+    let stdout = claude_stream(&[CLAUDE_INIT, CLAUDE_OK, assistant, "not json", last]);
+    let (turns, usage) = super::claude_usage(&stdout);
+    assert_eq!(turns, 3);
+    assert_eq!(usage.input_tokens, 4 + 25470 + 22520 + 2 + 3 + 5);
+    assert_eq!(usage.cached_input_tokens, 22520 + 5);
+    assert_eq!(usage.output_tokens, 149 + 7);
+    assert_eq!(usage.reasoning_output_tokens, 4);
+    let (turns, usage) = super::claude_usage(r#"{"type":"result"}"#);
+    assert_eq!((turns, usage.input_tokens), (0, 0));
+}
+
+#[test]
+fn post_answer_status_is_shared_without_inventing_a_turn_failure() {
+    assert!(super::answered_status_digest(Some(&exited(0))).is_none());
+    for status in [None, Some(exited(7))] {
+        let digest = super::answered_status_digest(status.as_ref()).expect("status digest");
+        assert!(digest.captured);
+        assert!(!digest.failed());
+        assert!(digest.turn_error.is_none());
+        assert!(digest.review_error.is_none());
+        assert_eq!(
+            digest.exit_code,
+            status.as_ref().and_then(std::process::ExitStatus::code)
+        );
+    }
+}

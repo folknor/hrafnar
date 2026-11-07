@@ -186,7 +186,7 @@ pub async fn interrupt(
     // the turn is over - without guessing from sidecar timestamps, which are
     // whole seconds and can tie with the session's previous row.
     while crate::inflight::interrupt_pending(session_id, data_root) {
-        if !crate::inflight::pid_alive(marker.pid) {
+        if !crate::inflight::identity_alive(marker.pid, marker.pid_start) {
             // Nobody is left to consume it; withdraw it so it cannot mark a
             // later resume of this session as interrupted.
             let _ = crate::inflight::take_interrupt_request(session_id, data_root);
@@ -229,7 +229,7 @@ pub async fn interrupt(
                 });
             }
             looked_again = true;
-        } else if !crate::inflight::pid_alive(marker.pid) {
+        } else if !crate::inflight::identity_alive(marker.pid, marker.pid_start) {
             bail!(
                 "the owning review (pid {}) exited without recording session {session_id}, \
                  so it cannot be resumed through review",

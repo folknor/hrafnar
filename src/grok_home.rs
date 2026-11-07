@@ -207,7 +207,19 @@ impl Grok {
     pub fn check_trust(&self, dir: &Path) -> anyhow::Result<Trust> {
         let path = self.home.join("trusted_folders.toml");
         let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if canonical.starts_with(self.home.join("worktrees")) {
+        // `dir` is canonical, but GROK_HOME may contain `..`. Compare against
+        // the same canonical spelling so a managed worktree cannot evade this
+        // refusal. Keep `self.home` raw below: the symlink check must still see
+        // aliases grok itself refuses to load.
+        let canonical_home = match std::fs::canonicalize(&self.home) {
+            Ok(home) => Some(home),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => anyhow::bail!("cannot resolve grok home {}: {e}", self.home.display()),
+        };
+        if canonical_home
+            .as_deref()
+            .is_some_and(|home| canonical.starts_with(home.join("worktrees")))
+        {
             anyhow::bail!(
                 "{} is a grok-managed worktree; review cannot model its trust key - \
                  trust it from grok",
@@ -371,7 +383,8 @@ fn locked_update(
 /// The cause of a cancelled turn, from a session's `events.jsonl` body.
 ///
 /// Takes the *last* `turn_ended` (a resumed session holds several turns), and
-/// the last permission refusal before it, which is what names the tool.
+/// the last permission refusal before it unless a later allowed permission
+/// superseded it.
 pub fn cancel_cause(events: &str) -> Option<String> {
     let mut refused_tool: Option<String> = None;
     let mut cause: Option<String> = None;
@@ -386,7 +399,9 @@ pub fn cancel_cause(events: &str) -> Option<String> {
             }
             Some("permission_resolved") => {
                 let decision = ev.get("decision").and_then(|d| d.as_str());
-                if decision.is_some_and(|d| d != "allow") {
+                if decision == Some("allow") {
+                    refused_tool = None;
+                } else if decision.is_some() {
                     refused_tool = ev
                         .get("tool_name")
                         .and_then(|t| t.as_str())
@@ -469,6 +484,7 @@ pub enum Unread {
         output_file: Option<String>,
     },
     /// A background subagent that finished after the model's turn ended.
+    /// The retained update fields do not include its result text.
     Subagent {
         id: String,
         status: Option<String>,
@@ -486,7 +502,8 @@ impl Unread {
     }
 }
 
-/// Background results in a session's `updates.jsonl` that the model never saw.
+/// Background results and completion notices in a session's `updates.jsonl`
+/// that the model may not have seen.
 ///
 /// Grok moves a long shell command to the background and hands the model a
 /// task id; a model that then waits on it (`get_command_or_subagent_output`)
@@ -497,16 +514,19 @@ impl Unread {
 /// That shows up as a completion *after* the last turn end - the exact
 /// signature of the live probe that lost a passing `brokkr test`, and absent
 /// from a session whose model waited. Background subagents
-/// (`subagent_spawned`/`subagent_finished`) are the same shape.
+/// (`subagent_spawned`/`subagent_finished`) have no read signal in the update
+/// data we retain, so completion relative to a turn end is only a heuristic for
+/// whether the result was seen.
 ///
 /// - **Only a real turn end counts.** Grok also starts turns itself when
 ///   background work finishes (prompt ids in `SYNTHETIC_TURN_PREFIXES`); one
 ///   torn down before it ran writes a `turn_completed` that is not `end_turn`,
 ///   and counting it would hide the very completion it was started for.
 /// - **"Never finished" is scoped to the latest turn**, because a later grok
-///   process can never finish an earlier one's task. It is safe to drop it
-///   after that turn only because `run_grok` *delivers* each item in the wake
-///   prompt itself (`wake_prompt`): the model has been told, whatever it did.
+///   process can never finish an earlier one's task. The wake prompt includes
+///   shell output, but for a subagent it only includes completion metadata and
+///   asks the model to fetch the result. That notice does not prove the model
+///   read the result.
 /// - **Persistent monitors are not work that must produce a result.** They
 ///   never complete by design (`cli.rs`: they "always wait the full timeout"),
 ///   so a `task_backgrounded` carrying `monitor_description` is ignored.
@@ -580,6 +600,8 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
             }
             Some("subagent_finished") => {
                 if let Some(id) = text("subagent_id") {
+                    // This retained update projection does not deliver the
+                    // subagent's result text; the wake prompt can only ask for it.
                     finished.push((
                         i,
                         Unread::Subagent {
@@ -645,17 +667,16 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
 /// a build's verdict is. Grok keeps the full log at `output_file`.
 const WAKE_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 
-/// The prompt that hands the model the results it never saw.
+/// The prompt that hands over shell output and notifies the model about
+/// subagent completions whose result it may need to fetch.
 ///
-/// The results are **in the prompt**, not pointed at. An earlier version only
-/// told the model to go and read them, and a model is free to end its turn
-/// without doing so - after which the next turn boundary would look clean. A
-/// prompt that contains the result has delivered it the moment it is sent,
-/// whatever the model then does.
+/// Shell output is **in the prompt**, not pointed at. Subagent results are not
+/// available in the retained update fields, so that case can only ask the model
+/// to fetch them. A clean turn boundary does not prove that it did.
 pub fn wake_prompt(unread: &[Unread]) -> String {
     let mut out = String::from(
-        "Your turn ended while background work you started was still running, so you never saw \
-         its result. Here it is.\n\n",
+        "Your turn ended while background work you started was still running. Here is the \
+         information available about it.\n\n",
     );
     for u in unread {
         match u {
@@ -696,18 +717,31 @@ pub fn wake_prompt(unread: &[Unread]) -> String {
                 command,
                 output_file,
             } => {
-                out.push_str(&format!(
-                    "## `{}` ({id}) did NOT finish\n\nIt was still running when the session \
-                     ended and was stopped, so it produced no result. Its partial output is in {}. \
-                     Re-run it in the foreground and wait for it if you still need it.\n\n",
-                    command.as_deref().unwrap_or("background work"),
-                    output_file.as_deref().unwrap_or("its output file"),
-                ));
+                if id.starts_with("subagent:") {
+                    out.push_str(&format!(
+                        "## Subagent {id} did NOT finish\n\nIt did not finish before the \
+                         session ended, so no result is available. Start another subagent if \
+                         you still need its result.\n\n",
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "## `{}` ({id}) did NOT finish\n\nIt had not finished when the session \
+                         ended, so no result is available.",
+                        command.as_deref().unwrap_or("background work")
+                    ));
+                    if let Some(path) = output_file {
+                        out.push_str(&format!(" Partial output is in {path}."));
+                    }
+                    out.push_str(
+                        " Re-run it in the foreground and wait for it if you still need it.\n\n",
+                    );
+                }
             }
             Unread::Subagent { id, status, error } => {
                 out.push_str(&format!(
-                    "## Subagent {id} finished: {}{}\n\nRead its result with \
-                     get_command_or_subagent_output.\n\n",
+                    "## Subagent {id} finished: {}{}\n\nThis wake record does not include \
+                     its result here. Fetch and read it with get_command_or_subagent_output \
+                     before ending this turn.\n\n",
                     status.as_deref().unwrap_or("unknown status"),
                     error
                         .as_deref()
@@ -719,8 +753,8 @@ pub fn wake_prompt(unread: &[Unread]) -> String {
     }
     out.push_str(
         "Continue the task you were given from here. Do not end your turn while any command or \
-         subagent you start is still running - wait for it. Finish with the report the task asked \
-         for.",
+         subagent you start is still running - wait for it. Read each subagent result before \
+         ending. Finish with the report the task asked for.",
     );
     out
 }
@@ -1174,6 +1208,20 @@ mod tests {
         std::fs::create_dir_all(&managed).expect("managed worktree");
         let err = grok.check_trust(&managed).expect_err("cannot be modelled");
         assert!(err.to_string().contains("grok-managed worktree"), "{err}");
+
+        // The home spelling may include `..`, while the project path above is
+        // canonical. The worktree refusal must compare equivalent paths.
+        let nested_home = home.join("nested-grok");
+        let detour = home.join("detour");
+        let aliased_worktree = nested_home.join("worktrees/abc");
+        std::fs::create_dir_all(&detour).expect("detour");
+        std::fs::create_dir_all(&aliased_worktree).expect("aliased worktree");
+        let alias = home.join("detour/../nested-grok");
+        let grok = grok_at(&alias);
+        let err = grok
+            .check_trust(&aliased_worktree)
+            .expect_err("noncanonical home must not bypass refusal");
+        assert!(err.to_string().contains("grok-managed worktree"), "{err}");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1219,6 +1267,14 @@ mod tests {
         let events = r#"{"type":"permission_resolved","tool_name":"read_file","decision":"allow"}
 {"type":"turn_ended","outcome":"cancelled","cancellation_category":"max_turns"}"#;
         assert_eq!(cancel_cause(events).as_deref(), Some("max_turns"));
+
+        let refusal_then_allow = r#"{"type":"permission_resolved","tool_name":"search_replace","decision":"cancelled"}
+{"type":"permission_resolved","tool_name":"read_file","decision":"allow"}
+{"type":"turn_ended","outcome":"cancelled","cancellation_category":"max_turns"}"#;
+        assert_eq!(
+            cancel_cause(refusal_then_allow).as_deref(),
+            Some("max_turns")
+        );
         assert_eq!(
             cancel_cause(r#"{"type":"turn_ended","outcome":"end_turn"}"#),
             None
@@ -1392,6 +1448,39 @@ mod tests {
         assert!(prompt.contains("THE VERDICT"), "the tail is kept");
         assert!(prompt.contains("/g/t3.log"), "{prompt}");
         assert!(prompt.len() < WAKE_OUTPUT_TAIL_BYTES + 2048);
+    }
+
+    #[test]
+    fn the_wake_prompt_is_explicit_about_subagent_results() {
+        let prompt = wake_prompt(&[Unread::Subagent {
+            id: "s1".to_string(),
+            status: Some("completed".to_string()),
+            error: None,
+        }]);
+        assert!(
+            prompt.contains("This wake record does not include its result here"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("get_command_or_subagent_output"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Read each subagent result before ending"),
+            "{prompt}"
+        );
+
+        let unfinished = wake_prompt(&[Unread::Unfinished {
+            id: "subagent:s2".to_string(),
+            command: Some("research task".to_string()),
+            output_file: None,
+        }]);
+        assert!(
+            unfinished.contains("no result is available"),
+            "{unfinished}"
+        );
+        assert!(!unfinished.contains("Partial output is in"), "{unfinished}");
+        assert!(!unfinished.contains("foreground"), "{unfinished}");
     }
 
     #[test]

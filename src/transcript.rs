@@ -52,7 +52,14 @@ pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Op
     let needle = format!("-{session_id}.jsonl");
     let mut stack = vec![(sessions, 0u32)];
     while let Some((dir, depth)) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).ok()?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // If the root cannot be opened, no part of the tree can be searched.
+            // A nested directory can disappear or be unreadable independently;
+            // skip it and keep searching the remaining branches.
+            Err(_) if depth == 0 => return None,
+            Err(_) => continue,
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -157,8 +164,9 @@ fn parse(content: &str) -> TranscriptSummary {
         task_complete: bool,
         stream_error: bool,
         final_answer: Option<String>,
-        /// call_id -> (name, arguments), preserving insertion order via a Vec.
-        in_flight: Vec<(String, (String, String))>,
+        /// Optional call_id -> (name, arguments), preserving insertion order
+        /// and distinct id-less calls via a Vec.
+        in_flight: Vec<(Option<String>, (String, String))>,
     }
 
     let mut cur = TurnState::default();
@@ -260,12 +268,16 @@ fn parse(content: &str) -> TranscriptSummary {
                     let call_id = p
                         .get("call_id")
                         .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .map(str::to_string);
+                    // A missing ID is not the same as an empty ID. Keep it
+                    // unmatched rather than letting an explicit empty ID
+                    // retire every call whose ID was absent.
                     let name = p
                         .get("name")
                         .and_then(|n| n.as_str())
-                        .unwrap_or(pt)
+                        // `pt` is the event kind (for example,
+                        // `function_call`), not the tool's name.
+                        .unwrap_or("(unknown tool)")
                         .to_string();
                     let args = p
                         .get("arguments")
@@ -277,11 +289,14 @@ fn parse(content: &str) -> TranscriptSummary {
             }
             Some(pt) if pt.ends_with("_call_output") => {
                 turn_produced_content = true;
-                if let Some(call_id) = payload
+                let output_call_id = payload
                     .and_then(|p| p.get("call_id"))
-                    .and_then(|c| c.as_str())
-                {
-                    cur.in_flight.retain(|(id, _)| id != call_id);
+                    .and_then(|c| c.as_str());
+                // An output without a call_id cannot be safely paired to one
+                // of several pending calls, so leave them unchanged.
+                if let Some(call_id) = output_call_id {
+                    cur.in_flight
+                        .retain(|(id, _)| id.as_deref() != Some(call_id));
                 }
             }
             _ => {}

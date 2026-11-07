@@ -43,6 +43,14 @@ fn died_without_answer(r: &provider::ProviderResult) -> bool {
     }
 }
 
+/// The exit-status verdict for one result: no answer, or an answer `review`
+/// could not verify (`Digest::review_error`). Distinct from
+/// `died_without_answer`, which decides retries: an unverified answer is a
+/// failure, but resending the request would not verify it.
+fn run_failed(r: &provider::ProviderResult) -> bool {
+    r.output.is_err() || r.digest.as_ref().is_some_and(provider::Digest::failed)
+}
+
 /// Codex's own stated reason for the turn ending (a stream `error`/`turn.failed`
 /// event) - an upstream refusal, a rate limit, an auth failure.
 ///
@@ -637,19 +645,10 @@ pub async fn run() -> Result<()> {
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
-    // Ensure audit ID exists - generate and persist if missing (after lock to prevent races)
-    let audit_id = match cfg.audit.id {
-        Some(ref id) => id.clone(),
-        None => {
-            let id = config::generate_short_id();
-            let config_path = project_root.join(".review.toml");
-            if let Err(e) = config_write::append_audit_id(&config_path, &id) {
-                eprintln!("warning: failed to write audit id to .review.toml: {e}");
-            }
-            cfg.audit.id = Some(id.clone());
-            id
-        }
-    };
+    // Re-read under the lock: cfg was loaded before waiting, so its audit id
+    // may be stale if another first run persisted one while this run queued.
+    let audit_id = config_write::ensure_audit_id(&project_root.join(".review.toml"))?;
+    cfg.audit.id = Some(audit_id.clone());
 
     // Codex run settings from project config: today just the stall timeout,
     // which is tunable (and disableable) because it rests on an empirical codex
@@ -787,9 +786,7 @@ pub async fn run() -> Result<()> {
     // Leftovers are a separate verdict across every invocation, and outrank
     // it: one provider's answer cannot excuse another's processes still
     // running.
-    let all_failed = results
-        .iter()
-        .all(|(_, r)| r.output.is_err() || died_without_answer(r));
+    let all_failed = results.iter().all(|(_, r)| run_failed(r));
     if let Some(code) = exit_status(all_failed, left_running) {
         std::process::exit(code);
     }
@@ -1161,6 +1158,11 @@ async fn run_session_resume(
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
+    // Persist an id before launching so every concurrent resume records the
+    // same project identity, and a write failure cannot leave an unidentifiable
+    // session behind.
+    let audit_id = config_write::ensure_audit_id(&project_root.join(".review.toml"))?;
+    let private = cfg.audit.private;
 
     // Permissions, model and effort are inherited from the session's own last
     // recorded run rather than defaulted (see `inherited_settings`). Each is
@@ -1214,18 +1216,6 @@ async fn run_session_resume(
             invoke.await
         }
     };
-
-    // The audit id is persisted when the config lacks one, which only a row
-    // recorded without an id can reach (`message_target` matched the rest).
-    let audit_id = match cfg.audit.id.clone() {
-        Some(id) => id,
-        None => {
-            let id = config::generate_short_id();
-            let _ = config_write::append_audit_id(&project_root.join(".review.toml"), &id);
-            id
-        }
-    };
-    let private = cfg.audit.private;
 
     let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
     audit::log_result(
@@ -1293,10 +1283,7 @@ async fn run_session_resume(
     // incident survive), but it is a failure for exit-code purposes - exiting 0
     // on a wedged run lies to scripts and CI, exactly as it did on the fan-out
     // path before this was fixed there. Anything left running outranks it.
-    if let Some(code) = exit_status(
-        result.output.is_err() || died_without_answer(&result),
-        left_running,
-    ) {
+    if let Some(code) = exit_status(run_failed(&result), left_running) {
         std::process::exit(code);
     }
     Ok(())
@@ -1526,6 +1513,9 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     if let Some(ref msg) = d.turn_error {
         println!("turn failed: {msg}");
     }
+    if let Some(ref msg) = d.review_error {
+        println!("review failed: {msg}");
+    }
     if let Some(line) = digest_summary_note(d) {
         println!("{line}");
     }
@@ -1561,8 +1551,9 @@ fn digest_summary_note(d: &provider::DigestSummary) -> Option<String> {
         Some(format!("note: interrupted - {how}"))
     } else if d.turn_error.is_some() && !d.captured {
         // Explained by `turn failed:` - don't also guess "died mid-turn" at
-        // it. Gated on the missing answer: a grok or claude answer followed by
-        // a non-zero exit is recorded as captured *with* a `turn_error`, and
+        // it. Gated on the missing answer: rows written before post-answer exit
+        // problems moved out of `turn_error` record a grok or claude answer
+        // followed by a non-zero exit as captured *with* a `turn_error`, and
         // "no conclusion" would contradict the answer printed below. The live
         // `print_digest` has the same gate.
         Some("note: no conclusion was produced".to_string())
@@ -1757,14 +1748,23 @@ mod tests {
     #[test]
     fn an_answer_with_a_non_zero_exit_is_not_called_inconclusive() {
         // What grok and claude record for an answer from a process that then
-        // exited non-zero: captured, with a turn_error saying so.
+        // exited non-zero: captured, with the observed exit code and no
+        // provider-stated `turn_error`.
         let d = summary(serde_json::json!({
+            "exit_code": 1, "captured": true, "turns": 1,
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+        }));
+        assert_eq!(digest_summary_note(&d), None);
+        // Rows recorded before that change carry a `turn_error` instead, and
+        // still must not be called inconclusive.
+        let legacy = summary(serde_json::json!({
             "exit_code": 1, "captured": true, "turns": 1,
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
             "reasoning_output_tokens": 0,
             "turn_error": "claude exited non-zero after producing an answer",
         }));
-        assert_eq!(digest_summary_note(&d), None);
+        assert_eq!(digest_summary_note(&legacy), None);
     }
 
     #[test]
@@ -2012,6 +2012,7 @@ mod tests {
                 quiet_secs: None,
                 last_rollout_event: None,
                 turn_error: None,
+                review_error: None,
                 interrupted,
             }),
             completed_epoch: 0,

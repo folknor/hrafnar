@@ -47,7 +47,7 @@ sandbox = "read-only"
 
 # Project file only.
 [_audit]
-id = "43fd"
+id = "0123456789abcdef0123456789abcdef"
 private = false
 
 # Global file only: see `review man projects`.
@@ -60,9 +60,10 @@ bz = "~/Programs/bz"
 - `[_groups]`: name to a non-empty list of archetypes, without duplicates.
 - `[_defaults]`: `providers` (the list used without `--provider`) and
   `stall_timeout_secs`.
-- `[_audit]`: `id` names the project's audit trail and is generated on the
-  first run if missing. `private = true` files the project's sessions in a
-  separate private log.
+- `[_audit]`: `id` names the project's audit trail. `review init` creates a
+  32-character hex id; an id-less project gets one before its first launch.
+  The id is saved before launch, and the run fails if it cannot be saved.
+  `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
 - Any other top-level table is a profile table, `[<provider>.<profile>]`, or a
   legacy host-scoped one, `[<host>.<provider>.<profile>]`.

@@ -10,6 +10,8 @@
 //!
 //! A selector is a **path** when it is spelled like one - `/...`, `./...`,
 //! `../...`, `.`, `..`, `~` or `~/...` - and a **registered name** otherwise.
+//! Other tilde-prefixed forms are sent to the path expander and rejected, not
+//! looked up as names.
 //! There is no fallback from one to the other: if a name that did not resolve
 //! fell back to a directory of that name, registering a project would silently
 //! retarget every command that had been spelling that directory, and a
@@ -36,10 +38,17 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Selection;
 
+#[path = "path_expansion.rs"]
+pub(crate) mod path_expansion;
+pub(crate) use self::path_expansion::expand as expand_path;
+
 /// Whether `selector` is spelled as a path rather than a registered name.
 fn is_path(selector: &str) -> bool {
-    matches!(selector, "." | ".." | "~")
-        || ["/", "./", "../", "~/"]
+    matches!(selector, "." | "..")
+        // Route unsupported `~user` forms through the shared path expander so
+        // they get the same grammar error as configured paths.
+        || selector.starts_with('~')
+        || ["/", "./", "../"]
             .iter()
             .any(|p| selector.starts_with(p))
 }
@@ -50,7 +59,7 @@ pub fn check_name(name: &str) -> std::result::Result<(), String> {
     if name.trim().is_empty() {
         return Err("a project name cannot be empty".to_string());
     }
-    if name.starts_with('~') || is_path(name) {
+    if is_path(name) {
         return Err(format!(
             "'{name}' is spelled like a path, so `-C {name}` would never look it up"
         ));
@@ -70,7 +79,7 @@ pub fn select(selector: Option<&str>) -> Result<Selection> {
     };
     if is_path(selector) {
         let expanded =
-            expand(selector, &env_var).map_err(|e| anyhow::anyhow!("-C {selector}: {e}"))?;
+            expand_path(selector, &env_var).map_err(|e| anyhow::anyhow!("-C {selector}: {e}"))?;
         let path = PathBuf::from(&expanded);
         let path = if path.is_absolute() {
             path
@@ -83,9 +92,6 @@ pub fn select(selector: Option<&str>) -> Result<Selection> {
             bail!("-C {selector}: {} is not a directory", path.display());
         }
         return Ok(Selection::Discover(canonical(&path)));
-    }
-    if selector.starts_with('~') {
-        bail!("-C {selector}: only `~` and `~/...` expand; spell the path out");
     }
     let (registry, global) = crate::config::global_projects()?;
     let path = lookup(selector, &registry, &env_var).map_err(|why| {
@@ -154,7 +160,7 @@ fn lookup(
         }
     };
     let raw = &registry[key];
-    let expanded = expand(raw, var).map_err(|e| format!("registered path {raw}: {e}"))?;
+    let expanded = expand_path(raw, var).map_err(|e| format!("registered path {raw}: {e}"))?;
     let path = PathBuf::from(&expanded);
     if !path.is_absolute() {
         return Err(format!(
@@ -165,51 +171,8 @@ fn lookup(
     Ok(path)
 }
 
-/// Expand `~`, `~/`, `$VAR` and `${VAR}`. Every failure is an error: unlike a
-/// writable root, which can be dropped with a warning, a project target that
-/// cannot be expanded leaves nothing to run the command against.
-fn expand(raw: &str, var: &dyn Fn(&str) -> Option<String>) -> Result<String> {
-    let home = || var("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"));
-    let raw = if raw == "~" {
-        home()?
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-        format!("{}/{rest}", home()?.trim_end_matches('/'))
-    } else if raw.starts_with('~') {
-        bail!("only `~` and `~/...` expand");
-    } else {
-        raw.to_string()
-    };
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw.as_str();
-    while let Some(idx) = rest.find('$') {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 1..];
-        let (name, tail) = if let Some(braced) = after.strip_prefix('{') {
-            match braced.find('}') {
-                Some(end) => (&braced[..end], &braced[end + 1..]),
-                None => bail!("unclosed '${{'"),
-            }
-        } else {
-            let end = after
-                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .unwrap_or(after.len());
-            (&after[..end], &after[end..])
-        };
-        if name.is_empty() {
-            bail!("empty variable name");
-        }
-        match var(name) {
-            Some(value) => out.push_str(&value),
-            None => bail!("${name} is not set"),
-        }
-        rest = tail;
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 fn env_var(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|v| !v.is_empty())
+    std::env::var(key).ok()
 }
 
 fn canonical(path: &Path) -> PathBuf {

@@ -4,6 +4,9 @@
 //! because the property is about the real dispatch order in `main`.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SCRATCH_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Run from `/`, where no `.review.toml` is found walking up, so the no-project
 /// condition holds wherever the build directory lives.
@@ -17,8 +20,17 @@ fn review(args: &[&str], xdg_config: &std::path::Path) -> std::process::Output {
 }
 
 fn broken_global_config() -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("man-broken-config");
-    std::fs::create_dir_all(dir.join("review")).expect("scratch config dir");
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let dir = loop {
+        let id = SCRATCH_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("man-broken-config-{}-{id}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => panic!("scratch config dir: {err}"),
+        }
+    };
+    std::fs::create_dir(dir.join("review")).expect("scratch config dir");
     std::fs::write(dir.join("review/config.toml"), "this is = = not toml [")
         .expect("broken config written");
     dir

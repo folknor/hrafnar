@@ -312,8 +312,8 @@ Reported by: forensics.
 `write_bundle` returns `Option<PathBuf>` and `eprintln!`s each failure;
 `find_transcript_path` and `summarize_session` return `Option`; `list_recent`
 returns `Vec` with errors swallowed. A caller cannot tell "no rollout exists"
-from "unreadable" from "codex home unknown"; the unreadable-directory and
-custom `CODEX_HOME` defects in `notes/bugs.md` are both that confusion.
+from "unreadable" from "codex home unknown"; the custom `CODEX_HOME` defect in
+`notes/bugs.md` is that confusion.
 Proposed: `enum Lookup { Found(PathBuf), Absent, Unreadable(io::Error) }`, so
 the baseline code can say which happened instead of the generic warning.
 
@@ -859,9 +859,6 @@ Reported by: providers, lifecycle, forensics, grok-man, config.
 - `man`: the sandbox-table and level-list tests check docs against
   hand-maintained copies, so they will not catch a provider being added; with a
   registry the sandbox test requires one column per registered provider.
-  `tests/man.rs` writes to `CARGO_TARGET_TMPDIR` and every test rewrites the
-  same `man-broken-config` dir, harmless under `--test-threads=1`, racy
-  otherwise.
 - Config: the pairwise-agreement tests (`man` sandbox table vs `sandbox_for`,
   `man` reserved-words table vs `RESERVED_NAMES`, `cli` subcommands vs
   `RESERVED_NAMES`, `every_documented_level_maps_somewhere`) each guard a copy

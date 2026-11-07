@@ -533,17 +533,6 @@ Reported by: config.
 strings. The path is already known as `ReviewConfig.files.local`; `app` should
 write to that.
 
-## CON-025 - How do `~` and `$VAR` expand?
-
-Reported by: config.
-
-`project::expand` is strict and errors; `writable_roots::expand` is lenient
-and warns. The policy divergence is by design; the grammar divergence is not
-(the `~user` defect in `notes/bugs.md`). `project::env_var` and
-`RealHost::var` both filter empty values, so `$HOME=""` behaves the same, an
-agreement by copy. Owner proposed: one expander returning a typed error, with
-callers choosing to bail or warn.
-
 ## CON-026 - What is a project root's canonical identity?
 
 Reported by: config.
@@ -714,8 +703,8 @@ Reported by: forensics.
 `run_codex_json` (baseline, watchdog, recovery), then
 `transcript::codex_home` applies the parent env and the `HOME` fallback, and
 `run_session_show` passes `None`. Owner proposed: resolve the rollout path once
-per run and carry it (which also serves the watchdog re-walk and custom
-`CODEX_HOME` defects in `notes/bugs.md`).
+per run and carry it (which also serves the custom `CODEX_HOME` defect in
+`notes/bugs.md`).
 
 ## CON-038 - Is this run suspicious, and is it an incident?
 

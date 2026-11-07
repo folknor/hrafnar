@@ -17,66 +17,6 @@ hunter's reading of the code, and some say so explicitly.
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-## BUG-001 - `interrupt_cmd` decides owner liveness by bare pid and can hang
-
-Reported by: lifecycle.
-
-`inflight::read_live` decides whether the owning `review` is alive with
-`identity_alive(marker.pid, marker.pid_start)` (pidfd plus start time).
-`interrupt_cmd::interrupt` answers the same question in both of its wait loops
-with `inflight::pid_alive(marker.pid)`, which is `kill(pid, 0)`. If the owner
-dies and its pid is reused while the interrupt waits, `pid_alive` stays true.
-The first loop (`while interrupt_pending`) never ends because nobody consumes
-the request; the second never ends because no rows come and the "owner exited"
-bail never fires. `review message` calls the same function, so a message can
-hang behind it forever. Fix proposed: one liveness predicate per recorded
-identity; `pid_alive` should not be public. The single-owner design is in
-`notes/consolidations.md` under the process-identity question.
-
-## BUG-002 - `config_write::load_doc` can wipe a project config
-
-Reported by: config.
-
-`load_doc` does `read_to_string(..).unwrap_or_default()`, so any read error
-(permissions, EIO, a non-UTF-8 byte) becomes an empty document, and
-`append_audit_id` then writes a file holding only `[_audit] id = ...` over the
-original. The comment says "or an empty doc if missing", but every failure is
-treated as missing. Only `NotFound` should map to empty. The hunter notes that
-`load` has just parsed the file, so a read failure means something changed in
-between, but the fallback is the wrong default for a writer. No test covers the
-read-error path.
-
-## BUG-003 - Concurrent first runs can mint two audit ids
-
-Reported by: config, orchestration.
-
-The fan-out in `app` checks `cfg.audit.id` "after lock to prevent races", but
-`cfg` was loaded before the global lock was taken. Two concurrent first runs in
-a project without an id both see `None`, both mint, and the second
-`append_audit_id` overwrites the first. The first run's audit and sidecar rows
-are then filed under an id the project no longer has, and `message_target`'s
-audit-id check refuses `review message` for that session ("not the project the
-session was started in"). The resume path (`run_session_resume`) mints after
-dropping the global lock and ignores the write error with `let _ =`, so its
-window is wider and its failure silent; it also does not update `cfg`. Two
-concurrent resumes of an id-less project can each append a different id.
-
-Fix proposed: re-read the file under the lock, or make the mint a
-compare-and-set in `config_write` (`ensure_audit_id(path) -> AuditId`: read,
-return an existing id, else write), called under the lock by both paths.
-
-## BUG-004 - Weak and fallback-constant identities
-
-Reported by: config.
-
-`generate_short_id` is 16 bits and falls back to the literal `4242` if
-`/dev/urandom` cannot be opened. `generate_uuid`'s fallback leaves `buf` zeroed
-if the open fails, minting the same "v4" UUID every time. The audit id is now a
-project identity that `review message` checks (`message_target`), so a
-1-in-65536 collision between two projects at the same recycled path is exactly
-the case that check exists to catch, and it would pass. Proposed: fail hard
-when randomness is unavailable, or use a longer id.
-
 ## BUG-005 - `-a all` includes `bare`
 
 Reported by: config.
@@ -95,17 +35,6 @@ holds, but `-a bare` only works when the config defines `bare = ""`; without
 it, `-a bare` is "not found". The parser forbids a non-empty `bare` to keep
 the two in step. Proposed: resolve `bare` in the archetype resolver regardless
 of config, so the config entry is no longer needed.
-
-## BUG-007 - `~user` expansion differs between `project` and `writable_roots`
-
-Reported by: config.
-
-`project::expand` refuses `~other/...` explicitly. `writable_roots::expand`
-passes `~other/e` through as a literal string, which then fails the
-`is_absolute` check with "ignoring relative writable_roots entry", a misleading
-message. The hunter separates policy from grammar: erroring in one and warning
-in the other is legitimate, while disagreeing on what `~user` means is not.
-The expansion question as a whole is in `notes/consolidations.md`.
 
 ## BUG-008 - A Stranded watchdog kill can be reported as a death and auto-resumed
 
@@ -133,49 +62,23 @@ substantive turn ending in `final_answer` + `task_complete`, then a
 `task_started` / `user_message` / `task_complete` micro-turn, through the stub
 harness to a Stranded kill.
 
-## BUG-009 - `find_transcript_path` gives up on the first unreadable directory
+## BUG-011 - Incident bundles read the whole rollout and judge "answered" their own way
 
-Reported by: forensics.
+Reported by: forensics. Narrowed: the invalid-UTF-8 loss is fixed (the read is
+now lossy, like the other readers).
 
-`let entries = std::fs::read_dir(&dir).ok()?;` sits inside the DFS loop. One
-unreadable or concurrently removed subdirectory anywhere under `sessions/`
-makes the whole lookup return `None`. Silent fallout: the watchdog never fires;
-a resume gets `rollout_baseline = None`, so recovery and the watchdog are
-disabled with a misleading "could not read the rollout" warning; `review
-sessions <id>` reports "not found". Proposed: `continue`, keeping `None` only
-for a missing root.
-
-## BUG-010 - The watchdog re-walks the whole sessions tree on every poll
-
-Reported by: forensics.
-
-`wait_for_stranded_completion` calls `find_transcript_path` every
-`poll_interval` for the whole run, even after the path is known: an unbounded
-recursive `read_dir` over every session codex has written on the host, so the
-cost grows with the operator's history. The rollout name is stable for a
-session, and the baseline lookup in `run_codex_json` already did the same walk
-before spawn and could hand the path in. Proposed: cache the path once found.
-
-## BUG-011 - `incident::scan_transcript` is unscoped, phantom-blind, and a third definition of "answered"
-
-Reported by: forensics.
-
-- It reads the whole rollout (`read_to_string`, no `slice_from_offset`), where
-  the rest of the forensics scope reads to the run's bytes.
-- It resets `final_answer_present` on `task_started` but knows nothing of the
-  phantom shutdown turn that `transcript::parse` rolls back. A clean session
-  followed by codex 0.147.0's teardown phantom reads as
-  `final_answer_present = None` ("suspicious") in `review incidents`, where
-  `transcript::parse` says complete.
-- It defines "answered" as `task_complete.last_agent_message != null`,
-  alongside `transcript::final_answer_text` (phase-tagged) and the `-o` file.
-  A commentary-only turn whose `last_agent_message` is the commentary reads
-  "completed" here and "no final answer" everywhere else.
-- `read_to_string` fails outright on invalid UTF-8 where the other readers are
-  lossy, so a bundle can lack the transcript tail for a rollout the run parsed
-  fine.
-- `transcript.tail.jsonl` is unscoped too; on a resume the tail can be
-  entirely previous turns.
+What remains needs the run's rollout offset, which `incident.rs` does not
+receive: `Incident` carries a transcript path but no offset. `write_bundle`
+scans the whole rollout, and `transcript.tail.jsonl` is unscoped too, so on a
+resume the tail can be entirely previous turns. The scanner judges "answered"
+as `task_complete.last_agent_message != null`, without phantom-turn handling
+or the shared phase-tagged recognizer, so it can disagree with
+`transcript::parse` (a codex 0.147.0 teardown phantom reads as suspicious; a
+commentary-only turn reads as completed). The fixer's proposed route:
+`provider.rs` already computes `recovery_scope`; pass that offset into
+`Incident`, then scope the excerpt with `transcript::slice_from_offset` and
+classify with the existing scoped transcript summary. Comments at the bundle
+read and scanner sites record the limitation.
 
 ## BUG-012 - A custom `CODEX_HOME` blinds resume forensics and `review sessions <id>`
 
@@ -193,32 +96,6 @@ in `DigestSummary`, and on a clean run no transcript is read at all. Proposed:
 persist the resolved rollout path in the sidecar row. The providers hunter
 notes not recording env values is a documented choice, and calls this a silent
 cross-axis coupling: the env decides where forensics look.
-
-## BUG-013 - `transcript::parse` collides id-less tool calls and mislabels tool names
-
-Reported by: forensics.
-
-A `_call` without `call_id` is stored under `""`, so every later id-less output
-retires all of them, and two id-less calls collide. `name` falls back to the
-payload type (`pt`), so "the tool name" is sometimes a tool name and sometimes
-an event type.
-
-## BUG-014 - `incident::write_bundle` stamps two different times
-
-Reported by: forensics.
-
-`write_bundle` calls `chrono_now()` twice, for the directory stamp and for
-`meta.timestamp`. They can straddle a second boundary, so the directory name
-and `meta.json` disagree.
-
-## BUG-015 - `incident::list_recent` trusts directory names and lists foreign directories
-
-Reported by: forensics.
-
-`list_recent` relies on directory names sorting chronologically and lists any
-directory under `incidents/`, including foreign ones. It always uses the real
-location, which the hunter calls fine for the operator view but untestable
-without touching the operator's home.
 
 ## BUG-016 - Stub tests probably append to the operator's real audit log
 
@@ -254,25 +131,6 @@ prints no `session:` line and no hint, while the same flow on codex prints
 both. The `RunOutput.session_id` contract ("new information only" vs "the
 session") differs between runners.
 
-## BUG-019 - `review`'s own diagnoses are reported as provider turn failures
-
-Reported by: providers.
-
-`wake_failure_digest` and the post-answer status digests put `review`'s own
-diagnosis into `turn_error`: "claude exited non-zero after producing an
-answer", "grok's exit status is unknown", "could not verify grok's background
-results", "wake-up turn ... failed", "still had unread background results".
-These print as `turn failed: ...`, `review incidents` lists them as `turn
-failed:`, and `app::stated_failure` reads them as "the provider stated a
-reason, do not retry". Separately, `wake_failure_digest` turns a run that had
-an answer into `captured: false`, so the run exits 1 while its answer is
-printed beneath "note: no conclusion was produced; the text below is not an
-answer", which is false: it is an answer whose background results were not
-verified. `wake_failure_digest` also asserts `exit_code: Some(1)`, an exit
-nothing produced; the comment says so, but the field cannot tell asserted from
-observed. The typed-outcome proposal that would separate these is in
-`notes/structural.md`.
-
 ## BUG-020 - The grok runner ignores the stop channel
 
 Reported by: providers. Not verified by the hunter.
@@ -300,14 +158,6 @@ Reported by: providers.
 That is the false-record class the surrounding comment says it prevents.
 Proposed: stop parsing it back; keep the override as the typed profile field
 (`writable_roots` already exists) and forbid restating it in `config`.
-
-## BUG-022 - `claude_usage` reads only the last result line
-
-Reported by: providers.
-
-With multiple result objects in one stream (the background-subagent case the
-comments describe), earlier turns' usage is lost. Moot while background tasks
-are disabled, but a trap for maki, whose stream may differ.
 
 ## BUG-023 - Grok write runs are recorded under grok-native sandbox names
 
@@ -346,34 +196,6 @@ each degrading differently: a skipped marker with a warning, `Ok(None)`, and an
 `InvalidInput` error. The `SessionId` newtype proposed as the single owner is
 in `notes/structural.md`.
 
-## BUG-025 - An uncanonical `GROK_HOME` bypasses the grok-worktree refusal
-
-Reported by: grok-man.
-
-`check_trust` canonicalizes `dir` but compares it with
-`self.home.join("worktrees")` uncanonicalized. `Grok::resolve` only requires
-`home` to be absolute. `GROK_HOME=/home/u/./.grok`, a trailing `..`, or a home
-under a symlinked ancestor (allowed: the symlink test is only on the trust
-file path, and only on existing components) makes `starts_with` false, and the
-run proceeds to compute a `workspace_key` the docstring says cannot be
-modelled: exactly the case where `--trust` could land on a declined source
-repo. Proposed: canonicalize `home` once in `resolve` (refusing if that fails
-for an existing path), as `user_home` already is.
-
-## BUG-026 - The wake prompt points at subagent results instead of delivering them
-
-Reported by: grok-man.
-
-`wake_prompt`'s doc says results are "in the prompt, not pointed at", because
-a model may end its turn without reading them. The `Unread::Subagent` arm does
-the opposite: "Read its result with get_command_or_subagent_output." After that
-wake turn ends cleanly, the subagent completion precedes a real turn end, so
-`unread_background_results` reports nothing and the guarantee closes without
-the model having seen anything. Either `updates.jsonl`'s `subagent_finished`
-carries the result text (then put it in the prompt), or the guarantee for
-subagents is "told", not "delivered", and the docs should say so. The hunter
-suggests checking `research/grok-build`.
-
 ## BUG-027 - A grok write run announces a trust grant grok will refuse
 
 Reported by: grok-man.
@@ -384,24 +206,17 @@ grant that grok (per `is_unsafe_trust_root`) will refuse. The post-run landed
 check catches it, but only after a write run whose edits were all cancelled.
 Proposed: refuse up front ("grok never trusts $HOME").
 
-## BUG-028 - `cancel_cause` blames an early refusal for a later turn end
-
-Reported by: grok-man. Called low impact.
-
-`cancel_cause` keeps the last refusal before `turn_ended` but does not reset
-`refused_tool` at a later allowed permission, so a refusal early in a turn that
-later ends for `max_turns` is blamed on the tool.
-
 ## BUG-029 - The global lock lives in `TMPDIR`
 
-Reported by: orchestration. Called the most likely real-world bug in that
-scope.
+Reported by: orchestration, and again by a wave fixer. Called the most likely
+real-world bug in that scope.
 
 `std::env::temp_dir().join("review.lock")` is computed twice in `app.rs` and
 depends on `TMPDIR`. Two `review` processes with different `TMPDIR` (a
 sandboxed agent often has one) do not serialise at all, contrary to the lock's
-purpose. The launch locks already live under the data dir. Proposed:
-`lock::global()` beside `inflight`'s locks.
+purpose. The launch locks already live under the data dir. Audit-id minting is
+now protected by its own lock on the config file, so the remaining cost is
+launch spacing. Proposed: `lock::global()` beside `inflight`'s locks.
 
 ## BUG-030 - A panicked fan-out task is recorded as provider "unknown"
 
@@ -425,7 +240,7 @@ this.
 
 ## BUG-032 - Stale and misplaced comments
 
-Reported by: orchestration, grok-man, providers.
+Reported by: orchestration, grok-man, providers, and a wave fixer.
 
 - `sessions.rs`: the `kind` doc comments on `SessionRecord` and `SessionEntry`
   say `"oneshot"`, `"session"` or `"prime"`; the values written are `"run"`
@@ -441,6 +256,12 @@ Reported by: orchestration, grok-man, providers.
 - `run_claude`'s `runtime` parameter comment says claude uses only the stop
   channel, the data root and the two grace periods; it also uses
   `claude_command`, `teardown` and `orphan_log`.
+- `incident.rs` describes its directory suffix from `generate_short_id` as a
+  "short random suffix"; audit ids now use 128 random bits, so the suffix is 32
+  hex characters. (The reconciler rewrote this one; check before acting.)
+- `app.rs` at the global lock still says "Re-read under the lock" about the
+  audit id; `ensure_audit_id` now takes its own lock on the config file, so the
+  global lock is no longer what makes it safe.
 
 ## BUG-033 - Grok submodule checkouts are untested in `main_checkout_of_worktree`
 
@@ -450,3 +271,57 @@ Reported by: grok-man.
 shape (submodules: `gitdir: ../.git/modules/x`) by returning `None`, keying on
 the submodule root. The hunter thinks this probably matches grok and calls it
 worth one test.
+
+## BUG-034 - The keeper test cleans up with a bare-pid kill that can fall back to pid 0
+
+Reported by: a wave fixer (lateral).
+
+The cleanup in `tests/keeper.rs` signals a detached process by bare pid with
+`kill`, with a fallback to pid 0, which would signal the test's own process
+group. The fixer replaced it with pidfd signalling, then reverted that with
+the rest of a redesign that was out of scope; the bare-pid cleanup is back.
+
+## BUG-035 - Claude result aggregation is partial
+
+Reported by: a wave fixer (lateral).
+
+Usage is now summed across all result events in a claude stream, but the
+served model and cost are still read from the last result only; a clean claude
+run still records no usage, because it has no digest; and the stream's
+head-plus-tail truncation can discard result events from the middle of a long
+stream before any of them are read.
+
+## BUG-036 - Missing result fields are still reported as provider turn errors
+
+Reported by: a wave fixer (lateral).
+
+When a claude result lacks `is_error`, or a grok result lacks `stopReason`,
+`review` infers a failure and records it in `turn_error`, the provider-stated
+field, rather than in the new `review_error` field for `review`'s own
+diagnoses.
+
+## BUG-038 - The persisted digest view omits the unconfirmed-exit note
+
+Reported by: a wave reviewer (lateral).
+
+The live `print_digest` prints `note: answer captured; process exit status
+could not be confirmed`, but `app::print_digest_summary`, which renders the
+persisted row for `review sessions <ID>`, has no matching note, so the
+after-the-fact view shows less than the live one.
+
+## BUG-039 - An empty audit id is accepted and never regenerated
+
+Reported by: a wave reviewer (lateral).
+
+`config_write::configured_audit_id`, like the older parse path, treats
+`id = ""` as a configured id, so `ensure_audit_id` returns the empty string
+instead of minting one. Rows elsewhere use `""` to mean "no audit id".
+
+## BUG-040 - Incident listing's new filter has no test
+
+Reported by: a wave reviewer (lateral).
+
+`incident::list_recent_from` now drops bundles without matching schema-1
+metadata, a provider and a UTC timestamp, and sorts by the recorded time. That
+is new behaviour with no unit test, though the helper takes an explicit
+directory precisely so it can have one.
