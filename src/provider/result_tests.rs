@@ -1,6 +1,6 @@
 //! Unit tests of the result digests shared by every runner.
 
-use super::super::provider_tests::exited;
+use super::super::tests::exited;
 
 #[test]
 fn post_answer_status_is_shared_without_inventing_a_turn_failure() {

@@ -95,7 +95,7 @@ fn inherited_settings(
         sandbox: record.sandbox.clone(),
         // For grok these are exactly the roots the session's `review-ws-*`
         // profile is named for, and a resume uses them verbatim rather than
-        // re-deriving - see `provider::GrokWrite::Resume`.
+        // re-deriving - see `provider::grok::GrokWrite::Resume`.
         writable_roots: record.writable_roots.clone(),
         model: record.model.clone(),
         effort: record.effort.clone(),

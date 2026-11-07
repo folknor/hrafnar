@@ -9,7 +9,11 @@ impl Grok {
     /// fan-out launches several grok runs at once and two creating the same
     /// profile unlocked would race; renamed into place so a grok starting
     /// concurrently never reads a half-written file.
-    pub fn ensure_profile(&self, name: &str, roots: &[String]) -> anyhow::Result<bool> {
+    pub(in crate::provider::grok) fn ensure_profile(
+        &self,
+        name: &str,
+        roots: &[String],
+    ) -> anyhow::Result<bool> {
         let mut created = false;
         locked_update(&self.home, "sandbox.toml", |text| {
             let (new_text, c) = merge_profile(text, name, roots)?;
@@ -123,7 +127,7 @@ fn locked_update(
 /// Content-addressed profiles give grok the codex property: a run gets exactly
 /// its set, a profile is created once and never modified, and concurrent runs
 /// with different sets touch different entries.
-pub const PROFILE_PREFIX: &str = "review-ws-";
+pub(in crate::provider::grok) const PROFILE_PREFIX: &str = "review-ws-";
 
 const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose writable roots are exactly\n\
 # the list below (derived per host - brokkr lock, cargo home, shared target -\n\
@@ -132,7 +136,7 @@ const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose 
 
 /// The root set in canonical form: sorted, deduplicated. The profile name and
 /// the recorded roots both use it, so a resume can check one against the other.
-pub fn canonical_roots(roots: &[String]) -> Vec<String> {
+pub(in crate::provider) fn canonical_roots(roots: &[String]) -> Vec<String> {
     let mut v = roots.to_vec();
     v.sort();
     v.dedup();
@@ -146,7 +150,7 @@ pub fn canonical_roots(roots: &[String]) -> Vec<String> {
 /// not meant as one: the name only has to be stable and collision-unlikely
 /// across one host's handful of sets, and `merge_profile` refuses a same-named
 /// profile whose contents differ, so a collision fails loudly.
-pub fn profile_name(roots: &[String]) -> String {
+pub(in crate::provider::grok) fn profile_name(roots: &[String]) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for root in canonical_roots(roots) {
         for b in root.bytes().chain(std::iter::once(0)) {
@@ -191,7 +195,7 @@ struct SandboxConfig {
 /// collided, and silently "fixing" it would rewrite the operator's config under
 /// a name that no longer describes it. The result is also refused if grok
 /// itself could not deserialize the whole file - see the module docs.
-pub fn merge_profile(
+pub(in crate::provider::grok) fn merge_profile(
     text: &str,
     name: &str,
     roots: &[String],

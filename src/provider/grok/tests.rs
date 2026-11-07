@@ -1,6 +1,6 @@
 //! Unit tests of grok provider behavior.
 
-use super::super::provider_tests::exited;
+use super::super::tests::exited;
 
 // ---------------------------------------------------------------------------
 // grok output classification
@@ -123,7 +123,7 @@ fn grok_cancelled_turn_is_not_an_answer() {
 #[test]
 fn grok_write_launch_keeps_a_resumed_session_on_its_recorded_profile() {
     use super::GrokWrite::{BuiltinWorkspace, Fresh, Resume};
-    let name = crate::grok_home::profile_name(&["/home/u/.brokkr".to_string()]);
+    let name = super::state::profile_name(&["/home/u/.brokkr".to_string()]);
     // A fresh write run takes a new profile named for its derived roots.
     assert_eq!(
         super::grok_write_launch(true, Some("workspace")),

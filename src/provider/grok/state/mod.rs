@@ -44,19 +44,20 @@ mod events;
 mod sandbox;
 mod trust;
 
-pub use background::{Unread, WorkId, unread_background_results, wake_prompt};
-pub use events::{cancel_cause, session_events, session_updates};
-pub use sandbox::{PROFILE_PREFIX, canonical_roots, merge_profile, profile_name};
-pub use trust::{Trust, trust_failures};
+pub(super) use background::{Unread, unread_background_results, wake_prompt};
+pub(super) use events::{cancel_cause, session_events, session_updates};
+pub(in crate::provider) use sandbox::canonical_roots;
+pub(super) use sandbox::{PROFILE_PREFIX, profile_name};
+pub(super) use trust::{Trust, trust_failures};
 
 /// Grok's environment as the *child* will see it. A profile `env` redirects
 /// only the child, so reading `review`'s own environment would set up - and
 /// judge trust against - the wrong home: the `CODEX_HOME`/`data_root` trap.
 #[derive(Debug, Clone)]
-pub struct Grok {
+pub(super) struct Grok {
     /// `GROK_HOME` (profile env, then process), else `<HOME>/.grok` - grok's own
     /// resolution order (`xai-dirs`).
-    pub home: PathBuf,
+    pub(super) home: PathBuf,
     /// The user's home directory the child sees, canonical; grok never trusts it
     /// (`is_unsafe_trust_root`), and falls back from a git root equal to it.
     user_home: Option<PathBuf>,
@@ -68,7 +69,7 @@ impl Grok {
     /// trust nothing. (A symlink anywhere on the path to its files is refused
     /// where they are used - `check_trust`, `locked_update` - because grok
     /// refuses to load its trust-boundary files through one.)
-    pub fn resolve(env: Option<&BTreeMap<String, String>>) -> anyhow::Result<Self> {
+    pub(super) fn resolve(env: Option<&BTreeMap<String, String>>) -> anyhow::Result<Self> {
         let var = |name: &str| {
             env.and_then(|e| e.get(name))
                 .map(PathBuf::from)

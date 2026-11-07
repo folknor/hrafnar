@@ -5,7 +5,7 @@ use std::path::Path;
 /// Takes the *last* `turn_ended` (a resumed session holds several turns), and
 /// the last permission refusal before it unless a later allowed permission
 /// superseded it.
-pub fn cancel_cause(events: &str) -> Option<String> {
+pub(in crate::provider::grok) fn cancel_cause(events: &str) -> Option<String> {
     let mut refused_tool: Option<String> = None;
     let mut cause: Option<String> = None;
     for line in events.lines() {
@@ -45,13 +45,19 @@ pub fn cancel_cause(events: &str) -> Option<String> {
 }
 
 /// The `events.jsonl` body for a session, found by id under any cwd directory.
-pub fn session_events(grok_home: &Path, session_id: &str) -> Option<String> {
+pub(in crate::provider::grok) fn session_events(
+    grok_home: &Path,
+    session_id: &str,
+) -> Option<String> {
     session_file(grok_home, session_id, "events.jsonl")
 }
 
 /// The `updates.jsonl` body for a session (the ACP update stream: tool calls,
 /// background task lifecycle, turn boundaries).
-pub fn session_updates(grok_home: &Path, session_id: &str) -> Option<String> {
+pub(in crate::provider::grok) fn session_updates(
+    grok_home: &Path,
+    session_id: &str,
+) -> Option<String> {
     session_file(grok_home, session_id, "updates.jsonl")
 }
 

@@ -20,8 +20,7 @@ use result::{
 };
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod provider_tests;
+mod tests;
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -223,7 +222,7 @@ pub async fn invoke(
     let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
     let sandbox = sandbox.as_deref();
     let grok_write = if provider == "grok" {
-        grok_write_launch(oneshot, sandbox)
+        grok::grok_write_launch(oneshot, sandbox)
     } else {
         None
     };
@@ -232,9 +231,9 @@ pub async fn invoke(
     // recorded with it, verbatim: the profile name is fixed for the session's
     // life (grok refuses to switch it) and names exactly one root set, so
     // re-deriving on another host would describe a different profile.
-    let derives = grok_write == Some(GrokWrite::Fresh)
+    let derives = grok_write == Some(grok::GrokWrite::Fresh)
         || (provider == "codex" && sandbox == Some("workspace-write"));
-    let resumes_profile = matches!(grok_write, Some(GrokWrite::Resume(_)));
+    let resumes_profile = matches!(grok_write, Some(grok::GrokWrite::Resume(_)));
 
     // Derived here rather than inside the runners so the same values that
     // widen the run are the ones recorded on the result: a grant that is applied
@@ -275,7 +274,7 @@ pub async fn invoke(
     // Grok's profile name is a hash of the canonical set, and the recorded
     // roots must hash back to it on resume - so record them canonically too.
     if grok_write.is_some() {
-        root_paths = crate::grok_home::canonical_roots(&root_paths);
+        root_paths = grok::canonical_roots(&root_paths);
     }
     // A profile `config` entry restating the key wins, deliberately - but the
     // record must follow the run, not the derivation, or the sidecar makes a
@@ -304,7 +303,7 @@ pub async fn invoke(
             let roots = root_paths.clone();
             let env = env.cloned();
             let prepared = tokio::task::spawn_blocking(move || {
-                prepare_grok_write(&kind, &root, &roots, env.as_ref())
+                grok::prepare_grok_write(&kind, &root, &roots, env.as_ref())
             })
             .await
             .map_err(|e| anyhow::anyhow!("grok setup task failed: {e}"))
@@ -417,12 +416,7 @@ pub async fn invoke(
     // is not "the folder is now permanently trusted", and the sidecar field
     // claims the latter. Re-read after the run; small file, no lock.
     if trust_grant.is_some() {
-        let landed = crate::grok_home::Grok::resolve(env).is_ok_and(|g| {
-            matches!(
-                g.check_trust(project_root),
-                Ok(crate::grok_home::Trust::Trusted)
-            )
-        });
+        let landed = grok::trust_landed(env, project_root);
         if !landed {
             eprintln!(
                 "warning: grok --trust did not durably trust {} - the next write run \
@@ -500,114 +494,6 @@ fn announcement_lines(
             }
         })
         .collect()
-}
-
-/// How a grok run that may write is launched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GrokWrite {
-    /// A fresh write run: roots derived, launched under the `review-ws-*`
-    /// profile named for them.
-    Fresh,
-    /// A resume of a session created under a `review-ws-*` profile: the same
-    /// profile, with the roots recorded with the session. Grok fixes a
-    /// session's sandbox profile for its lifetime and refuses a different
-    /// `--sandbox` on resume (`resolve_startup_sandbox` → `Conflict`).
-    Resume(String),
-    /// A resume of a session created under grok's built-in `workspace`, before
-    /// `review` made profiles. It can only continue as it began: trusted, but
-    /// without the extra roots.
-    BuiltinWorkspace,
-}
-
-/// Whether, and how, a grok run writes. A fresh `workspace` run takes a new
-/// profile; a resume passes the recorded name through unchanged, because grok
-/// refuses any other.
-fn grok_write_launch(oneshot: bool, sandbox: Option<&str>) -> Option<GrokWrite> {
-    match sandbox {
-        Some(name) if name.starts_with(crate::grok_home::PROFILE_PREFIX) => {
-            Some(GrokWrite::Resume(name.to_string()))
-        }
-        Some("workspace") if oneshot => Some(GrokWrite::Fresh),
-        Some("workspace") => Some(GrokWrite::BuiltinWorkspace),
-        _ => None,
-    }
-}
-
-/// What `prepare_grok_write` decided.
-#[derive(Debug, Default)]
-struct GrokPrepared {
-    /// The `review-ws-*` profile to launch under, when the run uses one.
-    profile: Option<String>,
-    /// The trust key `--trust` will grant, when the project had no decision
-    /// yet. `None` when it was already trusted: no flag, no grant, nothing to
-    /// announce.
-    trust_grant: Option<String>,
-}
-
-/// Get grok's own config ready for a write run.
-///
-/// Trust is granted by grok (`--trust`, grok's own key and lock), and only when
-/// the project has no decision yet - a grant is a **permanent**, host-wide
-/// decision in `trusted_folders.toml`, and it means more than "may edit": grok's
-/// folder trust gates whether the repo's own `.grok` MCP/LSP config may spawn
-/// servers (`trust.rs` module docs), so from then on every grok session there,
-/// interactive ones included, runs that config without asking. It is therefore
-/// announced on the run that makes it, and recorded in the sidecar.
-/// `check_trust` refuses the cases where the grant would be wrong.
-///
-/// Creating a profile is printed, because it edits the operator's file and an
-/// edit nobody saw is the ambient widening the rest of this file refuses; an
-/// existing profile is silent - it was announced when it was made.
-fn prepare_grok_write(
-    kind: &GrokWrite,
-    project_root: &Path,
-    roots: &[String],
-    env: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<GrokPrepared> {
-    let grok = crate::grok_home::Grok::resolve(env)?;
-    let mut prepared = GrokPrepared::default();
-    if grok.check_trust(project_root)? == crate::grok_home::Trust::Undecided {
-        let key = grok.workspace_key(project_root);
-        eprintln!(
-            "grok: trusting {} permanently in {} - a write run's edits are cancelled in \
-             an untrusted folder; grok will also run this repo's .grok MCP/LSP config \
-             without asking from now on",
-            key.display(),
-            grok.home.join("trusted_folders.toml").display()
-        );
-        prepared.trust_grant = Some(key.to_string_lossy().into_owned());
-    }
-    let name = match kind {
-        GrokWrite::BuiltinWorkspace => return Ok(prepared),
-        GrokWrite::Fresh => crate::grok_home::profile_name(roots),
-        GrokWrite::Resume(name) => {
-            // The recorded roots must be the set the session's profile is named
-            // for; anything else is a row edited by hand or a record from a
-            // different run, and launching would grant a set nobody recorded.
-            if crate::grok_home::profile_name(roots) != *name {
-                anyhow::bail!(
-                    "the roots recorded with this session do not match its grok \
-                     sandbox profile `{name}` - start a fresh run"
-                );
-            }
-            name.clone()
-        }
-    };
-    // Recreated on resume if someone deleted it: the name pins the exact set,
-    // so recreating it grants nothing the session did not already have.
-    if grok.ensure_profile(&name, roots)? {
-        eprintln!(
-            "grok: created sandbox profile `{name}` in {} (writable roots: {})",
-            grok.home.join("sandbox.toml").display(),
-            if roots.is_empty() {
-                "none beyond grok's workspace".to_string()
-            } else {
-                roots.join(", ")
-            }
-        );
-    }
-    prepared.profile = Some(name);
-    Ok(prepared)
 }
 
 /// The writable roots a profile `config` entry sets, when one does.

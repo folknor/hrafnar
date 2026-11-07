@@ -1,6 +1,6 @@
 //! Unit tests of claude provider behavior.
 
-use super::super::provider_tests::exited;
+use super::super::tests::exited;
 use super::*;
 
 #[tokio::test]

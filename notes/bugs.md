@@ -170,8 +170,6 @@ Reported by: orchestration, grok-man, providers, and wave fixers.
 - `config::RESERVED_NAMES`'s doc comment says to keep it in step with "the
   Reserved words table in CLAUDE.md"; the table is in `docs/config.md` and is
   tested.
-- `src/timings.rs` names `provider_tests` as the suite that drives the long
-  timings; that suite is `tests/provider_runs.rs`.
 - `run_claude`'s `runtime` parameter comment says claude uses only the stop
   channel, the data root and the two grace periods; it also uses
   `claude_command`, `teardown` and `orphan_log`.

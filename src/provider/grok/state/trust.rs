@@ -21,7 +21,7 @@ impl Grok {
     /// `-w` worktree, resolved through grok's sqlite registry - `check_trust`
     /// refuses rather than guess, because a wrong key here could let `--trust`
     /// overwrite a declined folder.
-    pub fn workspace_key(&self, dir: &Path) -> PathBuf {
+    pub(in crate::provider::grok) fn workspace_key(&self, dir: &Path) -> PathBuf {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let Some(root) = dir.ancestors().find(|a| a.join(".git").exists()) else {
             return dir;
@@ -51,7 +51,7 @@ fn main_checkout_of_worktree(root: &Path) -> Option<PathBuf> {
 
 /// What a `trusted_folders.toml` body says about one trust key.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Trust {
+pub(in crate::provider::grok) enum Trust {
     Trusted,
     /// No decision recorded: grok would prompt, and `dontAsk` cancels.
     Undecided,
@@ -120,7 +120,7 @@ impl Grok {
     ///   grant land on a declined source repo.
     ///
     /// A missing store is `Undecided`: `--trust` creates it.
-    pub fn check_trust(&self, dir: &Path) -> anyhow::Result<Trust> {
+    pub(in crate::provider::grok) fn check_trust(&self, dir: &Path) -> anyhow::Result<Trust> {
         let path = self.home.join("trusted_folders.toml");
         let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         // `dir` is canonical, but GROK_HOME may contain `..`. Compare against
@@ -173,7 +173,7 @@ impl Grok {
 
     /// A hint for a cancelled turn when the project was not trusted, or `None`
     /// when it was or the store cannot be read (no false blame).
-    pub fn untrusted_hint(&self, dir: &Path) -> Option<String> {
+    pub(in crate::provider::grok) fn untrusted_hint(&self, dir: &Path) -> Option<String> {
         let path = self.home.join("trusted_folders.toml");
         let doc = parse_trust(&std::fs::read_to_string(&path).ok()?).ok()?;
         (self.decision(&doc, dir) != Trust::Trusted).then(|| {
@@ -192,7 +192,7 @@ impl Grok {
 /// names "folder trust". A failed grant is otherwise invisible whenever the
 /// turn happens not to edit, and a process-local one means the *next* run is
 /// untrusted again.
-pub fn trust_failures(stderr: &str) -> Vec<String> {
+pub(in crate::provider::grok) fn trust_failures(stderr: &str) -> Vec<String> {
     stderr
         .lines()
         .filter(|l| l.contains("folder trust"))

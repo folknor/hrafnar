@@ -11,7 +11,6 @@ pub mod config;
 pub mod config_cmd;
 pub mod config_write;
 pub mod contained;
-pub mod grok_home;
 pub mod incident;
 pub mod inflight;
 pub mod input;

@@ -8,11 +8,8 @@ use super::last_error;
 use super::process::pidfd_signal;
 use super::protocol::{Control, Event, Outcome, Proc, Spec};
 
-#[path = "events.rs"]
 mod events;
-#[path = "launch.rs"]
 mod launch;
-#[path = "teardown.rs"]
 mod teardown;
 
 /// The keeper process. Returns its exit code: 0 once it has run to the end of

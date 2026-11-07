@@ -1,5 +1,9 @@
 use super::*;
 
+mod state;
+
+pub(super) use state::canonical_roots;
+
 /// Grok's headless result object (`--output-format json`). One JSON object on
 /// stdout per run, whatever the outcome; the fields we don't use (usage,
 /// requestId, thought) are ignored rather than modelled. The served model and
@@ -80,9 +84,9 @@ const GROK_MAX_WAKES: u32 = 10;
 /// that looks finished, with the build's result never read and no report. So
 /// the guarantee is enforced here instead of hoped for: after every turn,
 /// grok's own update stream is checked for results the model never saw
-/// (`grok_home::unread_background_results`), and if there are any the session
+/// (`state::unread_background_results`), and if there are any the session
 /// is resumed, same sandbox and model, with a prompt that **contains** them
-/// (`grok_home::wake_prompt`: each command's exit status and output tail, or a
+/// (`state::wake_prompt`: each command's exit status and output tail, or a
 /// plain "did NOT finish"). Carrying the result rather than pointing at it is
 /// what makes delivery independent of the model: a prompt that only told it to
 /// go and read the output could be ignored, and the next turn boundary would
@@ -148,7 +152,7 @@ pub(super) async fn run_grok(
     }
     // Fail closed: without grok's home the results cannot be checked, and an
     // unchecked run must not pass as one whose results were seen.
-    let grok = match crate::grok_home::Grok::resolve(env) {
+    let grok = match state::Grok::resolve(env) {
         Ok(g) => g,
         Err(e) => {
             let reason = format!("could not verify grok's background results: {e:#}");
@@ -168,9 +172,9 @@ pub(super) async fn run_grok(
     loop {
         // Fail closed: a run whose results cannot be checked is not a run
         // whose results were seen.
-        let pending = match crate::grok_home::session_updates(&grok.home, &sid) {
+        let pending = match state::session_updates(&grok.home, &sid) {
             None => Err(format!("no update log for grok session {sid}")),
-            Some(log) => crate::grok_home::unread_background_results(&log),
+            Some(log) => state::unread_background_results(&log),
         };
         let pending = match pending {
             Ok(p) => p,
@@ -193,7 +197,7 @@ pub(super) async fn run_grok(
         {
             break;
         }
-        let names: Vec<String> = pending.iter().map(crate::grok_home::Unread::id).collect();
+        let names: Vec<String> = pending.iter().map(state::Unread::id).collect();
         if wakes == GROK_MAX_WAKES {
             let reason = format!(
                 "grok still had unread background results after {GROK_MAX_WAKES} wake-ups: {}",
@@ -212,7 +216,7 @@ pub(super) async fn run_grok(
         // Same sandbox (grok refuses a different one on resume) and model; no
         // `--trust` (granted on the first turn if it was needed); no launch
         // signal (the lock was released when the first turn spawned).
-        let prompt = crate::grok_home::wake_prompt(&pending);
+        let prompt = state::wake_prompt(&pending);
         let (next, next_turns, next_usage) = match run_grok_turn(
             &sid,
             model,
@@ -407,7 +411,7 @@ async fn run_grok_turn(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
-    let grok = crate::grok_home::Grok::resolve(env).ok();
+    let grok = state::Grok::resolve(env).ok();
     // Re-checked immediately before spawn. `check_trust` in `invoke` and grok's
     // own grant are two separate reads of the store, and grok's grant overwrites
     // a `trusted = false` - so a "no" recorded between them (by the operator, or
@@ -486,7 +490,7 @@ async fn run_grok_turn(
     // read only when interpreting an error - so it would stay invisible on any
     // turn that happened not to edit, and the next run would be untrusted.
     if trust {
-        for line in crate::grok_home::trust_failures(&stderr) {
+        for line in state::trust_failures(&stderr) {
             eprintln!("warning: grok --trust: {line}");
         }
     }
@@ -530,9 +534,9 @@ async fn run_grok_turn(
             // says why, and folder trust is the cause worth naming outright.
             let cause = grok.as_ref().and_then(|g| {
                 let sid = session_id.as_deref().unwrap_or(&lookup_id);
-                crate::grok_home::session_events(&g.home, sid)
+                state::session_events(&g.home, sid)
                     .as_deref()
-                    .and_then(crate::grok_home::cancel_cause)
+                    .and_then(state::cancel_cause)
             });
             let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
@@ -689,6 +693,124 @@ enum GrokOutcome {
     },
 }
 
+/// How a grok run that may write is launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GrokWrite {
+    /// A fresh write run: roots derived, launched under the `review-ws-*`
+    /// profile named for them.
+    Fresh,
+    /// A resume of a session created under a `review-ws-*` profile: the same
+    /// profile, with the roots recorded with the session. Grok fixes a
+    /// session's sandbox profile for its lifetime and refuses a different
+    /// `--sandbox` on resume (`resolve_startup_sandbox` → `Conflict`).
+    Resume(String),
+    /// A resume of a session created under grok's built-in `workspace`, before
+    /// `review` made profiles. It can only continue as it began: trusted, but
+    /// without the extra roots.
+    BuiltinWorkspace,
+}
+
+/// Whether, and how, a grok run writes. A fresh `workspace` run takes a new
+/// profile; a resume passes the recorded name through unchanged, because grok
+/// refuses any other.
+pub(super) fn grok_write_launch(oneshot: bool, sandbox: Option<&str>) -> Option<GrokWrite> {
+    match sandbox {
+        Some(name) if name.starts_with(state::PROFILE_PREFIX) => {
+            Some(GrokWrite::Resume(name.to_string()))
+        }
+        Some("workspace") if oneshot => Some(GrokWrite::Fresh),
+        Some("workspace") => Some(GrokWrite::BuiltinWorkspace),
+        _ => None,
+    }
+}
+
+/// What `prepare_grok_write` decided.
+#[derive(Debug, Default)]
+pub(super) struct GrokPrepared {
+    /// The `review-ws-*` profile to launch under, when the run uses one.
+    pub(super) profile: Option<String>,
+    /// The trust key `--trust` will grant, when the project had no decision
+    /// yet. `None` when it was already trusted: no flag, no grant, nothing to
+    /// announce.
+    pub(super) trust_grant: Option<String>,
+}
+
+/// Get grok's own config ready for a write run.
+///
+/// Trust is granted by grok (`--trust`, grok's own key and lock), and only when
+/// the project has no decision yet - a grant is a **permanent**, host-wide
+/// decision in `trusted_folders.toml`, and it means more than "may edit": grok's
+/// folder trust gates whether the repo's own `.grok` MCP/LSP config may spawn
+/// servers (`trust.rs` module docs), so from then on every grok session there,
+/// interactive ones included, runs that config without asking. It is therefore
+/// announced on the run that makes it, and recorded in the sidecar.
+/// `check_trust` refuses the cases where the grant would be wrong.
+///
+/// Creating a profile is printed, because it edits the operator's file and an
+/// edit nobody saw is the ambient widening the rest of this file refuses; an
+/// existing profile is silent - it was announced when it was made.
+pub(super) fn prepare_grok_write(
+    kind: &GrokWrite,
+    project_root: &Path,
+    roots: &[String],
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<GrokPrepared> {
+    let grok = state::Grok::resolve(env)?;
+    let mut prepared = GrokPrepared::default();
+    if grok.check_trust(project_root)? == state::Trust::Undecided {
+        let key = grok.workspace_key(project_root);
+        eprintln!(
+            "grok: trusting {} permanently in {} - a write run's edits are cancelled in \
+             an untrusted folder; grok will also run this repo's .grok MCP/LSP config \
+             without asking from now on",
+            key.display(),
+            grok.home.join("trusted_folders.toml").display()
+        );
+        prepared.trust_grant = Some(key.to_string_lossy().into_owned());
+    }
+    let name = match kind {
+        GrokWrite::BuiltinWorkspace => return Ok(prepared),
+        GrokWrite::Fresh => state::profile_name(roots),
+        GrokWrite::Resume(name) => {
+            // The recorded roots must be the set the session's profile is named
+            // for; anything else is a row edited by hand or a record from a
+            // different run, and launching would grant a set nobody recorded.
+            if state::profile_name(roots) != *name {
+                anyhow::bail!(
+                    "the roots recorded with this session do not match its grok \
+                     sandbox profile `{name}` - start a fresh run"
+                );
+            }
+            name.clone()
+        }
+    };
+    // Recreated on resume if someone deleted it: the name pins the exact set,
+    // so recreating it grants nothing the session did not already have.
+    if grok.ensure_profile(&name, roots)? {
+        eprintln!(
+            "grok: created sandbox profile `{name}` in {} (writable roots: {})",
+            grok.home.join("sandbox.toml").display(),
+            if roots.is_empty() {
+                "none beyond grok's workspace".to_string()
+            } else {
+                roots.join(", ")
+            }
+        );
+    }
+    prepared.profile = Some(name);
+    Ok(prepared)
+}
+
+/// Whether the project is now trusted in grok's store, as the child's
+/// environment resolves it. Read after a run that passed `--trust`, because a
+/// grant grok accepted for the session is not proof that it was persisted.
+pub(super) fn trust_landed(
+    env: Option<&std::collections::BTreeMap<String, String>>,
+    project_root: &Path,
+) -> bool {
+    state::Grok::resolve(env)
+        .is_ok_and(|g| matches!(g.check_trust(project_root), Ok(state::Trust::Trusted)))
+}
+
 #[cfg(test)]
-#[path = "grok_tests.rs"]
 mod tests;

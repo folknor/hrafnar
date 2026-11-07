@@ -8,7 +8,7 @@ const SYNTHETIC_TURN_PREFIXES: &[&str] =
 /// over in a prompt - so delivering it does not depend on the model choosing
 /// to go and read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unread {
+pub(in crate::provider::grok) enum Unread {
     /// A shell command that finished after the model's turn ended.
     Finished {
         id: WorkId,
@@ -40,7 +40,7 @@ pub enum Unread {
 /// Identity of one kind of grok background work. Keeping the kind separate
 /// from the provider id avoids collisions between task ids and subagent ids.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum WorkId {
+pub(in crate::provider::grok) enum WorkId {
     Task(String),
     Subagent(String),
 }
@@ -64,7 +64,7 @@ impl std::fmt::Display for WorkId {
 
 impl Unread {
     /// The existing display identifier: the task id, or `subagent:<id>`.
-    pub fn id(&self) -> String {
+    pub(in crate::provider::grok) fn id(&self) -> String {
         self.work_id().to_string()
     }
 
@@ -110,7 +110,9 @@ impl Unread {
 /// flushes its log before a headless process exits (`unified_log::flush_blocking`),
 /// so a malformed line means something is wrong - and treating it as "nothing
 /// unread" would make the guarantee fail open exactly when it cannot be checked.
-pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
+pub(in crate::provider::grok) fn unread_background_results(
+    updates: &str,
+) -> Result<Vec<Unread>, String> {
     let mut started: Vec<(usize, WorkId, serde_json::Value)> = Vec::new();
     let mut finished: Vec<(usize, Unread)> = Vec::new();
     // Shell completions the model was not waiting for (`will_wake`): grok
@@ -248,7 +250,7 @@ const WAKE_OUTPUT_TAIL_BYTES: usize = 16 * 1024;
 /// Shell output is **in the prompt**, not pointed at. Subagent results are not
 /// available in the retained update fields, so that case can only ask the model
 /// to fetch them. A clean turn boundary does not prove that it did.
-pub fn wake_prompt(unread: &[Unread]) -> String {
+pub(in crate::provider::grok) fn wake_prompt(unread: &[Unread]) -> String {
     let mut out = String::from(
         "Your turn ended while background work you started was still running. Here is the \
          information available about it.\n\n",

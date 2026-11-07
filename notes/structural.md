@@ -809,10 +809,11 @@ Reported by: forensics.
 
 ## STR-035 - Split `grok_home.rs` and give grok a module of its own
 
-Reported by: grok-man. Narrowed: the file has been split mechanically into
-`src/grok_home/` (trust, sandbox, events, background) with every path kept.
-Moving it under the grok runner is the separate easy entry below; what remains
-here is the `prepare` hook, the `fsutil` move and resolving `Grok` once.
+Reported by: grok-man. Narrowed: the file has been split and moved under the
+grok runner as `src/provider/grok/state/` (trust, sandbox, events,
+background), private to the runner, and grok's write setup moved from the
+dispatcher into the runner. What remains is a general `prepare` hook for every
+provider, the `fsutil` move and resolving `Grok` once.
 
 `grok_home.rs` is four modules in one file: the trust store mirror and
 decision; sandbox profile naming, TOML merge and the locked atomic write; the
@@ -899,33 +900,5 @@ Reported by: providers, lifecycle.
   then), opencode's after its first event; both are SIGINT-once, and the
   keeper's forward-once suits both, since maki's second SIGINT kills it.
 - Effort via maki's config would mean writing maki's config per run, another
-  `prepare_grok_write`-style setup inside `invoke` unless the `prepare` hook
-  exists.
-
-## STR-038 - Move `grok_home` under the grok runner
-
-Reported by: the operator, during the split wave.
-
-`src/grok_home/` now holds trust decisions, sandbox profiles, session events,
-and background-work analysis with the wake prompt, not just grok's home
-directory, so the name no longer fits. Its caller is effectively the grok
-runner, which the split placed at `src/provider/grok.rs`. Proposed: move it to
-`src/provider/grok/` as children of the runner (the runner becoming
-`src/provider/grok/mod.rs` or similar), update the callers to the new paths,
-and narrow visibility so nothing outside the grok runner sees its internals
-such as `PROFILE_PREFIX`. A top-level `src/grok/` beside `src/provider/grok.rs`
-was considered and rejected: two modules named grok. This is a move and a
-rename of paths, with no behaviour change.
-
-## STR-039 - Module file layout that hides the module graph after the split
-
-Reported by: a wave reviewer.
-
-- `src/keeper/runtime.rs` declares `events`, `launch` and `teardown` with
-  `#[path = "..."]`, so they sit flat in `src/keeper/` while being children of
-  `runtime`. Moving them to `src/keeper/runtime/` would make the tree say what
-  the module graph says.
-- `src/provider/mod.rs` declares its dispatch tests as
-  `#[path = "tests.rs"] mod provider_tests;`, and the per-runner test files
-  reach its `exited` helper through `super::super::provider_tests::exited`;
-  the file name and module name differ for no visible reason.
+  setup step like grok's `prepare_grok_write` (now in the grok runner), which
+  a general `prepare` hook would give every provider a place for.
