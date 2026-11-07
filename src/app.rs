@@ -511,16 +511,22 @@ pub async fn run() -> Result<()> {
     }
 
     // Resolve archetype(s) - supports "all", groups, comma-separated, or single
-    // names - into (label, prime) pairs. No archetype at all is one bare run.
+    // names - into (label, prime) pairs. `bare` is a synthetic no-prime selector;
+    // "all" includes configured archetypes except the special `bare` entry.
     let mut archetypes_to_run: Vec<(String, String)> = Vec::new();
     match archetype_arg {
         None => archetypes_to_run.push((BARE.to_string(), String::new())),
         Some(arg) => {
             for name in arg.split(',') {
-                if name == "all" {
+                if name == BARE {
+                    // The legacy positional form has always meant this without
+                    // consulting config; keep the explicit flag equivalent.
+                    archetypes_to_run.push((BARE.to_string(), String::new()));
+                } else if name == "all" {
                     archetypes_to_run.extend(
                         cfg.archetypes
                             .iter()
+                            .filter(|(n, _)| n.as_str() != BARE)
                             .map(|(n, p)| (n.clone(), p.value.clone())),
                     );
                 } else if let Some(group) = cfg.groups.get(name) {
@@ -556,8 +562,8 @@ pub async fn run() -> Result<()> {
 
     if archetypes_to_run.is_empty() {
         bail!(
-            "no archetypes configured in {}\n  \
-             Omit the archetype to send stdin unchanged, or add one under [archetypes].",
+            "no priming archetypes configured in {}\n  \
+             Use -a bare or omit -a to send stdin unchanged, or add one under [archetypes].",
             cfg.searched()
         );
     }
@@ -659,6 +665,7 @@ pub async fn run() -> Result<()> {
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
     struct PendingResult {
+        provider: String,
         ctx: std::sync::Arc<RecordCtx>,
         handle: tokio::task::JoinHandle<TaskOutcome>,
     }
@@ -710,6 +717,7 @@ pub async fn run() -> Result<()> {
                 prompt: assembled.clone(),
             });
             pending.push(PendingResult {
+                provider: prov_name.clone(),
                 ctx: std::sync::Arc::clone(&ctx),
                 handle: tokio::spawn(run_launch(launch, ctx)),
             });
@@ -736,7 +744,7 @@ pub async fn run() -> Result<()> {
             Ok(outcome) => outcome.result,
             Err(err) => {
                 let result = provider::ProviderResult {
-                    provider: "unknown".into(),
+                    provider: p.provider.clone(),
                     output: Err(anyhow::anyhow!("task panicked: {err}")),
                     session_id: None,
                     digest: None,

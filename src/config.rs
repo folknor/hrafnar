@@ -56,10 +56,10 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
 }
 
 /// Names that can't be archetypes or groups: `all`, the `-a` keyword for every
-/// configured archetype, and the subcommand names. `-a` itself cannot collide
-/// with a subcommand, but the legacy positional form can - `review sessions`
-/// runs the subcommand, silently, rather than the archetype - so they stay
-/// reserved while that alias exists. Keep in step with `cli::Command` and the
+/// configured archetype except `bare`, and the subcommand names. `-a` itself
+/// cannot collide with a subcommand, but the legacy positional form can: `review
+/// sessions` runs the subcommand, silently, rather than the archetype. So they
+/// stay reserved while that alias exists. Keep in step with `cli::Command` and the
 /// "Reserved words" table in CLAUDE.md.
 pub const RESERVED_NAMES: &[&str] = &[
     "all",
@@ -74,10 +74,9 @@ pub const RESERVED_NAMES: &[&str] = &[
     "help",
 ];
 
-/// The legacy positional `review bare` means "no archetype" regardless of the
-/// config, so an archetype named `bare` must mean that too: an empty prime.
-/// `bare = ""` is in most existing configs and stays valid; anything else would
-/// be silently ignored by `review bare`.
+/// `bare` is the explicit no-prime selector, and the legacy positional
+/// `review bare` means the same. Existing `bare = ""` definitions stay valid;
+/// a non-empty prompt would be ignored by both forms.
 const BARE: &str = "bare";
 
 /// Which file a resolved value came from.
@@ -633,7 +632,8 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         if name == BARE && !prime.trim().is_empty() {
             bail!(
                 "archetype 'bare' in {origin} has a prompt, but `bare` means no archetype - \
-                 `review bare` ignores it\n  Give it an empty prompt (bare = \"\") or rename it."
+                 `review bare` and `-a bare` ignore it\n  \
+                 Give it an empty prompt (bare = \"\") or rename it."
             );
         }
     }

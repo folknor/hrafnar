@@ -64,6 +64,9 @@ fn configured_audit_id(doc: &DocumentMut) -> Result<Option<String>> {
     let id = id
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("[_audit].id is not a string in .review.toml"))?;
+    if id.is_empty() {
+        return Ok(None);
+    }
     Ok(Some(id.to_string()))
 }
 
@@ -114,6 +117,18 @@ mod tests {
         assert_eq!(ensure_audit_id(&path).unwrap(), "beef");
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw, "[_audit]\nid = \"beef\"\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ensure_audit_id_replaces_an_empty_id() {
+        let path = scratch_file("[_audit]\nid = \"\"\n");
+        let id = ensure_audit_id(&path).unwrap();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let cfg = config::parse_file(&raw, "test", config::Layer::Local).unwrap();
+        assert_eq!(cfg.audit.id.as_deref(), Some(id.as_str()));
         let _ = std::fs::remove_file(&path);
     }
 

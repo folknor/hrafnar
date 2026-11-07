@@ -28,10 +28,11 @@ prints its help and exits 2.
 prompt in the config, prepended to stdin with a blank line between.
 
 - no `-a`: stdin is sent unchanged, recorded under the archetype label `bare`.
+- `-a bare`: one unprimed run, whether or not `bare` is in the config.
 - `-a security`: one archetype.
 - `-a security,bugs`: several, comma-separated.
 - `-a sweep`: a group, which expands to its member archetypes.
-- `-a all`: every configured archetype.
+- `-a all`: every configured archetype except the special `bare` entry.
 
 Names can be mixed (`-a sweep,perf`) and duplicates are dropped. An unknown
 name is an error listing what is configured. The old positional form

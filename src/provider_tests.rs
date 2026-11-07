@@ -185,10 +185,23 @@ fn claude_result_without_is_error_fails_closed() {
     // answered.
     let unflagged = r#"{"type": "result", "result": "maybe", "session_id": "s"}"#;
     let outcome = super::interpret_claude_output(unflagged, "").expect("a result object");
-    let super::ClaudeOutcome::NoAnswer { reason, .. } = outcome else {
+    let super::ClaudeOutcome::NoAnswer {
+        reason,
+        review_error,
+        ..
+    } = outcome
+    else {
         panic!("a result with no is_error is not trusted as an answer");
     };
     assert!(reason.contains("no is_error flag"), "{reason}");
+    assert!(review_error, "the missing flag is review's diagnosis");
+    let digest = super::review_no_answer_digest(reason, Some(&exited(0)));
+    assert!(digest.turn_error.is_none());
+    assert_eq!(
+        digest.review_error.as_deref(),
+        Some("claude reported an error (no is_error flag): maybe")
+    );
+    assert!(digest.failed());
 }
 
 #[test]
@@ -276,12 +289,14 @@ fn grok_cancelled_turn_is_not_an_answer() {
         .expect("a cancelled turn still ran - it is not a launch failure");
     let super::GrokOutcome::NoAnswer {
         reason,
+        review_error,
         text,
         session_id,
     } = outcome
     else {
         panic!("a cancelled turn is not an answer");
     };
+    assert!(!review_error, "grok stated the stop reason");
     assert!(
         reason.contains("cancelled"),
         "names the stop reason: {reason}"
@@ -410,12 +425,47 @@ fn grok_missing_stop_reason_is_not_an_answer() {
         "",
     )
     .expect("an unlabelled turn still ran");
-    let super::GrokOutcome::NoAnswer { reason, .. } = outcome else {
+    let super::GrokOutcome::NoAnswer {
+        reason,
+        review_error,
+        ..
+    } = outcome
+    else {
         panic!("an unlabelled turn is not a proven answer");
     };
     assert!(
         reason.contains("missing"),
         "says the reason was absent: {reason}"
+    );
+    assert!(
+        review_error,
+        "the missing stop reason is review's diagnosis"
+    );
+    let digest = super::review_no_answer_digest(reason, Some(&exited(0)));
+    assert!(digest.turn_error.is_none());
+    assert!(
+        digest
+            .review_error
+            .as_deref()
+            .is_some_and(|message| message.contains("stopReason: missing"))
+    );
+    assert!(digest.failed());
+}
+
+#[test]
+fn a_resume_result_retains_the_session_id_known_to_its_caller() {
+    assert_eq!(
+        super::invocation_session_id(false, None, None, "known-session"),
+        Some("known-session".to_string())
+    );
+    assert_eq!(
+        super::invocation_session_id(
+            true,
+            Some("provider-session".to_string()),
+            Some("requested-session".to_string()),
+            "",
+        ),
+        Some("provider-session".to_string())
     );
 }
 
@@ -490,6 +540,23 @@ fn unrelated_profile_config_entries_leave_the_derived_roots_recorded() {
         r#"sandbox_workspace_write.network_access=true"#.to_string(),
     ];
     assert_eq!(super::config_writable_roots_override(&config), None);
+}
+
+#[test]
+fn a_longer_config_key_does_not_hide_the_writable_roots_override() {
+    let config = vec![
+        r#"sandbox_workspace_write.writable_roots=["/first"]"#.to_string(),
+        r#"sandbox_workspace_write.writable_roots_extra=["/ignored"]"#.to_string(),
+    ];
+    assert_eq!(
+        super::config_writable_roots_override(&config),
+        Some(vec!["/first".to_string()])
+    );
+    assert_eq!(
+        super::config_writable_roots_override(&config[1..]),
+        None,
+        "a key that only shares the prefix is not the override"
+    );
 }
 
 /// Codex takes the last `-c` for a repeated key, so the record must too.

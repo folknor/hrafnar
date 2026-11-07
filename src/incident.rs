@@ -139,6 +139,8 @@ fn incidents_dir(data_root: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// A name that shouldn't have its value recorded (heuristic, errs toward hiding).
+/// Bundles keep nonsecret values for replay and redact likely secrets. Sidecars
+/// record env names only, so omitting values there is compatible with this rule.
 fn looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     [
@@ -485,8 +487,28 @@ fn is_utc_timestamp(timestamp: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn scratch_incident_dir() -> PathBuf {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!(
+                "incidents-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn write_test_meta(base: &Path, name: &str, content: &str) {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.json"), content).unwrap();
+    }
 
     #[test]
     fn scan_flags_null_final_answer_as_death() {
@@ -567,6 +589,52 @@ mod tests {
         assert_eq!(shell_quote("plain-value"), "plain-value");
         assert_eq!(shell_quote("has space"), "'has space'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn recent_incidents_filter_metadata_and_sort_by_recorded_time() {
+        let base = scratch_incident_dir();
+        write_test_meta(
+            &base,
+            "older",
+            r#"{"schema":1,"timestamp":"2026-01-01T00:00:00Z","provider":"codex"}"#,
+        );
+        write_test_meta(
+            &base,
+            "newer",
+            r#"{"schema":1,"timestamp":"2026-02-01T00:00:00Z","provider":"claude"}"#,
+        );
+        write_test_meta(
+            &base,
+            "wrong_schema",
+            r#"{"schema":2,"timestamp":"2026-03-01T00:00:00Z","provider":"codex"}"#,
+        );
+        write_test_meta(
+            &base,
+            "missing_provider",
+            r#"{"schema":1,"timestamp":"2026-03-01T00:00:00Z"}"#,
+        );
+        write_test_meta(
+            &base,
+            "bad_timestamp",
+            r#"{"schema":1,"timestamp":"2026-03-01","provider":"codex"}"#,
+        );
+
+        let recent = list_recent_from(&base, 10);
+        let names: Vec<_> = recent
+            .iter()
+            .map(|item| item.dir.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["newer".to_string(), "older".to_string()]);
+
+        let limited = list_recent_from(&base, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(
+            limited[0].dir.file_name().and_then(|name| name.to_str()),
+            Some("newer")
+        );
+        assert!(list_recent_from(&base, 0).is_empty());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

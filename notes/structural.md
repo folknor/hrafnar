@@ -317,15 +317,14 @@ from "unreadable" from "codex home unknown"; the custom `CODEX_HOME` defect in
 Proposed: `enum Lookup { Found(PathBuf), Absent, Unreadable(io::Error) }`, so
 the baseline code can say which happened instead of the generic warning.
 
-## STR-014 - Keeper protocol bytes and durations
+## STR-014 - Keeper `Spec` durations flattened for JSON
 
-Reported by: lifecycle.
+Reported by: lifecycle. Narrowed: the protocol bytes are now a shared
+`keeper::Control` enum.
 
-Control is raw bytes `b'g'`, `b'i'`, `b't'`, matched in `read_control` and
-sent in four places in `contained`. `Spec`'s six `*_ms: u64` fields are
-durations flattened for JSON. Proposed: a shared
-`#[repr(u8)] enum Control { Go, Interrupt, Terminate }`, and serialising the
-`TeardownSchedule` from the keeper-bounds entry in `notes/consolidations.md`.
+`Spec`'s six `*_ms: u64` fields are durations flattened for JSON. Proposed:
+serialise the `TeardownSchedule` from the keeper-bounds entry in
+`notes/consolidations.md` instead.
 
 ## STR-015 - Log scope and audit id
 

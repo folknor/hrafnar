@@ -235,7 +235,7 @@ pub fn terminate_all() -> usize {
     with_registry(|r| {
         r.closed = true;
         for control in r.live.values() {
-            let _ = control.send(b't');
+            let _ = control.send(keeper::Control::Terminate.byte());
         }
         r.live.len()
     })
@@ -501,7 +501,7 @@ impl Contained {
     /// to). Returns the provider's pid.
     pub async fn go(&mut self) -> Result<u32> {
         self.control
-            .send(b'g')
+            .send(keeper::Control::Go.byte())
             .context("could not tell the keeper to launch")?;
         let rx = self
             .spawned
@@ -530,12 +530,12 @@ impl Contained {
 
     /// Forward one SIGINT to the provider (the keeper ignores repeats).
     pub fn interrupt(&self) {
-        let _ = self.control.send(b'i');
+        let _ = self.control.send(keeper::Control::Interrupt.byte());
     }
 
     /// Tear the provider and everything it started down now.
     pub fn terminate(&self) {
-        let _ = self.control.send(b't');
+        let _ = self.control.send(keeper::Control::Terminate.byte());
     }
 
     /// Wait for the provider itself to exit (or the keeper, should it die

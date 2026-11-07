@@ -3,7 +3,7 @@
 //! and the keeper must tear the run down on its own and leave its outcome in
 //! the orphan log, since nobody is left to read its events.
 
-use review::keeper::{self, Event, Spec};
+use review::keeper::{self, Control, Event, Spec};
 use std::io::{BufRead, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -23,10 +23,6 @@ fn pipe() -> (OwnedFd, OwnedFd) {
     assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
     // SAFETY: fresh descriptors.
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
-}
-
-fn alive(pid: u32) -> bool {
-    keeper::pidfd_open(pid).is_ok_and(|fd| !keeper::pidfd_exited(&fd))
 }
 
 #[test]
@@ -80,7 +76,7 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
     drop(events_w);
 
     let mut control = std::fs::File::from(control_w);
-    control.write_all(b"g").expect("go");
+    control.write_all(&[Control::Go.byte()]).expect("go");
     let mut events = std::io::BufReader::new(std::fs::File::from(events_r));
     let mut line = String::new();
     events.read_line(&mut line).expect("spawned event");
@@ -92,12 +88,17 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
         "{line}"
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let detached: u32 = loop {
+    let (detached, detached_pidfd): (u32, Option<OwnedFd>) = loop {
         if let Some(pid) = std::fs::read_to_string(&pidfile)
             .ok()
             .and_then(|s| s.trim().parse().ok())
         {
-            break pid;
+            let pidfd = match keeper::pidfd_open(pid) {
+                Ok(pidfd) => Some(pidfd),
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => None,
+                Err(err) => panic!("open detached pidfd: {err}"),
+            };
+            break (pid, pidfd);
         }
         assert!(std::time::Instant::now() < deadline, "no detached pid");
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -108,14 +109,16 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
     drop(events);
     let status = child.wait().expect("keeper exits");
     assert!(status.success(), "{status}");
-    let gone = !alive(detached);
-    if !gone {
-        // SAFETY: the pid this test's provider recorded.
-        unsafe { libc::kill(i32::try_from(detached).unwrap_or(0), libc::SIGKILL) };
+    let gone = detached_pidfd.as_ref().is_none_or(keeper::pidfd_exited);
+    if let Some(pidfd) = detached_pidfd
+        .as_ref()
+        .filter(|pidfd| !keeper::pidfd_exited(pidfd))
+    {
+        let _ = keeper::pidfd_signal(pidfd, libc::SIGKILL);
     }
     assert!(
         gone,
-        "the detached process must be torn down without its owner"
+        "detached process {detached} must be torn down without its owner"
     );
     let log = std::fs::read_to_string(&orphan_log).expect("orphan log written");
     let entry: serde_json::Value =
@@ -127,7 +130,7 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
 
 /// Start a keeper for `sh -c <script>` and hand `control` to it; return once it
 /// has exited.
-fn keeper_given(script: &str, control: &[u8]) -> std::process::ExitStatus {
+fn keeper_given(script: &str, control: &[Control]) -> std::process::ExitStatus {
     let (control_r, control_w) = pipe();
     let (events_r, events_w) = pipe();
     let spec = Spec {
@@ -166,7 +169,8 @@ fn keeper_given(script: &str, control: &[u8]) -> std::process::ExitStatus {
     drop(events_w);
     let mut control_w = std::fs::File::from(control_w);
     if !control.is_empty() {
-        control_w.write_all(control).expect("control");
+        let bytes: Vec<_> = control.iter().map(|control| control.byte()).collect();
+        control_w.write_all(&bytes).expect("control");
     }
     drop(control_w);
     let status = child.wait().expect("keeper exits");
@@ -178,7 +182,7 @@ fn keeper_given(script: &str, control: &[u8]) -> std::process::ExitStatus {
 fn a_keeper_whose_owner_is_gone_before_go_launches_nothing() {
     let root = scratch();
     let marker = root.join("ran");
-    let status = keeper_given(&format!("touch {}", marker.display()), b"");
+    let status = keeper_given(&format!("touch {}", marker.display()), &[]);
     assert!(status.success(), "{status}");
     assert!(!marker.exists(), "nothing may launch without `go`");
     let _ = std::fs::remove_dir_all(&root);
@@ -190,7 +194,10 @@ fn a_keeper_whose_owner_is_gone_before_go_launches_nothing() {
 fn a_terminate_ahead_of_go_launches_nothing() {
     let root = scratch();
     let marker = root.join("ran");
-    let status = keeper_given(&format!("touch {}", marker.display()), b"tg");
+    let status = keeper_given(
+        &format!("touch {}", marker.display()),
+        &[Control::Terminate, Control::Go],
+    );
     assert!(status.success(), "{status}");
     assert!(!marker.exists(), "a `g` after a `t` must not launch");
     let _ = std::fs::remove_dir_all(&root);

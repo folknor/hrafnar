@@ -114,7 +114,7 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
     Some(data_dir.join("review").join("inflight"))
 }
 
-/// Is `id` safe to use as a filename component?
+/// Is `id` safe to use as a path component for a session?
 ///
 /// The session id reaches here straight from `review resume <id>` on the command
 /// line, and `review` deliberately delegates session-id validation to the
@@ -123,11 +123,11 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
 /// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
 /// under the data dir.
 ///
-/// Provider session ids are UUIDs, so an allowlist of hex, dashes and
-/// underscores is comfortably permissive while excluding `/`, `.` and anything
-/// else that could traverse. An allowlist rather than a "reject `..`" denylist
-/// because only the former is safe by construction.
-fn is_safe_filename_component(id: &str) -> bool {
+/// Provider session ids are opaque, so allow ASCII alphanumerics, dashes and
+/// underscores while excluding `/`, `.` and anything else that could traverse.
+/// An allowlist rather than a "reject `..`" denylist because only the former is
+/// safe by construction.
+pub(crate) fn is_safe_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -233,7 +233,7 @@ pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&
     // Skipping the marker only costs liveness reporting for that run; letting it
     // through would let a crafted resume id write and delete an arbitrary
     // file.
-    if !is_safe_filename_component(session_id) {
+    if !is_safe_session_id(session_id) {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
         return Guard(None);
     }
@@ -361,7 +361,7 @@ const LAUNCH_LOCK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(
 
 /// Path of `session_id`'s launch lock, beside its marker.
 fn launch_lock_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBuf> {
-    if !is_safe_filename_component(session_id) {
+    if !is_safe_session_id(session_id) {
         return None;
     }
     Some(dir(data_root)?.join(format!("{session_id}.launch")))
@@ -470,7 +470,7 @@ pub fn interrupt_pending(session_id: &str, data_root: Option<&Path>) -> bool {
 
 /// Path of `session_id`'s interrupt request, beside its marker.
 fn interrupt_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBuf> {
-    if !is_safe_filename_component(session_id) {
+    if !is_safe_session_id(session_id) {
         return None;
     }
     Some(dir(data_root)?.join(format!("{session_id}.interrupt")))
@@ -708,27 +708,25 @@ mod tests {
 
     #[test]
     fn accepts_provider_session_ids() {
-        assert!(is_safe_filename_component(
-            "019fefb0-227c-7c83-a398-380011b8e66a"
-        ));
-        assert!(is_safe_filename_component("abc_123-DEF"));
+        assert!(is_safe_session_id("019fefb0-227c-7c83-a398-380011b8e66a"));
+        assert!(is_safe_session_id("abc_123-DEF"));
     }
 
     #[test]
     fn rejects_path_traversal() {
         // `review resume ../sessions` would otherwise write and then delete a file
         // outside the marker directory.
-        assert!(!is_safe_filename_component("../sessions"));
-        assert!(!is_safe_filename_component("../../etc/passwd"));
-        assert!(!is_safe_filename_component("a/b"));
-        assert!(!is_safe_filename_component("."));
-        assert!(!is_safe_filename_component(".."));
-        assert!(!is_safe_filename_component("with.dot"));
-        assert!(!is_safe_filename_component(""));
+        assert!(!is_safe_session_id("../sessions"));
+        assert!(!is_safe_session_id("../../etc/passwd"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id("."));
+        assert!(!is_safe_session_id(".."));
+        assert!(!is_safe_session_id("with.dot"));
+        assert!(!is_safe_session_id(""));
     }
 
     #[test]
     fn rejects_absurdly_long_ids() {
-        assert!(!is_safe_filename_component(&"a".repeat(129)));
+        assert!(!is_safe_session_id(&"a".repeat(129)));
     }
 }

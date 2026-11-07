@@ -2,7 +2,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
 Instructions come on stdin. With no archetype they are sent unchanged; with
--a, the archetype's priming prompt is prepended. Every run starts a fresh
+-a, the archetype's priming prompt is prepended. `-a bare` also sends stdin
+unchanged, whether or not `bare` is in the config. Every run starts a fresh
 session on each provider, and the session ID is printed above the response so
 you can follow up with `review message <ID>` while the cache is warm.
 
@@ -73,7 +74,7 @@ Examples:
   echo \"audit the auth flow\" | review -a security      With an archetype
   echo \"full sweep\" | review -a security,bugs          Several archetypes
   echo \"how to handle X?\" | review -a competitors      A group of archetypes
-  echo \"everything\" | review -a all                    Every configured archetype
+  echo \"everything\" | review -a all                    Every configured archetype (bare omitted)
   echo \"just claude\" | review --provider claude        Only one provider
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
@@ -151,7 +152,8 @@ pub struct Cli {
     pub project: Option<String>,
 
     /// Archetype(s) to prime with: a name, a group, a comma-separated list, or
-    /// "all". Omit to send stdin unchanged.
+    /// "all". "bare" selects an unprimed run even when absent from config.
+    /// Omit to send stdin unchanged.
     #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 

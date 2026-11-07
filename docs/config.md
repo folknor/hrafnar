@@ -61,7 +61,7 @@ bz = "~/Programs/bz"
 - `[_defaults]`: `providers` (the list used without `--provider`) and
   `stall_timeout_secs`.
 - `[_audit]`: `id` names the project's audit trail. `review init` creates a
-  32-character hex id; an id-less project gets one before its first launch.
+  32-character hex id; a missing or empty id gets one before the first launch.
   The id is saved before launch, and the run fails if it cannot be saved.
   `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
@@ -89,7 +89,7 @@ An archetype or group may not be named any of these:
 
 | Reserved word | Why |
 |---|---|
-| `all` | the `-a` keyword for every configured archetype |
+| `all` | the `-a` keyword for every configured archetype except `bare` |
 | `message` | a subcommand |
 | `resume` | a subcommand (hidden alias of `message`) |
 | `interrupt` | a subcommand |
@@ -103,6 +103,7 @@ An archetype or group may not be named any of these:
 Subcommand names are reserved because the legacy positional archetype form
 (`review sessions`) would run the subcommand instead, silently.
 
-`bare` is a special case: the legacy `review bare` means "no archetype", so an
-archetype named `bare` may only have an empty prompt (`bare = ""`), and no group
-may be named `bare`.
+`bare` is a special selector: `-a bare` and the legacy `review bare` mean "no
+archetype", whether or not `[archetypes].bare` exists. Existing `bare = ""`
+definitions remain valid, but a non-empty prompt is refused because the
+selector cannot prime. No group may be named `bare`.

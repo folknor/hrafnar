@@ -117,8 +117,9 @@ fn has_symlink_component(path: &Path) -> bool {
         .any(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
 }
 
-/// For a linked worktree (`.git` is a file reading `gitdir: <main>/.git/worktrees/<name>`),
-/// the main checkout's directory.
+/// For a linked worktree (`.git` points into `.git/worktrees/<name>`), the main
+/// checkout's directory. Other `.git` files, including submodule pointers into
+/// `.git/modules`, stay keyed on that repository's own root.
 fn main_checkout_of_worktree(root: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(root.join(".git")).ok()?;
     let gitdir = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
@@ -440,11 +441,8 @@ pub fn session_updates(grok_home: &Path, session_id: &str) -> Option<String> {
 /// Located by scanning `sessions/*/<id>/` rather than by re-encoding the cwd,
 /// so this does not depend on grok's path-encoding scheme.
 fn session_file(grok_home: &Path, session_id: &str, name: &str) -> Option<String> {
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    // Keep this path check identical to markers, launch locks and interrupts.
+    if !crate::inflight::is_safe_session_id(session_id) {
         return None;
     }
     let sessions = std::fs::read_dir(grok_home.join("sessions")).ok()?;
@@ -466,7 +464,7 @@ const SYNTHETIC_TURN_PREFIXES: &[&str] =
 pub enum Unread {
     /// A shell command that finished after the model's turn ended.
     Finished {
-        id: String,
+        id: WorkId,
         command: String,
         exit_code: Option<i64>,
         signal: Option<String>,
@@ -479,25 +477,55 @@ pub enum Unread {
     /// at exit (the background wait ran out) or lost it. A later grok process
     /// can never finish it - its task table starts empty.
     Unfinished {
-        id: String,
+        id: WorkId,
         command: Option<String>,
         output_file: Option<String>,
     },
     /// A background subagent that finished after the model's turn ended.
     /// The retained update fields do not include its result text.
     Subagent {
-        id: String,
+        id: WorkId,
         status: Option<String>,
         error: Option<String>,
     },
 }
 
-impl Unread {
-    /// A stable identifier: the task id, or `subagent:<id>`.
-    pub fn id(&self) -> String {
+/// Identity of one kind of grok background work. Keeping the kind separate
+/// from the provider id avoids collisions between task ids and subagent ids.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorkId {
+    Task(String),
+    Subagent(String),
+}
+
+impl WorkId {
+    fn raw_id(&self) -> &str {
         match self {
-            Self::Finished { id, .. } | Self::Unfinished { id, .. } => id.clone(),
-            Self::Subagent { id, .. } => format!("subagent:{id}"),
+            Self::Task(id) | Self::Subagent(id) => id,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Task(_) => f.write_str(self.raw_id()),
+            Self::Subagent(_) => write!(f, "subagent:{}", self.raw_id()),
+        }
+    }
+}
+
+impl Unread {
+    /// The existing display identifier: the task id, or `subagent:<id>`.
+    pub fn id(&self) -> String {
+        self.work_id().to_string()
+    }
+
+    fn work_id(&self) -> &WorkId {
+        match self {
+            Self::Finished { id, .. } | Self::Unfinished { id, .. } | Self::Subagent { id, .. } => {
+                id
+            }
         }
     }
 }
@@ -536,7 +564,7 @@ impl Unread {
 /// so a malformed line means something is wrong - and treating it as "nothing
 /// unread" would make the guarantee fail open exactly when it cannot be checked.
 pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
-    let mut started: Vec<(usize, String, serde_json::Value)> = Vec::new();
+    let mut started: Vec<(usize, WorkId, serde_json::Value)> = Vec::new();
     let mut finished: Vec<(usize, Unread)> = Vec::new();
     // Shell completions the model was not waiting for (`will_wake`): grok
     // delivers those only as a wake-up message in a *later* turn.
@@ -566,14 +594,14 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
                     continue;
                 }
                 if let Some(id) = text("task_id") {
-                    started.push((i, id, update.clone()));
+                    started.push((i, WorkId::Task(id), update.clone()));
                 }
             }
             Some("task_completed") => {
                 let snap = &update["task_snapshot"];
                 if let Some(id) = snap["task_id"].as_str() {
                     let item = Unread::Finished {
-                        id: id.to_string(),
+                        id: WorkId::Task(id.to_string()),
                         command: snap["command"].as_str().unwrap_or_default().to_string(),
                         exit_code: snap["exit_code"].as_i64(),
                         signal: snap["signal"].as_str().map(str::to_string),
@@ -595,7 +623,7 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
             }
             Some("subagent_spawned") => {
                 if let Some(id) = text("subagent_id") {
-                    started.push((i, format!("subagent:{id}"), update.clone()));
+                    started.push((i, WorkId::Subagent(id), update.clone()));
                 }
             }
             Some("subagent_finished") => {
@@ -605,7 +633,7 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
                     finished.push((
                         i,
                         Unread::Subagent {
-                            id,
+                            id: WorkId::Subagent(id),
                             status: text("status"),
                             error: text("error"),
                         },
@@ -646,7 +674,7 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
             .map(|(_, u)| u.clone()),
     );
     for (i, id, update) in &started {
-        if !after(*i, latest_turn_start) || finished.iter().any(|(_, f)| f.id() == *id) {
+        if !after(*i, latest_turn_start) || finished.iter().any(|(_, f)| f.work_id() == id) {
             continue;
         }
         unread.push(Unread::Unfinished {
@@ -658,8 +686,8 @@ pub fn unread_background_results(updates: &str) -> Result<Vec<Unread>, String> {
             output_file: update["output_file"].as_str().map(str::to_string),
         });
     }
-    unread.sort_by_key(Unread::id);
-    unread.dedup_by_key(|u| u.id());
+    unread.sort_by(|a, b| a.work_id().cmp(b.work_id()));
+    unread.dedup_by(|a, b| a.work_id() == b.work_id());
     Ok(unread)
 }
 
@@ -717,7 +745,7 @@ pub fn wake_prompt(unread: &[Unread]) -> String {
                 command,
                 output_file,
             } => {
-                if id.starts_with("subagent:") {
+                if let WorkId::Subagent(id) = id {
                     out.push_str(&format!(
                         "## Subagent {id} did NOT finish\n\nIt did not finish before the \
                          session ended, so no result is available. Start another subagent if \
@@ -739,9 +767,10 @@ pub fn wake_prompt(unread: &[Unread]) -> String {
             }
             Unread::Subagent { id, status, error } => {
                 out.push_str(&format!(
-                    "## Subagent {id} finished: {}{}\n\nThis wake record does not include \
+                    "## Subagent {} finished: {}{}\n\nThis wake record does not include \
                      its result here. Fetch and read it with get_command_or_subagent_output \
                      before ending this turn.\n\n",
+                    id.raw_id(),
                     status.as_deref().unwrap_or("unknown status"),
                     error
                         .as_deref()
@@ -1150,6 +1179,20 @@ mod tests {
         .expect("gitdir file");
         assert_eq!(grok.workspace_key(&wt.join("src")), main);
 
+        // A submodule .git file points into .git/modules, not .git/worktrees.
+        // It stays keyed on the submodule root just as grok's git2 key does.
+        let superproject = base.join("superproject");
+        let submodule = superproject.join("submodule");
+        std::fs::create_dir_all(superproject.join(".git/modules/x")).expect("module gitdir");
+        std::fs::create_dir_all(submodule.join("src")).expect("submodule");
+        std::fs::write(submodule.join(".git"), "gitdir: ../.git/modules/x\n")
+            .expect("submodule gitdir file");
+        assert_eq!(main_checkout_of_worktree(&submodule), None);
+        assert_eq!(
+            grok.workspace_key(&submodule),
+            std::fs::canonicalize(&submodule).expect("canonical submodule")
+        );
+
         // A repo root that is the user's home (dotfiles) is never the key; grok
         // falls back to the directory itself.
         let dotfiles_home = base.join("home");
@@ -1411,7 +1454,7 @@ mod tests {
     #[test]
     fn the_wake_prompt_carries_the_result_itself() {
         let finished = Unread::Finished {
-            id: "t1".to_string(),
+            id: WorkId::Task("t1".to_string()),
             command: "brokkr test -p piners-vm reg".to_string(),
             exit_code: Some(0),
             signal: None,
@@ -1420,7 +1463,7 @@ mod tests {
             output_file: Some("/g/t1.log".to_string()),
         };
         let lost = Unread::Unfinished {
-            id: "t2".to_string(),
+            id: WorkId::Task("t2".to_string()),
             command: Some("brokkr check".to_string()),
             output_file: Some("/g/t2.log".to_string()),
         };
@@ -1436,7 +1479,7 @@ mod tests {
 
         // A huge output is cut to its tail, and the prompt says where the rest is.
         let big = Unread::Finished {
-            id: "t3".to_string(),
+            id: WorkId::Task("t3".to_string()),
             command: "brokkr check".to_string(),
             exit_code: Some(1),
             signal: None,
@@ -1453,7 +1496,7 @@ mod tests {
     #[test]
     fn the_wake_prompt_is_explicit_about_subagent_results() {
         let prompt = wake_prompt(&[Unread::Subagent {
-            id: "s1".to_string(),
+            id: WorkId::Subagent("s1".to_string()),
             status: Some("completed".to_string()),
             error: None,
         }]);
@@ -1471,7 +1514,7 @@ mod tests {
         );
 
         let unfinished = wake_prompt(&[Unread::Unfinished {
-            id: "subagent:s2".to_string(),
+            id: WorkId::Subagent("s2".to_string()),
             command: Some("research task".to_string()),
             output_file: None,
         }]);
@@ -1525,6 +1568,26 @@ mod tests {
             update("turn_completed", None),
         ]);
         assert!(ids(&waited).is_empty());
+
+        // The display strings can overlap, but typed identities keep a task
+        // whose id starts with `subagent:` distinct from a subagent id.
+        let colliding = stream(&[
+            update("task_backgrounded", Some("subagent:s1")),
+            update("subagent_spawned", Some("s1")),
+            update("turn_completed", None),
+            update("task_completed", Some("subagent:s1")),
+            update("subagent_finished", Some("s1")),
+        ]);
+        let unread = unread_background_results(&colliding).expect("well-formed log");
+        assert_eq!(unread.len(), 2);
+        assert!(matches!(
+            unread[0].work_id(),
+            WorkId::Task(id) if id == "subagent:s1"
+        ));
+        assert!(matches!(
+            unread[1].work_id(),
+            WorkId::Subagent(id) if id == "s1"
+        ));
     }
 
     #[test]
@@ -1535,6 +1598,21 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create session dir");
         std::fs::write(dir.join("events.jsonl"), CANCELLED).expect("write events");
         assert_eq!(session_events(&home, sid).as_deref(), Some(CANCELLED));
+        let underscored = "ses_123";
+        let underscored_dir = home.join("sessions/%2Fother%2Fcwd").join(underscored);
+        std::fs::create_dir_all(&underscored_dir).expect("create underscored session dir");
+        std::fs::write(underscored_dir.join("events.jsonl"), CANCELLED)
+            .expect("write underscored session events");
+        std::fs::write(underscored_dir.join("updates.jsonl"), "updates")
+            .expect("write underscored session updates");
+        assert_eq!(
+            session_events(&home, underscored).as_deref(),
+            Some(CANCELLED)
+        );
+        assert_eq!(
+            session_updates(&home, underscored).as_deref(),
+            Some("updates")
+        );
         assert_eq!(session_events(&home, "../etc"), None);
         assert_eq!(session_events(&home, "missing"), None);
         let _ = std::fs::remove_dir_all(&home);

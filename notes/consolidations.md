@@ -716,15 +716,6 @@ incident?" is `suspicious && !interrupted` inline, and `run_incidents`
 re-decides "explained vs mystery" from `turn_error`. Owner proposed: an
 `is_incident()` method on the typed outcome.
 
-## CON-039 - What counts as a secret env var?
-
-Reported by: forensics.
-
-`incident::looks_secret` redacts values by name pattern; the sidecar and audit
-sidestep the question by never storing values. Two compatible policies. If the
-incident layer becomes generic, the hunter proposes the redaction rule lives
-with the env recording, not in `incident`.
-
 ## CON-040 - What does grok think of its trust store?
 
 Reported by: grok-man.
@@ -768,16 +759,6 @@ Reported by: grok-man.
 error, and in `untrusted_hint`; `GrokPrepared.trust_grant: Option<String>` is
 the key lossily stringified. Owner proposed: `check_trust -> (TrustKey,
 Trust)` with a `TrustKey(PathBuf)`, computed once.
-
-## CON-044 - Background work ids in grok's update log
-
-Reported by: grok-man.
-
-`Unread::id()` allocates a `String` and encodes the kind in a `subagent:`
-prefix, and the `subagent_spawned` arm mints the same prefix independently
-(`format!("subagent:{id}")`), so started/finished matching depends on two
-format strings agreeing. Owner proposed: `enum WorkId { Task(String),
-Subagent(String) }` with `Ord`.
 
 ## CON-045 - Display truncation of the in-flight tool
 

@@ -1050,6 +1050,19 @@ async fn run_claude_stub(
     .await
 }
 
+#[tokio::test]
+async fn a_claude_resume_reports_the_session_id_it_was_given() {
+    let scratch = Scratch::new();
+    let sid = "01920000-0000-7000-8000-000000000002";
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\nprintf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"continued\"}}'"
+    );
+    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), Some(sid))
+        .await
+        .expect("resume completes");
+    assert_eq!(run.session_id.as_deref(), Some(sid));
+}
+
 /// The session id of the one claude run in flight under `scratch`, once its
 /// pid is offered for signalling - which is what `review interrupt` waits for.
 async fn claude_signalable(scratch: &Scratch) -> String {

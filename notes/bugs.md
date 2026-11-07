@@ -17,25 +17,6 @@ hunter's reading of the code, and some say so explicitly.
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-## BUG-005 - `-a all` includes `bare`
-
-Reported by: config.
-
-`all` expands to every archetype, and most configs carry `bare = ""`, so
-`-a all` launches an extra unprimed run per provider. The hunter calls this
-probably unintended: `all` should mean every priming archetype. The wider
-question of who owns `bare` is in `notes/consolidations.md`.
-
-## BUG-006 - `bare` behaves differently as a positional and as `-a`
-
-Reported by: config.
-
-The legacy positional `review bare` means "no archetype" whatever the config
-holds, but `-a bare` only works when the config defines `bare = ""`; without
-it, `-a bare` is "not found". The parser forbids a non-empty `bare` to keep
-the two in step. Proposed: resolve `bare` in the archetype resolver regardless
-of config, so the config entry is no longer needed.
-
 ## BUG-008 - A Stranded watchdog kill can be reported as a death and auto-resumed
 
 Reported by: forensics.
@@ -119,18 +100,6 @@ attach to the operator's real config and DB: not a reproduction, and mildly
 dangerous. The proposed fix, building the replay from the actual spawned
 `Command`, is in `notes/structural.md` under the incident split.
 
-## BUG-018 - An interrupted claude or grok resume prints no resume hint
-
-Reported by: providers.
-
-`print_result` prints the "interrupted - continue within Nm" hint only when
-`result.session_id` is `Some`. The claude and grok runners return
-`session_id: None` on a resume (`keep_id` returns `None` when not oneshot);
-codex's returns the known id. So an interrupted `review message <claude-id>`
-prints no `session:` line and no hint, while the same flow on codex prints
-both. The `RunOutput.session_id` contract ("new information only" vs "the
-session") differs between runners.
-
 ## BUG-020 - The grok runner ignores the stop channel
 
 Reported by: providers. Not verified by the hunter.
@@ -144,20 +113,6 @@ it does not, a grok turn launches after the operator asked to stop. If it does,
 the error reads as a launch failure rather than "not launched: review was
 signalled to stop". The duplicated shutdown flags behind this are in
 `notes/consolidations.md`.
-
-## BUG-021 - `config_writable_roots_override` can record roots codex did not use
-
-Reported by: providers.
-
-- It picks the last entry with `starts_with("sandbox_workspace_write.writable_roots")`.
-  A longer key with that prefix is picked, fails the nested lookup and returns
-  `None`, so an earlier real override is ignored.
-- A value codex accepts but the TOML parser rejects also returns `None`; the
-  record then shows the derived roots while codex ran with the override.
-
-That is the false-record class the surrounding comment says it prevents.
-Proposed: stop parsing it back; keep the override as the typed profile field
-(`writable_roots` already exists) and forbid restating it in `config`.
 
 ## BUG-023 - Grok write runs are recorded under grok-native sandbox names
 
@@ -181,21 +136,6 @@ demands recorded roots hash to it. Proposed by grok-man: the record carries
 query works and resume still has the profile name. The type design is in
 `notes/structural.md`.
 
-## BUG-024 - Two session-id allowlists disagree on `_`
-
-Reported by: grok-man, lifecycle, providers, orchestration, forensics.
-
-`inflight` accepts `[A-Za-z0-9_-]`; `grok_home::session_file` accepts
-`[A-Za-z0-9-]` and silently returns `None` otherwise. opencode's ids are
-`ses_<...>`: a reader modelled on `session_file` would fail every opencode
-lookup, as "no log" rather than "invalid id". For grok, `None` from
-`session_updates` becomes a wake-verification failure ("no update log for grok
-session"), so a rejected id reads as a missing file. Within `inflight` the
-check also runs three separate times (mark, launch-lock path, interrupt path),
-each degrading differently: a skipped marker with a warning, `Ok(None)`, and an
-`InvalidInput` error. The `SessionId` newtype proposed as the single owner is
-in `notes/structural.md`.
-
 ## BUG-027 - A grok write run announces a trust grant grok will refuse
 
 Reported by: grok-man.
@@ -218,29 +158,9 @@ purpose. The launch locks already live under the data dir. Audit-id minting is
 now protected by its own lock on the config file, so the remaining cost is
 launch spacing. Proposed: `lock::global()` beside `inflight`'s locks.
 
-## BUG-030 - A panicked fan-out task is recorded as provider "unknown"
-
-Reported by: orchestration.
-
-The panic path records `provider: "unknown"`, although the provider name is
-available in the pending entry and could be kept.
-
-## BUG-031 - A keeper interrupt outside `Running` is dropped silently
-
-Reported by: lifecycle.
-
-`Keeper::interrupt` ignores `i`/SIGINT unless `phase == Running`. A SIGINT
-during `Starting` (between fork and exec) is lost, and `review interrupt` then
-waits for the run to end on its own and reports "ended before the interrupt
-took effect". The runners' readiness gate makes this unlikely today, but the
-keeper never reports whether it forwarded anything (its `interrupted` flag
-never leaves the process), so `review` cannot tell delivered from dropped. The
-"was this run interrupted" consolidation in `notes/consolidations.md` builds on
-this.
-
 ## BUG-032 - Stale and misplaced comments
 
-Reported by: orchestration, grok-man, providers, and a wave fixer.
+Reported by: orchestration, grok-man, providers, and wave fixers.
 
 - `sessions.rs`: the `kind` doc comments on `SessionRecord` and `SessionEntry`
   say `"oneshot"`, `"session"` or `"prime"`; the values written are `"run"`
@@ -256,30 +176,9 @@ Reported by: orchestration, grok-man, providers, and a wave fixer.
 - `run_claude`'s `runtime` parameter comment says claude uses only the stop
   channel, the data root and the two grace periods; it also uses
   `claude_command`, `teardown` and `orphan_log`.
-- `incident.rs` describes its directory suffix from `generate_short_id` as a
-  "short random suffix"; audit ids now use 128 random bits, so the suffix is 32
-  hex characters. (The reconciler rewrote this one; check before acting.)
 - `app.rs` at the global lock still says "Re-read under the lock" about the
   audit id; `ensure_audit_id` now takes its own lock on the config file, so the
   global lock is no longer what makes it safe.
-
-## BUG-033 - Grok submodule checkouts are untested in `main_checkout_of_worktree`
-
-Reported by: grok-man.
-
-`main_checkout_of_worktree` handles `.git` files without the `/worktrees/`
-shape (submodules: `gitdir: ../.git/modules/x`) by returning `None`, keying on
-the submodule root. The hunter thinks this probably matches grok and calls it
-worth one test.
-
-## BUG-034 - The keeper test cleans up with a bare-pid kill that can fall back to pid 0
-
-Reported by: a wave fixer (lateral).
-
-The cleanup in `tests/keeper.rs` signals a detached process by bare pid with
-`kill`, with a fallback to pid 0, which would signal the test's own process
-group. The fixer replaced it with pidfd signalling, then reverted that with
-the rest of a redesign that was out of scope; the bare-pid cleanup is back.
 
 ## BUG-035 - Claude result aggregation is partial
 
@@ -291,15 +190,6 @@ run still records no usage, because it has no digest; and the stream's
 head-plus-tail truncation can discard result events from the middle of a long
 stream before any of them are read.
 
-## BUG-036 - Missing result fields are still reported as provider turn errors
-
-Reported by: a wave fixer (lateral).
-
-When a claude result lacks `is_error`, or a grok result lacks `stopReason`,
-`review` infers a failure and records it in `turn_error`, the provider-stated
-field, rather than in the new `review_error` field for `review`'s own
-diagnoses.
-
 ## BUG-038 - The persisted digest view omits the unconfirmed-exit note
 
 Reported by: a wave reviewer (lateral).
@@ -309,19 +199,46 @@ could not be confirmed`, but `app::print_digest_summary`, which renders the
 persisted row for `review sessions <ID>`, has no matching note, so the
 after-the-fact view shows less than the live one.
 
-## BUG-039 - An empty audit id is accepted and never regenerated
+## BUG-041 - The README still describes the old `-a all` and `-a bare`
+
+Reported by: a wave fixer (lateral).
+
+`-a all` now skips the special `bare` entry, and `-a bare` means no archetype
+whether or not the config defines it; the CLI help, `docs/run.md` and
+`docs/config.md` say so. `README.md` still describes `-a all` as every
+archetype, and its archetype option table does not say `-a bare` works without
+a config entry.
+
+## BUG-042 - The incident timestamp check accepts impossible dates
+
+Reported by: a wave fixer (lateral).
+
+`incident::is_utc_timestamp`, which decides whether a directory is a real
+bundle, checks only the timestamp's shape and its `Z` suffix, so a value such
+as `2026-99-99T99:99:99Z` passes.
+
+## BUG-044 - Claude's missing-`is_error` diagnosis still reads as a claude statement
 
 Reported by: a wave reviewer (lateral).
 
-`config_write::configured_audit_id`, like the older parse path, treats
-`id = ""` as a configured id, so `ensure_audit_id` returns the empty string
-instead of minting one. Rows elsewhere use `""` to mean "no audit id".
+A claude result without `is_error` is now filed as `review_error`, but its text
+still reads "claude reported an error (no is_error flag): ...", claiming a
+provider statement that was never made. The exact-string assertion in
+`claude_result_without_is_error_fails_closed` (`src/provider_tests.rs`) has to
+change with it.
 
-## BUG-040 - Incident listing's new filter has no test
+## BUG-045 - An empty audit id gives a garbled mismatch message
 
 Reported by: a wave reviewer (lateral).
 
-`incident::list_recent_from` now drops bundles without matching schema-1
-metadata, a provider and a UTC timestamp, and sorts by the recorded time. That
-is new behaviour with no unit test, though the helper takes an explicit
-directory precisely so it can have one.
+`message_target` compares `cfg.audit.id` with the session record before
+`ensure_audit_id` runs, so a project whose file holds `id = ""` reports a
+mismatch with an empty id in the text rather than a clear message.
+
+## BUG-043 - `contained::spawn` records keeper pid 0 when the id is missing
+
+Reported by: a wave fixer (lateral).
+
+`contained::spawn` maps a missing `child.id()` to `0` when storing the keeper
+pid. If the keeper has already been reaped at that point, the marker or report
+can carry a misleading pid 0.

@@ -28,11 +28,17 @@ The stream ends in one result object per run, whatever the outcome, and its
 `is_error` says whether `result` is an answer (a run in which claude woke the
 model for a background subagent carries one per turn; the last is the answer).
 That is the grok arrangement ([grok.md](grok.md#turns-classify-themselves)), and
-`run_claude` handles it the same way: `is_error: false` is the answer; anything
-else is `Ok` carrying a digest whose `turn_error` names what claude reported,
-and keeps the session ID. A result object missing `is_error` counts as a
-failure, so a claude that stopped reporting it fails loudly rather than passing
-every run off as answered.
+`run_claude` handles it the same way: `is_error: false` is the answer; an
+ordinary failure with explicit `is_error: true` is `Ok` carrying a digest whose
+`turn_error` names what claude reported, and keeps the session ID. A result object missing
+`is_error` counts as a failure, so a claude that stopped reporting it fails
+loudly rather than passing every run off as answered. Since that failure is
+inferred by review, its explanation is recorded as `review_error`, not
+`turn_error`.
+
+Resumed output retains the session ID supplied to the runner. This lets the
+shared result printer show the same session line and interruption hint for a
+resume as for a fresh run.
 
 No result object at all splits on whether claude printed its first event, the
 `init` that carries the session ID. Before it, nothing ran and there is no

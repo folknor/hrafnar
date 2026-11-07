@@ -63,6 +63,33 @@ const CMDLINE_MAX: usize = 512;
 /// capped: the ticket's requirement is that every one is named.
 pub const KILLED_MAX: usize = 64;
 
+/// A byte in the review-to-keeper control pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Control {
+    Go = b'g',
+    Interrupt = b'i',
+    Terminate = b't',
+}
+
+impl Control {
+    pub const fn byte(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        if byte == Self::Go as u8 {
+            Some(Self::Go)
+        } else if byte == Self::Interrupt as u8 {
+            Some(Self::Interrupt)
+        } else if byte == Self::Terminate as u8 {
+            Some(Self::Terminate)
+        } else {
+            None
+        }
+    }
+}
+
 /// What `review` asks the keeper to run, and how patiently to tear it down.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Spec {
@@ -602,12 +629,14 @@ impl Keeper {
             return;
         };
         for &b in &buf[..n] {
-            match b {
+            match Control::from_byte(b) {
                 // Never once termination has begun: a `t` (or SIGTERM) ahead
                 // of the `g` means shutdown closed admission first.
-                b'g' if self.phase == Phase::Waiting && !self.terminate => self.launch(),
-                b'i' => self.interrupt(),
-                b't' => self.terminate = true,
+                Some(Control::Go) if self.phase == Phase::Waiting && !self.terminate => {
+                    self.launch();
+                }
+                Some(Control::Interrupt) => self.interrupt(),
+                Some(Control::Terminate) => self.terminate = true,
                 _ => {}
             }
         }
@@ -622,6 +651,10 @@ impl Keeper {
 
     /// Forward the first interrupt to the provider, once, while it runs.
     fn interrupt(&mut self) {
+        // `interrupted` only suppresses duplicate forwarding; review records
+        // intent at the caller. Supported callers wait for provider output
+        // before sending `i` or SIGINT, and terminate before readiness so a
+        // pre-exec child is not signalled with its default handler.
         if self.phase != Phase::Running || self.interrupted || self.leader_status.is_some() {
             return;
         }

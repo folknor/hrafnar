@@ -605,7 +605,8 @@ pub struct ProviderResult {
     pub provider: String,
     pub output: Result<String>,
     /// Session ID associated with this invocation, when one is known to the
-    /// caller (a fresh run captures the freshly-created session).
+    /// caller. Fresh runs capture the newly-created session; resumes retain
+    /// the ID they were given.
     pub session_id: Option<String>,
     /// Structured run summary (codex only, today).
     pub digest: Option<Digest>,
@@ -678,11 +679,29 @@ pub fn now_epoch_secs() -> u64 {
 /// alongside the text without a widening tuple.
 pub struct RunOutput {
     pub text: String,
+    /// Session ID associated with this invocation, including a resumed ID.
     pub session_id: Option<String>,
     pub digest: Option<Digest>,
     pub served: Served,
     /// What the run's processes left behind, across every invocation it made.
     pub leftovers: crate::contained::Leftovers,
+}
+
+/// The session associated with an invocation is the echoed/generated ID for a
+/// fresh run, and the requested ID for a resume. Keeping it on resumed results
+/// lets the shared printer name the session and print any interruption hint
+/// without changing resume recording, which uses the caller's ID directly.
+fn invocation_session_id(
+    oneshot: bool,
+    echoed: Option<String>,
+    oneshot_id: Option<String>,
+    requested_id: &str,
+) -> Option<String> {
+    if oneshot {
+        echoed.or(oneshot_id)
+    } else {
+        Some(requested_id.to_string())
+    }
 }
 
 /// Knobs on how a codex or claude run is executed, injectable so tests can
@@ -1203,13 +1222,21 @@ fn prepare_grok_write(
 
 fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
     const KEY: &str = "sandbox_workspace_write.writable_roots";
-    let entry = config
-        .iter()
-        .rev()
-        .find(|c| c.trim_start().starts_with(KEY))?;
+    // Keep this override supported: the typed `writable_roots` field adds to
+    // derived roots, while codex `-c` deliberately replaces the whole list.
+    // Match the complete key before parsing its value. A neighboring setting
+    // such as `sandbox_workspace_write.writable_roots_extra` must not hide an
+    // earlier override of the actual roots key.
+    let value = config.iter().rev().find_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        (key.trim() == KEY).then_some(value.trim())
+    })?;
     // Parse rather than string-scrape: the value is TOML, and a hand-written
-    // profile can spell an array in ways a regex would get wrong.
-    let parsed = entry.parse::<toml::Table>().ok()?;
+    // profile can spell an array in ways a regex would get wrong. Codex falls
+    // back to a string for values that are not TOML, but this setting requires
+    // an array of paths; such a string is not an effective writable-roots
+    // override.
+    let parsed = format!("{KEY} = {value}").parse::<toml::Table>().ok()?;
     let roots = parsed
         .get("sandbox_workspace_write")?
         .get("writable_roots")?
@@ -1528,11 +1555,11 @@ pub async fn run_claude(
     let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
 
-    // Only a fresh run reports a session id, as for grok: the caller passed a
-    // resume's id in and records it already. Claude's echoed id is preferred to
-    // the one we generated, so a claude that reassigned it could not orphan the
-    // session.
-    let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
+    // The echoed ID wins on a fresh run in case claude reassigned the requested
+    // UUID; on resume, retain the ID the caller asked us to continue.
+    let keep_id = |echoed: Option<String>| {
+        invocation_session_id(oneshot, echoed, oneshot_id.clone(), session_id)
+    };
     let result_line = last_claude_result(&stdout).unwrap_or_default();
     let served = result_served(result_line);
     let (turns, usage) = claude_usage(&stdout);
@@ -1628,11 +1655,17 @@ pub async fn run_claude(
         },
         ClaudeOutcome::NoAnswer {
             reason,
+            review_error,
             text,
             session_id,
         } => {
             let (text, digest) = if interrupt_requested {
                 (interrupted_text(text), interrupted_digest())
+            } else if review_error {
+                (
+                    text,
+                    with_usage(review_no_answer_digest(reason, status.as_ref())),
+                )
             } else {
                 (text, with_usage(no_answer_digest(reason, status.as_ref())))
             };
@@ -1693,11 +1726,14 @@ enum ClaudeOutcome {
         text: String,
         session_id: Option<String>,
     },
-    /// Claude produced a result object and flagged it an error. The session
-    /// exists (its transcript is on disk even for a launch the API refused), so
-    /// this is `Ok` with the id kept, for the reasons `no_answer_digest` gives.
+    /// Claude produced a result object that is either flagged as an error or
+    /// missing the flag needed to trust it as an answer. The session exists, so
+    /// this is `Ok` with its ID kept.
     NoAnswer {
         reason: String,
+        /// `true` when review inferred a failure because Claude omitted the
+        /// field that says whether the result is an error.
+        review_error: bool,
         text: String,
         session_id: Option<String>,
     },
@@ -1761,13 +1797,15 @@ fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> 
         reason.push_str(&format!(" ({})", facts.join(", ")));
     }
     // On an error the result text is claude's own explanation (the unknown
-    // model: "There's an issue with the selected model ..."), which is the
-    // thing worth persisting in the greppable `turn_error`.
+    // model: "There's an issue with the selected model ..."). It is persisted
+    // with the provider reason; a missing `is_error` routes the diagnosis to
+    // `review_error` below.
     if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
         reason.push_str(&format!(": {}", line.trim()));
     }
     Ok(ClaudeOutcome::NoAnswer {
         reason,
+        review_error: result.is_error.is_none(),
         text,
         session_id: result.session_id,
     })
@@ -2009,12 +2047,12 @@ async fn run_grok(
         if pending.is_empty() {
             break;
         }
-        // A stated failure (grok said why the turn ended) is not fixed by
-        // waking: resending buys the same answer. The digest already fails it.
+        // A failed turn is not fixed by waking, whether grok stated a reason or
+        // review found its stop reason missing. The digest already fails it.
         if out
             .digest
             .as_ref()
-            .is_some_and(|d| d.turn_error.is_some() && !d.captured)
+            .is_some_and(|d| (d.turn_error.is_some() || d.review_error.is_some()) && !d.captured)
         {
             break;
         }
@@ -2079,7 +2117,7 @@ async fn run_grok(
         leftovers.merge(std::mem::take(&mut next.leftovers));
         out = RunOutput {
             // The wake turn's report is the run's answer; the id stays the
-            // first turn's (a resume does not report one).
+            // first turn's (a wake resumes that same session).
             session_id: out.session_id,
             leftovers,
             ..next
@@ -2315,15 +2353,15 @@ async fn run_grok_turn(
             eprintln!("warning: grok --trust: {line}");
         }
     }
-    // Only a *fresh* run reports a session id: it is new information, and it
-    // must survive a turn that produced no answer so that turn can still be
-    // resumed. A resume reports `None` because the caller passed the id in and
-    // already records it (`main` logs the `review resume` id, not this field);
-    // claude does the same. Preferring grok's echoed id over the UUID we
-    // generated means a future grok that reassigns it cannot orphan the session.
+    // A fresh run reports grok's echoed ID or the UUID we requested, so a
+    // future grok that reassigns it cannot orphan the session. A resume reports
+    // the requested ID too, so output can name the session while resume
+    // recording continues to use that same caller-known ID.
     // Where to look for the event log if grok does not echo an id.
     let lookup_id = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
-    let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
+    let keep_id = |echoed: Option<String>| {
+        invocation_session_id(oneshot, echoed, oneshot_id.clone(), session_id)
+    };
     let served = result_served(&stdout);
     let (turns, usage) = grok_usage(&stdout);
     let with_usage = |digest: Digest| Digest {
@@ -2347,6 +2385,7 @@ async fn run_grok_turn(
         },
         GrokOutcome::NoAnswer {
             reason,
+            review_error,
             text,
             session_id,
         } => {
@@ -2360,10 +2399,15 @@ async fn run_grok_turn(
             });
             let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
+            let digest = if review_error {
+                review_no_answer_digest(reason, status.as_ref())
+            } else {
+                no_answer_digest(reason, status.as_ref())
+            };
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
-                digest: Some(with_usage(no_answer_digest(reason, status.as_ref()))),
+                digest: Some(with_usage(digest)),
                 served,
                 leftovers,
             }
@@ -2509,6 +2553,16 @@ fn no_answer_digest(reason: String, status: Option<&std::process::ExitStatus>) -
     }
 }
 
+/// A missing provider result field is review's diagnosis, not a reason the
+/// provider stated. Keep the no-answer and observed-status facts while
+/// attributing the explanation to `review_error`.
+fn review_no_answer_digest(reason: String, status: Option<&std::process::ExitStatus>) -> Digest {
+    let mut digest = no_answer_digest(String::new(), status);
+    digest.turn_error = None;
+    digest.review_error = Some(reason);
+    digest
+}
+
 /// Decide whether a finished grok run produced an answer, from its streams
 /// alone.
 ///
@@ -2556,6 +2610,7 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
     if stop != GROK_OK_STOP {
         return Ok(GrokOutcome::NoAnswer {
             reason: format!("grok ended the turn without an answer (stopReason: {stop})"),
+            review_error: result.stop_reason.is_none(),
             // Whatever the model had said when it was cut off. Kept because it
             // is all there is and often the only clue about what the run was
             // doing - the digest, not this text, is what says it is not an
@@ -2576,9 +2631,12 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
 #[derive(Debug)]
 enum GrokOutcome {
     Answered(GrokAnswer),
-    /// A turn ran and grok said why it produced nothing.
+    /// A turn ran and either grok stated a non-answer or omitted its stop reason.
     NoAnswer {
         reason: String,
+        /// `true` when review inferred a failure because grok omitted the
+        /// field that says how its turn ended.
+        review_error: bool,
         text: String,
         session_id: Option<String>,
     },
@@ -3577,10 +3635,10 @@ fn print_digest(d: &Digest) {
         // task_complete is NOT a success signal - it fires on aborted turns too
         // (task_complete.last_agent_message=null), so the exit status sets tone.
         // A kill by us is excluded: "died" would be a lie about our own doing.
-        if d.turn_error.is_some() {
-            // Already explained by `turn failed:` above. Saying "died without a
-            // final answer" underneath a stated cause is the bug this branch
-            // exists to avoid: it reframes an answered question as a mystery.
+        if d.turn_error.is_some() || d.review_error.is_some() {
+            // Already explained above. Saying "died without a final answer"
+            // underneath a diagnosis is the bug this branch avoids: it reframes
+            // an explained no-answer as a mystery.
             // "Not an answer" rather than "interim": for codex and grok the text
             // is interim commentary, but for claude it is the error message
             // itself.
