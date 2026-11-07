@@ -102,7 +102,7 @@ fn grant(path: &str, why: &'static str) -> crate::writable_roots::GrantedRoot {
 fn announcement_reports_derived_roots_with_their_reason() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
     let lines = super::announcement_lines(
-        "codex",
+        super::Provider::Codex,
         "profile config override",
         &granted,
         &["/run/user/1000".to_string()],
@@ -121,7 +121,7 @@ fn announcement_reports_derived_roots_with_their_reason() {
 fn announcement_follows_a_config_override_rather_than_the_derivation() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
     let lines = super::announcement_lines(
-        "codex",
+        super::Provider::Codex,
         "profile config override",
         &granted,
         &["/secret".to_string()],
@@ -142,7 +142,7 @@ fn announcement_follows_a_config_override_rather_than_the_derivation() {
 #[test]
 fn announcement_covers_roots_added_to_an_empty_derivation() {
     let lines = super::announcement_lines(
-        "codex",
+        super::Provider::Codex,
         "profile config override",
         &[],
         &["/srv/cache".to_string()],
@@ -163,7 +163,12 @@ fn announcement_matches_reasons_by_path_not_by_position() {
         grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)"),
     ];
     let effective = vec!["/run/user/1000".to_string(), "/srv/extra".to_string()];
-    let lines = super::announcement_lines("codex", "profile config override", &granted, &effective);
+    let lines = super::announcement_lines(
+        super::Provider::Codex,
+        "profile config override",
+        &granted,
+        &effective,
+    );
     assert_eq!(
         lines,
         vec![
@@ -180,7 +185,13 @@ fn announcement_matches_reasons_by_path_not_by_position() {
 fn announcement_is_empty_when_an_override_grants_nothing() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
     assert!(
-        super::announcement_lines("codex", "profile config override", &granted, &[]).is_empty()
+        super::announcement_lines(
+            super::Provider::Codex,
+            "profile config override",
+            &granted,
+            &[]
+        )
+        .is_empty()
     );
 }
 
@@ -195,8 +206,14 @@ fn persisted_sandbox_levels_normalize_known_grok_names() {
         ("read-only", "read-only"),
         ("custom", "custom"),
     ] {
-        assert_eq!(super::recorded_sandbox("grok", Some(native)), Some(level));
-        assert_eq!(super::recorded_sandbox("codex", Some(native)), Some(native));
+        assert_eq!(
+            super::recorded_sandbox(super::Provider::Grok, Some(native)),
+            Some(level)
+        );
+        assert_eq!(
+            super::recorded_sandbox(super::Provider::Codex, Some(native)),
+            Some(native)
+        );
     }
-    assert_eq!(super::recorded_sandbox("grok", None), None);
+    assert_eq!(super::recorded_sandbox(super::Provider::Grok, None), None);
 }

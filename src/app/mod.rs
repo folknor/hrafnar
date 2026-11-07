@@ -263,39 +263,33 @@ pub async fn run() -> Result<()> {
 
     // Provider list: --provider wins, otherwise [_defaults].providers from the
     // first layer that sets it.
-    let providers_to_run: Vec<String> = match cli.provider.as_ref().filter(|v| !v.is_empty()) {
-        Some(v) => v.clone(),
-        None => match cfg.default_providers() {
-            Some(p) if !p.is_empty() => p.to_vec(),
-            _ => bail!(
-                "no providers to run: pass --provider <name> or set [_defaults].providers \
+    // Both are typed where they were parsed (clap, the config files), so there
+    // is no unknown name left to reject here.
+    let providers_to_run: Vec<provider::Provider> =
+        match cli.provider.as_ref().filter(|v| !v.is_empty()) {
+            Some(v) => v.clone(),
+            None => match cfg.default_providers() {
+                Some(p) if !p.is_empty() => p.to_vec(),
+                _ => bail!(
+                    "no providers to run: pass --provider <name> or set [_defaults].providers \
                  (looked in {})",
-                cfg.searched()
-            ),
-        },
-    };
-
-    for prov in &providers_to_run {
-        if !config::KNOWN_PROVIDERS.contains(&prov.as_str()) {
-            bail!(
-                "unknown provider '{prov}'\n  supported: {}",
-                config::KNOWN_PROVIDERS.join(", ")
-            );
-        }
-    }
+                    cfg.searched()
+                ),
+            },
+        };
 
     // If a profile was requested, every launched provider must have it in some
     // layer. Validate up front so we fail before spawning.
     if let Some(ref profile) = cli.profile {
         for prov in &providers_to_run {
-            cfg.require_profile(prov, profile)?;
+            cfg.require_profile(*prov, profile)?;
         }
     }
 
     let missing: Vec<&str> = providers_to_run
         .iter()
-        .map(String::as_str)
-        .filter(|p| !provider::is_available(p))
+        .filter(|p| !provider::is_available(**p))
+        .map(|p| p.as_str())
         .collect();
 
     // Dry run: print what would be sent and exit
@@ -356,7 +350,7 @@ pub async fn run() -> Result<()> {
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
     struct PendingResult {
-        provider: String,
+        provider: provider::Provider,
         ctx: std::sync::Arc<RecordCtx>,
         handle: tokio::task::JoinHandle<TaskOutcome>,
     }
@@ -366,7 +360,7 @@ pub async fn run() -> Result<()> {
     for (arch_name, prime) in &archetypes_to_run {
         let assembled = prompt::assemble(prime, &stdin_instructions);
 
-        for prov_name in &providers_to_run {
+        for &prov_name in &providers_to_run {
             // Profile overrides (validated above to exist when --profile is set).
             let profile = cli
                 .profile
@@ -386,7 +380,7 @@ pub async fn run() -> Result<()> {
                 .unwrap_or_default();
 
             let launch = Launch {
-                provider: prov_name.clone(),
+                provider: prov_name,
                 model,
                 effort,
                 sandbox,
@@ -408,7 +402,7 @@ pub async fn run() -> Result<()> {
                 prompt: assembled.clone(),
             });
             pending.push(PendingResult {
-                provider: prov_name.clone(),
+                provider: prov_name,
                 ctx: std::sync::Arc::clone(&ctx),
                 handle: tokio::spawn(run_launch(launch, ctx)),
             });
@@ -435,7 +429,7 @@ pub async fn run() -> Result<()> {
             Ok(outcome) => outcome.result,
             Err(err) => {
                 let result = provider::ProviderResult {
-                    provider: p.provider.clone(),
+                    provider: p.provider,
                     output: Err(anyhow::anyhow!("task panicked: {err}")),
                     session_id: None,
                     codex_home: None,

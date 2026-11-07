@@ -18,139 +18,23 @@ propose its single owner should live. Unverified.
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-Most of the per-provider questions below share one proposed owner, a
-`Provider` enum with a capability table; that type is described once in
-`notes/structural.md`. Each entry here keeps its own sites.
+The per-provider questions below are owned by `provider::Provider`
+(src/provider/kind.rs) and the exhaustive matches beside it, described in
+`notes/structural.md`. Each entry here keeps only its residue.
 
-## CON-001 - Is this a known provider?
-
-Reported by: providers, config, orchestration.
-
-Sites:
-- `config::KNOWN_PROVIDERS` and its `contains` checks in `parse_file` (three
-  times).
-- `app::run`'s loop over `--provider` (the fan-out).
-- `app::resume_record` (validating a recorded provider).
-- `config_cmd::probe_availability` (iterates the list).
-- `provider::invoke`'s `other => Err("unknown provider")` arm, reachable only
-  because the type allows any string.
-- `provider::is_available`, which maps a provider name to a binary name.
-- The `man` test.
-
-They agree today; all read `KNOWN_PROVIDERS`. Owner proposed: a `Provider`
-enum with `FromStr`/`Deserialize` (and clap `ValueEnum`), parsed once at the
-config, CLI and sidecar boundaries, so the parse is the validation and the
-dispatch in `invoke` is exhaustive. The config hunter calls the fan-out check a
-legitimate re-check of `--provider` input that never went through config, fine
-once it is `Provider::from_str`.
-
-The orchestration hunter flags a latent problem: the test
-`a_recorded_provider_review_no_longer_supports_is_refused` uses `"opencode"`
-as its example of a removed provider. When opencode returns, rows written by
-the old opencode integration (if any survive on a host) become resumable by
-the new runner with whatever sandbox and model strings the old one recorded.
-The retired/new distinction is not representable today; it needs a
-`review_version` floor per provider or a distinct spelling for the retired one
-(lifecycle and orchestration both suggest an `Unknown(String)` or
-`Retired(String)` arm for rows naming removed providers).
-
-## CON-002 - Can this provider's turn be ended with SIGINT and stay resumable?
-
-Reported by: providers, lifecycle, orchestration, config.
-
-Sites:
-- `provider::Unrecorded::for_provider`: `matches!(provider, "codex" | "claude")`,
-  with its own doc giving the same reason.
-- `interrupt_cmd::interruptible`: the same `matches!`. Its doc claims it is
-  "shared ... so the two cannot disagree", but `Unrecorded` is a second copy
-  the comment does not know about.
-- `interrupt_cmd`'s refusal prose: "only codex and claude runs can be
-  interrupted".
-- `cli.rs` help text (`AFTER_HELP`, `MESSAGE_AFTER_HELP`, `INTERRUPT_AFTER_HELP`,
-  the `Command::Message` and `Command::Interrupt` docs): "codex or claude" five
-  times.
-- `config_cmd`'s STEERING block, which names "codex or claude" in text.
-- `install_signal_supervisor`'s messages.
-- Implicitly, which runners have a stop arm and set `record_child_pid` (claude
-  and codex do; `run_grok_turn` has neither), and which write a readiness flag.
-- The `"codex"`/`"claude"` literals passed to `inflight::mark`.
-
-They agree today and nothing ties them together. maki and opencode both answer
-yes. The lifecycle hunter notes a missed edit to `Unrecorded` would let a
-SIGTERM end their runs without waiting for the row, making the session
-unresumable. Owner proposed: a capability, `Provider::interrupt() ->
-Option<InterruptStyle>` (SIGINT-ends-turn for codex, claude, maki, opencode;
-none for grok), with the help, STEERING and refusal text generated from it or
-tested against it.
-
-## CON-003 - Does this provider have a filesystem sandbox, and what is its default level?
+## CON-003 - What is a provider's default sandbox level, at the runner?
 
 Reported by: providers, config, grok-man, orchestration.
 
-Sites:
-- `provider::effective_sandbox`: codex and grok get read-only; the rest `None`.
-- `config_cmd::sandbox_text`: `"claude"` means ignored; everything else shows
-  "unset (runner default: read-only)". The grok-man hunter also points at a
-  hard-coded `[("claude", true), ("codex", codex), ("grok", false)]` table in
-  `config_cmd.rs` worth checking.
-- `config::sandbox_for`: only grok translates; everything else passes through.
-- `provider::invoke`: the claude-specific comment, the absent `sandbox`
-  argument in the dispatch, and the writable-roots warning.
-- `run_grok_turn`'s `(None, true) => read-only` default.
-- `run_codex`'s `sandbox.unwrap_or("read-only")` and `codex_sandbox_args`'s
-  `!= "read-only"`.
-- The `man` sandbox-table test, which hard-codes its columns
-  `| codex | grok | claude |` and tests claude by
-  `effective_sandbox(...).is_none()`.
-
-The default "read-only" is a literal in at least four places. The sites
-already disagree for any provider beyond the three: adding maki or opencode to
-`KNOWN_PROVIDERS` compiles and falls into every `_ =>` arm, so `sandbox_text`
-prints "runner default: read-only" (false: neither has a filesystem sandbox),
-`effective_sandbox` records `None` (right by accident), and `sandbox_for`
-passes `read-only` through as if it meant something. The config hunter calls
-these three different wrong defaults from one omission. Adding maki to
-`KNOWN_PROVIDERS` does not fail the `man` sandbox test, which only checks rows
-it finds. Owner proposed: the per-provider capability table, holding the
-sandbox model, the default and the native translation, with the `man` test
-requiring one column per registered provider. The sandbox type design is in
-`notes/structural.md`.
-
-## CON-004 - What is this provider's stale-session cutoff?
-
-Reported by: providers, orchestration, grok-man.
-
-Sites:
-- `timings::stale_session`, matching on the provider name with
-  `_ => STALE_SESSION`.
-- `provider::resume_hint`, which reads it for display.
-- `cli::MESSAGE_AFTER_HELP`, which restates 27 and 55 minutes and the grouping
-  "(claude, grok)".
-- The `cli.rs` test `message_help_states_the_current_stale_cutoffs`, which
-  restates the labels `("codex", "(codex)")` and `("claude", "(claude, grok)")`.
-- The `man` stale-cutoff test, which iterates `KNOWN_PROVIDERS` (the grok-man
-  hunter calls this one a genuine single owner with a checked rendering).
-
-The `cli` test is a pairwise-agreement test: it checks the two numbers and
-that grok equals claude, but adding maki with the default cutoff leaves the
-help reading "(claude, grok)" and the test passing. maki and opencode would
-silently get 55 minutes through the wildcard, which may be right or wrong
-since their providers' caches differ, but nobody would have decided it. Owner
-proposed: a capability field (`Provider::stale_cutoff()`), with the help line
-built from the table at runtime (clap accepts a `String` through
-`after_help(..)` if the derive's `&'static str` is replaced by a builder hook
-or a `LazyLock`).
-
-## CON-005 - Which providers auto-resume, and on which deaths?
-
-Reported by: orchestration.
-
-`app::after_run` hard-codes `provider_name == "codex"` twice, and
-`RESUME_NUDGE` is codex wording in `app`. The comment says only codex
-auto-resumes, so only codex has one to withhold. Whether a death class is
-resumable rests on codex's mid-turn wedge: provider knowledge living in
-orchestration. Owner proposed: a capability on the provider plus a `Died`
-outcome variant, so `after_run` needs no provider name.
+`provider::effective_sandbox` is now the single answer for what is recorded
+and advertised (`review config` asks it), and the `man` sandbox test requires
+one column per provider. The runners still choose their own default
+independently: `run_codex`'s `sandbox.unwrap_or("read-only")` and
+`codex_sandbox_args`'s `!= "read-only"`, and `run_grok_turn`'s
+`(None, true) => read-only`. Nothing ties them to `effective_sandbox`. This
+closes with the sandbox-level and permission-plan types in
+`notes/structural.md`, where the launch resolves the level once and the
+runners receive it.
 
 ## CON-006 - Did this run produce an answer?
 
@@ -473,7 +357,9 @@ Sites:
 
 The config hunter reads a subtle disagreement between the `Profile` doc and
 what the code grants for grok. Owner proposed: a permission plan built once
-per launch, with `derives` coming from the capability table.
+per launch. `derives` is now an exhaustive `match provider` in `invoke`, not
+a flag: grok's answer depends on fresh vs resume, so it cannot be a static
+per-provider fact.
 
 ## CON-020 - Which sandbox names are `review`'s levels?
 

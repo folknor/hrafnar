@@ -228,7 +228,12 @@ fn write_marker(path: &Path, marker: &Marker) -> std::io::Result<()> {
 /// marker when dropped; a `Guard(None)` on any failure, so a broken data dir
 /// silently degrades to the old no-visibility behaviour instead of failing the
 /// run.
-pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&Path>) -> Guard {
+pub fn mark(
+    session_id: &str,
+    provider: crate::provider::Provider,
+    project: &str,
+    data_root: Option<&Path>,
+) -> Guard {
     // Refuse to build a path out of anything that is not plainly a session id.
     // Skipping the marker only costs liveness reporting for that run; letting it
     // through would let a crafted resume id write and delete an arbitrary
@@ -248,7 +253,7 @@ pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&
     let path = dir.join(format!("{session_id}.json"));
     let marker = Marker {
         session_id: session_id.to_string(),
-        provider: provider.to_string(),
+        provider: provider.as_str().to_string(),
         project: project.to_string(),
         started_epoch: crate::provider::now_epoch_secs(),
         pid: std::process::id(),
@@ -537,7 +542,7 @@ mod tests {
     fn a_run_does_not_delete_a_marker_another_run_has_taken_over() {
         let root = scratch_root();
         let sid = "019fefb0-227c-7c83-a398-380011b8e66b";
-        let first = mark(sid, "claude", "/p", Some(&root));
+        let first = mark(sid, crate::provider::Provider::Claude, "/p", Some(&root));
         // A second run of the same session writes the same path - here from
         // the same `review` in the same second, so only the run id differs.
         let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
@@ -562,7 +567,12 @@ mod tests {
         );
         // A marker that is still ours is removed as before.
         std::fs::remove_file(&path).expect("clear");
-        drop(mark(sid, "claude", "/p", Some(&root)));
+        drop(mark(
+            sid,
+            crate::provider::Provider::Claude,
+            "/p",
+            Some(&root),
+        ));
         assert!(!path.exists(), "our own marker goes when the run does");
         let _ = std::fs::remove_dir_all(&root);
     }

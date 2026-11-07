@@ -22,11 +22,12 @@ static UNRECORDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 pub struct Unrecorded(());
 
 impl Unrecorded {
-    /// A guard for a run of `provider`; only codex and claude runs are waited
-    /// for, since only their turns can be ended in a way that leaves them
-    /// resumable (both answer `SIGINT` by closing the turn).
-    pub fn for_provider(provider: &str) -> Option<Self> {
-        matches!(provider, "codex" | "claude").then(|| {
+    /// A guard for a run of `provider`; only interruptible providers' runs are
+    /// waited for, since only their turns can be ended in a way that leaves
+    /// them resumable (`Provider::interruptible`, the answer `review interrupt`
+    /// reads too).
+    pub fn for_provider(provider: super::Provider) -> Option<Self> {
+        provider.interruptible().then(|| {
             UNRECORDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Self(())
         })

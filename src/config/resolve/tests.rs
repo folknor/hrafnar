@@ -23,7 +23,7 @@ mod layering {
     }
 
     fn entry<'a>(cfg: &'a ReviewConfig, provider: &str, profile: &str) -> &'a ProfileEntry {
-        &cfg.profiles[provider][profile]
+        &cfg.profiles[&provider.parse::<Provider>().unwrap()][profile]
     }
 
     // ---- profiles -------------------------------------------------------
@@ -54,7 +54,7 @@ mod layering {
             "h",
         )
         .unwrap();
-        let p = cfg.resolve_profile("codex", "deep").unwrap();
+        let p = cfg.resolve_profile(Provider::Codex, "deep").unwrap();
         assert_eq!(p.model.as_deref(), Some("local-model"));
         assert_eq!(p.effort, None);
         assert_eq!(p.sandbox, None);
@@ -159,7 +159,7 @@ model = \"global-host\"
             "h",
         )
         .unwrap();
-        assert!(cfg.resolve_profile("codex", "deep").is_none());
+        assert!(cfg.resolve_profile(Provider::Codex, "deep").is_none());
     }
 
     #[test]
@@ -174,14 +174,14 @@ model = \"global-host\"
         )
         .unwrap();
         assert_eq!(
-            cfg.resolve_profile("codex", "deep")
+            cfg.resolve_profile(Provider::Codex, "deep")
                 .unwrap()
                 .model
                 .as_deref(),
             Some("l")
         );
         assert_eq!(
-            cfg.resolve_profile("codex", "fast")
+            cfg.resolve_profile(Provider::Codex, "fast")
                 .unwrap()
                 .model
                 .as_deref(),
@@ -212,7 +212,7 @@ model = \"global-host\"
         for host in ["a", "b.c", "plantasjen"] {
             let cfg = layered("", g, host).unwrap();
             assert_eq!(
-                cfg.resolve_profile("grok", "deep")
+                cfg.resolve_profile(Provider::Grok, "deep")
                     .unwrap()
                     .model
                     .as_deref(),
@@ -421,7 +421,7 @@ model = \"global-host\"
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &["grok".to_string()]);
+        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Grok]);
         let p = cfg.providers.as_ref().unwrap();
         assert_eq!(p.layer, Layer::Local);
         assert_eq!(p.table, "[_defaults]");
@@ -437,7 +437,7 @@ model = \"global-host\"
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &[] as &[String]);
+        assert_eq!(cfg.default_providers().unwrap(), &[] as &[Provider]);
         assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Local);
     }
 
@@ -451,7 +451,7 @@ model = \"global-host\"
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &["codex".to_string()]);
+        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Codex]);
         assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Global);
         // 0 means "disabled", which is a setting, not an absence.
         assert_eq!(cfg.stall_timeout_secs(), Some(0));
@@ -463,7 +463,7 @@ model = \"global-host\"
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &["claude".to_string()]);
+        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Claude]);
         assert_eq!(cfg.stall_timeout_secs(), Some(600));
         let s = cfg.stall_timeout_secs.as_ref().unwrap();
         assert_eq!(s.layer, Layer::Global);

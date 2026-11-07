@@ -1,12 +1,14 @@
 mod claude;
 mod codex;
 mod grok;
+mod kind;
 mod output;
 mod result;
 mod runtime;
 
 pub use claude::run_claude;
 pub use codex::run_codex_json;
+pub use kind::{Provider, UnknownProvider};
 pub use output::{print_result, resume_hint};
 pub use result::{Digest, DigestSummary, ProviderResult, RunOutput, Served, Usage, now_epoch_secs};
 pub use runtime::{
@@ -29,8 +31,28 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 /// Check whether a provider binary is available on PATH.
-pub fn is_available(provider: &str) -> bool {
-    which::which(provider).is_ok()
+pub fn is_available(provider: Provider) -> bool {
+    which::which(provider.binary()).is_ok()
+}
+
+/// The continuation to send when a fresh run of `r`'s provider ended in a way
+/// that provider recovers from by resuming once, or `None`.
+///
+/// Whether a no-answer outcome is a recoverable death is the adapter's reading
+/// of its own failure evidence, so it is asked here rather than decided by
+/// orchestration from the provider's name. It must stay a pure reading of the
+/// result. The vetoes every provider shares stay in `app::launch::after_run`:
+/// an interrupted run and a stated failure are settled before this is asked;
+/// an unclean teardown and a missing session id are checked after, because
+/// they only withhold a resume this function asked for, and reporting a
+/// withheld resume for a provider that never resumes would be false.
+pub fn recovery(r: &ProviderResult) -> Option<&'static str> {
+    match r.provider {
+        Provider::Codex => codex::recovery(r),
+        // A claude or grok turn that ends without an answer says why, or was
+        // killed; neither has codex's mid-turn wedge for a resume to finish.
+        Provider::Claude | Provider::Grok => None,
+    }
 }
 
 /// Create a fresh, exclusively-owned temp file for codex's `-o` output and
@@ -201,7 +223,7 @@ pub type LaunchSignal = tokio::sync::oneshot::Sender<()>;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
-    provider: &str,
+    provider: Provider,
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
@@ -221,18 +243,20 @@ pub async fn invoke(
     // their own native value.
     let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
     let sandbox = sandbox.as_deref();
-    let grok_write = if provider == "grok" {
-        grok::grok_write_launch(oneshot, sandbox)
-    } else {
-        None
+    let grok_write = match provider {
+        Provider::Grok => grok::grok_write_launch(oneshot, sandbox),
+        Provider::Claude | Provider::Codex => None,
     };
     // Roots are *derived* for a codex write run and a fresh grok write run. A
     // resumed grok session under a `review-ws-*` profile instead takes the roots
     // recorded with it, verbatim: the profile name is fixed for the session's
     // life (grok refuses to switch it) and names exactly one root set, so
     // re-deriving on another host would describe a different profile.
-    let derives = grok_write == Some(grok::GrokWrite::Fresh)
-        || (provider == "codex" && sandbox == Some("workspace-write"));
+    let derives = match provider {
+        Provider::Grok => grok_write == Some(grok::GrokWrite::Fresh),
+        Provider::Codex => sandbox == Some("workspace-write"),
+        Provider::Claude => false,
+    };
     let resumes_profile = matches!(grok_write, Some(grok::GrokWrite::Resume(_)));
 
     // Derived here rather than inside the runners so the same values that
@@ -282,10 +306,13 @@ pub async fn invoke(
     // logged with the derived roots, and one overriding to `[]` would be logged
     // as widened when it was not.
     // `config` is codex `-c` only; grok never sees it.
-    if provider == "codex"
-        && let Some(overridden) = config_writable_roots_override(config)
-    {
-        root_paths = overridden;
+    match provider {
+        Provider::Codex => {
+            if let Some(overridden) = config_writable_roots_override(config) {
+                root_paths = overridden;
+            }
+        }
+        Provider::Claude | Provider::Grok => {}
     }
 
     // A grok write run needs grok's own config ready before it launches, or it
@@ -353,14 +380,14 @@ pub async fn invoke(
 
     let sandbox = grok_profile.as_deref().or(sandbox);
 
-    let result = match (provider, setup) {
-        (_, Err(e)) => Err(e),
-        (provider, Ok(())) => match provider {
+    let result = match setup {
+        Err(e) => Err(e),
+        Ok(()) => match provider {
             // `sandbox` is an OS filesystem sandbox, which codex and grok both have
             // and claude does not: claude's `--permission-mode` is a tool-approval
             // policy on a different axis with no honest mapping, so claude ignores
             // it. `config` (codex `-c`) stays codex-only.
-            "claude" => {
+            Provider::Claude => {
                 run_claude(
                     session_id,
                     model,
@@ -374,7 +401,7 @@ pub async fn invoke(
                 )
                 .await
             }
-            "grok" => {
+            Provider::Grok => {
                 run_grok(
                     session_id,
                     model,
@@ -390,7 +417,7 @@ pub async fn invoke(
                 )
                 .await
             }
-            "codex" => {
+            Provider::Codex => {
                 run_codex(
                     session_id,
                     model,
@@ -407,7 +434,6 @@ pub async fn invoke(
                 )
                 .await
             }
-            other => Err(anyhow::anyhow!("unknown provider: {other}")),
         },
     };
     // Record a trust grant only if it actually landed. Grok reports a refused or
@@ -429,7 +455,7 @@ pub async fn invoke(
     let completed_epoch = now_epoch_secs();
     match result {
         Ok(run) => ProviderResult {
-            provider: provider.to_string(),
+            provider,
             output: Ok(run.text),
             session_id: run.session_id,
             codex_home: run.codex_home,
@@ -444,7 +470,7 @@ pub async fn invoke(
             leftovers: run.leftovers,
         },
         Err(e) => ProviderResult {
-            provider: provider.to_string(),
+            provider,
             output: Err(e),
             session_id: None,
             codex_home: None,
@@ -478,7 +504,7 @@ pub async fn invoke(
 /// effective one, so the two could disagree with nothing failing. A pure
 /// function over both sets is the only shape that can be tested.
 fn announcement_lines(
-    provider: &str,
+    provider: Provider,
     other: &str,
     granted_roots: &[crate::writable_roots::GrantedRoot],
     root_paths: &[String],
@@ -546,12 +572,16 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// session's record carries no level to inherit (a row written before levels
 /// were recorded). Claude has no filesystem sandbox on this axis, so it records
 /// none.
+///
+/// This is also the one place that says what an omitted level means for a
+/// provider: `review config` asks it (with `None`) rather than restating a
+/// default, so the advertised default cannot drift from the recorded one.
 // Keep the native selector here for launch and resume. `sessions::record`
 // normalizes the query field and saves this selector separately.
-pub(crate) fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
+pub(crate) fn effective_sandbox(provider: Provider, sandbox: Option<&str>) -> Option<String> {
     match provider {
-        "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
-        _ => None,
+        Provider::Codex | Provider::Grok => Some(sandbox.unwrap_or("read-only").to_string()),
+        Provider::Claude => None,
     }
 }
 
@@ -585,11 +615,25 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Normalize known Grok sandbox names for persisted queries, retaining custom
 /// names verbatim. The native name must also be saved for exact session resume.
-pub(crate) fn recorded_sandbox<'a>(provider: &str, sandbox: Option<&'a str>) -> Option<&'a str> {
-    match (provider, sandbox) {
-        ("grok", Some("workspace")) => Some("workspace-write"),
-        ("grok", Some("none")) => Some("danger-full-access"),
-        ("grok", Some(name)) if grok::is_generated_profile_name(name) => Some("workspace-write"),
-        _ => sandbox,
+pub(crate) fn recorded_sandbox(provider: Provider, sandbox: Option<&str>) -> Option<&str> {
+    match provider {
+        Provider::Grok => match sandbox {
+            Some("workspace") => Some("workspace-write"),
+            Some("none") => Some("danger-full-access"),
+            Some(name) if grok::is_generated_profile_name(name) => Some("workspace-write"),
+            _ => sandbox,
+        },
+        Provider::Claude | Provider::Codex => sandbox,
+    }
+}
+
+/// The provider's native sandbox selector, saved beside the normalized level
+/// so a resume can pass it back verbatim. Only grok's differs from the level:
+/// a grok session cannot change profiles, and its `review-ws-*` names do not
+/// round-trip through `review`'s vocabulary.
+pub(crate) fn native_sandbox_to_record(provider: Provider, sandbox: Option<&str>) -> Option<&str> {
+    match provider {
+        Provider::Grok => sandbox,
+        Provider::Claude | Provider::Codex => None,
     }
 }

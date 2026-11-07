@@ -148,7 +148,7 @@ what its tools started, prints the result and exits 128+signal; a second exits
 at once; a signal ignored by the parent stays ignored. A cancelled run reports
 `stop_reason` Cancelled with `is_error: true`, and the session persists.
 
-So maki joins `interrupt_cmd::interruptible`, and the keeper forwards SIGINT
+So `Provider::Maki.interruptible()` is true, and the keeper forwards SIGINT
 as for claude. To confirm by probe: when the handler is installed relative to
 the init event (claude's rule is that a signal before init kills it with
 nothing printed), and that SIGTERM also prints a result (claude's does not).
@@ -159,12 +159,15 @@ defence.
 
 ## Config and wiring
 
-- `KNOWN_PROVIDERS` gains `maki`; `review config` reports whether it is on
-  `PATH`.
+- `Provider` (src/provider/kind.rs) gains `Maki`; the compiler then lists
+  every exhaustive match that must decide for it (dispatch in `invoke`,
+  `effective_sandbox`, `sandbox_for`, `recorded_sandbox`, inheritance,
+  `recovery`, the cutoff). Help text, `review config` and the `man` tables
+  follow from the enum; the `man` sandbox table needs a maki column.
 - Profiles: `[maki.<profile>]` with `model` (`provider/model-id`), `env`,
   `comment`. `sandbox` and `writable_roots` warn as ignored, as for claude.
   `effort` refused until the upstream patch lands (see above).
-- `timings::stale_session` for maki: open. The cache lifetime depends on the
+- `Provider::stale_cutoff` for maki: open. The cache lifetime depends on the
   backend (DeepSeek, Kimi and GLM each differ, and maki sends no cache hints on
   the OpenAI-compatible path, relying on provider-side prefix caching). Start
   at the non-codex 55 minutes and measure.
@@ -212,8 +215,8 @@ defence.
 2. Send the three upstream patches.
 3. `run_maki` with its own builder and result parsing, sharing what it can
    with `run_claude`.
-4. Wiring: `KNOWN_PROVIDERS`, `interruptible`, `sandbox_for`, config
-   validation for `effort`, `review config`.
+4. Wiring: the `Provider::Maki` variant and every match the compiler names,
+   config validation for `effort`.
 5. Stub tests in `tests/provider_runs.rs` mirroring claude's: interrupt,
    answer beating it, stop before and after init, death after start,
    `is_error` with exit 0.

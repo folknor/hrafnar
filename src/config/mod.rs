@@ -16,8 +16,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub use crate::provider::Provider;
+
 const CONFIG_FILENAME: &str = ".review.toml";
-pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
 
 /// Names that can't be archetypes or groups: `all`, the `-a` keyword for every
 /// configured archetype except `bare`, and the subcommand names. `-a` itself
@@ -78,7 +79,7 @@ pub struct AuditConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultsConfig {
     /// The provider list used when `--provider` is omitted.
-    pub providers: Option<Vec<String>>,
+    pub providers: Option<Vec<Provider>>,
     /// Seconds of rollout silence, with no final answer written, after which a
     /// codex run is treated as stalled: killed, bundled, and reported as a
     /// failure. `0` disables the check; omitted uses the built-in default
@@ -134,7 +135,7 @@ pub struct Profile {
 }
 
 /// provider -> profile name -> profile.
-type ProfileTables = BTreeMap<String, BTreeMap<String, Profile>>;
+type ProfileTables = BTreeMap<Provider, BTreeMap<String, Profile>>;
 
 /// One config file, parsed and checked on its own but not yet resolved against
 /// the other layer.
@@ -206,10 +207,10 @@ pub struct ReviewConfig {
     pub groups: BTreeMap<String, Sourced<Vec<String>>>,
     /// Always the project's: an audit id identifies a project.
     pub audit: AuditConfig,
-    pub providers: Option<Sourced<Vec<String>>>,
+    pub providers: Option<Sourced<Vec<Provider>>>,
     pub stall_timeout_secs: Option<Sourced<u64>>,
     /// provider -> profile name -> entry.
-    pub profiles: BTreeMap<String, BTreeMap<String, ProfileEntry>>,
+    pub profiles: BTreeMap<Provider, BTreeMap<String, ProfileEntry>>,
     pub hostname: String,
     pub files: ConfigFiles,
     /// This host's `[_projects.<host>]` registry, name -> path as written.
@@ -218,9 +219,9 @@ pub struct ReviewConfig {
 
 impl ReviewConfig {
     /// The effective profile for `provider`, if any layer defines it.
-    pub fn resolve_profile(&self, provider: &str, profile: &str) -> Option<&Profile> {
+    pub fn resolve_profile(&self, provider: Provider, profile: &str) -> Option<&Profile> {
         self.profiles
-            .get(provider)?
+            .get(&provider)?
             .get(profile)
             .map(|e| &e.effective.profile)
     }
@@ -230,7 +231,7 @@ impl ReviewConfig {
     /// app does not need to restate the config resolver's search rules.
     pub(crate) fn require_profile(
         &self,
-        provider: &str,
+        provider: Provider,
         profile: &str,
     ) -> anyhow::Result<&Profile> {
         self.resolve_profile(provider, profile).ok_or_else(|| {
@@ -267,7 +268,7 @@ impl ReviewConfig {
         self.archetypes.get(name).map(|s| s.value.as_str())
     }
 
-    pub fn default_providers(&self) -> Option<&[String]> {
+    pub fn default_providers(&self) -> Option<&[Provider]> {
         self.providers.as_ref().map(|s| s.value.as_slice())
     }
 

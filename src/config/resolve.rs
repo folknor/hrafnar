@@ -1,5 +1,6 @@
 use super::{
-    ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, ReviewConfig, Sourced, toml_key,
+    ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, Provider, ReviewConfig, Sourced,
+    toml_key,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -23,9 +24,9 @@ pub fn resolve(
 
     let mut archetypes: BTreeMap<String, Sourced<String>> = BTreeMap::new();
     let mut groups: BTreeMap<String, Sourced<Vec<String>>> = BTreeMap::new();
-    let mut providers: Option<Sourced<Vec<String>>> = None;
+    let mut providers: Option<Sourced<Vec<Provider>>> = None;
     let mut stall_timeout_secs: Option<Sourced<u64>> = None;
-    let mut defs: BTreeMap<String, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
+    let mut defs: BTreeMap<Provider, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
 
     for (layer, mut file) in layers {
@@ -76,7 +77,7 @@ pub fn resolve(
             for (prov, profiles) in host_tables {
                 for (name, profile) in profiles {
                     let table = format!("[{}.{prov}.{name}]", toml_key(hostname));
-                    defs.entry(prov.clone())
+                    defs.entry(prov)
                         .or_default()
                         .entry(name)
                         .or_default()
@@ -92,7 +93,7 @@ pub fn resolve(
         for (prov, profiles) in file.profiles {
             for (name, profile) in profiles {
                 let table = format!("[{prov}.{name}]");
-                defs.entry(prov.clone())
+                defs.entry(prov)
                     .or_default()
                     .entry(name)
                     .or_default()

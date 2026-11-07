@@ -1,5 +1,21 @@
 use super::*;
 
+/// Nudge sent when auto-resuming a codex run that died without a final answer.
+const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
+Continue from exactly where you left off and produce your complete final response now.";
+
+/// Codex's recovery from its mid-turn wedge: a run that ended with no real
+/// final answer - no `-o` capture and nothing recovered from the rollout - is
+/// resumed once with a nudge, cache still warm. A manual resume is what rescued
+/// the original death of this kind; a run that captured or recovered an answer
+/// is not retried. See `provider::recovery` for the vetoes applied before this.
+pub(super) fn recovery(r: &ProviderResult) -> Option<&'static str> {
+    r.digest
+        .as_ref()
+        .is_some_and(|d| !d.captured && !d.recovered_from_transcript)
+        .then_some(RESUME_NUDGE)
+}
+
 /// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
 /// the NDJSON for the `thread.started` event and publish the session id on
 /// `sid_tx` the moment it appears.
@@ -481,7 +497,7 @@ pub async fn run_codex_json(
     let early_marker = known_session_id.as_deref().map(|sid| {
         crate::inflight::mark(
             sid,
-            "codex",
+            Provider::Codex,
             &project_root.to_string_lossy(),
             runtime.data_root.as_deref(),
         )
@@ -574,8 +590,12 @@ pub async fn run_codex_json(
                             return;
                         }
                     };
-                    let mut guard =
-                        crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
+                    let mut guard = crate::inflight::mark(
+                        &sid,
+                        Provider::Codex,
+                        &project,
+                        data_root.as_deref(),
+                    );
                     guard.record_keeper(keeper_pid);
                     guard
                 }

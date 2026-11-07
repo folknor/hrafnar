@@ -17,14 +17,15 @@
 //! availability map), so it is testable without `PATH` or files; `run` only
 //! loads, probes and prints.
 
-use crate::config::{self, KNOWN_PROVIDERS, Profile, ProfileDef, ProfileEntry, ReviewConfig};
+use crate::config::{self, Profile, ProfileDef, ProfileEntry, Provider, ReviewConfig};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// provider name -> whether its binary is on `PATH` on this host.
-pub type Availability = BTreeMap<String, bool>;
+/// Whether a provider's binary is on `PATH` on this host. A function rather
+/// than a map, so no provider can be missing from it and read as absent.
+pub type Availability<'a> = &'a dyn Fn(Provider) -> bool;
 
 /// How much of an archetype's first prompt line the human view shows.
 const PRIME_PREVIEW_CHARS: usize = 72;
@@ -34,20 +35,15 @@ const PRIME_PREVIEW_CHARS: usize = 72;
 /// it has picked a project.
 pub fn run(sel: &config::Selection) -> Result<()> {
     let (cfg, project_root) = config::load_optional(sel)?;
-    let avail = probe_availability();
-    print!("{}", render_text(&cfg, project_root.as_deref(), &avail));
+    print!(
+        "{}",
+        render_text(
+            &cfg,
+            project_root.as_deref(),
+            &crate::provider::is_available
+        )
+    );
     Ok(())
-}
-
-fn probe_availability() -> Availability {
-    KNOWN_PROVIDERS
-        .iter()
-        .map(|p| ((*p).to_string(), crate::provider::is_available(p)))
-        .collect()
-}
-
-fn installed(avail: &Availability, provider: &str) -> bool {
-    avail.get(provider).copied().unwrap_or(false)
 }
 
 /// Env var *names* only - values can carry secrets.
@@ -59,11 +55,7 @@ fn env_keys(p: &Profile) -> Vec<&str> {
 }
 
 /// The terminal view: compact, no colours, one block per section.
-pub fn render_text(
-    cfg: &ReviewConfig,
-    project_root: Option<&Path>,
-    avail: &Availability,
-) -> String {
+pub fn render_text(cfg: &ReviewConfig, project_root: Option<&Path>, avail: Availability) -> String {
     let mut out = String::new();
     // Writing into a `String` cannot fail; the `fmt::Result` plumbing exists
     // only so the body can use `?` instead of discarding each `writeln!`.
@@ -75,7 +67,7 @@ fn write_text(
     out: &mut String,
     cfg: &ReviewConfig,
     project_root: Option<&Path>,
-    avail: &Availability,
+    avail: Availability,
 ) -> std::fmt::Result {
     writeln!(out, "files:")?;
     match cfg.files.local {
@@ -120,20 +112,29 @@ fn write_text(
             if s.value.is_empty() {
                 "(empty list)".to_string()
             } else {
-                s.value.join(", ")
+                s.value
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             },
             source(s.layer.as_str(), &s.table, None)
         )?,
         None => writeln!(out, "  default: none set (a run needs --provider)")?,
     }
-    let pw = KNOWN_PROVIDERS.iter().map(|p| p.len()).max().unwrap_or(0);
+    let pw = Provider::all()
+        .iter()
+        .map(|p| p.as_str().len())
+        .max()
+        .unwrap_or(0);
     let mut missing_defaults = Vec::new();
-    for provider in KNOWN_PROVIDERS {
-        let is_default = defaults.iter().any(|d| d == provider);
-        let ok = installed(avail, provider);
+    for &provider in Provider::all() {
+        let is_default = defaults.contains(&provider);
+        let ok = avail(provider);
         if is_default && !ok {
-            missing_defaults.push(*provider);
+            missing_defaults.push(provider);
         }
+        let provider = provider.as_str();
         let status = if ok { "installed" } else { "NOT INSTALLED" };
         let mark = if is_default { "  default" } else { "" };
         let line = format!("  {provider:<pw$}  {status:<13}{mark}");
@@ -188,7 +189,7 @@ fn write_text(
         }
         writeln!(out, "  {provider}:")?;
         for (name, entry) in by_name {
-            write_profile(out, provider, name, entry)?;
+            write_profile(out, *provider, name, entry)?;
         }
     }
 
@@ -207,19 +208,25 @@ fn write_text(
     // the tool, and an orchestrating agent told to "interrupt the agent" will
     // otherwise stop its own background task - killing `review`, not the turn.
     writeln!(out)?;
-    writeln!(out, "{STEERING}")?;
+    writeln!(out, "{}", steering())?;
     Ok(())
 }
 
-const STEERING: &str = "\
-steering a running agent:
-  echo \"<new info>\" | review message <ID>   ends a codex or claude turn in flight, then sends the message
+/// The interruptible providers are named from `Provider::interruptible`, so a
+/// new one appears here when its runner can be interrupted, and not before.
+fn steering() -> String {
+    format!(
+        "steering a running agent:
+  echo \"<new info>\" | review message <ID>   ends a {} turn in flight, then sends the message
   review interrupt <ID>                     ends the turn without a message
-  Do not stop or kill the `review` process to interrupt an agent.";
+  Do not stop or kill the `review` process to interrupt an agent.",
+        Provider::interruptible_names()
+    )
+}
 
 fn write_profile(
     out: &mut String,
-    provider: &str,
+    provider: Provider,
     name: &str,
     entry: &ProfileEntry,
 ) -> std::fmt::Result {
@@ -269,7 +276,7 @@ fn source(layer: &str, table: &str, host: Option<&str>) -> String {
     }
 }
 
-fn settings(provider: &str, p: &Profile) -> String {
+fn settings(provider: Provider, p: &Profile) -> String {
     format!(
         "model {}, effort {}, sandbox {}",
         p.model.as_deref().unwrap_or("unset"),
@@ -281,12 +288,15 @@ fn settings(provider: &str, p: &Profile) -> String {
 /// The human view says what an unset sandbox *means* for the provider, because
 /// "unset" alone invites the wrong guess: codex and grok runners default to
 /// read-only, while claude has no filesystem sandbox on this axis at all.
-fn sandbox_text(provider: &str, sandbox: Option<&str>) -> String {
-    match (provider, sandbox) {
-        ("claude", Some(s)) => format!("{s} (ignored by claude)"),
-        ("claude", None) => "n/a (claude ignores sandbox)".to_string(),
-        (_, Some(s)) => s.to_string(),
-        (_, None) => "unset (runner default: read-only)".to_string(),
+///
+/// Both answers come from `provider::effective_sandbox`, the function that
+/// decides what a run records, so the advertised default is the recorded one.
+fn sandbox_text(provider: Provider, sandbox: Option<&str>) -> String {
+    match (crate::provider::effective_sandbox(provider, None), sandbox) {
+        (None, Some(s)) => format!("{s} (ignored by {provider})"),
+        (None, None) => format!("n/a ({provider} ignores sandbox)"),
+        (Some(_), Some(s)) => s.to_string(),
+        (Some(default), None) => format!("unset (runner default: {default})"),
     }
 }
 
@@ -358,11 +368,12 @@ model = \"opus\"
         resolve(local, Some(global), "host").unwrap()
     }
 
-    fn avail(codex: bool) -> Availability {
-        [("claude", true), ("codex", codex), ("grok", false)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect()
+    fn avail(codex: bool) -> impl Fn(Provider) -> bool {
+        move |p| match p {
+            Provider::Claude => true,
+            Provider::Codex => codex,
+            Provider::Grok => false,
+        }
     }
 
     fn text(avail_codex: bool) -> String {

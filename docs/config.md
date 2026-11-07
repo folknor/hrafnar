@@ -66,7 +66,10 @@ bz = "~/Programs/bz"
   `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
 - Any other top-level table is a profile table, `[<provider>.<profile>]`, or a
-  legacy host-scoped one, `[<host>.<provider>.<profile>]`.
+  legacy host-scoped one, `[<host>.<provider>.<profile>]`. A table named after
+  a provider that would also be a valid legacy host table (a host named like a
+  provider, or a profile named like one) is an error rather than a guess:
+  rename the profile, or move that host's profiles to hostless tables.
 
 ## How the two files combine
 

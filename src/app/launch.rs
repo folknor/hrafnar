@@ -2,11 +2,7 @@
 
 use crate::{audit, provider, sessions};
 
-/// Nudge sent when auto-resuming a codex run that died without a final answer.
-const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
-Continue from exactly where you left off and produce your complete final response now.";
-
-/// A codex run that ended with no real final answer - no `-o` capture and
+/// A run that ended with no real final answer - no `-o` capture and
 /// nothing recovered from the rollout. This is the death worth resuming past;
 /// a run that captured or recovered an answer is not retried.
 fn died_without_answer(r: &provider::ProviderResult) -> bool {
@@ -59,7 +55,7 @@ fn record_run(
         private,
         audit_id,
         archetype,
-        &result.provider,
+        result.provider.as_str(),
         session_for_log,
         prompt,
         &result.output,
@@ -72,7 +68,7 @@ fn record_run(
             private,
             audit_id,
             archetype,
-            &result.provider,
+            result.provider,
             sid,
             kind,
             result.completed_epoch,
@@ -130,7 +126,7 @@ impl RecordCtx {
 
 /// One provider launch in the fan-out, with its resolved profile.
 pub(super) struct Launch {
-    pub(super) provider: String,
+    pub(super) provider: provider::Provider,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
     pub(super) sandbox: Option<String>,
@@ -149,7 +145,7 @@ impl Launch {
     /// included - or the retry launches narrower than the run it replaces.
     async fn invoke(&self, session: &str, prompt: &str) -> provider::ProviderResult {
         provider::invoke(
-            &self.provider,
+            self.provider,
             session,
             self.model.as_deref(),
             self.effort.as_deref(),
@@ -193,31 +189,40 @@ enum AfterRun {
     /// Its teardown left processes running, or could not say: a resume would
     /// run beside processes that may still hold the session or edit the tree.
     LeftRunning,
-    /// A codex mid-turn death: resume this session once, cache still warm.
-    AutoResume(String),
+    /// A death its provider recovers from (`provider::recovery`): resume this
+    /// session once with the given nudge, cache still warm.
+    AutoResume {
+        session: String,
+        nudge: &'static str,
+    },
 }
 
-/// The "work around" for codex mid-turn deaths: a run that ended with no real
-/// final answer gets one immediate resume with a nudge, on the same profile. A
-/// manual resume is what rescued the original Death 2. Only a run that produced
-/// nothing is a candidate at all; of those, an interrupted one and one with a
-/// stated reason are left alone.
-fn after_run(provider_name: &str, first: &provider::ProviderResult) -> AfterRun {
+/// Whether to auto-resume a fresh run that has just ended, on the same
+/// profile. Whether an outcome is a recoverable death at all is the provider
+/// adapter's reading (`provider::recovery`; today only codex's mid-turn wedge
+/// qualifies). The vetoes here hold for every provider and are applied first:
+/// an interrupted run, a stated reason for producing nothing, and a teardown
+/// that left processes running are left alone.
+fn after_run(first: &provider::ProviderResult) -> AfterRun {
     if first.digest.as_ref().is_some_and(|d| d.interrupted) {
         return AfterRun::Interrupted;
     }
     if let Some(why) = stated_failure(first).filter(|_| died_without_answer(first)) {
         return AfterRun::StatedFailure(why.to_string());
     }
-    // Only codex auto-resumes, so only codex has one to withhold.
-    if provider_name == "codex" && died_without_answer(first) && !first.leftovers.is_clean() {
+    let Some(nudge) = provider::recovery(first) else {
+        return AfterRun::Report;
+    };
+    // Only a run its provider would resume has a resume to withhold.
+    if !first.leftovers.is_clean() {
         return AfterRun::LeftRunning;
     }
     match &first.session_id {
-        Some(sid) if provider_name == "codex" && died_without_answer(first) => {
-            AfterRun::AutoResume(sid.clone())
-        }
-        _ => AfterRun::Report,
+        Some(sid) => AfterRun::AutoResume {
+            session: sid.clone(),
+            nudge,
+        },
+        None => AfterRun::Report,
     }
 }
 
@@ -270,13 +275,13 @@ fn after_auto_resume(
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
     // Held until the rows below are written, so a signalled `review` does not
     // exit with this session unrecorded (see `provider::install_signal_supervisor`).
-    let _unrecorded = provider::Unrecorded::for_provider(&launch.provider);
+    let _unrecorded = provider::Unrecorded::for_provider(launch.provider);
     if !launch.delay.is_zero() {
         tokio::time::sleep(launch.delay).await;
     }
-    let prov = &launch.provider;
+    let prov = launch.provider;
     let first = launch.invoke("", &launch.prompt).await;
-    let outcome = match after_run(prov, &first) {
+    let outcome = match after_run(&first) {
         AfterRun::Report => TaskOutcome {
             result: first,
             also: None,
@@ -314,9 +319,12 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
                 also_kind: None,
             }
         }
-        AfterRun::AutoResume(sid) => {
-            eprintln!("codex session {sid} died without a final answer - auto-resuming once");
-            let second = launch.invoke(&sid, RESUME_NUDGE).await;
+        AfterRun::AutoResume {
+            session: sid,
+            nudge,
+        } => {
+            eprintln!("{prov} session {sid} died without a final answer - auto-resuming once");
+            let second = launch.invoke(&sid, nudge).await;
             after_auto_resume(first, second)
         }
     };
@@ -366,7 +374,7 @@ mod tests {
     /// a final answer; `interrupted` whether `review interrupt` ended it.
     fn codex_run(sid: &str, answered: bool, interrupted: bool) -> provider::ProviderResult {
         provider::ProviderResult {
-            provider: "codex".into(),
+            provider: provider::Provider::Codex,
             output: Ok(format!("text of {sid}")),
             session_id: Some(sid.into()),
             codex_home: None,
@@ -398,12 +406,29 @@ mod tests {
         }
     }
 
+    fn auto_resume(sid: &str) -> AfterRun {
+        let nudge = provider::recovery(&codex_run(sid, false, false)).expect("codex recovers");
+        AfterRun::AutoResume {
+            session: sid.into(),
+            nudge,
+        }
+    }
+
+    #[test]
+    fn only_a_provider_that_recovers_is_auto_resumed() {
+        // The same dead outcome on claude is reported as it is: claude has no
+        // mid-turn wedge for a resume to finish.
+        let mut claude = codex_run("s", false, false);
+        claude.provider = provider::Provider::Claude;
+        assert_eq!(after_run(&claude), AfterRun::Report);
+        // And a claude death with leftovers has no resume to withhold.
+        claude.leftovers.unknown = Some("keeper died".into());
+        assert_eq!(after_run(&claude), AfterRun::Report);
+    }
+
     #[test]
     fn a_codex_death_is_auto_resumed() {
-        assert_eq!(
-            after_run("codex", &codex_run("s", false, false)),
-            AfterRun::AutoResume("s".into())
-        );
+        assert_eq!(after_run(&codex_run("s", false, false)), auto_resume("s"));
     }
 
     #[test]
@@ -414,10 +439,10 @@ mod tests {
             cmdline: "python3 loop.py".into(),
             truncated: false,
         });
-        assert_eq!(after_run("codex", &dead), AfterRun::LeftRunning);
+        assert_eq!(after_run(&dead), AfterRun::LeftRunning);
         let mut unknown = codex_run("s", false, false);
         unknown.leftovers.unknown = Some("keeper died".into());
-        assert_eq!(after_run("codex", &unknown), AfterRun::LeftRunning);
+        assert_eq!(after_run(&unknown), AfterRun::LeftRunning);
         // Cleanly killed leftovers change nothing.
         let mut killed = codex_run("s", false, false);
         killed.leftovers.killed.push(crate::keeper::Proc {
@@ -425,26 +450,20 @@ mod tests {
             cmdline: "sleep 600".into(),
             truncated: false,
         });
-        assert_eq!(
-            after_run("codex", &killed),
-            AfterRun::AutoResume("s".into())
-        );
+        assert_eq!(after_run(&killed), auto_resume("s"));
     }
 
     #[test]
     fn an_interrupted_run_is_not_auto_resumed() {
         assert_eq!(
-            after_run("codex", &codex_run("s", false, true)),
+            after_run(&codex_run("s", false, true)),
             AfterRun::Interrupted
         );
     }
 
     #[test]
     fn an_answered_run_is_reported() {
-        assert_eq!(
-            after_run("codex", &codex_run("s", true, false)),
-            AfterRun::Report
-        );
+        assert_eq!(after_run(&codex_run("s", true, false)), AfterRun::Report);
     }
 
     #[test]

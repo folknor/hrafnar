@@ -45,7 +45,7 @@ pub async fn run(session_id: &str) -> Result<()> {
     if outcome.interrupted {
         println!(
             "{}",
-            crate::provider::resume_hint(&outcome.provider, session_id)
+            crate::provider::resume_hint(outcome.provider, session_id)
         );
     } else {
         // The run finished before the signal took effect; its answer is in the
@@ -63,7 +63,7 @@ pub async fn run(session_id: &str) -> Result<()> {
 pub struct Outcome {
     pub interrupted: bool,
     pub project: String,
-    pub provider: String,
+    pub provider: crate::provider::Provider,
 }
 
 /// The verb, minus printing. `data_root` and `rows` (every sidecar row, oldest
@@ -88,17 +88,17 @@ pub async fn interrupt(
              `review sessions --all` lists the ones that are"
         );
     };
-    let provider = marker.provider.clone();
-    let provider = provider.as_str();
     if marker.cleanup_pending {
         bail!("{}", cleanup_pending_message(session_id, &marker));
     }
-    if !interruptible(provider) {
-        bail!(
-            "session {session_id} is a {provider} run; only codex and claude runs can be \
-             interrupted"
-        );
-    }
+    let provider = match marker.provider.parse::<crate::provider::Provider>() {
+        Ok(p) if p.interruptible() => p,
+        _ => bail!(
+            "session {session_id} is a {} run; only {} runs can be interrupted",
+            marker.provider,
+            crate::provider::Provider::interruptible_names()
+        ),
+    };
     // The pid is offered once the provider has printed its first output, a
     // second or two after launch. A run caught inside that window - which
     // `review message` does routinely, its launch lock handing over the moment
@@ -117,7 +117,7 @@ pub async fn interrupt(
                     return Ok(Outcome {
                         interrupted: false,
                         project: marker.project.clone(),
-                        provider: provider.to_string(),
+                        provider,
                     });
                 }
                 Some(m) if m.child_pid.is_some() => break m,
@@ -217,7 +217,7 @@ pub async fn interrupt(
             return Ok(Outcome {
                 interrupted: true,
                 project: row.project.clone(),
-                provider: provider.to_string(),
+                provider,
             });
         }
         if let Some(row) = new.last() {
@@ -225,7 +225,7 @@ pub async fn interrupt(
                 return Ok(Outcome {
                     interrupted: false,
                     project: row.project.clone(),
-                    provider: provider.to_string(),
+                    provider,
                 });
             }
             looked_again = true;
@@ -254,9 +254,11 @@ pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Marke
     )
 }
 
-/// Whether a run of `provider` can be ended mid-turn and resumed: both codex and
-/// claude close the turn on `SIGINT` and leave a resumable session. Grok has no
-/// such lever. Shared with `review message`, so the two cannot disagree.
+/// Whether a recorded run of `provider` (a marker's string) can be ended
+/// mid-turn and resumed: `Provider::interruptible`, which the signal
+/// supervisor's `Unrecorded` reads too. A name `review` does not drive is not.
 pub(crate) fn interruptible(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude")
+    provider
+        .parse::<crate::provider::Provider>()
+        .is_ok_and(crate::provider::Provider::interruptible)
 }

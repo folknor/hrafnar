@@ -351,7 +351,7 @@ pub async fn run_claude(
     let marker_sid = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
     let marker = crate::inflight::mark(
         &marker_sid,
-        "claude",
+        Provider::Claude,
         &project_root.to_string_lossy(),
         runtime.data_root.as_deref(),
     );

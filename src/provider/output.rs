@@ -15,7 +15,7 @@ pub fn print_result(result: &ProviderResult) {
                 result.session_id.as_deref(),
                 result.digest.as_ref().map(|d| d.interrupted),
             ) {
-                println!("\n{}", resume_hint(&result.provider, sid));
+                println!("\n{}", resume_hint(result.provider, sid));
             }
         }
         Err(err) => {
@@ -27,8 +27,8 @@ pub fn print_result(result: &ProviderResult) {
 
 /// How to continue an interrupted session, and by when - shared by the run's
 /// own output and `review interrupt`, so both say the same thing.
-pub fn resume_hint(provider: &str, session_id: &str) -> String {
-    let cutoff = crate::timings::stale_session(provider).as_secs() / 60;
+pub fn resume_hint(provider: Provider, session_id: &str) -> String {
+    let cutoff = provider.stale_cutoff().as_secs() / 60;
     format!(
         "interrupted - continue within {cutoff}m with:\n  \
          echo \"<message>\" | review message {session_id}"

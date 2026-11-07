@@ -120,13 +120,7 @@ pub const STALE_SESSION: Duration = Duration::from_secs(55 * 60);
 /// minutes short of that, for the same reason `STALE_SESSION` stops short of 1h.
 pub const STALE_SESSION_CODEX: Duration = Duration::from_secs(27 * 60);
 
-/// The stale-session cutoff for a resume of `provider`'s session.
-pub fn stale_session(provider: &str) -> Duration {
-    match provider {
-        "codex" => STALE_SESSION_CODEX,
-        _ => STALE_SESSION,
-    }
-}
+// Which provider gets which cutoff is `provider::Provider::stale_cutoff`.
 
 /// How often `review interrupt` checks whether the interrupted run has been
 /// recorded. codex winds a turn down in seconds, so this only sets how promptly
@@ -179,8 +173,9 @@ mod tests {
 
     #[test]
     fn codex_sessions_go_stale_sooner() {
-        assert_eq!(stale_session("codex"), Duration::from_secs(27 * 60));
-        assert_eq!(stale_session("claude"), STALE_SESSION);
-        assert_eq!(stale_session("grok"), STALE_SESSION);
+        use crate::provider::Provider;
+        assert_eq!(Provider::Codex.stale_cutoff(), Duration::from_secs(27 * 60));
+        assert_eq!(Provider::Claude.stale_cutoff(), STALE_SESSION);
+        assert_eq!(Provider::Grok.stale_cutoff(), STALE_SESSION);
     }
 }

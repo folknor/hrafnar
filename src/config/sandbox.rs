@@ -1,3 +1,5 @@
+use super::Provider;
+
 /// Translate `review`'s sandbox vocabulary into a provider's own.
 ///
 /// `review`'s levels, in increasing order of access, are `read-only`,
@@ -30,15 +32,19 @@
 /// moment one provider can reinterpret them. Custom profiles have the entire
 /// rest of the namespace, and `read-only` is unaffected either way because every
 /// provider already spells it that way.
-pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
-    match (provider, sandbox) {
+pub fn sandbox_for(provider: Provider, sandbox: &str) -> String {
+    match provider {
         // Grok's built-ins are `read-only`, `workspace` and `none`.
-        ("grok", "workspace-write") => "workspace".to_string(),
-        ("grok", "danger-full-access") => "none".to_string(),
-        // `read-only` happens to be spelled the same everywhere, which is why
-        // the default path was portable across providers by luck rather than
-        // design.
-        _ => sandbox.to_string(),
+        Provider::Grok => match sandbox {
+            "workspace-write" => "workspace".to_string(),
+            "danger-full-access" => "none".to_string(),
+            _ => sandbox.to_string(),
+        },
+        // codex's names are `review`'s. `read-only` happens to be spelled the
+        // same everywhere, which is why the default path was portable across
+        // providers by luck rather than design. Claude has no filesystem
+        // sandbox; `invoke` never hands it the value.
+        Provider::Codex | Provider::Claude => sandbox.to_string(),
     }
 }
 
@@ -46,6 +52,8 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    const CODEX: Provider = Provider::Codex;
+    const GROK: Provider = Provider::Grok;
 
     #[test]
     fn sandbox_levels_translate_per_provider() {
@@ -55,7 +63,7 @@ mod tests {
         // `invoke` drops the value rather than mapping it, so asserting a level
         // survives translation for claude would imply an enforcement claude does
         // not make.
-        for provider in ["codex", "grok"] {
+        for provider in [CODEX, GROK] {
             assert_eq!(
                 sandbox_for(provider, "read-only"),
                 "read-only",
@@ -67,13 +75,13 @@ mod tests {
         // not a soft failure - grok cannot resolve the profile and refuses to
         // start - so this mapping is what makes one profile vocabulary usable
         // across providers.
-        assert_eq!(sandbox_for("codex", "workspace-write"), "workspace-write");
-        assert_eq!(sandbox_for("grok", "workspace-write"), "workspace");
+        assert_eq!(sandbox_for(CODEX, "workspace-write"), "workspace-write");
+        assert_eq!(sandbox_for(GROK, "workspace-write"), "workspace");
         assert_eq!(
-            sandbox_for("codex", "danger-full-access"),
+            sandbox_for(CODEX, "danger-full-access"),
             "danger-full-access"
         );
-        assert_eq!(sandbox_for("grok", "danger-full-access"), "none");
+        assert_eq!(sandbox_for(GROK, "danger-full-access"), "none");
     }
 
     #[test]
@@ -82,14 +90,8 @@ mod tests {
         // `~/.grok/sandbox.toml`, so a name `review` does not recognise may be
         // perfectly valid. Rewriting or rejecting it would make `review` the
         // reason a working provider config could not be used.
-        assert_eq!(
-            sandbox_for("grok", "my-custom-profile"),
-            "my-custom-profile"
-        );
-        assert_eq!(
-            sandbox_for("codex", "my-custom-profile"),
-            "my-custom-profile"
-        );
+        assert_eq!(sandbox_for(GROK, "my-custom-profile"), "my-custom-profile");
+        assert_eq!(sandbox_for(CODEX, "my-custom-profile"), "my-custom-profile");
     }
 
     /// `review`'s documented sandbox vocabulary. Kept here rather than in the
@@ -103,7 +105,7 @@ mod tests {
         // arms: adding a level here without teaching grok about it would
         // otherwise pass it through verbatim and fail at launch.
         for level in SANDBOX_LEVELS {
-            let mapped = sandbox_for("grok", level);
+            let mapped = sandbox_for(GROK, level);
             assert!(
                 ["read-only", "workspace", "none"].contains(&mapped.as_str()),
                 "{level} maps to {mapped}, which is not one of grok's built-in profiles"

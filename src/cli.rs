@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 
-const AFTER_HELP: &str = "\
+const AFTER_HELP_TEMPLATE: &str = "\
 Instructions come on stdin. With no archetype they are sent unchanged; with
 -a, the archetype's priming prompt is prepended. `-a bare` also sends stdin
 unchanged, whether or not `bare` is in the config. Every run starts a fresh
@@ -8,7 +8,7 @@ session on each provider, and the session ID is printed above the response so
 you can follow up with `review message <ID>` while the cache is warm.
 
 Steering a running agent: `echo \"<new info>\" | review message <ID>`. It ends
-the codex or claude turn in flight and continues the session with your message. Do not
+the {INTERRUPTIBLE} turn in flight and continues the session with your message. Do not
 stop or kill the `review` process to interrupt an agent - use `review message`,
 or `review interrupt <ID>` to stop without a message.
 
@@ -32,7 +32,7 @@ never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
 `review interrupt`, `review incidents` and `review sessions --all` refuse -C.
 
-Providers: claude, codex, grok, from --provider or [_defaults].providers. A
+Providers: {PROVIDERS}, from --provider or [_defaults].providers. A
 provider that is not installed fails the run before anything launches.
 
 Profiles (-p): a profile resolves to its first definition, looking in the
@@ -79,17 +79,49 @@ Examples:
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
-  review interrupt <ID>                                Stop a codex or claude run mid-turn
+  review interrupt <ID>                                Stop a {INTERRUPTIBLE} run mid-turn
   review config                                        Effective configuration
 
 More depth on any of this: `review man` lists the bundled topics.";
 
-// The cutoffs are restated from `timings::stale_session` because clap needs a
-// `&'static str`; a test keeps the two in step.
-const MESSAGE_AFTER_HELP: &str = "\
-If a codex or claude turn is in flight, it is interrupted first (as `review
+/// Help templates name providers through markers, filled from
+/// `provider::Provider` by `render`: `{INTERRUPTIBLE}` (`claude or codex`),
+/// `{UNINTERRUPTIBLE}` (`grok`), `{PROVIDERS}` (`claude, codex, grok`) and
+/// `{CUTOFFS}` (each provider's stale cutoff). Hand-written lists here drifted
+/// from the code that decides them, and a new provider would have been missing
+/// from every one.
+fn render(template: &str) -> String {
+    use crate::provider::Provider;
+    template
+        .replace("{INTERRUPTIBLE}", &Provider::interruptible_names())
+        .replace("{UNINTERRUPTIBLE}", &Provider::uninterruptible_names())
+        .replace("{PROVIDERS}", &Provider::supported())
+        .replace("{CUTOFFS}", &Provider::stale_cutoff_prose())
+}
+
+/// A rendered template, for clap attributes, which take a `&'static str`.
+macro_rules! rendered {
+    ($name:ident = $template:expr) => {
+        static $name: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| render($template));
+    };
+}
+
+rendered!(AFTER_HELP = AFTER_HELP_TEMPLATE);
+rendered!(MESSAGE_AFTER_HELP = MESSAGE_AFTER_HELP_TEMPLATE);
+rendered!(INTERRUPT_AFTER_HELP = INTERRUPT_AFTER_HELP_TEMPLATE);
+rendered!(
+    MESSAGE_ABOUT =
+        "Send stdin to a session, interrupting its {INTERRUPTIBLE} turn if one is running"
+);
+rendered!(
+    INTERRUPT_ABOUT =
+        "Interrupt a {INTERRUPTIBLE} run in flight, then print how to resume its session"
+);
+
+const MESSAGE_AFTER_HELP_TEMPLATE: &str = "\
+If a {INTERRUPTIBLE} turn is in flight, it is interrupted first (as `review
 interrupt` does) - the turn is cut off and whatever it had not finished is lost -
-and the message then continues the session. A grok turn in flight cannot be
+and the message then continues the session. A {UNINTERRUPTIBLE} turn in flight cannot be
 interrupted; the message is refused until it ends.
 
 The session must come from a run on this host: its provider is read from the
@@ -101,7 +133,7 @@ archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
 Continuing only pays off while the provider's prompt cache is warm, so a session
-last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
+last touched more than {CUTOFFS}
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
 
@@ -110,14 +142,14 @@ verify it), and 3 if anything it
 started was left running (which outranks 1). A session whose earlier `review` is gone while that run's
 processes are still being torn down is refused until they are.";
 
-const INTERRUPT_AFTER_HELP: &str = "\
-Works on codex and claude runs, not grok. This ends the turn, waits for the run
+const INTERRUPT_AFTER_HELP_TEMPLATE: &str = "\
+Works on {INTERRUPTIBLE} runs, not {UNINTERRUPTIBLE}. This ends the turn, waits for the run
 to record its session, and prints the `review message` command that continues
 it. The interrupted run exits 1, like any run that produced no answer. To stop a
 turn and send new information in one step, use `review message` instead.
 
 Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
-ends its codex and claude turns the same way and records them before exiting; a
+ends its {INTERRUPTIBLE} turns the same way and records them before exiting; a
 second signal skips that and tears the runs down at once, which can lose their
 records, and a third exits without waiting for the teardown to report. SIGKILL
 loses the session, though what the runs started is still torn down.";
@@ -137,7 +169,7 @@ Outside a project it shows the global layer alone.";
     name = "review",
     about = "Send a prompt to fresh AI sessions across providers",
     override_usage = "echo <instructions> | review [OPTIONS]\n       review <COMMAND>",
-    after_help = AFTER_HELP,
+    after_help = AFTER_HELP.as_str(),
     // Without this a subcommand name after a flag (`review -C bz config`) is
     // taken as the legacy positional archetype.
     subcommand_precedence_over_arg = true
@@ -165,7 +197,7 @@ pub struct Cli {
 
     /// Limit to specific providers (comma-separated, e.g. claude,codex)
     #[arg(long, value_delimiter = ',')]
-    pub provider: Option<Vec<String>>,
+    pub provider: Option<Vec<crate::provider::Provider>>,
 
     /// Print the assembled prompt instead of sending it
     #[arg(long)]
@@ -247,8 +279,7 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Send stdin to a session, interrupting its codex or claude turn if one is running
-    #[command(after_help = MESSAGE_AFTER_HELP)]
+    #[command(about = MESSAGE_ABOUT.as_str(), after_help = MESSAGE_AFTER_HELP.as_str())]
     Message {
         /// Session ID, as printed above the earlier run's response
         #[arg(value_name = "ID")]
@@ -272,8 +303,7 @@ pub enum Command {
         dry_run: bool,
     },
 
-    /// Interrupt a codex or claude run in flight, then print how to resume its session
-    #[command(after_help = INTERRUPT_AFTER_HELP)]
+    #[command(about = INTERRUPT_ABOUT.as_str(), after_help = INTERRUPT_AFTER_HELP.as_str())]
     Interrupt {
         /// Session ID of the run, as listed by `review sessions`
         #[arg(value_name = "ID")]
@@ -339,18 +369,28 @@ mod tests {
     }
 
     #[test]
-    fn message_help_states_the_current_stale_cutoffs() {
-        for (provider, label) in [("codex", "(codex)"), ("claude", "(claude, grok)")] {
-            let mins = crate::timings::stale_session(provider).as_secs() / 60;
-            let needle = format!("{mins} minutes ago {label}");
+    fn help_names_providers_from_the_table() {
+        // Every marker is filled: an unknown one would print literally.
+        for help in [
+            &*AFTER_HELP,
+            &*MESSAGE_AFTER_HELP,
+            &*INTERRUPT_AFTER_HELP,
+            &*MESSAGE_ABOUT,
+            &*INTERRUPT_ABOUT,
+        ] {
+            assert!(!help.contains("{"), "unfilled marker in {help:?}");
+        }
+        let message = MESSAGE_AFTER_HELP.replace('\n', " ");
+        for p in crate::provider::Provider::all() {
+            let mins = p.stale_cutoff().as_secs() / 60;
             assert!(
-                MESSAGE_AFTER_HELP.replace('\n', " ").contains(&needle),
-                "message help should say {needle:?}"
+                message.contains(&format!("{mins} minutes ago (")),
+                "message help should state {p}'s cutoff"
             );
         }
-        assert_eq!(
-            crate::timings::stale_session("grok"),
-            crate::timings::stale_session("claude")
+        assert!(
+            message.contains(&crate::provider::Provider::stale_cutoff_prose()),
+            "{message}"
         );
     }
 

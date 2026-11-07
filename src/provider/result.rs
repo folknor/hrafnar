@@ -149,7 +149,7 @@ impl Digest {
 }
 
 pub struct ProviderResult {
-    pub provider: String,
+    pub provider: super::Provider,
     pub output: Result<String>,
     /// Session ID associated with this invocation, when one is known to the
     /// caller. Fresh runs capture the newly-created session; resumes retain

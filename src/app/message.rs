@@ -5,7 +5,6 @@ use anyhow::{Result, bail};
 use super::{exit_status, format_runtime, print_left_running, run_failed, selected_root};
 use crate::{
     audit, config, config_write, inflight, input, interrupt_cmd, lock, project, provider, sessions,
-    timings,
 };
 
 /// The provider a `review resume` talks to: the one the sidecar recorded for the
@@ -18,27 +17,38 @@ use crate::{
 /// created - another host's (whose provider store is not here either), one made
 /// outside `review`, or a lost log - and that is an error, not a guess.
 ///
-/// A recorded provider is still validated, so a row naming a removed provider
+/// A recorded provider is still parsed, so a row naming a removed provider
 /// (kilo/opencode) cannot turn into an unrunnable invocation.
+///
+/// Recognising the name is not the same as the current runner understanding
+/// the session. Today every recognised name has only ever had one integration,
+/// so the two coincide. They stop coinciding the moment a removed provider's
+/// name is driven again (opencode is the expected case): rows the old
+/// integration wrote would parse as the new one. The stale-session gate does
+/// not cover that - rows with no usable epoch bypass it - so re-adding a name
+/// must come with a compatibility check here, a minimum `review_version` per
+/// provider below which rows are refused, with the crate version bumped past
+/// every build of the old integration (rows record `CARGO_PKG_VERSION`), and
+/// a missing or malformed version refused.
 fn resume_record(
     session_id: &str,
     record: Option<sessions::SessionRecord>,
-) -> Result<sessions::SessionRecord> {
+) -> Result<(sessions::SessionRecord, provider::Provider)> {
     let Some(record) = record else {
         bail!(
             "no record of session {session_id} on this host\n  \
              `review sessions` lists the sessions this host's review runs created."
         );
     };
-    if !config::KNOWN_PROVIDERS.contains(&record.provider.as_str()) {
+    let Ok(provider) = record.provider.parse::<provider::Provider>() else {
         bail!(
             "session {session_id} was recorded for provider '{}', which review no \
              longer supports\n  supported: {}",
             record.provider,
-            config::KNOWN_PROVIDERS.join(", ")
+            provider::Provider::supported()
         );
-    }
-    Ok(record)
+    };
+    Ok((record, provider))
 }
 
 /// What a `review resume` launches with, taken from the session's own last
@@ -82,19 +92,18 @@ fn resume_record(
 /// data, not a judgement about predictability.
 fn inherited_settings(
     record: Option<&sessions::SessionRecord>,
-    provider_name: &str,
+    provider: provider::Provider,
 ) -> InheritedSettings {
-    let Some(record) = record.filter(|r| r.provider == provider_name) else {
+    let Some(record) = record.filter(|r| r.provider == provider.as_str()) else {
         return InheritedSettings::default();
     };
     InheritedSettings {
-        sandbox: if provider_name == "grok" {
-            record
+        sandbox: match provider {
+            provider::Provider::Grok => record
                 .provider_sandbox
                 .clone()
-                .or_else(|| record.sandbox.clone())
-        } else {
-            record.sandbox.clone()
+                .or_else(|| record.sandbox.clone()),
+            provider::Provider::Claude | provider::Provider::Codex => record.sandbox.clone(),
         },
         // For grok these are exactly the roots the session's `review-ws-*`
         // profile is named for, and a resume uses them verbatim rather than
@@ -292,8 +301,8 @@ async fn run_session_resume(
     expected: Option<(std::path::PathBuf, Option<String>)>,
 ) -> Result<()> {
     // Looked up once and reused by the cache-age gate and inheritance below.
-    let record = resume_record(session_id, sessions::latest_for_session(session_id))?;
-    let provider_name = record.provider.as_str();
+    let (record, provider_name) =
+        resume_record(session_id, sessions::latest_for_session(session_id))?;
     eprintln!("provider: {provider_name} (from the session record)");
     let archetype = record.archetype.as_str();
 
@@ -339,7 +348,7 @@ async fn run_session_resume(
         provider::ProviderRuntime::from_config(cfg.stall_timeout_secs(), cfg.audit.private);
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
-    // last ended; past the provider's cutoff (`timings::stale_session`: 27 min
+    // last ended; past the provider's cutoff (`Provider::stale_cutoff`: 27 min
     // for codex, whose prompt cache lasts ~30 min, ~55 min otherwise) the cache
     // is cold, and resuming means reprocessing the whole session prefix at full
     // cost. Resuming is the *warm* follow-up path, so a cold resume is refused:
@@ -347,7 +356,7 @@ async fn run_session_resume(
     // timestamp leaves the age unknown, and the resume proceeds rather than blocks.
     let age = sessions::Age::since_epoch(record.epoch_secs);
     if let Some(elapsed) = age.elapsed_secs() {
-        if elapsed > timings::stale_session(provider_name).as_secs() {
+        if elapsed > provider_name.stale_cutoff().as_secs() {
             bail!(
                 "session last touched {age} - its prompt cache is cold.\n  \
                  Resuming would reprocess the whole session prefix at full cost.\n  \
@@ -402,12 +411,11 @@ async fn run_session_resume(
     // A session created under a profile CODEX_HOME must resume against that
     // same storage directory. Older rows have no saved path and keep using the
     // current process environment/default.
-    let codex_home_env = if provider_name == "codex" {
-        record.codex_home.as_ref().map(|home| {
+    let codex_home_env = match provider_name {
+        provider::Provider::Codex => record.codex_home.as_ref().map(|home| {
             std::collections::BTreeMap::from([("CODEX_HOME".to_string(), home.clone())])
-        })
-    } else {
-        None
+        }),
+        provider::Provider::Claude | provider::Provider::Grok => None,
     };
 
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
@@ -454,7 +462,7 @@ async fn run_session_resume(
         private,
         &audit_id,
         archetype,
-        &result.provider,
+        result.provider.as_str(),
         session_id,
         &stdin_instructions,
         &result.output,
@@ -479,7 +487,7 @@ async fn run_session_resume(
             private,
             &audit_id,
             archetype,
-            &result.provider,
+            result.provider,
             session_id,
             sessions::SessionKind::Resume,
             result.completed_epoch,
@@ -545,8 +553,8 @@ mod tests {
     fn a_resume_takes_the_provider_from_the_record() {
         // The session ID came from review's own output, whose run wrote this
         // row, so the provider is on record and is never asked for.
-        let rec = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
-        assert_eq!(rec.provider, "codex");
+        let (rec, provider) = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
+        assert_eq!(provider, provider::Provider::Codex);
         assert_eq!(rec.archetype, "security");
         assert_eq!(rec.codex_home, None);
     }
@@ -571,14 +579,18 @@ mod tests {
             let mut rec = minimal_row("grok");
             rec.sandbox = Some(native.to_string());
             assert_eq!(
-                inherited_settings(Some(&rec), "grok").sandbox.as_deref(),
+                inherited_settings(Some(&rec), provider::Provider::Grok)
+                    .sandbox
+                    .as_deref(),
                 Some(native)
             );
             rec.provider_sandbox = Some(native.to_string());
-            rec.sandbox =
-                crate::provider::recorded_sandbox("grok", Some(native)).map(str::to_string);
+            rec.sandbox = crate::provider::recorded_sandbox(provider::Provider::Grok, Some(native))
+                .map(str::to_string);
             assert_eq!(
-                inherited_settings(Some(&rec), "grok").sandbox.as_deref(),
+                inherited_settings(Some(&rec), provider::Provider::Grok)
+                    .sandbox
+                    .as_deref(),
                 Some(native)
             );
         }
@@ -604,7 +616,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), "codex");
+        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.sandbox.as_deref(), Some("workspace-write"));
         assert_eq!(got.writable_roots, vec!["/home/u/.brokkr", "/srv/cache"]);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
@@ -631,7 +643,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), "codex");
+        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(got.effort, None);
     }
@@ -653,7 +665,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), "codex");
+        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);
@@ -681,7 +693,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), "codex");
+        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         // The model is provider-scoped too: a grok model name handed to codex
@@ -691,7 +703,7 @@ mod tests {
 
     #[test]
     fn no_record_inherits_nothing() {
-        let got = inherited_settings(None, "codex");
+        let got = inherited_settings(None, provider::Provider::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);

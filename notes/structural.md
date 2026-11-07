@@ -26,50 +26,27 @@ before adding maki; the providers hunter calls for a rewrite around all three.
 
 ## Types
 
-## STR-001 - A `Provider` enum with one capability table
+## STR-001 - Provider residue: runtime command hook and session artifacts
 
 Reported by: providers, lifecycle, config, orchestration, grok-man, forensics.
 
-The provider is a `&str`/`String` end to end: `Cli.provider`,
-`Launch.provider`, `ProviderResult.provider`, `SessionRecord.provider`,
-`Marker.provider`, `invoke(provider: &str, ..)`. It is matched in at least
-nine places across five files, listed per question in
-`notes/consolidations.md` (known provider, interruptible, sandbox, stale
-cutoff, auto-resume, session-id minting). Adding `"maki"` to `KNOWN_PROVIDERS`
-compiles and silently falls into every `_ =>` arm.
+`provider::Provider` (src/provider/kind.rs) exists and is parsed at the
+config, CLI and resume boundaries; launch-time decisions match it
+exhaustively. What remains:
 
-Proposed: `enum Provider { Claude, Codex, Grok, Maki, Opencode }` with
-`FromStr`, serde and clap `ValueEnum`, parsed once at the config, CLI and
-sidecar boundaries, with an `Unknown`/`Retired(String)` arm for rows naming
-removed providers. A capabilities struct per provider, owned by one module
-(`provider::spec(Provider) -> &'static Capabilities`), carries what the
-scattered sites decide today:
-- filesystem sandbox or not, the default level, the native spelling of each
-  level;
-- interrupt style (SIGINT ends the turn, or none);
-- stale cutoff;
-- auto-resume policy;
-- session-id policy (caller-minted, with any required prefix such as
-  opencode's `ses`, or reported by the stream);
-- whether `effort` is a flag, part of the model string, or config-only;
-  whether `model` and codex-style `config` overrides are honoured;
-- whether writable roots are derived;
-- has an on-disk transcript; the binary name for `is_available`.
-
-`KNOWN_PROVIDERS` becomes a projection of the registry. `Availability`
-(today `BTreeMap<String, bool>` with `unwrap_or(false)`) becomes a total
-function. `ProviderRuntime` (today `codex_binary: String`,
-`claude_command: Vec<String>`, and grok hardcoded as `Command::new("grok")`,
-which is why grok has no runner-level test) becomes a map or
-`fn command(Provider) -> Vec<String>`, giving maki and opencode a stub hook.
-Help text, STEERING and refusal prose are generated from the table, and the
-`man` tests iterate it. The orchestration hunter's version is a `Provider`
-trait or enum with methods: `capabilities()`, `run(spec)`,
-`session_artifacts(id, record)`, `mint_session_id()`, so orchestration holds no
-provider-name literal outside tests.
-
-Payoff claimed: adding a provider becomes one adapter file plus one variant,
-and the compiler lists every site that must decide something about it.
+- `ProviderRuntime` still carries `codex_binary: String` and
+  `claude_command: Vec<String>`, with grok hardcoded as `Command::new("grok")`
+  (why grok has no runner-level test). It should become
+  `fn command(Provider) -> Vec<String>` (or a per-provider map), giving each new
+  runner a stub hook from its first commit.
+- `app::history` (`review sessions <id>`) still tests `latest.provider ==
+  "codex"` to decide whether a rollout transcript exists: per-provider session
+  artifacts, which belong with the forensics split rather than a flag.
+- Not adopted, deliberately: a static `Capabilities` struct of booleans (the
+  sandbox, writable-roots and recovery questions depend on the launch, so they
+  are exhaustive operations, not flags), and a `Retired(String)` variant (an
+  executable enum cannot tell an old integration's rows from a new one's; the
+  compatibility rule is stated at `app::message::resume_record`).
 
 ## STR-002 - Sandbox level, native sandbox and permission plan as separate types
 

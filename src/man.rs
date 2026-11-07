@@ -291,16 +291,16 @@ mod tests {
             .into_iter()
             .map(|r| (r[0].clone(), r[1].clone()))
             .collect();
-        let actual: BTreeSet<(String, String)> = crate::config::KNOWN_PROVIDERS
+        let actual: BTreeSet<(String, String)> = crate::provider::Provider::all()
             .iter()
             .map(|p| {
-                let secs = crate::timings::stale_session(p).as_secs();
+                let secs = p.stale_cutoff().as_secs();
                 assert_eq!(
                     secs % 60,
                     0,
                     "{p}'s cutoff is not whole minutes; reword the table"
                 );
-                ((*p).to_string(), format!("{} minutes ago", secs / 60))
+                (p.as_str().to_string(), format!("{} minutes ago", secs / 60))
             })
             .collect();
         assert_eq!(documented, actual);
@@ -310,19 +310,41 @@ mod tests {
     /// level. It does not prove the provider enforces the level - that is the
     /// provider tests' and diagnostics' job - only that the table says what
     /// `review` passes on.
+    /// One column per provider, so a new provider fails this until the table
+    /// says what it does with each level.
     #[test]
     fn the_sandbox_table_states_each_providers_level() {
-        let rows = table(topic("sandbox"), "| `sandbox` | codex | grok | claude |");
+        use crate::provider::Provider;
+        let columns: Vec<&str> = [Provider::Codex, Provider::Grok, Provider::Claude]
+            .iter()
+            .map(|p| p.as_str())
+            .collect();
+        let mut sorted = columns.clone();
+        sorted.sort_unstable();
+        let mut all: Vec<&str> = Provider::all().iter().map(|p| p.as_str()).collect();
+        all.sort_unstable();
+        assert_eq!(
+            sorted, all,
+            "the sandbox table needs one column per provider"
+        );
+        let header = format!("| `sandbox` | {} |", columns.join(" | "));
+        let rows = table(topic("sandbox"), &header);
         let levels: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
         assert_eq!(
             levels,
             ["read-only", "workspace-write", "danger-full-access"]
         );
         for r in &rows {
-            assert_eq!(r[1], crate::config::sandbox_for("codex", &r[0]), "{r:?}");
-            assert_eq!(r[2], crate::config::sandbox_for("grok", &r[0]), "{r:?}");
-            let claude = crate::provider::effective_sandbox("claude", Some(&r[0]));
-            assert_eq!(r[3] == "ignored", claude.is_none(), "{r:?} vs {claude:?}");
+            for (i, name) in columns.iter().enumerate() {
+                let p: Provider = name.parse().expect("a provider");
+                let cell = &r[i + 1];
+                match crate::provider::effective_sandbox(p, Some(&r[0])) {
+                    None => assert_eq!(cell, "ignored", "{p}: {r:?}"),
+                    Some(_) => {
+                        assert_eq!(*cell, crate::config::sandbox_for(p, &r[0]), "{p}: {r:?}");
+                    }
+                }
+            }
         }
     }
 

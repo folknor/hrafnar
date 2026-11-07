@@ -138,7 +138,13 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
 
     // The recorded home keeps custom CODEX_HOME sessions visible. Older rows
     // have no path and use the current process environment/default.
-    let transcript = if latest.provider == "codex" {
+    // Only codex keeps a rollout `review` reads. A recorded name that no
+    // longer parses (a removed provider) is shown as recorded, with none.
+    let has_rollout = match latest.provider.parse::<provider::Provider>() {
+        Ok(provider::Provider::Codex) => true,
+        Ok(provider::Provider::Claude | provider::Provider::Grok) | Err(_) => false,
+    };
+    let transcript = if has_rollout {
         let home = transcript::codex_home(
             latest.codex_home.as_deref(),
             None,
@@ -166,9 +172,7 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
     } else {
         None
     };
-    if latest.provider == "codex"
-        && let Some(ref t) = transcript
-    {
+    if let Some(ref t) = transcript {
         println!("transcript: {}", t.path);
         println!(
             "  task_complete={} stream_error={}",

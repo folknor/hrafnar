@@ -125,7 +125,7 @@ pub(super) async fn run_grok(
     // anyone could have it to message.
     let project = project_root.to_string_lossy().into_owned();
     let mut _marker =
-        (!oneshot).then(|| crate::inflight::mark(session_id, "grok", &project, data_root));
+        (!oneshot).then(|| crate::inflight::mark(session_id, Provider::Grok, &project, data_root));
     let (mut first, first_turns, first_usage) = run_grok_turn(
         session_id,
         model,
@@ -148,7 +148,12 @@ pub(super) async fn run_grok(
         .clone()
         .unwrap_or_else(|| session_id.to_string());
     if _marker.is_none() {
-        _marker = Some(crate::inflight::mark(&sid, "grok", &project, data_root));
+        _marker = Some(crate::inflight::mark(
+            &sid,
+            Provider::Grok,
+            &project,
+            data_root,
+        ));
     }
     // Fail closed: without grok's home the results cannot be checked, and an
     // unchecked run must not pass as one whose results were seen.

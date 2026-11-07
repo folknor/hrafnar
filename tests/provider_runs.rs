@@ -1393,7 +1393,7 @@ async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
     let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
     let outcome = outcome.expect("the verb succeeds");
     assert!(outcome.interrupted, "the verb reports the interrupt");
-    assert_eq!(outcome.provider, "claude");
+    assert_eq!(outcome.provider, review::provider::Provider::Claude);
     let digest = run.digest.expect("digest");
     assert!(digest.interrupted);
     assert!(

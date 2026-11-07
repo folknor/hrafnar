@@ -1,12 +1,12 @@
 use super::{
-    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, KNOWN_PROVIDERS, Layer,
-    Profile, ProfileTables, RESERVED_NAMES, toml_key,
+    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, ProfileTables,
+    Provider, RESERVED_NAMES, toml_key,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
 fn unknown_provider_hint() -> String {
-    format!("supported: {}", KNOWN_PROVIDERS.join(", "))
+    format!("supported: {}", Provider::supported())
 }
 
 /// Parse one config file. `origin` names it in errors. Checks everything that
@@ -69,30 +69,25 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         let toml::Value::Table(inner) = val else {
             bail!("unexpected top-level key '{key}' in {origin}: expected a table");
         };
-        if KNOWN_PROVIDERS.contains(&key.as_str()) {
-            let parsed = parse_profiles(inner, &key, origin)?;
-            profiles.insert(key, parsed);
+        let Ok(provider) = key.parse::<Provider>() else {
+            hosts.insert(key.clone(), parse_host(inner, &key, origin)?);
             continue;
+        };
+        // Provider names and legacy host names share the top-level namespace,
+        // so a host named after a provider - one that exists now, or one added
+        // later - would silently change meaning. Both readings are therefore
+        // checked against the full schema: a table that is also a valid legacy
+        // host table is refused rather than guessed at. (A non-empty one only:
+        // an empty `[<provider>]` table cannot be meant as a host.)
+        if !inner.is_empty() && parse_host(inner.clone(), &key, origin).is_ok() {
+            bail!(
+                "[{key}.*] in {origin} reads both as {key} profiles ([{key}.<profile>]) and as \
+                 a legacy host table for a host named '{key}' ([{key}.<provider>.<profile>])\n  \
+                 Rename the profile if you meant {key} profiles, or move the host's profiles \
+                 to hostless [<provider>.<profile>] tables if you meant the host."
+            );
         }
-        let mut host_profiles: ProfileTables = BTreeMap::new();
-        for (prov, pv) in inner {
-            if !KNOWN_PROVIDERS.contains(&prov.as_str()) {
-                bail!(
-                    "unknown provider '{prov}' in [{key}.{prov}.*] in {origin}\n  \
-                     {}\n  \
-                     A top-level table is either a provider ([<provider>.<profile>]) \
-                     or a legacy host ([<host>.<provider>.<profile>]).",
-                    unknown_provider_hint()
-                );
-            }
-            let toml::Value::Table(pt) = pv else {
-                bail!("[{key}.{prov}] in {origin}: expected a table of profiles");
-            };
-            let prefix = format!("{}.{prov}", toml_key(&key));
-            let parsed = parse_profiles(pt, &prefix, origin)?;
-            host_profiles.insert(prov, parsed);
-        }
-        hosts.insert(key, host_profiles);
+        profiles.insert(provider, parse_profiles(inner, &key, origin)?);
     }
 
     for (name, prime) in &archetypes {
@@ -131,16 +126,8 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
             }
         }
     }
-    if let Some(ref providers) = defaults.providers {
-        for prov in providers {
-            if !KNOWN_PROVIDERS.contains(&prov.as_str()) {
-                bail!(
-                    "unknown provider '{prov}' in [_defaults].providers in {origin}\n  {}",
-                    unknown_provider_hint()
-                );
-            }
-        }
-    }
+    // `[_defaults].providers` was validated as it was deserialized: each entry
+    // is a `Provider`, whose parse error names the supported list.
 
     Ok(ConfigFile {
         archetypes,
@@ -151,6 +138,29 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         hosts,
         projects,
     })
+}
+
+/// A legacy `[<host>.<provider>.<profile>]` table's contents, strictly: every
+/// child must be a known provider's table of valid profiles.
+fn parse_host(inner: toml::Table, key: &str, origin: &str) -> Result<ProfileTables> {
+    let mut host_profiles: ProfileTables = BTreeMap::new();
+    for (prov, pv) in inner {
+        let Ok(provider) = prov.parse::<Provider>() else {
+            bail!(
+                "unknown provider '{prov}' in [{key}.{prov}.*] in {origin}\n  \
+                 {}\n  \
+                 A top-level table is either a provider ([<provider>.<profile>]) \
+                 or a legacy host ([<host>.<provider>.<profile>]).",
+                unknown_provider_hint()
+            );
+        };
+        let toml::Value::Table(pt) = pv else {
+            bail!("[{key}.{prov}] in {origin}: expected a table of profiles");
+        };
+        let prefix = format!("{}.{prov}", toml_key(key));
+        host_profiles.insert(provider, parse_profiles(pt, &prefix, origin)?);
+    }
+    Ok(host_profiles)
 }
 
 fn parse_profiles(t: toml::Table, prefix: &str, origin: &str) -> Result<BTreeMap<String, Profile>> {
@@ -207,7 +217,7 @@ sandbox = \"workspace-write\"
 ";
         let cfg = local_only(raw, "myhost").unwrap();
 
-        let opus = cfg.resolve_profile("claude", "opus").unwrap();
+        let opus = cfg.resolve_profile(Provider::Claude, "opus").unwrap();
         assert_eq!(opus.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(opus.effort.as_deref(), Some("medium"));
         assert_eq!(opus.sandbox, None);
@@ -216,16 +226,16 @@ sandbox = \"workspace-write\"
             "http://localhost:8787"
         );
 
-        let implement = cfg.resolve_profile("codex", "implement").unwrap();
+        let implement = cfg.resolve_profile(Provider::Codex, "implement").unwrap();
         assert_eq!(implement.model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(implement.effort.as_deref(), Some("high"));
         assert_eq!(implement.sandbox.as_deref(), Some("workspace-write"));
 
-        assert!(cfg.resolve_profile("claude", "nope").is_none());
+        assert!(cfg.resolve_profile(Provider::Claude, "nope").is_none());
 
         // Another host's tables do not apply here.
         let other = local_only(raw, "otherhost").unwrap();
-        assert!(other.resolve_profile("claude", "opus").is_none());
+        assert!(other.resolve_profile(Provider::Claude, "opus").is_none());
     }
 
     #[test]
@@ -237,7 +247,7 @@ sandbox = \"read-only\"
 ";
         for host in ["a", "b"] {
             let cfg = local_only(raw, host).unwrap();
-            let deep = cfg.resolve_profile("codex", "deep").unwrap();
+            let deep = cfg.resolve_profile(Provider::Codex, "deep").unwrap();
             assert_eq!(deep.model.as_deref(), Some("gpt-6-luna"));
         }
     }
@@ -272,8 +282,32 @@ providers = [\"claude\", \"codex\"]
         let cfg = local_only(raw, "h").unwrap();
         assert_eq!(
             cfg.default_providers().unwrap(),
-            &["claude".to_string(), "codex".to_string()]
+            &[Provider::Claude, Provider::Codex]
         );
+    }
+
+    #[test]
+    fn a_provider_table_that_is_also_a_valid_host_table_is_refused() {
+        // A legacy host named after a provider: `[claude.codex.deep]` is codex's
+        // `deep` profile on host `claude`, and also claude's `codex` profile
+        // with a `deep` key. Neither reading may win silently.
+        let raw = "[claude.codex.deep]\nmodel = \"m\"\n";
+        let err = local_only(raw, "h").unwrap_err().to_string();
+        assert!(err.contains("reads both as claude profiles"), "{err}");
+        // An empty profile named after a provider satisfies both readings too.
+        assert!(local_only("[claude.codex]\n", "h").is_err());
+    }
+
+    #[test]
+    fn a_provider_table_that_is_not_a_host_table_is_a_provider_table() {
+        // `env` is a table, so this is host-shaped, but as a host table its
+        // `env` "profile" holds an unknown key: only the provider reading is
+        // valid.
+        let raw = "[claude.codex]\nenv = { TOKEN = \"v\" }\n";
+        let cfg = local_only(raw, "h").unwrap();
+        assert!(cfg.resolve_profile(Provider::Claude, "codex").is_some());
+        // An empty provider table is never a host.
+        assert!(local_only("[claude]\n", "h").is_ok());
     }
 
     #[test]
