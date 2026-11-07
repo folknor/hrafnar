@@ -4,26 +4,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-/// Open (or create) the host-wide launch lock at `inflight::global_lock_path`,
-/// creating its parent directory first. Every path that spaces out provider
-/// launches (the fan-out and `review message`) takes the lock through here, so
-/// they cannot disagree about where it lives.
-pub fn open_global_lock() -> Result<File> {
-    let path = crate::inflight::global_lock_path(None);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to create launch lock directory {}: {e}",
-                parent.display()
-            )
-        })?;
-    }
-    open_lock_file(&path)
-}
-
-/// Open (or create) a lock file safely. The lock may live on a shared,
-/// world-writable path (the `/tmp` fallback when no data directory can be
-/// resolved), and a data directory can itself be shared, so:
+/// Open (or create) the shared lock file safely. The lock lives on a shared,
+/// world-writable path (`/tmp`), so:
 /// - `O_NOFOLLOW` refuses to open through a symlink, defeating a planted-symlink
 ///   clobber that `File::create` (which follows symlinks and truncates) allowed;
 /// - mode `0666` lets a second user open the pre-existing lock for the flock

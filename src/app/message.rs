@@ -375,7 +375,8 @@ async fn run_session_resume(
     // limiting the lock exists to provide.
     // Held to the end, past the sidecar row: see `run_launch`.
     let _unrecorded = provider::Unrecorded::for_provider(provider_name);
-    let lock_file = lock::open_global_lock()?;
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
     // Persist an id before launching so every concurrent resume records the
     // same project identity, and a write failure cannot leave an unidentifiable
@@ -398,6 +399,17 @@ async fn run_session_resume(
         eprintln!("effort: {e} (inherited from the session record)");
     }
 
+    // A session created under a profile CODEX_HOME must resume against that
+    // same storage directory. Older rows have no saved path and keep using the
+    // current process environment/default.
+    let codex_home_env = if provider_name == "codex" {
+        record.codex_home.as_ref().map(|home| {
+            std::collections::BTreeMap::from([("CODEX_HOME".to_string(), home.clone())])
+        })
+    } else {
+        None
+    };
+
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
     let invoke = provider::invoke(
         provider_name,
@@ -406,7 +418,7 @@ async fn run_session_resume(
         inherited.effort.as_deref(),
         inherited.sandbox.as_deref(),
         &inherited.writable_roots,
-        None,
+        codex_home_env.as_ref(),
         &[],
         &stdin_instructions,
         &project_root,
@@ -491,6 +503,7 @@ async fn run_session_resume(
             &result.output,
             digest_summary.as_ref(),
             &result.leftovers,
+            result.codex_home.as_deref(),
         );
     }
 
@@ -535,6 +548,7 @@ mod tests {
         let rec = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
         assert_eq!(rec.provider, "codex");
         assert_eq!(rec.archetype, "security");
+        assert_eq!(rec.codex_home, None);
     }
 
     fn resume_error(record: Option<sessions::SessionRecord>) -> String {

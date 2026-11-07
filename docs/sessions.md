@@ -34,14 +34,16 @@ session must belong to the selected project.
 Fresh runs are recorded as `run`; resumes, including automatic resumes, are
 recorded as `session`.
 
-For codex it also reads the session's transcript, under the `CODEX_HOME` of
-the `review sessions` command itself: its path, whether the turn completed,
+For codex it also reads the session's transcript under the resolved
+`CODEX_HOME` recorded with the session: its path, whether the turn completed,
 the last event and any tool call still in flight. When the transcript holds a
 final answer, that answer is shown in place of the recorded response, marked
 `(recovered final answer from transcript)` when the two differ. A completed
 transcript with no final answer is flagged as having produced no conclusion;
-the recorded response is still shown below it. For a run whose profile set its
-own `CODEX_HOME`, run `review sessions <ID>` with that `CODEX_HOME` set.
+the recorded response is still shown below it. Older rows without a saved
+home use the current process environment and default, so a profile-only home
+from an older row cannot be reconstructed. A transcript lookup says whether
+it was absent, unreadable, or the home could not be resolved.
 
 ## Incidents
 
@@ -58,16 +60,20 @@ The verdicts:
 - `suspicious` - none of the above could be established.
 
 A bundle holds codex's stderr, the raw event stream, the digest and the
-transcript excerpt, so the run can be diagnosed without reproducing it.
-Interrupted runs are never bundled.
+transcript excerpt, so the run can be diagnosed without reproducing it. A
+bundle path is reported only when every artifact was written; partial writes
+are reported with their failed paths. `review incidents` lists readable
+bundles and warns about metadata it could not read or parse. Interrupted runs
+are never bundled.
 
 ## Querying further
 
 The session log is one JSON object per line. Fields include `session_id`,
 `provider`, `project`, `archetype`, `model`, `effort`, `sandbox`,
-`writable_roots`, `env_keys` (env var names only), the prompts, the response or error, and a
-flat `digest`, so `jq` answers what the listing does not (with the default
-data directory):
+`writable_roots`, `env_keys` (env var names only), `codex_home` (the resolved
+Codex rollout directory), the prompts, the response or error, and a flat
+`digest`, so `jq` answers what the listing does not (with the default data
+directory):
 
 ```
 jq 'select(.digest.captured == false)' ~/.local/share/review/sessions.jsonl

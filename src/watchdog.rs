@@ -186,7 +186,7 @@ fn scan_from_baseline(bytes: &[u8], baseline: u64) -> &[u8] {
 /// scopes the answer scan to this run's own events.
 pub async fn wait_for_stranded_completion(
     mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
-    codex_home: PathBuf,
+    codex_home: Option<PathBuf>,
     baseline: Option<u64>,
     timings: Timings,
 ) -> Verdict {
@@ -205,6 +205,7 @@ pub async fn wait_for_stranded_completion(
     // Session rollouts keep a stable path. Locate it once, then poll that file
     // directly instead of walking the full sessions tree on every interval.
     let mut cached_transcript: Option<(String, PathBuf)> = None;
+    let mut unreadable_session: Option<String> = None;
 
     loop {
         tokio::time::sleep(timings.poll_interval).await;
@@ -215,17 +216,34 @@ pub async fn wait_for_stranded_completion(
             continue;
         };
 
+        let Some(codex_home) = codex_home.as_deref() else {
+            continue;
+        };
+
         let (path, cache_matches) = match cached_transcript.as_ref() {
             Some((cached_id, path)) if cached_id == &session_id => (path.clone(), true),
             _ => {
-                let Some(path) =
-                    crate::transcript::find_transcript_path_in_home(&session_id, &codex_home)
-                else {
-                    // No rollout yet, or a custom CODEX_HOME we cannot see
-                    // into. Not an error - just nothing to judge.
-                    continue;
-                };
-                (path, false)
+                match crate::transcript::find_transcript_path_in_home_lookup(
+                    &session_id,
+                    codex_home,
+                ) {
+                    crate::transcript::Lookup::Found(path) => {
+                        unreadable_session = None;
+                        (path, false)
+                    }
+                    crate::transcript::Lookup::Absent | crate::transcript::Lookup::UnknownHome => {
+                        continue;
+                    }
+                    crate::transcript::Lookup::Unreadable(error) => {
+                        if unreadable_session.as_deref() != Some(session_id.as_str()) {
+                            eprintln!(
+                                "warning: rollout search for codex session {session_id} is unreadable: {error}"
+                            );
+                            unreadable_session = Some(session_id);
+                        }
+                        continue;
+                    }
+                }
             }
         };
 

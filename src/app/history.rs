@@ -8,12 +8,29 @@ use crate::{config, incident, inflight, project, provider, sessions, transcript}
 /// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
 /// dead run is triageable at a glance instead of buried under the incidents dir.
 pub(super) fn run_incidents(limit: usize) -> Result<()> {
-    let incidents = incident::list_recent(limit);
-    if incidents.is_empty() {
-        eprintln!("no incident bundles recorded (none of your codex runs have looked suspicious)");
+    let listing = incident::list_recent(limit);
+    for failure in &listing.failures {
+        let path = failure
+            .path
+            .as_deref()
+            .map(|path| format!(" {}", path.display()))
+            .unwrap_or_default();
+        eprintln!(
+            "warning: could not read incident data{path}: {}",
+            failure.message
+        );
+    }
+    if listing.incidents.is_empty() {
+        if listing.failures.is_empty() {
+            eprintln!(
+                "no incident bundles recorded (none of your codex runs have looked suspicious)"
+            );
+        } else {
+            eprintln!("no readable incident bundles found");
+        }
         return Ok(());
     }
-    for inc in &incidents {
+    for inc in &listing.incidents {
         let m = &inc.meta;
         let exit = match m.exit_code {
             Some(c) => c.to_string(),
@@ -119,31 +136,50 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
         print_digest_summary(d);
     }
 
-    // The on-disk rollout is the authoritative artifact. We recorded only env
-    // var *names*, so a run that overrode CODEX_HOME can't be resolved here;
-    // fall back to the default home and report a miss plainly.
+    // The recorded home keeps custom CODEX_HOME sessions visible. Older rows
+    // have no path and use the current process environment/default.
     let transcript = if latest.provider == "codex" {
-        transcript::summarize_session(session_id, None, None)
+        let home = transcript::codex_home(
+            latest.codex_home.as_deref(),
+            None,
+            std::path::Path::new(&latest.project),
+        );
+        let lookup = match home.as_deref() {
+            Some(home) => transcript::summarize_session_in_home_lookup(session_id, home, None),
+            None => transcript::Lookup::UnknownHome,
+        };
+        match lookup {
+            transcript::Lookup::Found(summary) => Some(summary),
+            transcript::Lookup::Absent => {
+                println!("transcript: (not found under the resolved CODEX_HOME)");
+                None
+            }
+            transcript::Lookup::Unreadable(error) => {
+                println!("transcript: (unreadable: {error})");
+                None
+            }
+            transcript::Lookup::UnknownHome => {
+                println!("transcript: (Codex home could not be resolved)");
+                None
+            }
+        }
     } else {
         None
     };
-    if latest.provider == "codex" {
-        match transcript {
-            Some(ref t) => {
-                println!("transcript: {}", t.path);
-                println!(
-                    "  task_complete={} stream_error={}",
-                    t.task_complete, t.stream_error
-                );
-                if let Some(ref last) = t.last_event {
-                    println!("  last_event: {last}");
-                }
-                if let Some((ref name, ref args)) = t.last_in_flight_tool {
-                    let shown: String = args.chars().take(200).collect();
-                    println!("  last_in_flight_tool: {name} {shown}");
-                }
-            }
-            None => println!("transcript: (not found under default CODEX_HOME)"),
+    if latest.provider == "codex"
+        && let Some(ref t) = transcript
+    {
+        println!("transcript: {}", t.path);
+        println!(
+            "  task_complete={} stream_error={}",
+            t.task_complete, t.stream_error
+        );
+        if let Some(ref last) = t.last_event {
+            println!("  last_event: {last}");
+        }
+        if let Some((ref name, ref args)) = t.last_in_flight_tool {
+            let shown: String = args.chars().take(200).collect();
+            println!("  last_in_flight_tool: {name} {shown}");
         }
     }
 

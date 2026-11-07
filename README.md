@@ -444,8 +444,7 @@ If you're hitting rate limits, increase the stagger. If you're only running 1-2 
 
 ## Concurrency
 
-A global file lock (`launch.lock` in review's data directory,
-`~/.local/share/review/` by default) serializes provider **launches**, not
+A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
 whole runs. An invocation holds it until its providers have been spawned (the
 fan-out path through its staggered launches, a `review resume` through the
 single spawn), then releases it and lets the runs proceed concurrently.

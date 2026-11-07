@@ -92,6 +92,7 @@ fn record_run(
             &result.output,
             digest_summary.as_ref(),
             &result.leftovers,
+            result.codex_home.as_deref(),
         );
     }
 }
@@ -368,6 +369,7 @@ mod tests {
             provider: "codex".into(),
             output: Ok(format!("text of {sid}")),
             session_id: Some(sid.into()),
+            codex_home: None,
             digest: Some(provider::Digest {
                 exit_code: Some(i32::from(!answered)),
                 signal: None,

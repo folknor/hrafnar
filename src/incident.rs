@@ -8,8 +8,9 @@
 //!
 //! `write_bundle` dumps all of it to `~/.local/share/review/incidents/<dir>/`
 //! so the *next* death is over-instrumented instead of a mystery. It is
-//! best-effort: every failure warns and returns, never derailing the run. Only
-//! suspicious runs write a bundle, so clean runs stay uncluttered.
+//! best-effort: `write_bundle` returns failures to its caller, which reports
+//! them without derailing the run. Only suspicious runs write a bundle, so
+//! clean runs stay uncluttered.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -162,10 +163,30 @@ fn looks_secret(name: &str) -> bool {
     .any(|needle| n.contains(needle))
 }
 
-/// Write a forensic bundle for a suspicious run. Returns the bundle directory on
-/// success. Best-effort: warns and returns `None` on any IO failure.
-pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
-    let base = incidents_dir(inc.data_root)?;
+#[derive(Debug)]
+pub struct IncidentFailure {
+    pub path: Option<PathBuf>,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub enum BundleWriteOutcome {
+    Written(PathBuf),
+    Unavailable(String),
+    Incomplete {
+        directory: Option<PathBuf>,
+        failures: Vec<IncidentFailure>,
+    },
+}
+
+/// Write a forensic bundle for a suspicious run. A directory is reported as
+/// written only when every artifact, including its index, was written.
+pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
+    let Some(base) = incidents_dir(inc.data_root) else {
+        return BundleWriteOutcome::Unavailable(
+            "could not determine the incident data directory".to_string(),
+        );
+    };
     let timestamp = crate::audit::chrono_now();
     let stamp = timestamp.replace(':', "-");
     let sid = inc.session_id.unwrap_or("no-session");
@@ -185,39 +206,56 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     });
     let dir = base.join(format!("{stamp}-{}-{sid}-{nonce}", inc.provider));
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "warning: failed to create incident dir {}: {e}",
-            dir.display()
-        );
-        return None;
+        return BundleWriteOutcome::Incomplete {
+            directory: Some(dir.clone()),
+            failures: vec![IncidentFailure {
+                path: Some(dir),
+                message: e.to_string(),
+            }],
+        };
     }
+    let mut failures = Vec::new();
 
     // Full stderr - the highest-value channel we used to discard. With
     // RUST_BACKTRACE set on the child, a panic lands here with its trace.
-    write_file(&dir, "stderr.txt", inc.stderr);
+    if let Err(error) = write_file(&dir, "stderr.txt", inc.stderr) {
+        failures.push(error);
+    }
 
     // The prompt piped on stdin, and the runnable command that consumes it.
-    write_file(&dir, "prompt.txt", inc.prompt.as_bytes());
+    if let Err(error) = write_file(&dir, "prompt.txt", inc.prompt.as_bytes()) {
+        failures.push(error);
+    }
     let mut full_argv = vec![inc.binary.to_string()];
     full_argv.extend(inc.argv.iter().cloned());
     let command = replay_command(&full_argv, inc.env, inc.cwd, &dir.join("prompt.txt"));
 
     // Raw NDJSON stream, tail-capped. The interesting part is where it stops.
     let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
-    write_file(&dir, "stdout.jsonl", stdout_slice);
+    if let Err(error) = write_file(&dir, "stdout.jsonl", stdout_slice) {
+        failures.push(error);
+    }
 
     // The excerpt and metadata must describe this invocation, not an earlier
     // turn in the same resumed session. Use the exact byte baseline that scoped
     // recovery; an untrusted baseline is represented by an offset beyond EOF.
     let mut rate_limits = None;
-    if let Some(path) = inc.transcript_path
-        && let Ok(bytes) = std::fs::read(path)
-    {
-        let scoped = crate::transcript::slice_from_offset(&bytes, inc.transcript_offset);
-        let content = String::from_utf8_lossy(scoped);
-        let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
-        write_file(&dir, "transcript.tail.jsonl", tail.as_bytes());
-        rate_limits = scan_rate_limits(&content);
+    if let Some(path) = inc.transcript_path {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let scoped = crate::transcript::slice_from_offset(&bytes, inc.transcript_offset);
+                let content = String::from_utf8_lossy(scoped);
+                let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
+                if let Err(error) = write_file(&dir, "transcript.tail.jsonl", tail.as_bytes()) {
+                    failures.push(error);
+                }
+                rate_limits = scan_rate_limits(&content);
+            }
+            Err(error) => failures.push(IncidentFailure {
+                path: Some(PathBuf::from(path)),
+                message: format!("failed to read rollout transcript: {error}"),
+            }),
+        }
     }
     let final_answer_present = inc.final_answer_present;
 
@@ -266,29 +304,37 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     // meta.json is the index `review incidents` reads and the file that makes
     // the bundle self-describing. If it can't be written (quota, unwritable
     // dir), don't advertise a path that points at a broken bundle.
-    let meta_ok = match serde_json::to_vec_pretty(&meta) {
-        Ok(bytes) => write_file(&dir, "meta.json", &bytes),
-        Err(e) => {
-            eprintln!("warning: failed to serialize incident meta: {e}");
-            false
+    match serde_json::to_vec_pretty(&meta) {
+        Ok(bytes) => {
+            if let Err(error) = write_file(&dir, "meta.json", &bytes) {
+                failures.push(error);
+            }
         }
-    };
-    if !meta_ok {
-        return None;
+        Err(error) => failures.push(IncidentFailure {
+            path: Some(dir.join("meta.json")),
+            message: format!("failed to serialize incident metadata: {error}"),
+        }),
     }
 
-    Some(dir)
+    if failures.is_empty() {
+        BundleWriteOutcome::Written(dir)
+    } else {
+        BundleWriteOutcome::Incomplete {
+            directory: Some(dir),
+            failures,
+        }
+    }
 }
 
-/// Write `bytes` to `dir/name`; returns whether it succeeded.
-fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> bool {
+/// Write `bytes` to `dir/name`, retaining the failed path and cause.
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), IncidentFailure> {
     let path = dir.join(name);
     match std::fs::write(&path, bytes) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("warning: failed to write {}: {e}", path.display());
-            false
-        }
+        Ok(()) => Ok(()),
+        Err(error) => Err(IncidentFailure {
+            path: Some(path),
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -404,36 +450,86 @@ pub struct ListedIncident {
     pub meta: IncidentSummary,
 }
 
+pub struct IncidentListing {
+    pub incidents: Vec<ListedIncident>,
+    pub failures: Vec<IncidentFailure>,
+}
+
 /// Recent incident bundles, newest first, ordered by their recorded UTC time.
-/// Only directories with recognized incident metadata are included.
-pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
+/// Read failures are returned alongside the bundles that could be read.
+pub fn list_recent(limit: usize) -> IncidentListing {
     // Always the real location: `review incidents` is an operator-facing view.
     let base = match incidents_dir(None) {
         Some(b) => b,
-        None => return Vec::new(),
+        None => {
+            return IncidentListing {
+                incidents: Vec::new(),
+                failures: vec![IncidentFailure {
+                    path: None,
+                    message: "could not determine the incident data directory".to_string(),
+                }],
+            };
+        }
     };
     list_recent_from(&base, limit)
 }
 
 /// Read incident bundles from an explicit directory, so listing can be
 /// exercised without consulting the operator's data directory.
-fn list_recent_from(base: &Path, limit: usize) -> Vec<ListedIncident> {
+fn list_recent_from(base: &Path, limit: usize) -> IncidentListing {
     if limit == 0 {
-        return Vec::new();
+        return IncidentListing {
+            incidents: Vec::new(),
+            failures: Vec::new(),
+        };
     }
-    let Ok(entries) = std::fs::read_dir(base) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return IncidentListing {
+                incidents: Vec::new(),
+                failures: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return IncidentListing {
+                incidents: Vec::new(),
+                failures: vec![IncidentFailure {
+                    path: Some(base.to_path_buf()),
+                    message: format!("failed to read incident directory: {error}"),
+                }],
+            };
+        }
     };
     let mut incidents = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let dir = entry.path();
-        let Some(meta) = read_incident_summary(&dir) else {
-            continue;
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(IncidentFailure {
+                    path: Some(base.to_path_buf()),
+                    message: format!("failed to read incident directory entry: {error}"),
+                });
+                continue;
+            }
         };
-        incidents.push(ListedIncident { dir, meta });
+        let dir = entry.path();
+        match entry.file_type() {
+            Ok(kind) if !kind.is_dir() => continue,
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(IncidentFailure {
+                    path: Some(dir),
+                    message: format!("failed to inspect incident entry: {error}"),
+                });
+                continue;
+            }
+        }
+        match read_incident_summary(&dir) {
+            Ok(meta) => incidents.push(ListedIncident { dir, meta }),
+            Err(error) => failures.push(error),
+        }
     }
     incidents.sort_by(|a, b| {
         b.meta
@@ -442,20 +538,40 @@ fn list_recent_from(base: &Path, limit: usize) -> Vec<ListedIncident> {
             .then_with(|| b.dir.file_name().cmp(&a.dir.file_name()))
     });
     incidents.truncate(limit);
-    incidents
+    IncidentListing {
+        incidents,
+        failures,
+    }
 }
 
-fn read_incident_summary(dir: &Path) -> Option<IncidentSummary> {
-    let content = std::fs::read_to_string(dir.join("meta.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+fn read_incident_summary(dir: &Path) -> Result<IncidentSummary, IncidentFailure> {
+    let path = dir.join("meta.json");
+    let content = std::fs::read_to_string(&path).map_err(|error| IncidentFailure {
+        path: Some(path.clone()),
+        message: format!("failed to read incident metadata: {error}"),
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| IncidentFailure {
+            path: Some(path.clone()),
+            message: format!("failed to parse incident metadata: {error}"),
+        })?;
     if value.get("schema").and_then(serde_json::Value::as_u64) != Some(u64::from(INCIDENT_SCHEMA)) {
-        return None;
+        return Err(IncidentFailure {
+            path: Some(path),
+            message: "unsupported incident metadata schema".to_string(),
+        });
     }
-    let meta: IncidentSummary = serde_json::from_value(value).ok()?;
+    let meta: IncidentSummary = serde_json::from_value(value).map_err(|error| IncidentFailure {
+        path: Some(path.clone()),
+        message: format!("failed to decode incident metadata: {error}"),
+    })?;
     if meta.provider.is_empty() || !is_utc_timestamp(&meta.timestamp) {
-        return None;
+        return Err(IncidentFailure {
+            path: Some(path),
+            message: "incident metadata has no provider or a bad UTC timestamp".to_string(),
+        });
     }
-    Some(meta)
+    Ok(meta)
 }
 
 fn is_utc_timestamp(timestamp: &str) -> bool {
@@ -629,18 +745,23 @@ mod tests {
 
         let recent = list_recent_from(&base, 10);
         let names: Vec<_> = recent
+            .incidents
             .iter()
             .map(|item| item.dir.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["newer".to_string(), "older".to_string()]);
+        assert_eq!(recent.failures.len(), 3);
 
         let limited = list_recent_from(&base, 1);
-        assert_eq!(limited.len(), 1);
+        assert_eq!(limited.incidents.len(), 1);
         assert_eq!(
-            limited[0].dir.file_name().and_then(|name| name.to_str()),
+            limited.incidents[0]
+                .dir
+                .file_name()
+                .and_then(|name| name.to_str()),
             Some("newer")
         );
-        assert!(list_recent_from(&base, 0).is_empty());
+        assert!(list_recent_from(&base, 0).incidents.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
 

@@ -531,6 +531,7 @@ async fn run_grok_turn(
         GrokOutcome::Answered(answer) => RunOutput {
             text: answer.text,
             session_id: keep_id(answer.session_id),
+            codex_home: None,
             served,
             leftovers,
             // A real answer from a process that nonetheless exited non-zero is
@@ -564,6 +565,7 @@ async fn run_grok_turn(
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
+                codex_home: None,
                 digest: Some(with_usage(digest)),
                 served,
                 leftovers,

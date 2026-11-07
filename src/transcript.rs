@@ -9,29 +9,22 @@
 //! when it died).
 
 use std::{
+    ffi::CStr,
     io,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
 /// Result of looking for or reading a rollout artifact.
 ///
-/// The compatibility `Option` helpers below intentionally keep returning
-/// `None` for both absence and I/O failure. New callers that need to report
-/// those cases separately should use the corresponding lookup helper.
+/// Callers can distinguish an absent artifact, an unreadable artifact, and an
+/// unresolved Codex home without inferring the cause from `None`.
 #[derive(Debug)]
 pub enum Lookup<T> {
     Found(T),
     Absent,
     Unreadable(io::Error),
-}
-
-impl<T> Lookup<T> {
-    fn into_option(self) -> Option<T> {
-        match self {
-            Self::Found(value) => Some(value),
-            Self::Absent | Self::Unreadable(_) => None,
-        }
-    }
+    UnknownHome,
 }
 
 pub struct TranscriptSummary {
@@ -53,46 +46,125 @@ pub struct TranscriptSummary {
     pub final_answer: Option<String>,
 }
 
-/// Codex home directory. `override_home` is the effective `CODEX_HOME` for the
-/// run (e.g. a profile `env` override), which wins over the parent process's
-/// environment - otherwise a run pointed at a custom codex home would have its
-/// transcript written somewhere we never look.
-pub(crate) fn codex_home(override_home: Option<&str>) -> PathBuf {
-    if let Some(dir) = override_home {
-        return PathBuf::from(dir);
+/// Resolve the Codex home as the child sees it. Relative paths are based on
+/// the provider working directory, not the caller's current directory.
+pub(crate) fn codex_home(
+    override_home: Option<&str>,
+    home_override: Option<&str>,
+    working_dir: &Path,
+) -> Option<PathBuf> {
+    let code_home = if override_home.is_some() {
+        None
+    } else {
+        std::env::var("CODEX_HOME").ok()
+    };
+    let home = std::env::var("HOME").ok();
+    let effective_home = home_override.or(home.as_deref());
+    let needs_passwd_home = override_home.is_none_or(str::is_empty)
+        && code_home.as_deref().is_none_or(str::is_empty)
+        && effective_home.is_none_or(str::is_empty);
+    let passwd_home = needs_passwd_home.then(home_directory_from_passwd).flatten();
+    resolve_codex_home(
+        override_home,
+        code_home.as_deref(),
+        effective_home,
+        passwd_home.as_deref(),
+        working_dir,
+    )
+}
+
+fn resolve_codex_home(
+    override_home: Option<&str>,
+    code_home: Option<&str>,
+    home: Option<&str>,
+    passwd_home: Option<&Path>,
+    working_dir: &Path,
+) -> Option<PathBuf> {
+    let configured = override_home
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| code_home.filter(|dir| !dir.is_empty()));
+    let home_dir = home
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| passwd_home.map(Path::to_path_buf));
+    let path = if let Some(dir) = configured {
+        PathBuf::from(dir)
+    } else {
+        home_dir?.join(".codex")
+    };
+    if path.is_absolute() {
+        Some(path)
+    } else if working_dir.is_absolute() {
+        Some(working_dir.join(path))
+    } else {
+        Some(std::env::current_dir().ok()?.join(working_dir).join(path))
     }
-    if let Ok(dir) = std::env::var("CODEX_HOME") {
-        return PathBuf::from(dir);
+}
+
+fn home_directory_from_passwd() -> Option<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    let mut capacity = 16 * 1024;
+    loop {
+        let mut buffer = vec![0u8; capacity];
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+        let mut result = std::ptr::null_mut();
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if code == libc::ERANGE && capacity < 1 << 20 {
+            capacity *= 2;
+            continue;
+        }
+        if code != 0 || result.is_null() {
+            return None;
+        }
+        let entry = unsafe { entry.assume_init() };
+        if entry.pw_dir.is_null() {
+            return None;
+        }
+        let bytes = unsafe { CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".codex")
 }
 
 /// Locate the transcript file for a session id by matching the `-<id>.jsonl`
 /// filename suffix (the id is a UUID, so this is unambiguous). Bounded
-/// recursive walk of the date-nested `sessions/` tree.
-pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
-    find_transcript_path_lookup(session_id, override_home).into_option()
-}
-
-/// Typed counterpart to `find_transcript_path`.
-///
-/// A missing override means the current process environment/default home. It
-/// does not recover a profile-specific home used by an older session; callers
-/// need a persisted rollout path for that case.
+/// recursive walk of the date-nested `sessions/` tree. A missing override uses
+/// the current process environment and the account home from the system user
+/// database when `HOME` is unset.
 pub fn find_transcript_path_lookup(
     session_id: &str,
     override_home: Option<&str>,
 ) -> Lookup<PathBuf> {
-    find_transcript_path_in_home_lookup(session_id, &codex_home(override_home))
+    let Some(home) = codex_home(override_home, None, &PathBuf::new()) else {
+        return Lookup::UnknownHome;
+    };
+    find_transcript_path_in_home_lookup(session_id, &home)
 }
 
-/// Locate a rollout under an already resolved home without re-reading the environment.
-pub(crate) fn find_transcript_path_in_home(session_id: &str, home: &Path) -> Option<PathBuf> {
-    find_transcript_path_in_home_lookup(session_id, home).into_option()
+/// Locate and summarize a rollout under an already resolved home.
+pub(crate) fn summarize_session_in_home_lookup(
+    session_id: &str,
+    home: &Path,
+    from_offset: Option<u64>,
+) -> Lookup<TranscriptSummary> {
+    match find_transcript_path_in_home_lookup(session_id, home) {
+        Lookup::Found(path) => summarize_lookup(&path, from_offset),
+        Lookup::Absent => Lookup::Absent,
+        Lookup::Unreadable(error) => Lookup::Unreadable(error),
+        Lookup::UnknownHome => Lookup::UnknownHome,
+    }
 }
 
-/// Typed counterpart to `find_transcript_path_in_home`.
 pub(crate) fn find_transcript_path_in_home_lookup(
     session_id: &str,
     home: &Path,
@@ -163,11 +235,6 @@ fn has_transcript_name(path: &Path, needle: &str) -> bool {
         .is_some_and(|name| name.ends_with(needle))
 }
 
-pub(crate) fn summarize(path: &Path, from_offset: Option<u64>) -> Option<TranscriptSummary> {
-    summarize_lookup(path, from_offset).into_option()
-}
-
-/// Typed counterpart to `summarize`.
 pub(crate) fn summarize_lookup(path: &Path, from_offset: Option<u64>) -> Lookup<TranscriptSummary> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -418,15 +485,6 @@ fn parse(content: &str) -> TranscriptSummary {
 /// summary to that run's own events - used by recovery so a prior turn's
 /// `final_answer` can never be reported as this run's result. Pass `None` to
 /// summarize the whole rollout (e.g. `review sessions <id>`).
-pub fn summarize_session(
-    session_id: &str,
-    override_home: Option<&str>,
-    from_offset: Option<u64>,
-) -> Option<TranscriptSummary> {
-    summarize_session_lookup(session_id, override_home, from_offset).into_option()
-}
-
-/// Typed counterpart to `summarize_session`.
 pub fn summarize_session_lookup(
     session_id: &str,
     override_home: Option<&str>,
@@ -436,6 +494,7 @@ pub fn summarize_session_lookup(
         Lookup::Found(path) => summarize_lookup(&path, from_offset),
         Lookup::Absent => Lookup::Absent,
         Lookup::Unreadable(error) => Lookup::Unreadable(error),
+        Lookup::UnknownHome => Lookup::UnknownHome,
     }
 }
 

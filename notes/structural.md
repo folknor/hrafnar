@@ -296,20 +296,6 @@ Registry(..) }`, the place to hang exit codes later; and for
 `LookupError { Unknown { registered }, Ambiguous(Vec<String>), Expand(..),
 NotAbsolute }`.
 
-## STR-013 - Typed forensic lookups
-
-Reported by: forensics. Narrowed: `transcript::Lookup<T>` (found, absent,
-unreadable) and typed counterparts of the transcript lookups now exist beside
-the old `Option` helpers.
-
-What remains: move the callers onto the typed helpers, in the codex runner
-(`src/provider/codex.rs`, for the baseline warning) and in `src/app/history.rs`
-(`review sessions <id>`), then drop the `Option` helpers; and give
-`incident::write_bundle` (today `Option<PathBuf>`, warning on each failure and
-able to return a path after some artifact writes failed) and
-`incident::list_recent` (today a `Vec` that swallows read and parse errors)
-typed outcomes too.
-
 ## STR-014 - Keeper `Spec` durations flattened for JSON
 
 Reported by: lifecycle. Narrowed: the protocol bytes are now a shared

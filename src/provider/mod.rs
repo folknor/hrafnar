@@ -432,6 +432,7 @@ pub async fn invoke(
             provider: provider.to_string(),
             output: Ok(run.text),
             session_id: run.session_id,
+            codex_home: run.codex_home,
             digest: run.digest,
             completed_epoch,
             sandbox: effective_sandbox(provider, sandbox),
@@ -446,6 +447,7 @@ pub async fn invoke(
             provider: provider.to_string(),
             output: Err(e),
             session_id: None,
+            codex_home: None,
             digest: None,
             completed_epoch,
             // A launch that failed still launched with these permissions

@@ -563,6 +563,7 @@ pub async fn run_claude(
             return Ok(RunOutput {
                 text,
                 session_id: keep_id(None),
+                codex_home: None,
                 digest: Some(digest),
                 served,
                 leftovers,
@@ -588,6 +589,7 @@ pub async fn run_claude(
         ClaudeOutcome::Answered { text, session_id } => RunOutput {
             text,
             session_id: keep_id(session_id),
+            codex_home: None,
             served,
             leftovers,
             // As for grok: a real answer from a process that exited non-zero is
@@ -618,6 +620,7 @@ pub async fn run_claude(
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
+                codex_home: None,
                 digest: Some(digest),
                 served,
                 leftovers,

@@ -400,22 +400,55 @@ pub async fn run_codex_json(
     // `final_answer` from a previous turn could then authorise killing a genuine
     // mid-turn wedge, or be recovered as this run's answer.
     // Resolve once so baseline, watchdog and recovery search the same home.
-    let codex_home =
-        crate::transcript::codex_home(env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str));
-    let rollout_baseline: Option<u64> = match known_session_id.as_deref() {
+    let codex_home = crate::transcript::codex_home(
+        env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str),
+        env.and_then(|e| e.get("HOME")).map(String::as_str),
+        project_root,
+    );
+    let mut baseline_problem = None;
+    let rollout_baseline: Option<u64> = match (codex_home.as_deref(), known_session_id.as_deref()) {
+        (None, _) => {
+            baseline_problem = Some("Codex home is unknown".to_string());
+            None
+        }
         // Fresh run: a new session id, so its rollout does not exist yet and
         // every byte in it will be ours. Zero is exact here, not a fallback.
-        None => Some(0),
+        (Some(_), None) => Some(0),
         // Resume: the rollout already holds earlier turns, so we must know
         // exactly where they end. If we cannot stat it, we do not guess.
-        Some(sid) => crate::transcript::find_transcript_path_in_home(sid, &codex_home)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len()),
+        (Some(home), Some(sid)) => {
+            match crate::transcript::find_transcript_path_in_home_lookup(sid, home) {
+                crate::transcript::Lookup::Found(path) => match std::fs::metadata(path) {
+                    Ok(metadata) => Some(metadata.len()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        baseline_problem =
+                            Some("the rollout disappeared before it could be read".to_string());
+                        None
+                    }
+                    Err(error) => {
+                        baseline_problem = Some(format!("the rollout could not be read: {error}"));
+                        None
+                    }
+                },
+                crate::transcript::Lookup::Absent => {
+                    baseline_problem = Some("the rollout was not found".to_string());
+                    None
+                }
+                crate::transcript::Lookup::Unreadable(error) => {
+                    baseline_problem = Some(format!("the rollout search was unreadable: {error}"));
+                    None
+                }
+                crate::transcript::Lookup::UnknownHome => {
+                    baseline_problem = Some("Codex home is unknown".to_string());
+                    None
+                }
+            }
+        }
     };
-    if rollout_baseline.is_none() {
+    if let Some(problem) = baseline_problem {
         eprintln!(
-            "warning: could not read the rollout for session {} before launch; \
-             completion watchdog and transcript recovery are disabled for this run",
+            "warning: {problem} for session {}; completion watchdog and transcript recovery \
+             are disabled for this run",
             known_session_id.as_deref().unwrap_or("?")
         );
     }
@@ -850,10 +883,37 @@ pub async fn run_codex_json(
         // the baseline is untrustworthy this yields nothing rather than the
         // whole history, which is the safe direction: no recovery beats a wrong
         // answer that also suppresses auto-resume.
-        session_id
-            .as_deref()
-            .and_then(|sid| crate::transcript::find_transcript_path_in_home(sid, &codex_home))
-            .and_then(|path| crate::transcript::summarize(&path, recovery_scope))
+        match (session_id.as_deref(), codex_home.as_deref()) {
+            (Some(sid), Some(home)) => {
+                match crate::transcript::summarize_session_in_home_lookup(sid, home, recovery_scope)
+                {
+                    crate::transcript::Lookup::Found(summary) => Some(summary),
+                    crate::transcript::Lookup::Absent => {
+                        eprintln!(
+                            "warning: rollout for codex session {sid} was not found during recovery"
+                        );
+                        None
+                    }
+                    crate::transcript::Lookup::Unreadable(error) => {
+                        eprintln!(
+                            "warning: rollout for codex session {sid} could not be read during recovery: {error}"
+                        );
+                        None
+                    }
+                    crate::transcript::Lookup::UnknownHome => {
+                        eprintln!("warning: Codex home is unknown during transcript recovery");
+                        None
+                    }
+                }
+            }
+            (Some(sid), None) => {
+                eprintln!(
+                    "warning: Codex home is unknown for session {sid}; transcript recovery is disabled"
+                );
+                None
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -897,7 +957,7 @@ pub async fn run_codex_json(
         let (codex_version, probe_leftovers) =
             crate::contained::version_probe(&runtime.codex_binary, &runtime.teardown).await;
         leftovers.merge(probe_leftovers);
-        crate::incident::write_bundle(&crate::incident::Incident {
+        match crate::incident::write_bundle(&crate::incident::Incident {
             codex_version,
             provider: "codex",
             // The binary actually executed, which is not always "codex": a
@@ -926,8 +986,38 @@ pub async fn run_codex_json(
             quiet_secs,
             last_rollout_event: last_rollout_event.as_deref(),
             turn_error: turn_error.as_deref(),
-        })
-        .map(|p| p.to_string_lossy().into_owned())
+        }) {
+            crate::incident::BundleWriteOutcome::Written(path) => {
+                Some(path.to_string_lossy().into_owned())
+            }
+            crate::incident::BundleWriteOutcome::Unavailable(reason) => {
+                eprintln!("warning: incident bundle was not written: {reason}");
+                None
+            }
+            crate::incident::BundleWriteOutcome::Incomplete {
+                directory,
+                failures,
+            } => {
+                for failure in failures {
+                    let path = failure
+                        .path
+                        .as_deref()
+                        .map(|path| format!(" {}", path.display()))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "warning: incident bundle write failed{path}: {}",
+                        failure.message
+                    );
+                }
+                if let Some(directory) = directory {
+                    eprintln!(
+                        "warning: incomplete incident bundle at {}",
+                        directory.display()
+                    );
+                }
+                None
+            }
+        }
     } else {
         None
     };
@@ -983,6 +1073,7 @@ pub async fn run_codex_json(
     Ok(RunOutput {
         text,
         session_id,
+        codex_home: codex_home.map(|path| path.to_string_lossy().into_owned()),
         digest: Some(digest),
         served: Served::default(),
         leftovers,

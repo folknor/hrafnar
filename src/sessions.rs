@@ -173,6 +173,11 @@ struct SessionEntry<'a> {
     /// left, so `jq 'select(.leftovers)'` finds the runs that left something.
     #[serde(skip_serializing_if = "Option::is_none")]
     leftovers: Option<crate::contained::Leftovers>,
+    /// Resolved Codex home used for this session's rollout. Stored separately
+    /// from `env_keys` because the profile value is needed for later forensics
+    /// and resumes, while environment values are otherwise not persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_home: Option<&'a str>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -226,6 +231,9 @@ pub struct SessionRecord {
     /// claude rows and for older rows.
     #[serde(default)]
     pub digest: Option<crate::provider::DigestSummary>,
+    /// Absent on rows written before Codex home persistence was added.
+    #[serde(default)]
+    pub codex_home: Option<String>,
 }
 
 fn deserialize_epoch_secs<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
@@ -338,6 +346,7 @@ pub fn record(
     result: &Result<String>,
     digest: Option<&crate::provider::DigestSummary>,
     leftovers: &crate::contained::Leftovers,
+    codex_home: Option<&str>,
 ) {
     record_with_kind(
         project_root,
@@ -360,6 +369,7 @@ pub fn record(
         result,
         digest,
         leftovers,
+        codex_home,
     );
 }
 
@@ -390,6 +400,7 @@ pub(crate) fn record_with_kind(
     result: &Result<String>,
     digest: Option<&crate::provider::DigestSummary>,
     leftovers: &crate::contained::Leftovers,
+    codex_home: Option<&str>,
 ) {
     let path = match sessions_path(private) {
         Some(p) => p,
@@ -432,6 +443,7 @@ pub(crate) fn record_with_kind(
         review_version: env!("CARGO_PKG_VERSION"),
         digest: digest.cloned(),
         leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),
+        codex_home,
     };
 
     let line = match serde_json::to_string(&entry) {

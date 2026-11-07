@@ -17,24 +17,6 @@ hunter's reading of the code, and some say so explicitly.
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-## BUG-012 - A custom `CODEX_HOME` blinds resume forensics and `review sessions <id>`
-
-Reported by: forensics, providers, and a wave fixer. Narrowed: within one run,
-codex's home is now resolved once and used for the baseline, the watchdog and
-recovery alike.
-
-What remains crosses runs. Only env var names are recorded, so `CODEX_HOME` set
-by a profile is lost after the run. The resume path passes no profile env, so
-the rollout baseline and transcript lookup use the default `CODEX_HOME`: a
-session created under a custom home resumes against the wrong one, and the
-watchdog and recovery are disabled with a warning. `run_session_show` passes no
-home override for the same reason and cannot find the rollout. The run itself
-knew the path, but it is not persisted in `DigestSummary`, and on a clean run
-no transcript is read at all. A typed transcript lookup now exists, but it
-cannot recover a profile-specific home from an older record. Proposed: persist
-the resolved rollout path in the sidecar row and read it on resume and in
-`review sessions <id>`.
-
 ## BUG-017 - The incident replay command omits runner-injected env
 
 Reported by: forensics.
@@ -75,16 +57,6 @@ so this is unverified rather than known wrong; a probe of a multi-result run
 (a background subagent wake) would settle it. Not a wave item: it needs a real
 provider run.
 
-## BUG-054 - An unwritable data directory now blocks every launch
-
-Reported by: a wave reviewer (lateral).
-
-`lock::open_global_lock` runs `create_dir_all` on `review`'s data directory and
-fails the run if that fails. The old `/tmp/review.lock` never failed this way,
-so a host whose data directory is read-only or cannot be created now refuses to
-launch at all. If that is not intended, fall back to the fixed `/tmp` lock path
-the helper already uses when no data location is set.
-
 ## BUG-055 - Small leftovers from the session-log and config changes
 
 Reported by: a wave reviewer (lateral). Cosmetic.
@@ -102,12 +74,3 @@ Reported by: a wave reconciler (lateral). Cosmetic.
 `review sessions` prints "turn in flight since <dur>" through
 `sessions::format_age`, which returns "now" under 60 seconds, so a turn that
 just started reads "turn in flight since now".
-
-## BUG-052 - Codex's home resolves to a relative path when no home is set
-
-Reported by: a wave fixer (lateral).
-
-If both `HOME` and `CODEX_HOME` are unset, `transcript::codex_home` resolves to
-the relative path `.codex`, so rollout lookups search under whatever the
-current directory is, and the typed lookup reports what it finds there rather
-than an unknown home.

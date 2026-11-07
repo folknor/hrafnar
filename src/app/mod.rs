@@ -333,7 +333,8 @@ pub async fn run() -> Result<()> {
     }
 
     // Global lock
-    let lock_file = lock::open_global_lock()?;
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
     // Re-read under the lock: cfg was loaded before waiting, so its audit id
@@ -437,6 +438,7 @@ pub async fn run() -> Result<()> {
                     provider: p.provider.clone(),
                     output: Err(anyhow::anyhow!("task panicked: {err}")),
                     session_id: None,
+                    codex_home: None,
                     digest: None,
                     completed_epoch: provider::now_epoch_secs(),
                     // A panicked task never reached a provider, so it launched

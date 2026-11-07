@@ -155,6 +155,9 @@ pub struct ProviderResult {
     /// caller. Fresh runs capture the newly-created session; resumes retain
     /// the ID they were given.
     pub session_id: Option<String>,
+    /// Resolved Codex home used for rollout lookup, persisted so resumes and
+    /// session forensics can find the same session even when a profile set it.
+    pub codex_home: Option<String>,
     /// Structured run summary (codex only, today).
     pub digest: Option<Digest>,
     /// UNIX seconds when this run actually finished. Stamped here rather than at
@@ -229,6 +232,8 @@ pub struct RunOutput {
     pub text: String,
     /// Session ID associated with this invocation, including a resumed ID.
     pub session_id: Option<String>,
+    /// Resolved Codex home used for rollout lookup, when this is a Codex run.
+    pub codex_home: Option<String>,
     pub digest: Option<Digest>,
     pub served: Served,
     /// What the run's processes left behind, across every invocation it made.
