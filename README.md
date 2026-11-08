@@ -1,6 +1,6 @@
 # review
 
-A Rust CLI that sends a prompt to fresh AI sessions across multiple providers (Claude Code, Codex, Grok) - for reviews, and with a write profile for fixes.
+A Rust CLI that sends a prompt to fresh AI sessions across multiple providers (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
@@ -8,7 +8,7 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 You pipe your instructions via stdin. The tool starts a **fresh session** on each provider and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
 
-Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. All three providers print the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
+Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. Every provider prints the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
 
 ## Quick start
 
@@ -96,7 +96,7 @@ Use `-a all` to fan out to every configured archetype except the special `bare` 
 
 Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
 
-How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md) and [reference/grok.md](reference/grok.md). All three capture the new session ID: claude and grok get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
+How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every provider captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
 ### Upgrading from the positional archetype
 
@@ -126,7 +126,7 @@ echo "audit the auth flow" | review -a security -p opus
 
 The older host-scoped form `[<host>.<provider>.<profile>]` still parses. It applies only on the host it names, and there it beats a hostless table in the same file - which means such a table keeps overriding the global config on that host until you delete it. `review config` shows it alongside the global profile it hides.
 
-`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare `review` run can never modify files. **Claude ignores it** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping.
+`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki profiles must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
 
 The levels are `review`'s own vocabulary, translated per provider at launch, because the providers do not agree on the names and grok *refuses to start* on one it cannot resolve:
 
@@ -407,6 +407,7 @@ Existing `.review.toml` files keep working, including legacy host tables, with o
 | claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
 | codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
 | grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
+| maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
 
 Use `--provider` to limit which providers run:
 

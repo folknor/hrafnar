@@ -4,8 +4,8 @@ How `review` is put together: the layers, how a run moves through them, and the
 rules that hold across modules. What each module owns in detail is in its own
 `//!` doc comment; this document is the map that tells you which one to open.
 Why the behaviour is what it is lives in [design.md](design.md), and the
-per-provider mechanism in [codex.md](codex.md), [claude.md](claude.md) and
-[grok.md](grok.md).
+per-provider mechanism in [codex.md](codex.md), [claude.md](claude.md),
+[grok.md](grok.md) and [maki.md](maki.md).
 
 ## Shape
 
@@ -23,7 +23,7 @@ From the operator's command line down to the process a provider runs in:
 |---|---|---|
 | Command | `cli`, `app` (`launch`, `message`, `history`), `interrupt_cmd`, `config_cmd`, `man`, `exit` | Parsing, the fan-out, the verbs, exit status |
 | Config | `config` (`parse`, `resolve`, `load`, `profile`, `sandbox`, `error`), `project`, `path_expansion`, `config_write` | Layered config, `-C` project selection, the audit id |
-| Provider | `provider` (`kind`, `launch`, `prepare`, `permissions`, `model`, `session`, `lifecycle`, `stream`, `outcome`, `result`, `output`), one adapter per provider: `claude`, `codex/`, `grok/` | Turning a launch request into a classified result |
+| Provider | `provider` (`kind`, `launch`, `prepare`, `permissions`, `model`, `session`, `lifecycle`, `stream`, `outcome`, `result`, `output`), one adapter per wire protocol: `claude_compat` (claude and maki, decoded by `claude_stream`), `codex/`, `grok/` | Turning a launch request into a classified result |
 | Containment | `contained`, `keeper/`, `supervisor`, `process`, `report` | Running each provider under its own keeper and proving its tree empty |
 | State | `data`, `sessions/`, `inflight`, `audit`, `incident`, `transcript`, `lock`, `fsutil` | Everything `review` writes to disk and reads back |
 | Shared policy | `writable_roots/`, `watchdog`, `timings`, `prompt`, `input`, `ids` | Pieces several layers use |

@@ -2,12 +2,13 @@
 //! the adapter (`prepare::Prepared`: permissions, writable roots, model
 //! arguments, a caller-minted session id where the provider accepts one),
 //! dispatches to that adapter's runner, and returns a `ProviderResult`.
-//! Each runner (`claude`, `codex`, `grok`) drives the shared `lifecycle` and
-//! classifies what it observed into an `Outcome`. Everything that depends on
-//! the provider is an exhaustive match on `Provider` in this module tree.
+//! Each runner (`claude_compat` for claude and maki, `codex`, `grok`) drives
+//! the shared `lifecycle` and classifies what it observed into an `Outcome`.
+//! Everything that depends on the provider is an exhaustive match on
+//! `Provider` in this module tree.
 
 mod artifacts;
-mod claude;
+mod claude_compat;
 mod claude_stream;
 pub(crate) mod codex;
 mod grok;
@@ -25,7 +26,7 @@ mod session;
 mod stream;
 
 pub(crate) use artifacts::session_artifacts;
-use claude::run_claude;
+use claude_compat::{Dialect, run_claude_compat};
 pub use kind::{Provider, UnknownProvider};
 pub use launch::{InheritedSettings, LaunchSpec, ProfileOrigin, RunSettings};
 use lifecycle::{Lease, LeaseUse, Run};
@@ -69,9 +70,9 @@ pub fn is_available(provider: Provider) -> bool {
 pub fn recovery(r: &ProviderResult) -> Option<&'static str> {
     match r.provider {
         Provider::Codex => codex::recovery(r),
-        // A claude or grok turn that ends without an answer says why, or was
-        // killed; neither has codex's mid-turn wedge for a resume to finish.
-        Provider::Claude | Provider::Grok => None,
+        // A claude, maki or grok turn that ends without an answer says why, or
+        // was killed; none has codex's mid-turn wedge for a resume to finish.
+        Provider::Claude | Provider::Grok | Provider::Maki => None,
     }
 }
 
@@ -276,8 +277,12 @@ pub async fn invoke(
         Err(e) => Err(e),
         Ok(()) => match provider {
             Provider::Claude => {
-                claude::prepare(&launch);
-                Ok(prepare::Prepared::Claude)
+                claude_compat::prepare(&launch);
+                Ok(prepare::Prepared::ClaudeCompat(Dialect::Claude))
+            }
+            Provider::Maki => {
+                claude_compat::prepare(&launch);
+                Ok(prepare::Prepared::ClaudeCompat(Dialect::Maki))
             }
             Provider::Codex => {
                 codex::prepare(&launch, &mut plan);

@@ -374,7 +374,7 @@ model = \"opus\"
         move |p| match p {
             Provider::Claude => true,
             Provider::Codex => codex,
-            Provider::Grok => false,
+            Provider::Grok | Provider::Maki => false,
         }
     }
 

@@ -35,7 +35,7 @@ The stream ends in one result object per run, whatever the outcome, and its
 `is_error` says whether `result` is an answer (a run in which claude woke the
 model for a background subagent carries one per turn; the last is the answer).
 That is the grok arrangement ([grok.md](grok.md#turns-classify-themselves)), and
-`run_claude` handles it the same way: `is_error: false` is the answer; an
+`run_claude_compat` handles it the same way: `is_error: false` is the answer; an
 ordinary failure with explicit `is_error: true` is `Ok` carrying a digest whose
 `turn_error` names what claude reported, and keeps the session ID. A result object missing
 `is_error` counts as a failure, so a claude that stopped reporting it fails
@@ -72,8 +72,10 @@ independently. Completed metrics and readiness observations survive a cancelled
 reader; an unfinished line is not observed on cancellation.
 
 `src/provider/claude_stream.rs` owns pure Claude-compatible result, init and
-metric decoding, with provider wording supplied by its adapter. Launch flags
-and readiness publication stay in the Claude adapter.
+metric decoding. Claude and maki share it and the runner in
+`src/provider/claude_compat.rs`; what differs between them - argv, forced
+environment, how a result and its cost are read - is an exhaustive match on
+the `Dialect` ([maki.md](maki.md)).
 
 Two details from Claude Code 2.1.284 decide the shape. `subtype` is no guide:
 an unknown `--model` came back `subtype: "success"`, `is_error: true`,
@@ -109,14 +111,14 @@ second turn, whose result object is the last in the stream.
 Claude, unlike grok, has a switch that removes the failure rather than
 detecting it: `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` takes the
 `run_in_background` parameter off the Bash tool altogether. Under it the same
-prompt ran the command in the foreground and reported its output. `run_claude`
+prompt ran the command in the foreground and reported its output. `run_claude_compat`
 sets it on every run, so no wake loop is needed.
 
 That exposes Bash's timeout, which kills a foreground command at 2 minutes by
 default. The model may pass a longer `timeout`, but under `dontAsk` a permission
 allowlist naming commands (`Bash(python3 *)`) denied every call carrying one -
 the probe's model tried 200s and was refused - so the default is the limit that
-actually binds. `run_claude` sets `BASH_DEFAULT_TIMEOUT_MS` and
+actually binds. `run_claude_compat` sets `BASH_DEFAULT_TIMEOUT_MS` and
 `BASH_MAX_TIMEOUT_MS` to 20 minutes (`CLAUDE_COMMAND_WAIT_SECS`, grok's
 allowance too); a 150-second command then ran to completion. All three are set
 before the profile's `env`, so a profile can restate any of them.
@@ -188,8 +190,9 @@ marker at an exclusively owned per-invocation path. Pending handoff remains
 visible through app recording and receipt publication; two unrelated runs of one
 session cannot overwrite or delete each other. Ambiguous observations are refused.
 
-`tests/provider_runs.rs` drives `invoke` and the complete Claude adapter against a stub claude
-(`ProviderRuntime.commands` with the Claude prefix) for each of these: the interrupt, an answer
+`tests/provider_runs.rs` drives `invoke` and the complete adapter against a
+stub (`ProviderRuntime.commands` with the provider's prefix) for each of these,
+once per dialect with that dialect's own wire fixtures: the interrupt, an answer
 beating it, a stop after and before the first event, a refused launch after a
 stop, a death after starting, and a stale request before a resume.
 

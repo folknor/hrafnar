@@ -31,6 +31,7 @@ pub enum Provider {
     Claude,
     Codex,
     Grok,
+    Maki,
 }
 
 impl Provider {
@@ -45,10 +46,11 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Grok => "grok",
+            Provider::Maki => "maki",
         }
     }
 
-    /// `claude, codex, grok`, for error messages and help.
+    /// `claude, codex, grok, maki`, for error messages and help.
     pub fn supported() -> String {
         names(Provider::all().iter().copied())
     }
@@ -59,12 +61,14 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::Grok => "grok",
+            Provider::Maki => "maki",
         }
     }
 
     /// Whether a turn in flight can be ended with `SIGINT` and leave a session
-    /// that resumes. codex and claude both close the turn on `SIGINT` (see
-    /// `reference/codex.md` and `reference/claude.md`); grok has no such lever.
+    /// that resumes. codex, claude and maki all close the turn on `SIGINT` (see
+    /// `reference/codex.md`, `reference/claude.md` and `reference/maki.md`);
+    /// grok has no such lever.
     ///
     /// The one answer read by `review interrupt`, `review message` and the
     /// signal supervisor's wait for unrecorded runs (`Unrecorded`), which used
@@ -74,21 +78,24 @@ impl Provider {
     /// does; this only keeps the callers agreeing.
     pub fn interruptible(self) -> bool {
         match self {
-            Provider::Claude | Provider::Codex => true,
+            Provider::Claude | Provider::Codex | Provider::Maki => true,
             Provider::Grok => false,
         }
     }
 
     /// How long since a session was last touched before `review message`
     /// refuses to resume it, because the provider's prompt cache has gone cold.
+    /// maki's cache lifetime is its backend's (each open-model host differs,
+    /// and maki sends no cache hints on the OpenAI-compatible path), so it
+    /// takes the general cutoff until one is measured.
     pub fn stale_cutoff(self) -> Duration {
         match self {
             Provider::Codex => crate::timings::STALE_SESSION_CODEX,
-            Provider::Claude | Provider::Grok => crate::timings::STALE_SESSION,
+            Provider::Claude | Provider::Grok | Provider::Maki => crate::timings::STALE_SESSION,
         }
     }
 
-    /// The interruptible providers, as `claude or codex`, for help and
+    /// The interruptible providers, as `claude, codex or maki`, for help and
     /// refusal text.
     pub fn interruptible_names() -> String {
         or_names(
@@ -110,7 +117,7 @@ impl Provider {
     }
 
     /// The stale cutoffs as help prose: `27 minutes ago (codex) or 55 minutes
-    /// ago (claude, grok)`, providers grouped by cutoff, shortest first.
+    /// ago (claude, grok, maki)`, providers grouped by cutoff, shortest first.
     pub fn stale_cutoff_prose() -> String {
         let mut by_cutoff: std::collections::BTreeMap<Duration, Vec<Provider>> =
             std::collections::BTreeMap::new();
@@ -216,10 +223,10 @@ mod tests {
 
     #[test]
     fn help_prose_follows_the_table() {
-        assert_eq!(Provider::interruptible_names(), "claude or codex");
+        assert_eq!(Provider::interruptible_names(), "claude, codex or maki");
         assert_eq!(
             Provider::stale_cutoff_prose(),
-            "27 minutes ago (codex) or 55 minutes ago (claude, grok)"
+            "27 minutes ago (codex) or 55 minutes ago (claude, grok, maki)"
         );
     }
 }

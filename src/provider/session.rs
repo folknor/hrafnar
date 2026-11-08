@@ -25,12 +25,25 @@ impl SessionId {
         &self.0
     }
 
-    // No current adapter imposes additional syntax. Do not impose UUID syntax
-    // on historical opaque IDs; new adapters must decide their own shape here.
+    // No adapter imposes syntax on an id it is handed to resume. Do not impose
+    // UUID syntax on historical opaque IDs; maki's own ids are base58, and a
+    // session started outside `review` may be resumed by its id. New adapters
+    // must decide their own shape here.
     fn validate_for(&self, provider: Provider) -> Result<()> {
         match provider {
-            Provider::Claude | Provider::Codex | Provider::Grok => Ok(()),
+            Provider::Claude | Provider::Codex | Provider::Grok | Provider::Maki => Ok(()),
         }
+    }
+
+    /// A hyphenated UUID, `8-4-4-4-12` hex digits: the form `review` mints,
+    /// and the one maki's `--session-id` accepts besides its own base58.
+    fn is_uuid(&self) -> bool {
+        let groups: Vec<&str> = self.0.split('-').collect();
+        groups.len() == 5
+            && groups
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
     }
 }
 
@@ -45,7 +58,7 @@ impl SessionStart {
     pub fn prepare(&mut self, provider: Provider) -> Result<()> {
         if let Self::Fresh { id } = self {
             match provider {
-                Provider::Claude | Provider::Grok => {
+                Provider::Claude | Provider::Grok | Provider::Maki => {
                     if id.is_none() {
                         *id = Some(SessionId::parse(&crate::ids::generate_uuid())?);
                     }
@@ -61,15 +74,26 @@ impl SessionStart {
             id.validate_for(provider)?;
         }
         match (provider, self) {
-            (Provider::Claude | Provider::Grok, Self::Fresh { id: None }) => {
+            (Provider::Claude | Provider::Grok | Provider::Maki, Self::Fresh { id: None }) => {
                 bail!("{provider} fresh launch requires a caller-minted session id")
             }
             (Provider::Codex, Self::Fresh { id: Some(_) }) => {
                 bail!("codex reports fresh session ids from its stream")
             }
-            (Provider::Claude | Provider::Grok, Self::Fresh { id: Some(_) })
+            // maki rejects a `--session-id` it cannot parse as a UUID or its
+            // own base58, after `review` has already recorded the launch.
+            (Provider::Maki, Self::Fresh { id: Some(id) }) if !id.is_uuid() => {
+                bail!(
+                    "maki fresh launch requires a UUID session id, got '{}'",
+                    id.as_str()
+                )
+            }
+            (Provider::Claude | Provider::Grok | Provider::Maki, Self::Fresh { id: Some(_) })
             | (Provider::Codex, Self::Fresh { id: None })
-            | (Provider::Claude | Provider::Codex | Provider::Grok, Self::Resume(_)) => Ok(()),
+            | (
+                Provider::Claude | Provider::Codex | Provider::Grok | Provider::Maki,
+                Self::Resume(_),
+            ) => Ok(()),
         }
     }
 
@@ -98,7 +122,7 @@ mod tests {
 
     #[test]
     fn preparation_mints_only_for_caller_assigned_adapters_and_preserves_ids() {
-        for provider in [Provider::Claude, Provider::Grok] {
+        for provider in [Provider::Claude, Provider::Grok, Provider::Maki] {
             let mut start = SessionStart::Fresh { id: None };
             assert!(start.validate(provider).is_err());
             start.prepare(provider).expect("prepare");
@@ -117,8 +141,30 @@ mod tests {
     }
 
     #[test]
+    fn maki_fresh_ids_must_be_uuids_but_resumed_ids_stay_opaque() {
+        let minted = SessionStart::Fresh {
+            id: Some(SessionId::parse("0b6c1f3e-4a2d-4e8b-9c51-7d2f8a6e3b10").expect("id")),
+        };
+        minted.validate(Provider::Maki).expect("a minted UUID");
+        for bad in [
+            "opaque",
+            "0b6c1f3e-4a2d-4e8b-9c51-7d2f8a6e3b1",
+            "0b6c1f3e4a2d4e8b9c517d2f8a6e3b10",
+        ] {
+            let start = SessionStart::Fresh {
+                id: Some(SessionId::parse(bad).expect("safe id")),
+            };
+            assert!(start.validate(Provider::Maki).is_err(), "{bad}");
+        }
+        // maki's own ids are base58; resuming one started outside review works.
+        SessionStart::Resume(SessionId::parse("1111114bZ6BZRUqUqZeo").expect("id"))
+            .validate(Provider::Maki)
+            .expect("resume ids are opaque");
+    }
+
+    #[test]
     fn resume_never_mints_or_adopts_an_echoed_identity() {
-        for provider in [Provider::Claude, Provider::Codex, Provider::Grok] {
+        for provider in Provider::all().iter().copied() {
             let mut start = SessionStart::Resume(SessionId::parse("old_opaque-ID").expect("id"));
             let saved = start.clone();
             start.prepare(provider).expect("prepare");

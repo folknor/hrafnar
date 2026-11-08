@@ -22,7 +22,7 @@ pub(crate) fn session_artifacts(record: &SessionRecord) -> SessionArtifacts {
             })
         }
         // Historical names are still displayed even when their provider was removed.
-        Ok(Provider::Claude | Provider::Grok) | Err(_) => None,
+        Ok(Provider::Claude | Provider::Grok | Provider::Maki) | Err(_) => None,
     };
     SessionArtifacts(lookup)
 }

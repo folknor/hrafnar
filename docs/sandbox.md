@@ -1,17 +1,29 @@
 # Sandbox levels
 
 A profile's `sandbox` says what a run may modify. It defaults to `read-only`
-for codex and grok. **Claude profiles must omit the setting**:
+for codex and grok. **Claude and maki profiles must omit the setting**:
 what a claude run can touch is decided by Claude Code's own permission
-configuration, and `review` records no level for it.
+configuration, what a maki run can touch by maki's own `permissions.toml`, and
+`review` records no level for either.
+
+**A maki run is not read-only by default.** maki's built-in rules allow its
+file-writing tools inside the working directory, so a maki run with no
+permissions file of its own can edit the project. Deny those tools in maki's
+permissions to make its runs read-only. Anything that would ask for approval is
+denied, since nobody is there to answer. `review` never marks the project as
+trusted for maki, but maki keeps any trust it was given before - answered in an
+interactive maki session, or granted by a `trust.paths` pattern in maki's own
+config. In an untrusted project the project's own `.maki` configuration can
+tighten maki's permissions but not loosen them; in a trusted one it can do
+both.
 
 The levels are `review`'s own names, translated per provider:
 
-| `sandbox` | codex | grok | claude |
-|---|---|---|---|
-| `read-only` | `read-only` | `read-only` | unsupported |
-| `workspace-write` | `workspace-write` | `workspace` | unsupported |
-| `danger-full-access` | `danger-full-access` | `none` | unsupported |
+| `sandbox` | codex | grok | claude | maki |
+|---|---|---|---|---|
+| `read-only` | `read-only` | `read-only` | unsupported | unsupported |
+| `workspace-write` | `workspace-write` | `workspace` | unsupported | unsupported |
+| `danger-full-access` | `danger-full-access` | `none` | unsupported | unsupported |
 
 Any other value is passed to the provider unchanged, for a provider that
 defines its own named profiles; the provider rejects a name it does not know

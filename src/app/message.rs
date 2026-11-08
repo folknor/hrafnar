@@ -129,7 +129,7 @@ fn message_target(
 }
 
 /// `review message <id>`: deliver stdin to a session whatever it is doing. A
-/// codex or claude turn in flight is ended first, exactly as `review interrupt`
+/// turn in flight on an interruptible provider is ended first, exactly as `review interrupt`
 /// ends it, and the message then continues the session as a resume.
 ///
 /// The verb exists for its name. Steering a running agent used to be

@@ -16,6 +16,9 @@ env = { RUST_LOG = "info" }
 [claude.opus]
 model = "Opus 4.8"
 effort = "medium"
+
+[maki.qwen]
+model = "openrouter/qwen/qwen3-coder"
 ```
 
 `review config` lists every profile visible here, where each one comes from,
@@ -67,17 +70,22 @@ Fields the selected provider does not honour are errors too, in every table
 are accepted everywhere.
 
 - `comment`: free text shown by `review config`, never sent to a provider.
-- `model`: the model to request.
-- `effort`: the reasoning effort to request.
+- `model`: the model to request. For maki, `provider/model-id`; without one,
+  maki picks its last used model, then its configured default.
+- `effort`: the reasoning effort to request. Maki profiles must omit it: maki
+  accepts an effort flag and ignores it, so set its thinking level in maki's
+  own config instead. A custom OpenAI-compatible model in maki only receives a
+  thinking level if its maki config declares the model's thinking fields.
 - `sandbox`: what the run may modify; defaults to `read-only` for codex and
-  grok. Claude profiles must omit it; configure Claude Code permissions
-  instead. See `review man sandbox` for what each level means per provider.
+  grok. Claude and maki profiles must omit it; configure the provider's own
+  permissions instead. See `review man sandbox` for what each level means per
+  provider, and why a maki run can write unless its permissions deny it.
 - `writable_roots`: extra paths a `workspace-write` run may write, added to the
   ones `review` derives for builds, never replacing them. `~`, `$VAR` and
   `${VAR}` expand; an entry naming an unset variable is dropped with a warning.
   A non-empty list requires `workspace-write` on codex or grok (grok
   also accepts its native `workspace` alias); otherwise parsing fails.
-  Remove the field or select that level. Claude profiles must omit it.
+  Remove the field or select that level. Claude and maki profiles must omit it.
   A codex `config` override of the writable roots replaces all of them,
   these included. See `review man sandbox`.
 - `config`: codex only; remove a non-empty list from other providers. Each
@@ -96,12 +104,15 @@ are accepted everywhere.
 ## What a run records
 
 Each run records its prepared permissions, effective writable roots, and model
-and effort selectors. Claude records no sandbox level; an old grok session
-with no known selector keeps it unknown. A level is not a certificate of
-filesystem enforcement: raw codex config can change permissions.
+and effort selectors. Claude and maki record no sandbox level; an old grok
+session with no known selector keeps it unknown. A level is not a certificate
+of filesystem enforcement: raw codex config can change permissions.
 
 Model and effort are launch selections, separate from the provider-reported
-served model. If neither a dedicated field nor raw config sets a selector,
+served model. maki reports no served model, so none is recorded for it. Its
+reported cost is recorded as maki gives it, which leaves out any turn maki has
+no price for, subagents included; a cost of zero is recorded as unknown, since
+maki reports zero for an unpriced model. If neither a dedicated field nor raw config sets a selector,
 it stays unset and the provider chooses. Codex precedence is explicit: a
 profile's `model` beats raw `config` entries for `model`; otherwise the last
 raw `model` entry is recorded. The last raw `model_reasoning_effort` entry

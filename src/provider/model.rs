@@ -41,6 +41,11 @@ impl ModelSpec {
                 spec.flag("-m", model);
                 spec.flag("--reasoning-effort", effort);
             }
+            // `provider/model-id`. maki accepts `--effort` and ignores it, and
+            // a resumed headless session takes its thinking level from config
+            // or the last one used anywhere, not from the session, so there is
+            // no flag that would honour an effort: `validate` refuses one.
+            Provider::Maki => spec.flag("--model", model),
             Provider::Codex => {
                 spec.flag("-m", model);
                 if let Some(effort) = effort {
@@ -92,7 +97,7 @@ impl ModelSpec {
             );
         }
         match self.provider {
-            Provider::Claude | Provider::Grok => {
+            Provider::Claude | Provider::Grok | Provider::Maki => {
                 if !self.config_args.is_empty() {
                     bail!(
                         "{} does not honour 'config'; remove config from this profile (config is codex-only)",
@@ -101,6 +106,16 @@ impl ModelSpec {
                 }
             }
             Provider::Codex => {}
+        }
+        match self.provider {
+            Provider::Maki => {
+                if self.effort.is_some() {
+                    bail!(
+                        "maki does not honour 'effort'; remove effort from this profile and set the thinking level in maki's own config (always_thinking) instead"
+                    );
+                }
+            }
+            Provider::Claude | Provider::Codex | Provider::Grok => {}
         }
         if let Some(key) = self.invalid {
             bail!(
@@ -146,7 +161,7 @@ mod tests {
 
     #[test]
     fn unsupported_config_is_rejected_for_direct_callers_too() {
-        for provider in [Provider::Claude, Provider::Grok] {
+        for provider in [Provider::Claude, Provider::Grok, Provider::Maki] {
             let spec = ModelSpec::new(provider, None, None, &["a=b".into()]);
             let error = spec
                 .validate(provider)
@@ -233,6 +248,15 @@ mod tests {
             assert_eq!(spec.args(), flags);
             assert!(spec.validate(Provider::Codex).is_err());
         }
+        let maki = ModelSpec::new(Provider::Maki, Some("openrouter/qwen"), None, &[]);
+        assert_eq!(maki.args(), ["--model", "openrouter/qwen"]);
+        maki.validate(Provider::Maki)
+            .expect("model alone is honoured");
+        let error = ModelSpec::new(Provider::Maki, None, Some("high"), &[])
+            .validate(Provider::Maki)
+            .expect_err("maki ignores effort")
+            .to_string();
+        assert!(error.contains("remove effort"), "{error}");
         let effort = "a\"b\nc";
         let spec = ModelSpec::new(Provider::Codex, None, Some(effort), &[]);
         assert_eq!(

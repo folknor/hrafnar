@@ -10,7 +10,10 @@ pub struct Permissions(NativePermissions);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum NativePermissions {
+    /// claude and maki run on their own permission configuration; `review`
+    /// grants nothing and claims no filesystem enforcement for them.
     Claude,
+    Maki,
     Codex(SandboxLevel),
     Grok(GrokPermissions),
 }
@@ -42,6 +45,7 @@ impl Permissions {
         let level = level.cloned().unwrap_or_default();
         Self(match provider {
             Provider::Claude => NativePermissions::Claude,
+            Provider::Maki => NativePermissions::Maki,
             Provider::Codex => NativePermissions::Codex(level),
             Provider::Grok => NativePermissions::Grok(match level {
                 SandboxLevel::ReadOnly => GrokPermissions::ReadOnly,
@@ -70,6 +74,7 @@ impl Permissions {
     ) -> Self {
         Self(match provider {
             Provider::Claude => NativePermissions::Claude,
+            Provider::Maki => NativePermissions::Maki,
             Provider::Codex => {
                 NativePermissions::Codex(level.map(SandboxLevel::from).unwrap_or_default())
             }
@@ -92,6 +97,7 @@ impl Permissions {
     pub fn provider(&self) -> Provider {
         match self.0 {
             NativePermissions::Claude => Provider::Claude,
+            NativePermissions::Maki => Provider::Maki,
             NativePermissions::Codex(_) => Provider::Codex,
             NativePermissions::Grok(_) => Provider::Grok,
         }
@@ -99,7 +105,7 @@ impl Permissions {
 
     pub fn selector(&self) -> Option<&str> {
         match &self.0 {
-            NativePermissions::Claude => None,
+            NativePermissions::Claude | NativePermissions::Maki => None,
             NativePermissions::Codex(level) => Some(level.as_str()),
             NativePermissions::Grok(selection) => match selection {
                 GrokPermissions::ReadOnly => Some("read-only"),
@@ -117,7 +123,9 @@ impl Permissions {
     pub fn native_to_record(&self) -> Option<&str> {
         match self.0 {
             NativePermissions::Grok(_) => self.selector(),
-            NativePermissions::Claude | NativePermissions::Codex(_) => None,
+            NativePermissions::Claude | NativePermissions::Maki | NativePermissions::Codex(_) => {
+                None
+            }
         }
     }
 
@@ -127,7 +135,7 @@ impl Permissions {
 
     fn roots(&self) -> RootPolicy {
         match &self.0 {
-            NativePermissions::Claude => RootPolicy::Ignore,
+            NativePermissions::Claude | NativePermissions::Maki => RootPolicy::Ignore,
             NativePermissions::Codex(SandboxLevel::WorkspaceWrite) => RootPolicy::Derive,
             NativePermissions::Codex(_) => RootPolicy::Ignore,
             NativePermissions::Grok(selection) => match selection {
@@ -144,7 +152,9 @@ impl Permissions {
 
     pub(super) fn write_setup(&self) -> Option<grok::GrokWrite> {
         match &self.0 {
-            NativePermissions::Claude | NativePermissions::Codex(_) => None,
+            NativePermissions::Claude | NativePermissions::Maki | NativePermissions::Codex(_) => {
+                None
+            }
             NativePermissions::Grok(selection) => match selection {
                 GrokPermissions::FreshWorkspace => Some(grok::GrokWrite::Fresh),
                 GrokPermissions::RecordedProfile { name, .. } => {
@@ -163,7 +173,7 @@ impl Permissions {
     /// launch syntax. An omitted saved Grok selector makes no permission claim.
     pub fn recorded_level(&self) -> Option<&str> {
         match &self.0 {
-            NativePermissions::Claude => None,
+            NativePermissions::Claude | NativePermissions::Maki => None,
             NativePermissions::Codex(level) => Some(level.as_str()),
             NativePermissions::Grok(selection) => match selection {
                 GrokPermissions::ReadOnly => Some("read-only"),
@@ -214,7 +224,7 @@ impl PermissionPlan {
                     paths = grok::RootSet::new(&paths).paths().to_vec();
                 }
             }
-            NativePermissions::Claude => {}
+            NativePermissions::Claude | NativePermissions::Maki => {}
         }
         if policy == RootPolicy::Ignore && !profile_roots.is_empty() {
             eprintln!(
@@ -321,12 +331,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_never_claims_filesystem_enforcement() {
-        for level in SandboxLevel::NAMED {
-            let permissions = Permissions::profile(Provider::Claude, Some(&level));
-            assert_eq!(permissions.selector(), None);
-            assert_eq!(permissions.recorded_level(), None);
-            assert_eq!(permissions.roots(), RootPolicy::Ignore);
+    fn claude_and_maki_never_claim_filesystem_enforcement() {
+        for provider in [Provider::Claude, Provider::Maki] {
+            for level in SandboxLevel::NAMED {
+                let permissions = Permissions::profile(provider, Some(&level));
+                assert_eq!(permissions.provider(), provider);
+                assert_eq!(permissions.selector(), None);
+                assert_eq!(permissions.recorded_level(), None);
+                assert_eq!(permissions.native_to_record(), None);
+                assert_eq!(permissions.roots(), RootPolicy::Ignore);
+            }
+            let restored = Permissions::restore(provider, Some("workspace-write"), None, &[]);
+            assert_eq!(restored.recorded_level(), None);
         }
     }
 }

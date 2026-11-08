@@ -44,11 +44,16 @@ digest says `recovered`. If there was no answer, the run is auto-resumed once
 with a nudge to finish (see `review man run`), and an incident bundle is filed
 (see `review man sessions`).
 
-A claude run killed or crashed after it started is a death too, and keeps its
-session ID. A claude run that never started has no session.
+A claude or maki run killed or crashed after it started is a death too, and
+keeps its session ID. A run that never started has no session. A maki session
+is saved only once it holds a message, so a maki killed while still connecting
+to its model provider may leave an ID that maki then reports as not found.
 
-Grok and claude classify their own turns, so neither is auto-resumed: a turn
-that ends without an answer is reported with the reason they gave.
+Grok, claude and maki classify their own turns, so none is auto-resumed: a turn
+that ends without an answer is reported with the reason they gave. A maki turn
+counts as answered only when maki says it finished the turn: one that stopped
+at its token or turn limit is a stated failure, with its partial text kept,
+even though maki does not flag it as an error.
 
 ## A stall
 

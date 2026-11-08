@@ -1350,6 +1350,7 @@ cat > /dev/null
 "#;
 
 /// Shell line printing claude's first event, which carries the session id.
+/// maki's `init` has the same shape.
 const CLAUDE_STUB_INIT: &str =
     r#"printf '%s\n' "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\"}""#;
 
@@ -1360,16 +1361,59 @@ fn claude_stub_result(is_error: bool, extra: &str) -> String {
     )
 }
 
-/// Shell fragment: on SIGINT, end the turn as claude does - print an aborted
-/// result and exit 0 - then wait for it.
-fn claude_stub_await_sigint() -> String {
-    format!(
-        r#"trap '{result}; exit 0' INT
-while :; do sleep 0.05; done"#,
-        result = claude_stub_result(
+/// The Claude-compatible providers, which share one runner and therefore
+/// every lifecycle scenario below; only their wire fixtures differ.
+const CLAUDE_COMPAT: [Provider; 2] = [Provider::Claude, Provider::Maki];
+
+/// Shell line printing `provider`'s answer `text`. maki answers only with
+/// `stop_reason: "end_turn"`.
+fn stub_answer(provider: Provider, text: &str) -> String {
+    match provider {
+        Provider::Maki => claude_stub_result(
+            false,
+            &format!(r#",\"result\":\"{text}\",\"stop_reason\":\"end_turn\""#),
+        ),
+        _ => claude_stub_result(false, &format!(r#",\"result\":\"{text}\""#)),
+    }
+}
+
+/// Shell line printing `provider`'s stated failure `text`. maki's provider
+/// failures carry `stop_reason: null` (probed: an API 402).
+fn stub_failure(provider: Provider, text: &str) -> String {
+    match provider {
+        Provider::Maki => claude_stub_result(
             true,
-            r#",\"subtype\":\"error_during_execution\",\"terminal_reason\":\"aborted_tools\""#
-        )
+            &format!(r#",\"subtype\":\"error\",\"result\":\"{text}\",\"stop_reason\":null"#),
+        ),
+        _ => claude_stub_result(true, &format!(r#",\"result\":\"{text}\""#)),
+    }
+}
+
+/// The exit status `provider` ends with after answering SIGINT itself:
+/// claude exits 0, maki 128+SIGINT.
+fn sigint_exit(provider: Provider) -> i32 {
+    match provider {
+        Provider::Maki => 130,
+        _ => 0,
+    }
+}
+
+/// Shell fragment: on SIGINT, end the turn as `provider` does - print its
+/// aborted result and exit - then wait for it.
+fn stub_await_sigint(provider: Provider) -> String {
+    let result = match provider {
+        Provider::Maki => claude_stub_result(
+            true,
+            r#",\"subtype\":\"error\",\"stop_reason\":\"cancelled\""#,
+        ),
+        _ => claude_stub_result(
+            true,
+            r#",\"subtype\":\"error_during_execution\",\"terminal_reason\":\"aborted_tools\""#,
+        ),
+    };
+    format!(
+        "trap '{result}; exit {code}' INT\nwhile :; do sleep 0.05; done",
+        code = sigint_exit(provider)
     )
 }
 
@@ -1381,10 +1425,21 @@ async fn run_claude_stub(
     runtime: &ProviderRuntime,
     resume: Option<&str>,
 ) -> Result<FixtureRun> {
+    run_compat_stub(Provider::Claude, scratch, body, runtime, resume).await
+}
+
+/// Run `body` as `provider` (claude or maki) through `invoke`.
+async fn run_compat_stub(
+    provider: Provider,
+    scratch: &Scratch,
+    body: &str,
+    runtime: &ProviderRuntime,
+    resume: Option<&str>,
+) -> Result<FixtureRun> {
     let script = scratch.write_stub(&format!("{CLAUDE_STUB_PREAMBLE}\n{body}"));
     let mut runtime = runtime.clone();
     runtime.commands.set(
-        Provider::Claude,
+        provider,
         ProviderCommand {
             program: "/bin/sh".into(),
             leading_args: vec![script],
@@ -1398,7 +1453,7 @@ async fn run_claude_stub(
     fixture_run(
         invoke(
             review::provider::LaunchSpec {
-                provider: Provider::Claude,
+                provider,
                 start: {
                     match resume {
                         Some(id) => review::provider::SessionStart::Resume(
@@ -1408,7 +1463,7 @@ async fn run_claude_stub(
                     }
                 },
                 settings: fixture_settings(
-                    Provider::Claude,
+                    provider,
                     review::config::Profile {
                         env: Some(env.clone()),
                         ..Default::default()
@@ -1438,21 +1493,22 @@ async fn a_claude_resume_reports_the_session_id_it_was_given() {
     assert_eq!(run.session_id.as_deref(), Some(sid));
 }
 
-/// The session id of the one claude run in flight under `scratch`, once its
-/// pid is offered for signalling - which is what `review interrupt` waits for.
-async fn claude_signalable(scratch: &Scratch) -> String {
+/// The session id of the one `provider` run in flight under `scratch`, once
+/// its pid is offered for signalling - which is what `review interrupt` waits
+/// for.
+async fn compat_signalable(provider: Provider, scratch: &Scratch) -> String {
     let data_root = scratch.data_root();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(m) = review::inflight::read_live(Some(&data_root))
             .into_iter()
-            .find(|m| m.provider == "claude" && m.signal_ready)
+            .find(|m| m.provider == provider.as_str() && m.signal_ready)
         {
             return m.session_id.clone();
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "claude's pid never offered"
+            "{provider}'s pid never offered"
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -1460,18 +1516,20 @@ async fn claude_signalable(scratch: &Scratch) -> String {
 
 /// Run `body` as the owner and `review interrupt` against it from "another
 /// process", appending the owner's sidecar row when its run returns, as the
-/// fan-out task does. The interrupt is sent once claude's pid is offered.
-async fn claude_interrupt_stub(
+/// fan-out task does. The interrupt is sent once the provider's pid is offered.
+async fn compat_interrupt_stub(
+    provider: Provider,
     scratch: &Scratch,
     body: &str,
 ) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
-    claude_interrupt_stub_at(scratch, body, true).await
+    compat_interrupt_stub_at(provider, scratch, body, true).await
 }
 
-/// As `claude_interrupt_stub`, but `after_pid: false` sends the interrupt as
-/// soon as the run is marked in flight - before claude's first event, as a
-/// second `review message` does when its launch lock hands over.
-async fn claude_interrupt_stub_at(
+/// As `compat_interrupt_stub`, but `after_pid: false` sends the interrupt as
+/// soon as the run is marked in flight - before the first event, as a second
+/// `review message` does when its launch lock hands over.
+async fn compat_interrupt_stub_at(
+    provider: Provider,
     scratch: &Scratch,
     body: &str,
     after_pid: bool,
@@ -1479,7 +1537,7 @@ async fn claude_interrupt_stub_at(
     let runtime = fast_runtime(scratch);
     let data_root = scratch.data_root();
     let owner = async {
-        let run = run_claude_stub(scratch, body, &runtime, None)
+        let run = run_compat_stub(provider, scratch, body, &runtime, None)
             .await
             .expect("run completes");
         publish_stub_handoff(&runtime, &run);
@@ -1487,7 +1545,7 @@ async fn claude_interrupt_stub_at(
     };
     let interrupter = async {
         let sid = if after_pid {
-            claude_signalable(scratch).await
+            compat_signalable(provider, scratch).await
         } else {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -1543,194 +1601,354 @@ async fn a_claude_run_launches_with_background_off_and_reports_its_answer() {
 }
 
 #[tokio::test]
-async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
-    let scratch = Scratch::new();
-    let body = format!("{CLAUDE_STUB_INIT}\n{}", claude_stub_await_sigint());
-    let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
-    let outcome = outcome.expect("the verb succeeds");
-    assert!(outcome.interrupted, "the verb reports the interrupt");
-    assert_eq!(outcome.provider, review::provider::Provider::Claude);
-    let summary = summary_of(&run);
-    let digest = run.digest.expect("digest");
-    assert!(summary.interrupted);
-    assert!(
-        summary.turn_error.is_none(),
-        "claude's complaint about the abort is not a stated failure"
-    );
-    assert_eq!(digest.exit.code(), Some(0), "claude answered SIGINT itself");
-    assert!(
-        summary
-            .terminated_by_review
-            .as_deref()
-            .is_some_and(|why| why.contains("operator interrupt")),
-        "got {:?}",
-        summary.terminated_by_review
-    );
-    assert!(run.text.contains("interrupted"), "got {:?}", run.text);
-    let sid = run.session_id.expect("the session survives the interrupt");
-    assert!(
-        !review::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
-        "the run consumed the request"
-    );
+async fn review_interrupt_ends_a_claude_compatible_turn_and_keeps_its_session() {
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(provider));
+        let (run, outcome) = compat_interrupt_stub(provider, &scratch, &body).await;
+        let outcome = outcome.expect("the verb succeeds");
+        assert!(
+            outcome.interrupted,
+            "{provider}: the verb reports the interrupt"
+        );
+        assert_eq!(outcome.provider, provider);
+        let summary = summary_of(&run);
+        let digest = run.digest.expect("digest");
+        assert!(summary.interrupted, "{provider}");
+        assert!(
+            summary.turn_error.is_none(),
+            "{provider}'s complaint about the abort is not a stated failure"
+        );
+        assert_eq!(
+            digest.exit.code(),
+            Some(sigint_exit(provider)),
+            "{provider} answered SIGINT itself"
+        );
+        assert!(
+            summary
+                .terminated_by_review
+                .as_deref()
+                .is_some_and(|why| why.contains("operator interrupt")),
+            "{provider}: got {:?}",
+            summary.terminated_by_review
+        );
+        assert!(
+            run.text.contains("interrupted"),
+            "{provider}: got {:?}",
+            run.text
+        );
+        let sid = run.session_id.expect("the session survives the interrupt");
+        assert!(
+            !review::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
+            "{provider}: the run consumed the request"
+        );
+    }
 }
 
 #[tokio::test]
-async fn review_interrupt_waits_for_a_claude_that_has_not_spoken_yet() {
+async fn review_interrupt_waits_for_a_claude_compatible_run_that_has_not_spoken_yet() {
     // A second `review message` meets a run in the second after it launched,
-    // before claude's first event offers its pid. Refusing then lost the
-    // message; the verb waits for the pid instead.
-    let scratch = Scratch::new();
-    let body = format!(
-        "sleep 1\n{CLAUDE_STUB_INIT}\n{}",
-        claude_stub_await_sigint()
-    );
-    let (run, outcome) = claude_interrupt_stub_at(&scratch, &body, false).await;
-    assert!(
-        outcome
-            .expect("the verb waits rather than refusing")
-            .interrupted,
-        "and then interrupts"
-    );
-    assert!(run.outcome.interrupted());
+    // before the first event offers its pid. Refusing then lost the message;
+    // the verb waits for the pid instead.
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let body = format!(
+            "sleep 1\n{CLAUDE_STUB_INIT}\n{}",
+            stub_await_sigint(provider)
+        );
+        let (run, outcome) = compat_interrupt_stub_at(provider, &scratch, &body, false).await;
+        assert!(
+            outcome
+                .expect("the verb waits rather than refusing")
+                .interrupted,
+            "{provider}: and then interrupts"
+        );
+        assert!(run.outcome.interrupted(), "{provider}");
+    }
 }
 
 #[tokio::test]
-async fn a_claude_answer_that_beats_the_interrupt_stands() {
-    let scratch = Scratch::new();
-    let body = format!(
-        "{CLAUDE_STUB_INIT}\n{}\ntrap 'exit 0' INT\nwhile :; do sleep 0.05; done",
-        claude_stub_result(false, r#",\"result\":\"THE ANSWER\""#)
-    );
-    let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
-    assert_eq!(run.text, "THE ANSWER");
-    assert!(!run.outcome.interrupted());
-    assert!(
-        !outcome.expect("the verb succeeds").interrupted,
-        "the verb says the run ended first"
-    );
+async fn a_claude_compatible_answer_that_beats_the_interrupt_stands() {
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let body = format!(
+            "{CLAUDE_STUB_INIT}\n{}\ntrap 'exit 0' INT\nwhile :; do sleep 0.05; done",
+            stub_answer(provider, "THE ANSWER")
+        );
+        let (run, outcome) = compat_interrupt_stub(provider, &scratch, &body).await;
+        assert_eq!(run.text, "THE ANSWER", "{provider}");
+        assert!(!run.outcome.interrupted(), "{provider}");
+        assert!(
+            !outcome.expect("the verb succeeds").interrupted,
+            "{provider}: the verb says the run ended first"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_stop_signal_ends_a_started_claude_turn_as_an_interrupt() {
-    let scratch = Scratch::new();
-    let runtime = fast_runtime(&scratch);
-    let body = format!("{CLAUDE_STUB_INIT}\n{}", claude_stub_await_sigint());
-    let stopper = async {
-        claude_signalable(&scratch).await;
-        runtime.lifecycle.request_stop();
-    };
-    let (run, ()) = tokio::join!(run_claude_stub(&scratch, &body, &runtime, None), stopper);
-    let run = run.expect("run completes");
-    let summary = summary_of(&run);
-    let digest = run.digest.expect("digest");
-    assert!(summary.interrupted);
-    assert_eq!(digest.exit.code(), Some(0), "SIGINT, not a group kill");
-    assert!(
-        summary
-            .terminated_by_review
-            .as_deref()
-            .is_some_and(|why| why.contains("signalled"))
-    );
-    assert!(run.session_id.is_some());
+async fn a_stop_signal_ends_a_started_claude_compatible_turn_as_an_interrupt() {
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let runtime = fast_runtime(&scratch);
+        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(provider));
+        let stopper = async {
+            compat_signalable(provider, &scratch).await;
+            runtime.lifecycle.request_stop();
+        };
+        let (run, ()) = tokio::join!(
+            run_compat_stub(provider, &scratch, &body, &runtime, None),
+            stopper
+        );
+        let run = run.expect("run completes");
+        let summary = summary_of(&run);
+        let digest = run.digest.expect("digest");
+        assert!(summary.interrupted, "{provider}");
+        assert_eq!(
+            digest.exit.code(),
+            Some(sigint_exit(provider)),
+            "{provider}: SIGINT, not a group kill"
+        );
+        assert!(
+            summary
+                .terminated_by_review
+                .as_deref()
+                .is_some_and(|why| why.contains("signalled")),
+            "{provider}"
+        );
+        assert!(run.session_id.is_some(), "{provider}");
 
-    // Once stopped, nothing new launches - a claude run waiting on its
-    // stagger or the lock must not start only to be killed.
-    let refused = run_claude_stub(&scratch, &body, &runtime, None).await;
-    assert!(
-        refused.is_err_and(|e| e.to_string().contains("not launched")),
-        "a launch after the stop must be refused"
-    );
+        // Once stopped, nothing new launches - a run waiting on its stagger
+        // or the lock must not start only to be killed.
+        let refused = run_compat_stub(provider, &scratch, &body, &runtime, None).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("not launched")),
+            "{provider}: a launch after the stop must be refused"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_claude_stopped_before_its_first_event_names_no_session() {
-    // Killed before claude could have written a session: recording one would
-    // print a resume command for a session that does not exist.
-    let scratch = Scratch::new();
-    let runtime = fast_runtime(&scratch);
-    let data_root = scratch.data_root();
-    let stopper = async {
-        // The marker goes up at spawn; claude never speaks, so no pid is offered.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while review::inflight::read_live(Some(&data_root)).is_empty() {
-            assert!(std::time::Instant::now() < deadline, "no marker");
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        runtime.lifecycle.request_stop();
-    };
-    let body = "while :; do sleep 0.05; done";
-    let (run, ()) = tokio::join!(run_claude_stub(&scratch, body, &runtime, None), stopper);
-    let Err(err) = run else {
-        panic!("a run stopped before it started has no session to report");
-    };
-    assert!(err.to_string().contains("not started"), "{err}");
-    assert!(review::inflight::read_live(Some(&data_root)).is_empty());
+async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session() {
+    // Killed before the provider could have written a session: recording one
+    // would print a resume command for a session that does not exist.
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let runtime = fast_runtime(&scratch);
+        let data_root = scratch.data_root();
+        let stopper = async {
+            // The marker goes up at spawn; the stub never speaks, so no pid is
+            // offered.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while review::inflight::read_live(Some(&data_root)).is_empty() {
+                assert!(std::time::Instant::now() < deadline, "no marker");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            runtime.lifecycle.request_stop();
+        };
+        let body = "while :; do sleep 0.05; done";
+        let (run, ()) = tokio::join!(
+            run_compat_stub(provider, &scratch, body, &runtime, None),
+            stopper
+        );
+        let Err(err) = run else {
+            panic!("{provider}: a run stopped before it started has no session to report");
+        };
+        assert!(err.to_string().contains("not started"), "{provider}: {err}");
+        assert!(
+            err.to_string().contains(provider.as_str()),
+            "{provider}: {err}"
+        );
+        assert!(review::inflight::read_live(Some(&data_root)).is_empty());
+    }
 }
 
 #[tokio::test]
-async fn a_claude_that_dies_after_starting_keeps_its_session() {
+async fn a_claude_compatible_run_that_dies_after_starting_keeps_its_session() {
     // Killed from outside or crashed after its first event: no result, but the
-    // session exists and is the turn most worth resuming.
-    let scratch = Scratch::new();
-    let body = format!("{CLAUDE_STUB_INIT}\nexit 3");
-    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), None)
-        .await
-        .expect("a death after starting is not a launch failure");
-    let summary = summary_of(&run);
-    let digest = run.digest.expect("digest");
-    assert!(!summary.captured);
-    assert!(!summary.interrupted);
-    assert!(
-        summary.turn_error.is_none(),
-        "claude stated no reason, so this is a death, not a stated failure"
-    );
-    assert_eq!(digest.exit.code(), Some(3));
-    assert!(run.session_id.is_some(), "the session id is kept");
-    assert!(run.text.contains("without a result"), "got {:?}", run.text);
+    // session may exist and is the turn most worth resuming.
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let body = format!("{CLAUDE_STUB_INIT}\nexit 3");
+        let run = run_compat_stub(provider, &scratch, &body, &fast_runtime(&scratch), None)
+            .await
+            .expect("a death after starting is not a launch failure");
+        let summary = summary_of(&run);
+        let digest = run.digest.expect("digest");
+        assert!(!summary.captured, "{provider}");
+        assert!(!summary.interrupted, "{provider}");
+        assert!(
+            summary.turn_error.is_none(),
+            "{provider} stated no reason, so this is a death, not a stated failure"
+        );
+        assert_eq!(digest.exit.code(), Some(3), "{provider}");
+        assert!(
+            run.session_id.is_some(),
+            "{provider}: the session id is kept"
+        );
+        assert!(
+            run.text
+                .contains(&format!("{provider} ended without a result")),
+            "got {:?}",
+            run.text
+        );
+    }
 }
 
 #[tokio::test]
-async fn output_before_init_is_not_a_claude_start() {
-    // A stray byte or diagnostic, then a crash, before claude's `init` event:
-    // claude never reached the point of having a session, so none is kept.
-    let scratch = Scratch::new();
-    let body = "printf 'booting'\nexit 1";
-    let run = run_claude_stub(&scratch, body, &fast_runtime(&scratch), None).await;
-    assert!(
-        run.is_err(),
-        "no init event, no session: a launch failure, not a death"
-    );
+async fn output_before_init_is_not_a_claude_compatible_start() {
+    // A stray byte or diagnostic, then a crash, before the `init` event: the
+    // provider never reached the point of having a session, so none is kept.
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let body = "printf 'booting'\nexit 1";
+        let run = run_compat_stub(provider, &scratch, body, &fast_runtime(&scratch), None).await;
+        assert!(
+            run.is_err(),
+            "{provider}: no init event, no session: a launch failure, not a death"
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_stale_interrupt_request_does_not_mark_a_claude_resume_interrupted() {
+async fn a_stale_interrupt_request_does_not_mark_a_claude_compatible_resume_interrupted() {
     // Left by a `review` killed before it consumed it. A resume that then fails
     // for its own reason must report that reason, not an interrupt.
-    let scratch = Scratch::new();
-    let sid = "0c1a0000-0000-4000-8000-000000000001";
-    std::fs::create_dir_all(scratch.data_root().join("review/inflight")).expect("dir");
-    review::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
-    let body = format!(
-        "{CLAUDE_STUB_INIT}\n{}\nexit 1",
-        claude_stub_result(true, r#",\"result\":\"rate limited\""#)
-    );
-    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), Some(sid))
+    for provider in CLAUDE_COMPAT {
+        let scratch = Scratch::new();
+        let sid = "0c1a0000-0000-4000-8000-000000000001";
+        std::fs::create_dir_all(scratch.data_root().join("review/inflight")).expect("dir");
+        review::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
+        let body = format!(
+            "{CLAUDE_STUB_INIT}\n{}\nexit 1",
+            stub_failure(provider, "rate limited")
+        );
+        let run = run_compat_stub(
+            provider,
+            &scratch,
+            &body,
+            &fast_runtime(&scratch),
+            Some(sid),
+        )
         .await
         .expect("run completes");
+        let summary = summary_of(&run);
+        assert!(run.digest.is_some(), "{provider}: digest");
+        assert!(
+            !summary.interrupted,
+            "{provider}: the request was not aimed at this run"
+        );
+        assert!(
+            summary
+                .turn_error
+                .as_deref()
+                .is_some_and(|e| e.contains("rate limited")),
+            "{provider}'s reason is kept: {:?}",
+            summary.turn_error
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_maki_error_result_with_exit_zero_is_a_stated_failure() {
+    // Probed: maki exits 0 when its result says `is_error: true` (an API 402).
+    // The exit code says nothing; the result decides.
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}\nexit 0",
+        stub_failure(Provider::Maki, "API error (402): no credits")
+    );
+    let run = run_compat_stub(
+        Provider::Maki,
+        &scratch,
+        &body,
+        &fast_runtime(&scratch),
+        None,
+    )
+    .await
+    .expect("an error result is a turn");
     let summary = summary_of(&run);
-    assert!(run.digest.is_some(), "digest");
+    assert!(!summary.captured);
     assert!(
-        !summary.interrupted,
-        "the request was not aimed at this run"
+        summary
+            .turn_error
+            .as_deref()
+            .is_some_and(|e| e.contains("API error (402)")),
+        "{:?}",
+        summary.turn_error
+    );
+    assert_eq!(run.digest.expect("digest").exit.code(), Some(0));
+    assert!(run.session_id.is_some());
+}
+
+#[tokio::test]
+async fn a_maki_cancelled_by_someone_else_is_a_stated_cancellation() {
+    // A SIGTERM delivered to maki directly, not through review: maki prints a
+    // `cancelled` result and exits 143. With no interrupt request, that is
+    // maki's stated cancellation, not an interrupt by the operator.
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}\nexit 143",
+        claude_stub_result(
+            true,
+            r#",\"subtype\":\"error\",\"stop_reason\":\"cancelled\""#
+        )
+    );
+    let run = run_compat_stub(
+        Provider::Maki,
+        &scratch,
+        &body,
+        &fast_runtime(&scratch),
+        None,
+    )
+    .await
+    .expect("a cancelled result is a turn");
+    let summary = summary_of(&run);
+    assert!(!summary.interrupted);
+    assert!(
+        summary
+            .turn_error
+            .as_deref()
+            .is_some_and(|e| e.contains("stop_reason: cancelled")),
+        "{:?}",
+        summary.turn_error
+    );
+    assert_eq!(run.digest.expect("digest").exit.code(), Some(143));
+    assert!(run.session_id.is_some());
+}
+
+#[tokio::test]
+async fn a_truncated_maki_answer_is_not_an_answer() {
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}",
+        claude_stub_result(
+            false,
+            r#",\"result\":\"half an answ\",\"stop_reason\":\"max_tokens\""#
+        )
+    );
+    let run = run_compat_stub(
+        Provider::Maki,
+        &scratch,
+        &body,
+        &fast_runtime(&scratch),
+        None,
+    )
+    .await
+    .expect("a truncated result is a turn");
+    let summary = summary_of(&run);
+    assert!(
+        !summary.captured,
+        "max_tokens with is_error false is not an answer"
     );
     assert!(
         summary
             .turn_error
             .as_deref()
-            .is_some_and(|e| e.contains("rate limited")),
-        "claude's reason is kept: {:?}",
+            .is_some_and(|e| e.contains("max_tokens")),
+        "{:?}",
         summary.turn_error
     );
+    assert_eq!(run.text, "half an answ", "the partial text is kept");
 }
 
 /// Whether `session_id`'s marker is readable once this task sees `launched`
@@ -2631,6 +2849,14 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
 printf '{"type":"result","is_error":false,"result":"fixture answer","session_id":"%s","num_turns":1}\n' "$sid"
 "#
         }
+        // maki's stream is claude's shape, but only `end_turn` is an answer.
+        Provider::Maki => {
+            r#"
+printf '{"type":"system","subtype":"init","session_id":"%s","model":"m"}\n' "$sid"
+[ "$STUB_MODE" != death ] || exit 7
+printf '{"type":"result","subtype":"success","is_error":false,"result":"fixture answer","stop_reason":"end_turn","session_id":"%s","num_turns":1,"total_cost_usd":0.0}\n' "$sid"
+"#
+        }
         // Grok has a single result, not an init stream. EOF before that object
         // establishes no turn; this intentionally differs from the other two.
         Provider::Grok => {
@@ -2725,7 +2951,13 @@ fi
                 )])
             ),
         ],
-        Provider::Codex | Provider::Claude | Provider::Grok => Vec::new(),
+        Provider::Codex | Provider::Claude | Provider::Grok | Provider::Maki => Vec::new(),
+    };
+    // maki refuses an effort it cannot honour, and a launch carrying one never
+    // starts; every other adapter renders the profile's.
+    let effort = match provider {
+        Provider::Maki => None,
+        Provider::Codex | Provider::Claude | Provider::Grok => Some("high".into()),
     };
     let launch = review::provider::LaunchSpec {
         provider,
@@ -2740,7 +2972,7 @@ fi
             provider,
             review::config::Profile {
                 model: Some("chosen-model".into()),
-                effort: Some("high".into()),
+                effort,
                 sandbox: level,
                 env: Some(env),
                 config,
@@ -2942,6 +3174,55 @@ async fn claude_launch_argv_table_keeps_permissions_and_session_modes_explicit()
                 "chosen-model",
                 "--effort",
                 "high",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            assert_eq!(normalized_args(&scratch, &result), expected);
+            assert_eq!(
+                std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
+                "prompt with spaces\nand a second line"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
+    for requested in
+        std::iter::once(None).chain(review::config::SandboxLevel::NAMED.into_iter().map(Some))
+    {
+        for resume in [false, true] {
+            let scratch = Scratch::new();
+            let (launch, runtime) = protocol_fixture(
+                &scratch,
+                Provider::Maki,
+                resume,
+                requested.clone(),
+                "answer",
+            );
+            let result = invoke(launch, None, &runtime, None).await;
+            if resume {
+                assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
+            }
+            assert_eq!(result.output.as_ref().expect("turn").text, "fixture answer");
+            assert_eq!(result.model.as_deref(), Some("chosen-model"));
+            assert_eq!(result.effort, None);
+            assert_eq!(result.permissions.as_ref().and_then(|p| p.selector()), None);
+            assert!(result.writable_roots.is_empty());
+            assert_eq!(
+                result.served,
+                review::provider::Served::default(),
+                "an unpriced zero and the requested model are not served facts"
+            );
+            let expected: Vec<_> = [
+                if resume { "--resume" } else { "--session-id" },
+                "<session>",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--model",
+                "chosen-model",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -3163,7 +3444,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         );
         let result = invoke(launch, None, &runtime, None).await;
         match provider {
-            Provider::Codex | Provider::Claude => {
+            Provider::Codex | Provider::Claude | Provider::Maki => {
                 let turn = result
                     .output
                     .as_ref()

@@ -4,7 +4,8 @@
 use super::*;
 
 pub(super) enum Prepared {
-    Claude,
+    /// claude or maki, which share one runner.
+    ClaudeCompat(Dialect),
     Codex,
     Grok(grok::Prepared),
 }
@@ -19,7 +20,9 @@ impl Prepared {
     ) -> Result<RunOutput> {
         let sandbox = plan.permissions.selector();
         match self {
-            Self::Claude => run_claude(launch, launched, runtime).await,
+            Self::ClaudeCompat(dialect) => {
+                run_claude_compat(*dialect, launch, launched, runtime).await
+            }
             Self::Codex => {
                 run_codex(
                     launch,
@@ -36,7 +39,7 @@ impl Prepared {
 
     pub fn record(&self, result: &mut ProviderResult) {
         match self {
-            Self::Claude | Self::Codex => {}
+            Self::ClaudeCompat(_) | Self::Codex => {}
             Self::Grok(prepared) => prepared.record(result),
         }
     }

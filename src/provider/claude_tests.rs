@@ -51,7 +51,7 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
         "the head-tail capture trims the middle event"
     );
     let outcome =
-        super::interpret_claude_output("claude", &joined, "").expect("the result survived");
+        super::interpret_claude_output(Dialect::Claude, &joined, "").expect("the result survived");
     assert!(matches!(outcome, super::ClaudeOutcome::Answered { .. }));
     let metrics = metrics.lock().expect("metrics").clone();
     assert_eq!(metrics.turns, 5);
@@ -74,7 +74,7 @@ fn a_missing_claude_result_does_not_dump_the_stream_into_the_error() {
         CLAUDE_INIT,
         &format!(r#"{{"type":"user","tool_result":"{big}"}}"#),
     ]);
-    let err = super::interpret_claude_output("claude", &stdout, "").expect_err("no result");
+    let err = super::interpret_claude_output(Dialect::Claude, &stdout, "").expect_err("no result");
     assert!(
         err.to_string().len() < 2000 + 200,
         "error is {} chars",
@@ -96,7 +96,8 @@ fn claude_stream(events: &[&str]) -> String {
 #[test]
 fn claude_clean_result_is_an_answer() {
     let stdout = claude_stream(&[CLAUDE_INIT, CLAUDE_OK]);
-    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
+    let outcome =
+        super::interpret_claude_output(Dialect::Claude, &stdout, "").expect("a result object");
     let super::ClaudeOutcome::Answered { text, session_id } = outcome else {
         panic!("is_error false is an answer");
     };
@@ -117,16 +118,19 @@ fn claude_api_error_is_a_stated_failure_that_keeps_its_session() {
         r#"{"type":"result","subtype":"success","is_error":true,"result":"There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.","session_id":"ff2d6c14-1b45-481f-85a2-24e367d9e6ad","num_turns":1,"terminal_reason":"api_error","api_error_status":404,"total_cost_usd":0}"#,
     ]);
     let outcome = super::interpret_claude_output(
-        "claude",
+        Dialect::Claude,
         &unknown_model,
         r#"[claude-code:unrecognized_model] {"model":"no-such-model-xyz"}"#,
     )
     .expect("an error result is still a result, not a launch failure");
     let super::ClaudeOutcome::NoAnswer {
-        reason, session_id, ..
+        stated: Some(reason),
+        unverified: None,
+        session_id,
+        ..
     } = outcome
     else {
-        panic!("is_error true is not an answer, whatever the subtype says");
+        panic!("is_error true is a stated failure, whatever the subtype says");
     };
     assert!(reason.contains("api_error"), "{reason}");
     assert!(reason.contains("404"), "{reason}");
@@ -145,35 +149,31 @@ fn claude_result_without_is_error_fails_closed() {
     // A claude that stopped reporting the flag must not pass every run off as
     // answered.
     let unflagged = r#"{"type": "result", "result": "maybe", "session_id": "s"}"#;
-    let outcome = super::interpret_claude_output("claude", unflagged, "").expect("a result object");
+    let outcome =
+        super::interpret_claude_output(Dialect::Claude, unflagged, "").expect("a result object");
     let super::ClaudeOutcome::NoAnswer {
-        reason,
-        review_error,
+        stated: None,
+        unverified: Some(reason),
         ..
     } = outcome
     else {
-        panic!("a result with no is_error is not trusted as an answer");
+        panic!("a result with no is_error is review's diagnosis, not an answer");
     };
-    assert!(reason.contains("no is_error flag"), "{reason}");
-    assert!(review_error, "the missing flag is review's diagnosis");
-    let outcome = super::Outcome::no_answer().unverified(reason);
-    assert!(outcome.stated.is_none());
     assert_eq!(
-        outcome.unverified.as_deref(),
-        Some("review could not classify claude result (no is_error flag): maybe")
+        reason,
+        "review could not classify claude result (no is_error flag): maybe"
     );
-    assert!(outcome.failed());
 }
 
 #[test]
 fn claude_output_without_a_result_object_is_a_launch_failure() {
-    let err = super::interpret_claude_output("claude", "", "Error: not logged in")
+    let err = super::interpret_claude_output(Dialect::Claude, "", "Error: not logged in")
         .expect_err("no result object: nothing ran");
     assert!(err.to_string().contains("not logged in"), "{err}");
     // A stream cut off after its first event is not a result either - the
-    // shape a claude killed mid-turn leaves. (`run_claude` still keeps that
-    // run's session: see `a_claude_that_dies_after_starting_keeps_its_session`.)
-    let err = super::interpret_claude_output("claude", &claude_stream(&[CLAUDE_INIT]), "")
+    // shape a claude killed mid-turn leaves. (`run_claude_compat` still keeps that
+    // run's session: see `a_claude_compatible_run_that_dies_after_starting_keeps_its_session`.)
+    let err = super::interpret_claude_output(Dialect::Claude, &claude_stream(&[CLAUDE_INIT]), "")
         .expect_err("a system event is not a result");
     assert!(err.to_string().contains("no result object"), "{err}");
 }
@@ -187,9 +187,12 @@ fn claude_interrupted_turn_is_not_an_answer() {
         CLAUDE_INIT,
         r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"4397a6d5-4943-4b52-a0b6-d20c75078bd9","num_turns":3,"terminal_reason":"aborted_tools","stop_reason":"tool_use"}"#,
     ]);
-    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
+    let outcome =
+        super::interpret_claude_output(Dialect::Claude, &stdout, "").expect("a result object");
     let super::ClaudeOutcome::NoAnswer {
-        reason, session_id, ..
+        stated: Some(reason),
+        session_id,
+        ..
     } = outcome
     else {
         panic!("an aborted turn is not an answer");
@@ -209,7 +212,8 @@ fn claude_last_result_in_the_stream_is_the_answer() {
     let first = CLAUDE_OK;
     let last = r#"{"type":"result","subtype":"success","is_error":false,"result":"PROBE-B-DONE","session_id":"2f8b2c2f-d939-4823-a615-7ebd6637f958","num_turns":1}"#;
     let stdout = claude_stream(&[CLAUDE_INIT, first, CLAUDE_INIT, last]);
-    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
+    let outcome =
+        super::interpret_claude_output(Dialect::Claude, &stdout, "").expect("a result object");
     let super::ClaudeOutcome::Answered { text, .. } = outcome else {
         panic!("the last result is an answer");
     };
@@ -348,4 +352,220 @@ async fn claude_init_does_not_accept_an_oversized_line_suffix() {
     )
     .await;
     assert!(lease.is_ready(), "eligible EOF init accepted");
+}
+
+/// maki's `init`, trimmed from a probe of maki's `-p` stream-json output.
+const MAKI_INIT: &str = r#"{"type":"system","subtype":"init","cwd":"/p","session_id":"3f17c0b4-5f22-43a4-a5af-1c8573d9ae40","tools":["read","bash"],"model":"m"}"#;
+
+/// A maki result event with the given `is_error`, `stop_reason` (raw JSON, or
+/// `None` to omit the key) and result text.
+fn maki_result(is_error: &str, stop_reason: Option<&str>, text: &str) -> String {
+    let stop = stop_reason.map_or(String::new(), |r| format!(r#","stop_reason":{r}"#));
+    format!(
+        r#"{{"type":"result","subtype":"x","is_error":{is_error},"num_turns":1,"result":{text}{stop},"session_id":"3f17c0b4-5f22-43a4-a5af-1c8573d9ae40","total_cost_usd":0.0,"usage":{{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}"#,
+        text = serde_json::Value::String(text.into())
+    )
+}
+
+fn maki_verdict(result: &str) -> super::ClaudeOutcome {
+    super::interpret_claude_output(Dialect::Maki, &claude_stream(&[MAKI_INIT, result]), "")
+        .expect("a result object")
+}
+
+#[test]
+fn maki_answers_only_on_end_turn() {
+    let super::ClaudeOutcome::Answered { text, session_id } =
+        maki_verdict(&maki_result("false", Some(r#""end_turn""#), "DONE"))
+    else {
+        panic!("is_error false with end_turn is an answer");
+    };
+    assert_eq!(text, "DONE");
+    assert_eq!(
+        session_id.as_deref(),
+        Some("3f17c0b4-5f22-43a4-a5af-1c8573d9ae40")
+    );
+}
+
+#[test]
+fn maki_unfinished_endings_are_stated_failures_that_keep_their_text() {
+    // maki sets is_error for `cancelled` alone, so a truncated answer would
+    // otherwise pass as complete.
+    for reason in ["max_tokens", "max_turns", "dropped", "compact"] {
+        let outcome = maki_verdict(&maki_result(
+            "false",
+            Some(&format!("\"{reason}\"")),
+            "PARTIAL",
+        ));
+        let super::ClaudeOutcome::NoAnswer {
+            stated: Some(stated),
+            unverified: None,
+            text,
+            ..
+        } = outcome
+        else {
+            panic!("{reason} is not an answer");
+        };
+        assert!(stated.contains(reason), "{stated}");
+        assert_eq!(
+            text, "PARTIAL",
+            "the partial text is kept as the turn's text"
+        );
+    }
+}
+
+#[test]
+fn maki_provider_failure_is_stated_with_its_api_error() {
+    // Probed: no credits on the configured backend. Exit 0, is_error true,
+    // stop_reason null, the API error as the result text.
+    let outcome = maki_verdict(&maki_result(
+        "true",
+        Some("null"),
+        "API error (402): You have no credits remaining.",
+    ));
+    let super::ClaudeOutcome::NoAnswer {
+        stated: Some(stated),
+        unverified: None,
+        session_id,
+        ..
+    } = outcome
+    else {
+        panic!("an API failure is maki's stated failure");
+    };
+    assert!(stated.contains("API error (402)"), "{stated}");
+    assert!(session_id.is_some(), "the session survives an API failure");
+    // A cancelled run that review did not interrupt: someone else signalled it.
+    let outcome = maki_verdict(&maki_result("true", Some(r#""cancelled""#), ""));
+    let super::ClaudeOutcome::NoAnswer {
+        stated: Some(stated),
+        ..
+    } = outcome
+    else {
+        panic!("cancelled is stated");
+    };
+    assert!(stated.contains("stop_reason: cancelled"), "{stated}");
+}
+
+#[test]
+fn maki_results_review_cannot_classify_fail_closed() {
+    for (is_error, stop, what) in [
+        ("false", Some("null"), "is_error false with no ending"),
+        ("false", Some(r#""new_reason""#), "an unfamiliar ending"),
+        ("false", Some("7"), "a non-string ending"),
+        ("false", None, "a missing stop_reason"),
+    ] {
+        let outcome = maki_verdict(&maki_result(is_error, stop, "maybe"));
+        let super::ClaudeOutcome::NoAnswer {
+            stated: None,
+            unverified: Some(unverified),
+            text,
+            ..
+        } = outcome
+        else {
+            panic!("{what} is review's diagnosis, not an answer");
+        };
+        assert!(
+            unverified.contains("could not classify maki"),
+            "{what}: {unverified}"
+        );
+        assert_eq!(text, "maybe", "{what}: the text survives");
+    }
+    // A stated error without the key keeps both facts.
+    let outcome = maki_verdict(&maki_result("true", None, "boom"));
+    let super::ClaudeOutcome::NoAnswer {
+        stated: Some(stated),
+        unverified: Some(unverified),
+        ..
+    } = outcome
+    else {
+        panic!("both facts survive");
+    };
+    assert!(stated.contains("boom"), "{stated}");
+    assert!(unverified.contains("no stop_reason"), "{unverified}");
+    let unflagged = r#"{"type":"result","result":"x","stop_reason":"end_turn"}"#;
+    assert!(matches!(
+        maki_verdict(unflagged),
+        super::ClaudeOutcome::NoAnswer {
+            stated: None,
+            unverified: Some(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn maki_setup_failure_detail_is_free_of_terminal_escapes() {
+    // Probed: an unknown --resume id exits 1 with nothing on stdout and a
+    // coloured banner on stderr.
+    let err = super::interpret_claude_output(
+        Dialect::Maki,
+        "",
+        "\n\u{1b}[1;31m\u{2716} not found: 1111114bZ6BZRUqUqZeo\u{1b}[0m\n",
+    )
+    .expect_err("no result object");
+    let message = err.to_string();
+    assert!(
+        message.starts_with("maki produced no result object"),
+        "{message}"
+    );
+    assert!(
+        message.contains("not found: 1111114bZ6BZRUqUqZeo"),
+        "{message}"
+    );
+    assert!(!message.contains('\u{1b}'), "{message:?}");
+}
+
+#[test]
+fn maki_zero_cost_is_unknown_and_no_served_model_is_invented() {
+    let zero = maki_result("false", Some(r#""end_turn""#), "x");
+    let metrics = super::summarize_output(Dialect::Maki, &claude_stream(&[MAKI_INIT, &zero]));
+    assert_eq!(metrics.turns, 1);
+    assert_eq!(metrics.usage.output, 2);
+    assert_eq!(
+        metrics.served(),
+        super::Served::default(),
+        "maki's 0.0 is unpriced, not free; its init model is the requested one"
+    );
+    let priced = zero.replace(r#""total_cost_usd":0.0"#, r#""total_cost_usd":0.25"#);
+    let metrics = super::summarize_output(Dialect::Maki, &priced);
+    assert_eq!(metrics.served().cost_usd, Some(0.25));
+    // claude's zero is a real zero.
+    let metrics = super::summarize_output(Dialect::Claude, &zero);
+    assert_eq!(metrics.served().cost_usd, Some(0.0));
+}
+
+#[test]
+fn maki_argv_never_carries_a_flag_maki_would_drop() {
+    let fresh = SessionStart::Fresh {
+        id: Some(SessionId::parse("0b6c1f3e-4a2d-4e8b-9c51-7d2f8a6e3b10").expect("id")),
+    };
+    let resume = SessionStart::Resume(SessionId::parse("1111114bZ6BZRUqUqZeo").expect("id"));
+    let selection = ModelSpec::new(Provider::Maki, Some("openrouter/qwen"), None, &[]);
+    let fresh_args = super::launch_args(Dialect::Maki, &fresh, &selection);
+    assert_eq!(
+        fresh_args,
+        [
+            "--session-id",
+            "0b6c1f3e-4a2d-4e8b-9c51-7d2f8a6e3b10",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--model",
+            "openrouter/qwen"
+        ]
+    );
+    let resume_args = super::launch_args(Dialect::Maki, &resume, &selection);
+    assert_eq!(resume_args[..2], ["--resume", "1111114bZ6BZRUqUqZeo"]);
+    for args in [fresh_args, resume_args] {
+        for arg in &args {
+            assert!(
+                !super::MAKI_IGNORED_FLAGS.contains(&arg.as_str()),
+                "maki ignores {arg}"
+            );
+            assert!(
+                arg != "--permission-mode" && arg != "--trust" && arg != "--yolo",
+                "{arg} must never reach maki"
+            );
+        }
+    }
+    assert!(super::forced_env(Dialect::Maki).is_empty());
 }

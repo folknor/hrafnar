@@ -1,4 +1,4 @@
-//! `review interrupt <ID>`: stop a codex or claude run mid-turn and hand back
+//! `review interrupt <ID>`: stop a codex, claude or maki run mid-turn and hand back
 //! its session.
 //!
 //! # Why a verb

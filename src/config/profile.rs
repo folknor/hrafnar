@@ -13,6 +13,13 @@ impl Profile {
                     );
                 }
             }
+            Provider::Maki => {
+                if self.sandbox.is_some() {
+                    bail!(
+                        "maki does not honour 'sandbox'; remove sandbox from this profile and configure permissions in maki's permissions.toml instead"
+                    );
+                }
+            }
             Provider::Codex | Provider::Grok => {}
         }
         if !self.writable_roots.is_empty()
@@ -21,6 +28,9 @@ impl Profile {
             match provider {
                 Provider::Claude => bail!(
                     "claude does not honour 'writable_roots'; remove writable_roots from this profile and configure permissions in Claude Code instead"
+                ),
+                Provider::Maki => bail!(
+                    "maki does not honour 'writable_roots'; remove writable_roots from this profile and configure permissions in maki's permissions.toml instead"
                 ),
                 Provider::Codex | Provider::Grok => bail!(
                     "writable_roots are not honoured at this sandbox level; remove writable_roots or set sandbox = \"workspace-write\""
@@ -51,6 +61,10 @@ mod tests {
                     ("claude", "writable_roots = ['/srv/cache']"),
                     ("claude", "config = ['a=b']"),
                     ("grok", "config = ['a=b']"),
+                    ("maki", "sandbox = 'read-only'"),
+                    ("maki", "writable_roots = ['/srv/cache']"),
+                    ("maki", "config = ['a=b']"),
+                    ("maki", "effort = 'high'"),
                     ("codex", "writable_roots = ['/srv/cache']"),
                     (
                         "grok",
@@ -72,14 +86,17 @@ mod tests {
     #[test]
     fn supported_profiles_and_harmless_empty_lists_still_load() {
         for provider in Provider::all() {
+            // maki honours a model but not an effort (see ModelSpec::validate).
+            let effort = match provider {
+                Provider::Maki => "",
+                Provider::Claude | Provider::Codex | Provider::Grok => "\neffort='high'",
+            };
             parse_file(
-                &format!(
-                    "[{provider}.test]\nmodel='m'\neffort='high'\nconfig=[]\nwritable_roots=[]"
-                ),
+                &format!("[{provider}.test]\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"),
                 "source",
                 Layer::Local,
             )
-            .expect("all existing providers apply model and effort");
+            .expect("every provider applies its supported selectors");
         }
         for (provider, level) in [
             ("codex", "workspace-write"),

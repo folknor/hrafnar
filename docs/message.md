@@ -7,14 +7,14 @@ dashes or underscores. Historical rows remain readable even if their IDs
 cannot be launched.
 
 - **Idle session**: the message continues it, as a new turn.
-- **Codex or claude turn in flight**: that turn is interrupted first - cut off,
+- **Codex, claude or maki turn in flight**: that turn is interrupted first - cut off,
   and whatever it had not finished is lost - and the message then continues the
   session. If the turn finishes before the interrupt lands, its answer stands
   and the message continues after it.
 - **Grok turn in flight**: refused. Grok has no way to stop a turn from outside;
   send the message once the turn ends.
 
-`review interrupt <ID>` ends a codex or claude turn without a message, waits
+`review interrupt <ID>` ends a codex, claude or maki turn without a message, waits
 for its run to record the session, and prints the `review message` command that
 continues it. A run already finishing waits for its exact handoff, without
 sending another signal. Active runs from an older review without handoff
@@ -22,7 +22,7 @@ support are refused before signalling; wait for them to finish. Old recorded
 sessions remain readable and can still be continued.
 
 **Never stop or kill the `review` process to interrupt an agent.** A first
-SIGINT or SIGTERM makes `review` try to end its codex and claude turns
+SIGINT or SIGTERM makes `review` try to end its codex, claude and maki turns
 gracefully and record them, within a bounded wait. A second signal, SIGKILL, or
 a provider that does not stop in time loses that record, and an unrecorded
 session cannot be continued at all. Grok turns are not ended gracefully.
@@ -32,7 +32,9 @@ session cannot be continued at all. Grok turns are not ended gracefully.
 Stdin as-is: no archetype prime, no profile. The session keeps the provider,
 sandbox level, model and effort recorded for it, and each is announced
 (`sandbox: workspace-write (inherited from the session record)`). There is no
-`--provider`, `-a` or `-p`.
+`--provider`, `-a` or `-p`. A maki session records no effort, and maki itself
+resumes at the thinking level its own config sets, else the one it last used
+anywhere on the host, not the one the session ran at.
 
 It does **not** keep the profile's `env` or codex `config` overrides: the
 session record holds env names only and no overrides, so there is nothing to
@@ -63,6 +65,7 @@ idle too long is refused:
 | codex | 27 minutes ago |
 | claude | 55 minutes ago |
 | grok | 55 minutes ago |
+| maki | 55 minutes ago |
 
 These are refusal thresholds, not a promise that the cache is warm before
 them. A session's clock is reset by every turn that ran, whether or not the
@@ -76,8 +79,8 @@ established, what is left.
 ## Several messages at once
 
 Messages to one session are serialised up to their launch. A second message
-waits until the first has launched, then finds its turn in flight: on codex or
-claude it interrupts it, on grok it is refused, and if the first turn has
+waits until the first has launched, then finds its turn in flight: on codex,
+claude or maki it interrupts it, on grok it is refused, and if the first turn has
 already finished it simply continues the session. While the first message is
 still waiting to launch (behind the host-wide launch lock), `review sessions`
 shows it as `[queued]`. A message arriving just after the first has launched,

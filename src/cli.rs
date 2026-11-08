@@ -59,8 +59,10 @@ project file before the global one, and that definition wins whole. Fields are
 never merged, so a project profile that leaves out `model` does not inherit the
 global profile's `model`. `sandbox` defaults to read-only, so a profile has to
 ask for workspace-write before a codex or grok run may modify files. Claude
-profiles must omit `sandbox`:
-what a claude run can touch is decided by Claude Code's own permission settings.
+and maki profiles must omit `sandbox`: what a claude run can touch is decided
+by Claude Code's own permission settings, and a maki run's by maki's
+permissions.toml - which by default lets maki edit the project. Maki profiles
+must also omit `effort`, which maki ignores.
 
 Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
 then the response. Codex and grok runs also print a digest between the session
@@ -105,8 +107,8 @@ Examples:
 More depth on any of this: `review man` lists the bundled topics.";
 
 /// Help templates name providers through markers, filled from
-/// `provider::Provider` by `render`: `{INTERRUPTIBLE}` (`claude or codex`),
-/// `{UNINTERRUPTIBLE}` (`grok`), `{PROVIDERS}` (`claude, codex, grok`) and
+/// `provider::Provider` by `render`: `{INTERRUPTIBLE}` (`claude, codex or maki`),
+/// `{UNINTERRUPTIBLE}` (`grok`), `{PROVIDERS}` (`claude, codex, grok, maki`) and
 /// `{CUTOFFS}` (each provider's stale cutoff). Hand-written lists here drifted
 /// from the code that decides them, and a new provider would have been missing
 /// from every one.

@@ -153,7 +153,7 @@ impl InheritedSettings {
             effort: record.effort.clone(),
             codex_home: match provider {
                 Provider::Codex => record.codex_home.clone(),
-                Provider::Claude | Provider::Grok => None,
+                Provider::Claude | Provider::Grok | Provider::Maki => None,
             },
         }
     }
