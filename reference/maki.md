@@ -163,9 +163,11 @@ with exit 0, a cancellation from outside, and a `max_tokens` answer.
 
 ## Cache
 
-`stale_cutoff` is the general 55 minutes. The real lifetime is the backend's:
-maki sends no cache hints on the OpenAI-compatible path and relies on the
-host's prefix caching, which differs per host. Unmeasured.
+`stale_cutoff` is the general 55 minutes. A prompt cache's lifetime is set by
+the host serving the model, not by the harness, and maki's host varies with
+`--model` (OpenRouter, DeepSeek, Moonshot and others each set their own). A
+cutoff keyed by provider therefore cannot be right for every maki session; the
+honest key is the model's host.
 
 ## Upstream patches worth sending
 

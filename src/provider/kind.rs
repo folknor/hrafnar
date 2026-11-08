@@ -85,9 +85,10 @@ impl Provider {
 
     /// How long since a session was last touched before `review message`
     /// refuses to resume it, because the provider's prompt cache has gone cold.
-    /// maki's cache lifetime is its backend's (each open-model host differs,
-    /// and maki sends no cache hints on the OpenAI-compatible path), so it
-    /// takes the general cutoff until one is measured.
+    /// The lifetime is set by whoever serves the model, not by the harness.
+    /// For claude and codex that host is fixed; maki's depends on the
+    /// `--model` it runs, so one per-provider value is only a placeholder for
+    /// maki and it takes the general cutoff.
     pub fn stale_cutoff(self) -> Duration {
         match self {
             Provider::Codex => crate::timings::STALE_SESSION_CODEX,
