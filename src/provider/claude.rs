@@ -234,30 +234,31 @@ const CLAUDE_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_claude(
-    session_id: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
+    session: &SessionStart,
+    selection: &super::ModelSpec,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
-    oneshot: bool,
     launched: Option<LaunchSignal>,
     // Named for codex, whose runner it was written for; claude uses its
     // command, stop channel, data root, teardown settings, orphan log, and
     // drain grace.
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
-    // In oneshot mode, generate a UUID up front and pass it via --session-id
-    // so the fresh session is persistable and the operator can follow up via
-    // `review resume <id>`. (Previously used --no-session-persistence, which made
-    // the session unreachable.)
-    let oneshot_id = if oneshot {
-        Some(crate::config::generate_uuid())
-    } else {
-        None
+    // The invocation owner supplies a fresh UUID; runners never mint IDs.
+    // Entry validation also protects direct runner callers.
+    selection.validate(Provider::Claude)?;
+    session.validate(Provider::Claude)?;
+    let session_id = session
+        .id()
+        .expect("validated caller-minted identity")
+        .as_str();
+    let fresh_id = match session {
+        SessionStart::Fresh { id } => id.as_ref().map(|id| id.as_str().to_string()),
+        SessionStart::Resume(_) => None,
     };
 
-    let mut args: Vec<String> = if let Some(ref id) = oneshot_id {
+    let mut args: Vec<String> = if let Some(ref id) = fresh_id {
         vec!["--session-id".to_string(), id.clone()]
     } else {
         vec!["--resume".to_string(), session_id.to_string()]
@@ -283,23 +284,12 @@ pub async fn run_claude(
     ] {
         args.push(arg.to_string());
     }
-    if let Some(m) = model {
-        args.push("--model".to_string());
-        args.push(m.to_string());
-    }
-    if let Some(e) = effort {
-        args.push("--effort".to_string());
-        args.push(e.to_string());
-    }
+    args.extend_from_slice(selection.args());
 
-    let (program, leading) = runtime
-        .claude_command
-        .split_first()
-        .map_or(("claude", &[][..]), |(p, rest)| (p.as_str(), rest));
-    let mut cmd = Command::new(program);
+    let mut cmd = runtime.commands.get(Provider::Claude).build();
     // Launched under a keeper (`contained::spawn`), which gives claude its own
     // process group and tears down every shell it started when the run ends.
-    cmd.args(leading).args(&args).current_dir(project_root);
+    cmd.args(&args).current_dir(project_root);
     // Keep the model's shell commands in the foreground, where their output
     // reaches it. `--print` does not wait for a background Bash command when the
     // model ends its turn: it *kills* it and exits 0. Probed on Claude Code
@@ -331,7 +321,7 @@ pub async fn run_claude(
     // killed before consuming it) is not aimed at this one, and would mark a
     // failed resume as interrupted, hiding claude's stated reason. A fresh run
     // needs no check: its session id is new. As in `run_codex_json`.
-    if !oneshot {
+    if !session.is_fresh() {
         let _ = crate::inflight::take_interrupt_request(session_id, runtime.data_root.as_deref());
     }
     // A run still waiting on the lock or its stagger when `review` was told to
@@ -348,7 +338,7 @@ pub async fn run_claude(
     // message must then find this marker, or it launches beside this run
     // instead of interrupting it. Dropped (removing the marker) on any early
     // return below.
-    let marker_sid = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
+    let marker_sid = fresh_id.clone().unwrap_or_else(|| session_id.to_string());
     let marker = crate::inflight::mark(
         &marker_sid,
         Provider::Claude,
@@ -497,9 +487,7 @@ pub async fn run_claude(
 
     // The echoed ID wins on a fresh run in case claude reassigned the requested
     // UUID; on resume, retain the ID the caller asked us to continue.
-    let keep_id = |echoed: Option<String>| {
-        invocation_session_id(oneshot, echoed, oneshot_id.clone(), session_id)
-    };
+    let keep_id = |echoed: Option<String>| session.result_id(echoed);
     let metrics = claude_metrics
         .lock()
         .map(|metrics| metrics.clone())

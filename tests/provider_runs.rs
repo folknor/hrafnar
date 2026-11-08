@@ -1,4 +1,4 @@
-//! End-to-end tests for the codex and claude runners, driven by stub providers.
+//! End-to-end tests for all provider runners, driven by stub providers.
 //!
 //! An integration test rather than a unit test because every provider runs
 //! under a keeper, and the keeper is the built `review` binary: Cargo hands an
@@ -54,7 +54,8 @@
 
 use anyhow::Result;
 use review::provider::{
-    Digest, ProviderRuntime, RunOutput, new_output_file, run_claude, run_codex_json,
+    Digest, Provider, ProviderCommand, ProviderCommands, ProviderRuntime, RunOutput,
+    new_output_file, run_claude, run_codex_json,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -222,9 +223,17 @@ fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
         // Execute the stable system shell, not the fixture file another test
         // thread may still have open for writing. The script path is argv[0]
         // from the shell's perspective; see `run_stub_with`.
-        codex_binary: "/bin/sh".to_string(),
-        // Replaced by `claude_runtime` for the claude tests.
-        claude_command: vec!["claude-not-stubbed".to_string()],
+        commands: {
+            let mut commands = ProviderCommands::default();
+            commands.set(
+                Provider::Codex,
+                ProviderCommand {
+                    program: "/bin/sh".to_string(),
+                    leading_args: Vec::new(),
+                },
+            );
+            commands
+        },
         timings: review::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
@@ -1238,20 +1247,33 @@ async fn run_claude_stub(
 ) -> Result<RunOutput> {
     let script = scratch.write_stub(&format!("{CLAUDE_STUB_PREAMBLE}\n{body}"));
     let mut runtime = runtime.clone();
-    runtime.claude_command = vec!["/bin/sh".to_string(), script];
+    runtime.commands.set(
+        Provider::Claude,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec![script],
+        },
+    );
     let mut env = BTreeMap::new();
     env.insert(
         "STUB_DIR".to_string(),
         scratch.root.to_string_lossy().into_owned(),
     );
     run_claude(
-        resume.unwrap_or(""),
-        None,
-        None,
+        &{
+            let mut start = match resume {
+                Some(id) => {
+                    review::provider::SessionStart::Resume(review::provider::SessionId::parse(id)?)
+                }
+                None => review::provider::SessionStart::Fresh { id: None },
+            };
+            start.prepare(review::provider::Provider::Claude)?;
+            start
+        },
+        &review::provider::ModelSpec::new(review::provider::Provider::Claude, None, None, &[]),
         Some(&env),
         "review this",
         &scratch.project(),
-        resume.is_none(),
         None,
         &runtime,
     )
@@ -1604,7 +1626,13 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
         claude_stub_result(false, r#",\"result\":\"ok\""#)
     );
     let mut runtime = fast_runtime(&scratch);
-    runtime.claude_command = vec!["/bin/sh".to_string(), scratch.write_stub(&body)];
+    runtime.commands.set(
+        Provider::Claude,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec![scratch.write_stub(&body)],
+        },
+    );
     let mut env = BTreeMap::new();
     env.insert(
         "STUB_DIR".to_string(),
@@ -1613,15 +1641,18 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let data_root = scratch.data_root();
     let project = scratch.project();
+    let start = review::provider::SessionStart::Resume(
+        review::provider::SessionId::parse(sid).expect("test id"),
+    );
+    let selection =
+        review::provider::ModelSpec::new(review::provider::Provider::Claude, None, None, &[]);
     let (run, marked) = tokio::join!(
         run_claude(
-            sid,
-            None,
-            None,
+            &start,
+            &selection,
             Some(&env),
             "more",
             &project,
-            false,
             Some(tx),
             &runtime
         ),
@@ -1778,11 +1809,17 @@ sleep 1
 async fn a_provider_that_cannot_exec_fails_the_launch() {
     let scratch = Scratch::new();
     let mut runtime = fast_runtime(&scratch);
-    runtime.codex_binary = scratch
-        .root
-        .join("no-such-codex")
-        .to_string_lossy()
-        .into_owned();
+    runtime.commands.set(
+        Provider::Codex,
+        ProviderCommand {
+            program: scratch
+                .root
+                .join("no-such-codex")
+                .to_string_lossy()
+                .into_owned(),
+            leading_args: Vec::new(),
+        },
+    );
     let err = match run_stub_with(&scratch, "unused", &runtime).await {
         Ok(_) => panic!("a missing binary must fail the launch"),
         Err(e) => e.to_string(),
@@ -1818,4 +1855,423 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
     assert_eq!(digest.turns, 2);
     assert_eq!(digest.usage.input_tokens, 28);
     assert_eq!(digest.usage.output_tokens, 32);
+}
+
+#[tokio::test]
+async fn model_selection_arguments_and_record_share_the_prepared_spec() {
+    use review::provider::{Permissions, Provider, SessionStart};
+    let scratch = Scratch::new();
+    let script = scratch.write_stub(&format!(
+        "{CLAUDE_STUB_PREAMBLE}\n{CLAUDE_STUB_INIT}\n{}",
+        claude_stub_result(false, r#",\"result\":\"ok\""#)
+    ));
+    let mut runtime = fast_runtime(&scratch);
+    runtime.commands.set(
+        Provider::Claude,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec![script],
+        },
+    );
+    let env = BTreeMap::from([(
+        "STUB_DIR".into(),
+        scratch.root.to_string_lossy().into_owned(),
+    )]);
+    let result = review::provider::invoke(
+        Provider::Claude,
+        SessionStart::Fresh { id: None },
+        Some("chosen-model"),
+        Some("high"),
+        Permissions::profile(Provider::Claude, None),
+        &[],
+        Some(&env),
+        &[],
+        "review this",
+        &scratch.project(),
+        None,
+        &runtime,
+    )
+    .await;
+    assert_eq!(result.output.expect("answer"), "ok");
+    assert_eq!(result.model.as_deref(), Some("chosen-model"));
+    assert_eq!(result.effort.as_deref(), Some("high"));
+    let args = std::fs::read_to_string(scratch.root.join("args")).expect("stub args");
+    assert!(
+        args.contains("--model chosen-model --effort high"),
+        "{args}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_model_selection_is_refused_before_a_session_launches() {
+    use review::provider::{Permissions, Provider, SessionStart};
+    let scratch = Scratch::new();
+    let result = review::provider::invoke(
+        Provider::Codex,
+        SessionStart::Fresh { id: None },
+        Some("chosen"),
+        Some("high"),
+        Permissions::profile(Provider::Codex, None),
+        &[],
+        None,
+        &["model_reasoning_effort=123".into()],
+        "review this",
+        &scratch.project(),
+        None,
+        &fast_runtime(&scratch),
+    )
+    .await;
+    let error = result
+        .output
+        .expect_err("invalid config refused")
+        .to_string();
+    assert!(error.contains("must be a string"), "{error}");
+    assert!(result.session_id.is_none());
+    assert!(result.permissions.is_none());
+    assert!(result.model.is_none());
+    assert!(result.effort.is_none());
+    assert!(!scratch.codex_home().join("pid").exists());
+}
+
+#[test]
+fn command_prefix_defaults_and_replacement_cover_every_provider() {
+    let mut commands = ProviderCommands::default();
+    for &provider in Provider::all() {
+        assert_eq!(commands.get(provider).program, provider.binary());
+        assert!(commands.get(provider).leading_args.is_empty());
+    }
+    let original = commands.clone();
+    commands.set(
+        Provider::Codex,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec!["fixture with spaces".into()],
+        },
+    );
+    assert_eq!(
+        commands.get(Provider::Claude),
+        original.get(Provider::Claude)
+    );
+    assert_eq!(commands.get(Provider::Grok), original.get(Provider::Grok));
+    assert_eq!(
+        commands.get(Provider::Codex).leading_args,
+        ["fixture with spaces"]
+    );
+}
+
+#[tokio::test]
+async fn codex_prefix_is_preserved_in_spawn_probe_and_replay_metadata() {
+    let scratch = Scratch::new();
+    let script = scratch.root.join("provider with spaces.sh");
+    std::fs::write(&script, r#"
+[ "$1" = 'prefix with spaces' ] || exit 61
+shift
+if [ "$1" = --version ]; then
+    [ "$#" = 1 ] || exit 62
+    printf 'fixture-version\n'
+    exit 0
+fi
+[ "$1" = exec ] && [ "$2" = --json ] || exit 63
+cat >/dev/null
+printf '%s\n' '{"type":"error","message":"fixture refusal"}' '{"type":"turn.failed","error":{"message":"fixture refusal"}}'
+exit 1
+"#).expect("write prefix fixture");
+    let prefix = vec![
+        script.to_string_lossy().into_owned(),
+        "prefix with spaces".into(),
+    ];
+    let mut runtime = fast_runtime(&scratch);
+    runtime.commands.set(
+        Provider::Codex,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: prefix.clone(),
+        },
+    );
+    let out_file = new_output_file().expect("output file");
+    let args = vec!["exec".into(), "--json".into()];
+    let run = run_codex_json(
+        args.clone(),
+        &out_file,
+        None,
+        None,
+        "prompt",
+        &scratch.project(),
+        None,
+        &runtime,
+    )
+    .await
+    .expect("fixture ran");
+    assert!(
+        run.digest
+            .expect("digest")
+            .turn_error
+            .expect("stated failure")
+            .contains("fixture refusal")
+    );
+    let dirs = scratch.incident_dirs();
+    assert_eq!(dirs.len(), 1);
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dirs[0].join("meta.json")).expect("metadata"),
+    )
+    .expect("metadata json");
+    assert_eq!(meta["codex_version"], "fixture-version");
+    let expected: Vec<String> = std::iter::once("/bin/sh".to_string())
+        .chain(prefix)
+        .chain(args)
+        .collect();
+    assert_eq!(meta["argv"], serde_json::json!(expected));
+    assert!(
+        meta["command"]
+            .as_str()
+            .expect("replay command")
+            .contains("'prefix with spaces'")
+    );
+}
+
+#[tokio::test]
+async fn empty_command_program_fails_to_launch() {
+    let scratch = Scratch::new();
+    let mut runtime = fast_runtime(&scratch);
+    runtime.commands.set(
+        Provider::Codex,
+        ProviderCommand {
+            program: String::new(),
+            leading_args: Vec::new(),
+        },
+    );
+    let err = match run_stub_with(&scratch, "unused", &runtime).await {
+        Ok(_) => panic!("empty executable must fail"),
+        Err(error) => error,
+    };
+    assert!(err.to_string().contains("failed to launch"), "{err:#}");
+}
+
+#[tokio::test]
+async fn grok_prefix_drives_fresh_resume_and_stated_failure_through_invoke() {
+    use review::provider::{Permissions, SessionId, SessionStart};
+    let scratch = Scratch::new();
+    let script = scratch.write_stub(r#"
+[ "$1" = 'prefix with spaces' ] || exit 71
+shift
+printf '%s\n' "$@" > "$STUB_DIR/args"
+prompt= sid= mode=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --session-id|--resume)
+            [ "$#" -ge 2 ] && [ -z "$sid" ] && [ -n "$2" ] || exit 73
+            mode=$1; sid=$2; shift 2 ;;
+        --prompt-file)
+            [ "$#" -ge 2 ] && [ -z "$prompt" ] && [ -n "$2" ] || exit 74
+            prompt=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$sid" ] && [ -f "$prompt" ] || exit 72
+cat "$prompt" > "$STUB_DIR/prompt"
+printf '%s\n' "$PWD" > "$STUB_DIR/cwd"
+printf '%s\n' "$mode" "$sid" > "$STUB_DIR/session"
+printf '%s %s\n' "$mode" "$sid" >> "$STUB_DIR/trace"
+mkdir -p "$GROK_HOME/sessions/fixture/$sid"
+: > "$GROK_HOME/sessions/fixture/$sid/updates.jsonl"
+if [ "$STUB_WAKE" = 1 ] && [ "$mode" = --session-id ]; then
+    printf '%s\n' \
+      '{"params":{"update":{"sessionUpdate":"turn_completed"}}}' \
+      '{"params":{"update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"fixture-task","command":"fixture build","exit_code":0,"output":"fixture build passed"}}}}' \
+      > "$GROK_HOME/sessions/fixture/$sid/updates.jsonl"
+fi
+printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1}\n' "$STUB_STOP" "$sid"
+"#);
+    let mut runtime = fast_runtime(&scratch);
+    runtime.commands.set(
+        Provider::Grok,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec![script, "prefix with spaces".into()],
+        },
+    );
+    let sid = "grok-prefix-session";
+    let mut env = BTreeMap::from([
+        (
+            "GROK_HOME".into(),
+            scratch
+                .root
+                .join("grok-home")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "STUB_DIR".into(),
+            scratch.root.to_string_lossy().into_owned(),
+        ),
+        ("STUB_STOP".into(), "end_turn".into()),
+    ]);
+    let assert_args = |mode: &str, expected_sid: &str| {
+        let args = std::fs::read_to_string(scratch.root.join("args")).expect("args");
+        let lines: Vec<_> = args.lines().collect();
+        for (flag, value) in [
+            (mode, expected_sid),
+            ("--sandbox", "read-only"),
+            ("-m", "chosen-model"),
+            ("--reasoning-effort", "high"),
+            ("--permission-mode", "dontAsk"),
+            ("--output-format", "json"),
+        ] {
+            assert_eq!(
+                lines.iter().filter(|arg| **arg == flag).count(),
+                1,
+                "{args}"
+            );
+            let at = lines.iter().position(|arg| *arg == flag).expect("flag");
+            assert_eq!(lines[at + 1], value, "{args}");
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|arg| **arg == "--session-id" || **arg == "--resume")
+                .count(),
+            1,
+            "one session mode: {args}"
+        );
+        assert_eq!(
+            lines.iter().filter(|arg| **arg == "--prompt-file").count(),
+            1,
+            "{args}"
+        );
+        assert!(
+            !args.contains("prefix with spaces"),
+            "prefix consumed exactly once"
+        );
+        let prompt_at = lines
+            .iter()
+            .position(|s| *s == "--prompt-file")
+            .expect("prompt flag");
+        assert!(
+            !std::path::Path::new(lines[prompt_at + 1]).exists(),
+            "prompt removed on return"
+        );
+        assert!(
+            review::inflight::live_marker(expected_sid, Some(&scratch.data_root())).is_none(),
+            "marker removed on return"
+        );
+    };
+    for (start, mode, stop) in [
+        (
+            SessionStart::Fresh {
+                id: Some(SessionId::parse(sid).expect("id")),
+            },
+            "--session-id",
+            "end_turn",
+        ),
+        (
+            SessionStart::Resume(SessionId::parse(sid).expect("id")),
+            "--resume",
+            "end_turn",
+        ),
+        (
+            SessionStart::Resume(SessionId::parse(sid).expect("id")),
+            "--resume",
+            "cancelled",
+        ),
+    ] {
+        env.insert("STUB_STOP".into(), stop.into());
+        let result = review::provider::invoke(
+            Provider::Grok,
+            start,
+            Some("chosen-model"),
+            Some("high"),
+            Permissions::profile(Provider::Grok, None),
+            &[],
+            Some(&env),
+            &[],
+            "inspect this prompt",
+            &scratch.project(),
+            None,
+            &runtime,
+        )
+        .await;
+        assert_eq!(result.output.expect("fixture ran"), "fixture answer");
+        assert_eq!(result.session_id.as_deref(), Some(sid));
+        if stop == "cancelled" {
+            let digest = result.digest.expect("failure digest");
+            assert_eq!(digest.exit_code, Some(0));
+            assert!(digest.failed());
+            assert!(
+                digest
+                    .turn_error
+                    .expect("stated stop")
+                    .contains("cancelled")
+            );
+            assert!(
+                digest.review_error.is_none(),
+                "background verification succeeded"
+            );
+        } else {
+            assert!(
+                result.digest.is_none(),
+                "successful answer needs no diagnostic digest"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(scratch.root.join("session")).expect("session"),
+            format!("{mode}\n{sid}\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
+            "inspect this prompt"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.root.join("cwd"))
+                .expect("cwd")
+                .trim(),
+            scratch
+                .project()
+                .canonicalize()
+                .expect("canonical project")
+                .to_string_lossy()
+        );
+        assert_args(mode, sid);
+    }
+
+    // The wake is a second contained launch inside one invoke, using the same
+    // configured prefix and checked session rather than a real Grok executable.
+    std::fs::write(scratch.root.join("trace"), "").expect("clear trace");
+    env.insert("STUB_WAKE".into(), "1".into());
+    env.insert("STUB_STOP".into(), "end_turn".into());
+    let wake_sid = "grok-wake-session";
+    let result = review::provider::invoke(
+        Provider::Grok,
+        SessionStart::Fresh {
+            id: Some(SessionId::parse(wake_sid).expect("id")),
+        },
+        Some("chosen-model"),
+        Some("high"),
+        Permissions::profile(Provider::Grok, None),
+        &[],
+        Some(&env),
+        &[],
+        "start background work",
+        &scratch.project(),
+        None,
+        &runtime,
+    )
+    .await;
+    assert_eq!(result.session_id.as_deref(), Some(wake_sid));
+    assert!(result.digest.is_none(), "wake verification succeeded");
+    assert!(
+        result
+            .output
+            .expect("wake answer")
+            .contains("grok woken 1 time(s)")
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.root.join("trace")).expect("launch trace"),
+        format!("--session-id {wake_sid}\n--resume {wake_sid}\n")
+    );
+    assert!(
+        std::fs::read_to_string(scratch.root.join("prompt"))
+            .expect("wake prompt")
+            .contains("fixture build passed")
+    );
+    assert_args("--resume", wake_sid);
 }

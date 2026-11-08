@@ -57,19 +57,26 @@ next to what it hides.
 
 Every field is optional. An unknown key is an error, because a misspelled key
 would otherwise parse as an empty profile and silently replace the global one.
+Fields the selected provider does not honour are errors too, in every table
+(including inactive legacy hosts). Empty `config` and `writable_roots` lists
+are accepted everywhere.
 
 - `comment`: free text shown by `review config`, never sent to a provider.
 - `model`: the model to request.
 - `effort`: the reasoning effort to request.
-- `sandbox`: what the run may modify; defaults to `read-only`. Claude ignores
-  it. See `review man sandbox` for what each level means per provider.
+- `sandbox`: what the run may modify; defaults to `read-only` for codex and
+  grok. Claude profiles must omit it; configure Claude Code permissions
+  instead. See `review man sandbox` for what each level means per provider.
 - `writable_roots`: extra paths a `workspace-write` run may write, added to the
   ones `review` derives for builds, never replacing them. `~`, `$VAR` and
   `${VAR}` expand; an entry naming an unset variable is dropped with a warning.
-  Ignored, with a warning, unless the profile is `workspace-write` on codex or
-  grok. A codex `config` override of the writable roots replaces all of them,
+  A non-empty list requires `workspace-write` on codex or grok (grok
+  also accepts its native `workspace` alias); otherwise parsing fails.
+  Remove the field or select that level. Claude profiles must omit it.
+  A codex `config` override of the writable roots replaces all of them,
   these included. See `review man sandbox`.
-- `config`: codex only. Each string is passed to codex verbatim as a `-c`
+- `config`: codex only; remove a non-empty list from other providers. Each
+  string is passed to codex verbatim as a `-c`
   override, after `review`'s own, so it can restate one deliberately - which
   includes the settings behind the sandbox guarantees. Codex runs ignore the
   operator's own codex `config.toml`, so anything an override refers to, such
@@ -81,13 +88,18 @@ would otherwise parse as an empty profile and silently replace the global one.
 
 ## What a run records
 
-Each run records the sandbox level `review` selected (`read-only` when the
-profile set none), the writable roots it granted, and the model and effort it
-passed. The level is not a certificate of effective permissions: a codex
-`config` override that changes permissions is not reflected in it, and an old
-grok session resumed with no recorded level records `read-only` while grok
-applies whatever level it saved. That record is what a later
-`review message` inherits. Two limits: a model or effort the provider chose
-itself (none set in the profile) is recorded as unset, so a resume also leaves
-it to the provider; and a codex `config` override that changes the model or
-effort is not reflected in the record, so a resume does not repeat it.
+Each run records its prepared permissions, effective writable roots, and model
+and effort selectors. Claude records no sandbox level; an old grok session
+with no known selector keeps it unknown. A level is not a certificate of
+filesystem enforcement: raw codex config can change permissions.
+
+Model and effort are launch selections, separate from the provider-reported
+served model. If neither a dedicated field nor raw config sets a selector,
+it stays unset and the provider chooses. Codex precedence is explicit: a
+profile's `model` beats raw `config` entries for `model`; otherwise the last
+raw `model` entry is recorded. The last raw `model_reasoning_effort` entry
+beats `effort`. Those effective selectors are inherited on a message even
+though raw config is not stored or replayed. Final non-string TOML values for
+these two raw overrides are errors: change them to strings or remove them.
+Other raw config is still validated by codex. Existing session rows remain
+readable; historical rows retain the selectors originally recorded.

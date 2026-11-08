@@ -438,7 +438,7 @@ pub async fn run() -> Result<()> {
                     // A panicked task never reached a provider, so it launched
                     // with nothing; recording a sandbox here would attribute
                     // permissions to a run that never happened.
-                    sandbox: None,
+                    permissions: None,
                     writable_roots: Vec::new(),
                     model: None,
                     effort: None,

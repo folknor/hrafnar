@@ -26,86 +26,33 @@ before adding maki; the providers hunter calls for a rewrite around all three.
 
 ## Types
 
-## STR-001 - Provider residue: runtime command hook and session artifacts
+## STR-001 - Provider residue: session artifact ownership
 
 Reported by: providers, lifecycle, config, orchestration, grok-man, forensics.
 
-`provider::Provider` (src/provider/kind.rs) exists and is parsed at the
-config, CLI and resume boundaries; launch-time decisions match it
-exhaustively. What remains:
-
-- `ProviderRuntime` still carries `codex_binary: String` and
-  `claude_command: Vec<String>`, with grok hardcoded as `Command::new("grok")`
-  (why grok has no runner-level test). It should become
-  `fn command(Provider) -> Vec<String>` (or a per-provider map), giving each new
-  runner a stub hook from its first commit.
-- `app::history` (`review sessions <id>`) still tests `latest.provider ==
-  "codex"` to decide whether a rollout transcript exists: per-provider session
-  artifacts, which belong with the forensics split rather than a flag.
-- Not adopted, deliberately: a static `Capabilities` struct of booleans (the
-  sandbox, writable-roots and recovery questions depend on the launch, so they
-  are exhaustive operations, not flags), and a `Retired(String)` variant (an
-  executable enum cannot tell an old integration's rows from a new one's; the
-  compatibility rule is stated at `app::message::resume_record`).
-
-## STR-002 - Sandbox level, native sandbox and permission plan as separate types
-
-Reported by: providers, config, orchestration, grok-man.
-
-`sandbox: Option<&str>` carries `review`'s vocabulary on a fresh run and the
-provider's native vocabulary on a resume (grok's `workspace`, or a
-`review-ws-<hash>` profile name), round-tripped through `sandbox_for`, which
-is safe only because it passes unknown names through and is idempotent on its
-own outputs. `grok_write_launch` recovers the profile kind by
-`starts_with(PROFILE_PREFIX)`; `derives` compares against `"workspace-write"`;
-`effective_sandbox` writes the native name back into the record (the
-recording defect is in `notes/bugs.md`). `app::inherited_settings`'s long
-comment argues the safety of this, and its cross-provider guard is tested
-though unreachable. `GrokWrite` already exists as the typed shape but is
-reconstructed from a string on every call.
-
-Proposed (the hunters' versions converge):
-- `enum SandboxLevel { ReadOnly, WorkspaceWrite, DangerFullAccess, Custom(String) }`
-  with `Default = ReadOnly`, parsed at `Profile` deserialisation; `Custom`
-  keeps the deliberate pass-through and the named levels become reserved by
-  construction.
-- A per-provider native form: grok
-  `enum GrokSandbox { Builtin(Level), ReviewProfile(ProfileName), Custom(String) }`;
-  "none" for claude, maki and opencode.
-- A permission plan per launch, because for maki and opencode read-only is not
-  a sandbox at all (maki's permissions config, opencode's agent definition):
-  `enum Permissions { Sandbox(NativeSandbox, Vec<GrantedRoot>), AgentPolicy(..), None }`
-  (orchestration: `NativePermissions { Codex(level), Grok(Builtin|Profile(name, roots)), Opencode(agent), None }`).
-  Deciding it is one function, not `invoke`'s
-  `provider == "codex" && sandbox == Some("workspace-write")`.
-- A recorded form that says which vocabulary it is in (grok-man: `level` plus
-  optional `provider_sandbox`), so resume copies the native value verbatim with
-  no round-trip, and "a grok level fed to codex" is unrepresentable.
-
-The config hunter adds that the dependency arrow is backwards today: config
-imports `sandbox_for` because `Profile` holds the level, but config should
-hold `SandboxLevel` and know nothing about grok.
+Provider identity and runtime command prefixes are shared and typed. The remaining
+artifact selection in app::history (review sessions <id>) already parses the
+persisted provider and matches exhaustively: Codex has a rollout; Claude and Grok
+do not. The old string-comparison claim is stale. Move artifact discovery and
+rendering to their provider/forensic owners with the forensics split, rather
+than inventing a static artifact capability flag. That ownership move remains.
 
 ## STR-003 - Session start and session id as types
 
 Reported by: providers, lifecycle, orchestration, forensics, grok-man.
 
-Fresh vs resume travels as `oneshot: bool` plus `session_id: &str`, with the
-empty string as the sentinel (`Launch::invoke` derives
-`oneshot = session.is_empty()`; `run_session_resume` passes `session_id, ..,
-false`). Impossible combinations are representable, every runner branches on
-both, and "fresh, with this id" (claude today, maki and opencode next) cannot
-be said. Session ids are `&str` everywhere; validation runs in several places
-with different degradation (the allowlist defect in `notes/bugs.md`).
+Launch intent and caller-side minting are now typed in provider::session:
+SessionStart reaches all runners and SessionId checks supplied launch IDs.
+The shared grammar owns the 128-byte path-component bound. Historical rows
+and provider evidence intentionally remain strings, not validated serde types.
 
-Proposed: `enum SessionStart { Fresh { id: Option<SessionId> }, Resume(SessionId) }`
-(providers: `enum Session { Fresh, Resume(SessionId) }`), and a `SessionId`
-newtype validated once where an id enters `review` (CLI argument, provider
-stream, the minter), with `as_path_component()`, a length bound and the
-provider-specific shape as an associated check. Every path in `inflight`
-becomes infallible, and `find_transcript_path`, `grok_home`, `transcript` and
-`sessions` stop re-validating or forgetting to. The minting policy is in
-`notes/consolidations.md`.
+Residue: inflight's string-facing marker/interrupt/lock APIs and Grok session
+file reads still use fallible safety guards; Codex live stream IDs, transcript
+lookup and session artifact APIs still carry strings. Convert executable/path
+identities at those boundaries without rejecting malformed historical rows or
+losing malformed provider evidence. Do not claim all paths infallible until
+those consumers take SessionId. Provider result strings need not themselves
+become validated evidence: evidence and executable identity are different.
 
 ## STR-004 - A typed run outcome in place of `Result<String>` plus `Option<Digest>` plus flags
 
@@ -307,30 +254,6 @@ tuple carrying the validated target, and should be named. `load` returns
 `(ReviewConfig, PathBuf)` and `load_optional` `(ReviewConfig,
 Option<PathBuf>)`, where the root is derivable from `files.local`. Proposed:
 `project_root: Option<ProjectRoot>` on `ReviewConfig`, no tuples.
-
-## STR-019 - Model and effort per provider, and profile fields only some providers honour
-
-Reported by: config, providers.
-
-For opencode, effort is the `#variant` suffix of the model string; for maki it
-is config-only and the CLI flag is silently ignored; for claude and codex it is
-a flag. The profile cannot express "this provider will ignore this field", so
-`review config` prints `effort high` on a maki profile and the sidecar records
-`effort: high` for a run that did not use it: `ProviderResult::effort` is
-filled from the request, not from what was applied (the false-record problem
-the `writable_roots` override comment warns about). Likewise `config` (codex
-`-c` only), `writable_roots` (codex and grok write only) and `sandbox` (not
-claude) are checked at run time with a warning, or not at all: `config` on a
-grok or claude profile is silently dropped.
-
-Proposed: since profiles are keyed by provider (`[codex.deep]`), the parse
-rejects fields a provider does not honour, the same way `deny_unknown_fields`
-rejects typos (a per-provider profile type, or `Profile` validated against
-capabilities in `parse_profiles`); a `ModelSpec` the provider renders, so
-opencode's `provider/model#variant` composition is in one place; and the
-recorded model and effort come from the adapter ("applied" vs "requested,
-unsupported"). The config hunter calls this the cheapest way to stop maki
-users writing `effort =` and believing it.
 
 ## STR-020 - Pass a resolved launch, not its fields
 

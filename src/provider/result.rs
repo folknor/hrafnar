@@ -164,28 +164,27 @@ pub struct ProviderResult {
     /// sidecar-record time so the cold-cache clock reflects completion, not the
     /// (possibly much later) moment results are collected in launch order.
     pub completed_epoch: u64,
-    /// The filesystem permissions this run actually launched with, in the
-    /// provider's own vocabulary. The sidecar normalizes known levels and saves
+    /// The provider-specific permission decision for this invocation. Failed
+    /// setup retains the request; successful setup carries its prepared selector. The sidecar normalizes known levels and saves
     /// this native selector separately for exact resume. Recorded because the
     /// guarantee a profile advertises is worth nothing if the permissions a run *received* are only
     /// visible in the launching terminal: `jq 'select(.sandbox=="read-only")'`
     /// has to be able to answer "which runs could not write?" after the fact.
-    pub sandbox: Option<String>,
-    /// Writable roots derived for this run beyond the provider's defaults
+    pub permissions: Option<super::Permissions>,
+    /// Effective writable roots for this run beyond the provider's defaults
     /// (`src/writable_roots/`). Empty for every run that widened nothing,
     /// which is every read-only run.
     pub writable_roots: Vec<String>,
     /// The model and reasoning effort this run launched with, recorded for the
-    /// same reason `sandbox` is: they are properties of the *run*, and a
+    /// same reason `permissions` is: they are properties of the *run*, and a
     /// `review resume` that cannot see them silently falls back to whatever
     /// the provider defaults to. `None` means "we passed nothing and the
     /// provider chose", which since `--ignore-user-config` means codex's
     /// built-in default rather than the operator's configured one.
     ///
-    /// A profile `config` entry restating `model` or `model_reasoning_effort`
-    /// is deliberately *not* parsed back out the way `writable_roots` is: which
-    /// of `-m` and `-c model=` codex resolves last is not established here, and
-    /// a confident wrong record is worse than an incomplete one.
+    /// ModelSpec supplies the same selection to argv and these projections,
+    /// including Codex raw selector precedence. These are launch selections,
+    /// never a claim about which model the provider actually served.
     pub model: Option<String>,
     pub effort: Option<String>,
     /// What the provider reports actually served the run. Record-only.

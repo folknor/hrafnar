@@ -20,7 +20,7 @@ pub struct Incident<'a> {
     pub provider: &'a str,
     /// The binary invoked (e.g. "codex") - argv[0] of the replayable command.
     pub binary: &'a str,
-    /// `<binary> --version`, best-effort; deaths may be version-specific. It
+    /// `<binary> <leading args> --version`, best-effort; deaths may be version-specific. It
     /// probes the binary that actually ran, not the provider name: those differ
     /// whenever the binary is overridden (the test harness runs a stub), and
     /// probing the name recorded the host's real codex for a stub run. Taken by

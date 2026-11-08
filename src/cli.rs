@@ -39,7 +39,8 @@ Profiles (-p): a profile resolves to its first definition, looking in the
 project file before the global one, and that definition wins whole. Fields are
 never merged, so a project profile that leaves out `model` does not inherit the
 global profile's `model`. `sandbox` defaults to read-only, so a profile has to
-ask for workspace-write before a run may modify files. Claude ignores `sandbox`:
+ask for workspace-write before a codex or grok run may modify files. Claude
+profiles must omit `sandbox`:
 what a claude run can touch is decided by Claude Code's own permission settings.
 
 Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
@@ -191,7 +192,7 @@ pub struct Cli {
 
     /// Named profile (model/effort/sandbox/env), resolved per launched provider
     /// from [<provider>.<profile>]. The first definition found wins whole;
-    /// sandbox defaults to read-only and claude ignores it (see below)
+    /// sandbox defaults to read-only; claude profiles must omit it (see below)
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 

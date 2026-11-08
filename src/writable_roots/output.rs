@@ -5,12 +5,17 @@ use super::GrantedRoot;
 /// TOML strings are emitted with escaping so a path containing a quote or a
 /// backslash cannot break out of the array and inject an unrelated key.
 pub fn config_override(grants: &[GrantedRoot]) -> Option<String> {
-    if grants.is_empty() {
+    config_override_paths(&grants.iter().map(|g| g.path.clone()).collect::<Vec<_>>())
+}
+
+/// Render the resolved effective set, which may come from a raw profile override.
+pub fn config_override_paths(paths: &[String]) -> Option<String> {
+    if paths.is_empty() {
         return None;
     }
-    let list = grants
+    let list = paths
         .iter()
-        .map(|g| format!("\"{}\"", escape_toml(&g.path)))
+        .map(|g| format!("\"{}\"", escape_toml(g)))
         .collect::<Vec<_>>()
         .join(",");
     Some(format!("sandbox_workspace_write.writable_roots=[{list}]"))

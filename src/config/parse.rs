@@ -87,7 +87,7 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
                  to hostless [<provider>.<profile>] tables if you meant the host."
             );
         }
-        profiles.insert(provider, parse_profiles(inner, &key, origin)?);
+        profiles.insert(provider, parse_profiles(inner, provider, &key, origin)?);
     }
 
     for (name, prime) in &archetypes {
@@ -158,16 +158,24 @@ fn parse_host(inner: toml::Table, key: &str, origin: &str) -> Result<ProfileTabl
             bail!("[{key}.{prov}] in {origin}: expected a table of profiles");
         };
         let prefix = format!("{}.{prov}", toml_key(key));
-        host_profiles.insert(provider, parse_profiles(pt, &prefix, origin)?);
+        host_profiles.insert(provider, parse_profiles(pt, provider, &prefix, origin)?);
     }
     Ok(host_profiles)
 }
 
-fn parse_profiles(t: toml::Table, prefix: &str, origin: &str) -> Result<BTreeMap<String, Profile>> {
+fn parse_profiles(
+    t: toml::Table,
+    provider: Provider,
+    prefix: &str,
+    origin: &str,
+) -> Result<BTreeMap<String, Profile>> {
     let mut out = BTreeMap::new();
     for (name, v) in t {
         let profile: Profile = v
             .try_into()
+            .map_err(|e| anyhow::anyhow!("[{prefix}.{name}] in {origin}: {e}"))?;
+        profile
+            .validate(provider)
             .map_err(|e| anyhow::anyhow!("[{prefix}.{name}] in {origin}: {e}"))?;
         out.insert(name, profile);
     }
@@ -229,7 +237,13 @@ sandbox = \"workspace-write\"
         let implement = cfg.resolve_profile(Provider::Codex, "implement").unwrap();
         assert_eq!(implement.model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(implement.effort.as_deref(), Some("high"));
-        assert_eq!(implement.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            implement
+                .sandbox
+                .as_ref()
+                .map(crate::config::SandboxLevel::as_str),
+            Some("workspace-write")
+        );
 
         assert!(cfg.resolve_profile(Provider::Claude, "nope").is_none());
 

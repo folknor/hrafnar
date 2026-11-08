@@ -281,7 +281,10 @@ fn settings(provider: Provider, p: &Profile) -> String {
         "model {}, effort {}, sandbox {}",
         p.model.as_deref().unwrap_or("unset"),
         p.effort.as_deref().unwrap_or("unset"),
-        sandbox_text(provider, p.sandbox.as_deref())
+        sandbox_text(
+            provider,
+            p.sandbox.as_ref().map(crate::config::SandboxLevel::as_str)
+        )
     )
 }
 
@@ -289,10 +292,13 @@ fn settings(provider: Provider, p: &Profile) -> String {
 /// "unset" alone invites the wrong guess: codex and grok runners default to
 /// read-only, while claude has no filesystem sandbox on this axis at all.
 ///
-/// Both answers come from `provider::effective_sandbox`, the function that
+/// Both answers come from `provider::Permissions::profile`, the function that
 /// decides what a run records, so the advertised default is the recorded one.
 fn sandbox_text(provider: Provider, sandbox: Option<&str>) -> String {
-    match (crate::provider::effective_sandbox(provider, None), sandbox) {
+    match (
+        crate::provider::Permissions::profile(provider, None).selector(),
+        sandbox,
+    ) {
         (None, Some(s)) => format!("{s} (ignored by {provider})"),
         (None, None) => format!("n/a ({provider} ignores sandbox)"),
         (Some(_), Some(s)) => s.to_string(),

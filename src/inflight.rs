@@ -117,8 +117,8 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
 /// Is `id` safe to use as a path component for a session?
 ///
 /// The session id reaches here straight from `review resume <id>` on the command
-/// line, and `review` deliberately delegates session-id validation to the
-/// provider - so by the time we see it, it is arbitrary operator input. Using it
+/// line or historical evidence. Launches use checked SessionId values, but
+/// these string-facing forensic APIs must also reject unsafe input. Using it
 /// unchecked as a path component let `review resume ../foo` escape the marker
 /// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
 /// under the data dir.
@@ -128,11 +128,7 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
 /// An allowlist rather than a "reject `..`" denylist because only the former is
 /// safe by construction.
 pub(crate) fn is_safe_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    crate::provider::SessionId::is_safe(id)
 }
 
 /// Is `pid` a live process? Signal 0 performs permission and existence checks

@@ -121,32 +121,6 @@ fn grok_cancelled_turn_is_not_an_answer() {
 }
 
 #[test]
-fn grok_write_launch_keeps_a_resumed_session_on_its_recorded_profile() {
-    use super::GrokWrite::{BuiltinWorkspace, Fresh, Resume};
-    let name = super::state::profile_name(&["/home/u/.brokkr".to_string()]);
-    // A fresh write run takes a new profile named for its derived roots.
-    assert_eq!(
-        super::grok_write_launch(true, Some("workspace")),
-        Some(Fresh)
-    );
-    // Grok refuses a resume whose --sandbox differs from the session's saved
-    // profile, so a session created under the built-in `workspace` (before
-    // profiles) must resume as `workspace` - trusted, no extra roots ...
-    assert_eq!(
-        super::grok_write_launch(false, Some("workspace")),
-        Some(BuiltinWorkspace)
-    );
-    // ... and one created under a `review-ws-*` profile keeps that exact one.
-    assert_eq!(
-        super::grok_write_launch(false, Some(&name)),
-        Some(Resume(name.clone()))
-    );
-    // Anything else does not write.
-    assert_eq!(super::grok_write_launch(true, Some("read-only")), None);
-    assert_eq!(super::grok_write_launch(true, None), None);
-}
-
-#[test]
 fn grok_turns_and_usage_are_read_from_the_result() {
     // Trimmed from a real grok 1.0.40 run. Before this was read, every grok
     // digest said 0 turns and 0 tokens, which reads as "nothing ran" on a run

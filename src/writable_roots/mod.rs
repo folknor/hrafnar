@@ -29,9 +29,9 @@
 //! This is deliberately the *one* place where ambient environment is allowed to
 //! influence a run, and it is narrowed hard to stay defensible:
 //!
-//! - it applies **only** to `workspace-write`; a `read-only` profile derives
-//!   nothing, because the whole point of that profile is that nothing is
-//!   writable;
+//! - derivation applies to Codex workspace-write and fresh Grok workspace-write
+//!   launches. Restored generated Grok profiles retain their recorded canonical
+//!   root set instead. Other levels and providers derive nothing;
 //! - it derives only paths that resolve **identically from every login path**.
 //!   `$CARGO_TARGET_DIR` and the `./target` symlink are cargo facts. The build
 //!   lock is not a fact about Rust at all - it is derived because brokkr locks
@@ -64,7 +64,7 @@ mod test_host;
 
 pub use derivation::derive;
 pub use host::{Host, RealHost};
-pub use output::config_override;
+pub use output::{config_override, config_override_paths};
 pub use profile::derive_with;
 
 /// One derived grant: the path, and why a build needs it.

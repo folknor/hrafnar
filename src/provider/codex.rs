@@ -174,19 +174,18 @@ fn codex_sandbox_args(level: &str) -> Vec<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_codex(
-    session_id: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
-    sandbox: Option<&str>,
-    granted_roots: &[crate::writable_roots::GrantedRoot],
+    session: &SessionStart,
+    selection: &super::ModelSpec,
+    sandbox: &str,
+    root_paths: &[String],
     env: Option<&std::collections::BTreeMap<String, String>>,
-    config: &[String],
     prompt: &str,
     project_root: &Path,
-    oneshot: bool,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    selection.validate(Provider::Codex)?;
+    session.validate(Provider::Codex)?;
     // The helper returns the exclusively-created path needed in argv. Cleanup
     // transfers to run_codex_json, which handles its pre-guard stop and guards
     // every fallible launch path after that.
@@ -272,20 +271,13 @@ pub(super) async fn run_codex(
         "-c".to_string(),
         "model_reasoning_summary=\"detailed\"".to_string(),
     ];
-    args.extend(codex_sandbox_args(sandbox.unwrap_or("read-only")));
-    if let Some(m) = model {
-        args.push("-m".to_string());
-        args.push(m.to_string());
-    }
-    if let Some(e) = effort {
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort=\"{e}\""));
-    }
+    args.extend(codex_sandbox_args(sandbox));
+    args.extend_from_slice(selection.args());
     // Writable roots the host needs for a build, derived by the caller (see
     // `invoke`, and `src/writable_roots/` for why they are derived at all).
     // Placed before profile `config` so a profile can restate
     // `sandbox_workspace_write.writable_roots` and win.
-    if let Some(override_arg) = crate::writable_roots::config_override(granted_roots) {
+    if let Some(override_arg) = crate::writable_roots::config_override_paths(root_paths) {
         args.push("-c".to_string());
         args.push(override_arg);
     }
@@ -319,28 +311,26 @@ pub(super) async fn run_codex(
     // and gets it from the permissions profile in `codex_sandbox_args`, there
     // being no `sandbox_read_only.network_access`. Passed before profile
     // `config`, so a profile can restate the key and win.
-    if sandbox == Some("workspace-write") {
+    if sandbox == "workspace-write" {
         args.push("-c".to_string());
         args.push("sandbox_workspace_write.network_access=true".to_string());
     }
 
-    // Profile `config` overrides, each a verbatim `-c key=value`. Placed after
-    // effort so a profile could even override reasoning effort if it wanted.
-    for c in config {
-        args.push("-c".to_string());
-        args.push(c.clone());
-    }
+    // Keep raw config after generated settings; ModelSpec owns its selector
+    // precedence and the values recorded for restoration.
+    args.extend_from_slice(selection.config_args());
 
     // A fresh run captures the new session id from the stream; the `resume`
     // subcommand carries the id we already know. Both stream `--json` and take
     // `-o` (placed at the subcommand level for resume, exec level for fresh).
-    let known_session_id = if oneshot {
+    let known_session_id = if session.is_fresh() {
         args.push("--json".to_string());
         args.push("-o".to_string());
         args.push(last_msg_path.clone());
         None
     } else {
         args.push("resume".to_string());
+        let session_id = session.id().expect("resume identity").as_str();
         args.push(session_id.to_string());
         args.push("--json".to_string());
         args.push("-o".to_string());
@@ -383,7 +373,8 @@ pub async fn run_codex_json(
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
-    let mut cmd = Command::new(&runtime.codex_binary);
+    let command = runtime.commands.get(Provider::Codex);
+    let mut cmd = command.build();
     cmd.args(&args)
         .current_dir(project_root)
         // Make a codex panic legible: without this it exits 1 with no trace,
@@ -974,8 +965,13 @@ pub async fn run_codex_json(
     let incident_path = if suspicious && !interrupted {
         // The version probe runs a provider binary too, so it is contained
         // like the run, and what it leaves joins the run's leftovers.
-        let (codex_version, probe_leftovers) =
-            crate::contained::version_probe(&runtime.codex_binary, &runtime.teardown).await;
+        let (codex_version, probe_leftovers) = crate::contained::version_probe(
+            &command.program,
+            &command.leading_args,
+            &runtime.teardown,
+        )
+        .await;
+        let replay_args: Vec<String> = command.leading_args.iter().chain(&args).cloned().collect();
         leftovers.merge(probe_leftovers);
         match crate::incident::write_bundle(&crate::incident::Incident {
             codex_version,
@@ -983,9 +979,9 @@ pub async fn run_codex_json(
             // The binary actually executed, which is not always "codex": a
             // stub overrides it. `command` in meta.json has to replay the
             // process that really ran.
-            binary: &runtime.codex_binary,
+            binary: &command.program,
             session_id: session_id.as_deref(),
-            argv: &args,
+            argv: &replay_args,
             prompt,
             cwd: project_root,
             env,

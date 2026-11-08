@@ -661,11 +661,15 @@ impl Drop for Contained {
     }
 }
 
-/// `binary --version` under a keeper, for incident bundles: a wrapper or a
+/// `binary <leading_args> --version` under a keeper, for incident bundles: a wrapper or a
 /// stub can fork too. Its leftovers join the run's.
-pub async fn version_probe(binary: &str, settings: &Settings) -> (Option<String>, Leftovers) {
+pub async fn version_probe(
+    binary: &str,
+    leading_args: &[String],
+    settings: &Settings,
+) -> (Option<String>, Leftovers) {
     let mut cmd = Command::new(binary);
-    cmd.arg("--version");
+    cmd.args(leading_args).arg("--version");
     let label = format!("{binary} --version probe");
     // Never inherit our stdin: a binary that reads stdin before parsing its
     // arguments would block forever, taking the incident write with it.

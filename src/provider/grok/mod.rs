@@ -102,40 +102,42 @@ const GROK_MAX_WAKES: u32 = 10;
 /// session id rather than dropping both.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_grok(
-    session_id: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
+    session: &SessionStart,
+    selection: &super::ModelSpec,
     sandbox: Option<&str>,
     trust: bool,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
-    oneshot: bool,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    selection.validate(Provider::Grok)?;
+    session.validate(Provider::Grok)?;
+    let session_id = session.id().expect("validated grok identity").as_str();
     let data_root = runtime.data_root.as_deref();
     // In flight for the whole run, wake turns included. Never offered a pid:
     // grok has no clean way to end a turn, so `review interrupt` refuses it.
     // What the marker buys is `review message` seeing the turn in flight and
     // refusing, as its help says, instead of launching a second turn on the
     // session beside this one - and `review sessions` showing it. A resume
-    // marks before its launch (the order `review message`'s launch lock
-    // relies on); a fresh run as soon as its id is known, which is before
-    // anyone could have it to message.
+    // marks before launch, including fresh caller-minted identities. If the
+    // provider echoes a different identity, retain both guards through wakes.
     let project = project_root.to_string_lossy().into_owned();
-    let mut _marker =
-        (!oneshot).then(|| crate::inflight::mark(session_id, Provider::Grok, &project, data_root));
-    let (mut first, first_turns, first_usage) = run_grok_turn(
+    let mut _marker = Some(crate::inflight::mark(
         session_id,
-        model,
-        effort,
+        Provider::Grok,
+        &project,
+        data_root,
+    ));
+    let (mut first, first_turns, first_usage) = run_grok_turn(
+        session,
+        selection,
         sandbox,
         trust,
         env,
         prompt,
         project_root,
-        oneshot,
         launched,
         runtime,
         _marker.as_mut(),
@@ -147,14 +149,16 @@ pub(super) async fn run_grok(
         .session_id
         .clone()
         .unwrap_or_else(|| session_id.to_string());
-    if _marker.is_none() {
-        _marker = Some(crate::inflight::mark(
+    let _echo_marker = if sid != session_id {
+        Some(crate::inflight::mark(
             &sid,
             Provider::Grok,
             &project,
             data_root,
-        ));
-    }
+        ))
+    } else {
+        None
+    };
     // Fail closed: without grok's home the results cannot be checked, and an
     // unchecked run must not pass as one whose results were seen.
     let grok = match state::Grok::resolve(env) {
@@ -232,16 +236,24 @@ pub(super) async fn run_grok(
         // `--trust` (granted on the first turn if it was needed); no launch
         // signal (the lock was released when the first turn spawned).
         let prompt = state::wake_prompt(&pending);
+        let wake = match SessionId::parse(&sid) {
+            Ok(id) => SessionStart::Resume(id),
+            Err(e) => {
+                out.digest = Some(wake_failure_digest(
+                    format!("invalid wake session id: {e}"),
+                    out.digest.take(),
+                ));
+                break;
+            }
+        };
         let (next, next_turns, next_usage) = match run_grok_turn(
-            &sid,
-            model,
-            effort,
+            &wake,
+            selection,
             sandbox,
             false,
             env,
             &prompt,
             project_root,
-            false,
             None,
             runtime,
             _marker.as_mut(),
@@ -311,19 +323,19 @@ fn wake_failure_digest(reason: String, last: Option<Digest>) -> Digest {
 /// One grok process: a single headless turn.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok_turn(
-    session_id: &str,
-    model: Option<&str>,
-    effort: Option<&str>,
+    session: &SessionStart,
+    selection: &super::ModelSpec,
     sandbox: Option<&str>,
     trust: bool,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
-    oneshot: bool,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
     marker: Option<&mut crate::inflight::Guard>,
 ) -> Result<(RunOutput, u32, Usage)> {
+    selection.validate(Provider::Grok)?;
+    session.validate(Provider::Grok)?;
     // Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read
     // literally as a one-character prompt. `--prompt-file` is the equivalent
     // escape from shell argument length limits, so the prompt goes via a temp
@@ -333,13 +345,16 @@ async fn run_grok_turn(
         .with_context(|| format!("failed to write grok prompt file {prompt_path}"))?;
     let _prompt_file = RemoveOnDrop(prompt_path.clone());
 
-    let oneshot_id = if oneshot {
-        Some(crate::config::generate_uuid())
-    } else {
-        None
+    let session_id = session
+        .id()
+        .expect("validated caller-minted identity")
+        .as_str();
+    let fresh_id = match session {
+        SessionStart::Fresh { id } => id.as_ref().map(|id| id.as_str().to_string()),
+        SessionStart::Resume(_) => None,
     };
 
-    let mut args: Vec<String> = if let Some(ref id) = oneshot_id {
+    let mut args: Vec<String> = if let Some(ref id) = fresh_id {
         vec!["--session-id".to_string(), id.clone()]
     } else {
         vec!["--resume".to_string(), session_id.to_string()]
@@ -362,16 +377,9 @@ async fn run_grok_turn(
     // made every such write session unresumable. Omitting the flag defers to
     // what the session already had - no trust or root setup happens, because
     // there is nothing recorded to say the session writes.
-    match (sandbox, oneshot) {
-        (Some(level), _) => {
-            args.push("--sandbox".to_string());
-            args.push(level.to_string());
-        }
-        (None, true) => {
-            args.push("--sandbox".to_string());
-            args.push("read-only".to_string());
-        }
-        (None, false) => {}
+    if let Some(level) = sandbox {
+        args.push("--sandbox".to_string());
+        args.push(level.to_string());
     }
     // Grok's own (hidden, headless-honoured) grant: records the project in
     // `trusted_folders.toml` under grok's key and lock before the turn starts.
@@ -382,14 +390,7 @@ async fn run_grok_turn(
     if trust {
         args.push("--trust".to_string());
     }
-    if let Some(m) = model {
-        args.push("-m".to_string());
-        args.push(m.to_string());
-    }
-    if let Some(e) = effort {
-        args.push("--reasoning-effort".to_string());
-        args.push(e.to_string());
-    }
+    args.extend_from_slice(selection.args());
     // When the model ends its turn with a command still in the background,
     // headless grok waits for it - by default only 600s, then kills it
     // (`reap_pending_background_tasks`). Raised to the same wait as a foreground
@@ -399,7 +400,7 @@ async fn run_grok_turn(
     args.push("--background-wait-timeout".to_string());
     args.push(GROK_COMMAND_WAIT_SECS.to_string());
 
-    let mut cmd = Command::new("grok");
+    let mut cmd = runtime.commands.get(Provider::Grok).build();
     cmd.args(&args).current_dir(project_root);
     // Keep shell commands in the foreground until they finish. Grok moves any
     // command that blocks longer than 15s to the background, and headless `-p`
@@ -442,7 +443,7 @@ async fn run_grok_turn(
     if *runtime.stop.borrow() {
         anyhow::bail!("not launched: review was signalled to stop");
     }
-    let label = match &oneshot_id {
+    let label = match &fresh_id {
         Some(id) => format!("the grok run of session {id}"),
         None => format!("the grok run of session {session_id}"),
     };
@@ -520,10 +521,8 @@ async fn run_grok_turn(
     // the requested ID too, so output can name the session while resume
     // recording continues to use that same caller-known ID.
     // Where to look for the event log if grok does not echo an id.
-    let lookup_id = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
-    let keep_id = |echoed: Option<String>| {
-        invocation_session_id(oneshot, echoed, oneshot_id.clone(), session_id)
-    };
+    let lookup_id = fresh_id.clone().unwrap_or_else(|| session_id.to_string());
+    let keep_id = |echoed: Option<String>| session.result_id(echoed);
     let served = result_served(&stdout);
     let (turns, usage) = grok_usage(&stdout);
     let with_usage = |digest: Digest| Digest {
@@ -731,23 +730,6 @@ pub(super) enum GrokWrite {
     /// `review` made profiles. It can only continue as it began: trusted, but
     /// without the extra roots.
     BuiltinWorkspace,
-}
-
-/// Whether, and how, a grok run writes. A fresh `workspace` run takes a new
-/// profile; a resume passes the recorded name through unchanged, because grok
-/// refuses any other.
-pub(super) fn grok_write_launch(oneshot: bool, sandbox: Option<&str>) -> Option<GrokWrite> {
-    match sandbox {
-        // A fresh run only gets a generated profile through the `workspace`
-        // path below. A named profile, including one with our prefix, is the
-        // operator's profile and must pass through unchanged.
-        Some(name) if !oneshot && is_generated_profile_name(name) => {
-            Some(GrokWrite::Resume(name.to_string()))
-        }
-        Some("workspace") if oneshot => Some(GrokWrite::Fresh),
-        Some("workspace") if !oneshot => Some(GrokWrite::BuiltinWorkspace),
-        _ => None,
-    }
 }
 
 /// Generated profiles use exactly the stable suffix emitted by

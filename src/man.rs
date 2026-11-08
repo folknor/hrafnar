@@ -332,18 +332,22 @@ mod tests {
         let levels: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
         assert_eq!(
             levels,
-            ["read-only", "workspace-write", "danger-full-access"]
+            crate::config::SandboxLevel::NAMED
+                .iter()
+                .map(crate::config::SandboxLevel::as_str)
+                .collect::<Vec<_>>()
         );
         for r in &rows {
             for (i, name) in columns.iter().enumerate() {
                 let p: Provider = name.parse().expect("a provider");
                 let cell = &r[i + 1];
-                match crate::provider::effective_sandbox(p, Some(&r[0])) {
-                    None => assert_eq!(cell, "ignored", "{p}: {r:?}"),
-                    Some(_) => {
-                        assert_eq!(*cell, crate::config::sandbox_for(p, &r[0]), "{p}: {r:?}");
-                    }
-                }
+                let level = crate::config::SandboxLevel::from(r[0].as_str());
+                let permissions = crate::provider::Permissions::profile(p, Some(&level));
+                assert_eq!(
+                    cell,
+                    permissions.selector().unwrap_or("unsupported"),
+                    "{p}: {r:?}"
+                );
             }
         }
     }

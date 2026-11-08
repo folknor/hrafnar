@@ -2,7 +2,9 @@
 
 `echo "<message>" | review message <ID>` delivers stdin to a session, whatever
 it is doing. The ID is the one printed as `session: <ID>` above a run's
-response.
+response. IDs used to launch a turn must be 1-128 ASCII letters, digits,
+dashes or underscores. Historical rows remain readable even if their IDs
+cannot be launched.
 
 - **Idle session**: the message continues it, as a new turn.
 - **Codex or claude turn in flight**: that turn is interrupted first - cut off,

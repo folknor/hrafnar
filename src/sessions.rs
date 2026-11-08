@@ -332,7 +332,7 @@ pub(crate) fn record_with_kind(
     // The filesystem permissions the run launched with. Recorded because a
     // profile's advertised guarantee is worth nothing if what a run actually
     // received is only visible in the terminal that launched it.
-    sandbox: Option<&str>,
+    sandbox: Option<&crate::provider::Permissions>,
     writable_roots: Vec<String>,
     served: &crate::provider::Served,
     grok_trust: Option<&str>,
@@ -371,8 +371,8 @@ pub(crate) fn record_with_kind(
         model,
         effort,
         env_keys,
-        sandbox: crate::provider::recorded_sandbox(provider, sandbox),
-        provider_sandbox: crate::provider::native_sandbox_to_record(provider, sandbox),
+        sandbox: sandbox.and_then(crate::provider::Permissions::recorded_level),
+        provider_sandbox: sandbox.and_then(crate::provider::Permissions::native_to_record),
         writable_roots,
         served_model: served.model.as_deref(),
         cost_usd: served.cost_usd,

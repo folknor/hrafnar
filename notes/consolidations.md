@@ -22,20 +22,6 @@ The per-provider questions below are owned by `provider::Provider`
 (src/provider/kind.rs) and the exhaustive matches beside it, described in
 `notes/structural.md`. Each entry here keeps only its residue.
 
-## CON-003 - What is a provider's default sandbox level, at the runner?
-
-Reported by: providers, config, grok-man, orchestration.
-
-`provider::effective_sandbox` is now the single answer for what is recorded
-and advertised (`review config` asks it), and the `man` sandbox test requires
-one column per provider. The runners still choose their own default
-independently: `run_codex`'s `sandbox.unwrap_or("read-only")` and
-`codex_sandbox_args`'s `!= "read-only"`, and `run_grok_turn`'s
-`(None, true) => read-only`. Nothing ties them to `effective_sandbox`. This
-closes with the sandbox-level and permission-plan types in
-`notes/structural.md`, where the launch resolves the level once and the
-runners receive it.
-
 ## CON-006 - Did this run produce an answer?
 
 Reported by: providers, orchestration, forensics.
@@ -317,60 +303,6 @@ makes the race unreachable is the launch lock, a cross-module invariant. Owner
 proposed: key the marker path by run (`<session>.<run_id>.json`, or a
 directory per session with one file per run), so "ours" holds by
 construction; `read_live` groups by session, and `still_ours` and the race go.
-
-## CON-018 - Who mints a fresh run's session id?
-
-Reported by: providers, orchestration, config.
-
-| Provider | Who mints the id today |
-|---|---|
-| claude | the runner calls `generate_uuid` |
-| grok | the runner calls `generate_uuid` |
-| codex | learned from the stream |
-| maki | would be the caller (copy claude) |
-| opencode | the caller, with a `ses_` prefix |
-
-The per-provider fact is encoded by which runner calls `generate_uuid`, which
-lives in `config.rs`. `Launch::invoke` derives `oneshot = session.is_empty()`,
-so there is no way to say "fresh, with this id". Nothing would stop `review
-message <id>` from handing a non-`ses` id to opencode. Owner proposed: an
-`IdPolicy::CallerMinted(fn() -> SessionId) | StreamReported` capability, and a
-per-provider `mint_session_id()`. The session types are in
-`notes/structural.md`.
-
-## CON-019 - Which writable roots apply to this run, and which are recorded?
-
-Reported by: providers, config.
-
-Sites:
-- `provider::invoke`'s `derives` (codex workspace-write, or a grok fresh
-  write) and its warning branch ("apply only to a codex or grok
-  workspace-write profile").
-- `invoke`'s three recording layers: derived roots, grok-canonicalised roots,
-  and the codex `config` override parsed back out by
-  `config_writable_roots_override` (see its defect in `notes/bugs.md`).
-- codex itself, deciding from argv order.
-- `Profile.writable_roots`' doc ("ignored unless sandbox is workspace-write")
-  and the `writable_roots` module doc.
-- `grok_write_launch`, which decides for grok, including whether
-  `danger-full-access` grants.
-
-The config hunter reads a subtle disagreement between the `Profile` doc and
-what the code grants for grok. Owner proposed: a permission plan built once
-per launch. `derives` is now an exhaustive `match provider` in `invoke`, not
-a flag: grok's answer depends on fresh vs resume, so it cannot be a static
-per-provider fact.
-
-## CON-020 - Which sandbox names are `review`'s levels?
-
-Reported by: config, grok-man.
-
-Sites: `sandbox_for`'s match arms; the test constant `SANDBOX_LEVELS`; the
-`man` test's `["read-only", "workspace-write", "danger-full-access"]`; the
-"reserved level names" prose; `every_documented_level_maps_somewhere`. They
-agree, held by pairwise tests. Owner proposed: a `SandboxLevel` enum whose
-named variants are the levels (`SandboxLevel::NAMED` or `ALL`), with the
-`man` and doc checks iterating it.
 
 ## CON-021 - What is a reserved name?
 

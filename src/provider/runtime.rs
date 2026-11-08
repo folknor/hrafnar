@@ -140,20 +140,72 @@ pub fn install_signal_supervisor() {
     });
 }
 
-/// Knobs on how a codex or claude run is executed, injectable so tests can
-/// drive the real `run_codex_json` and `run_claude` paths against a stub in
-/// milliseconds rather than minutes. Production always uses `Default`.
+/// A trusted executable and its leading arguments. Adapters append their own
+/// arguments and retain ownership of cwd, environment, stdio and containment.
+/// An empty program fails to spawn; it never selects a real provider instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderCommand {
+    pub program: String,
+    pub leading_args: Vec<String>,
+}
+
+impl ProviderCommand {
+    pub fn build(&self) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.program);
+        command.args(&self.leading_args);
+        command
+    }
+}
+
+/// Total command configuration for the closed provider set. Private storage
+/// cannot lose slots; Provider::all is generated from the enum variants.
+#[derive(Clone)]
+pub struct ProviderCommands(Vec<(super::Provider, ProviderCommand)>);
+
+impl Default for ProviderCommands {
+    fn default() -> Self {
+        Self(
+            super::Provider::all()
+                .iter()
+                .map(|&provider| {
+                    (
+                        provider,
+                        ProviderCommand {
+                            program: provider.binary().to_string(),
+                            leading_args: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+impl ProviderCommands {
+    pub fn get(&self, provider: super::Provider) -> &ProviderCommand {
+        &self
+            .0
+            .iter()
+            .find(|(p, _)| *p == provider)
+            .expect("every provider has a command slot")
+            .1
+    }
+
+    /// Replace one prefix, without changing the table's totality or other slots.
+    pub fn set(&mut self, provider: super::Provider, command: ProviderCommand) {
+        self.0
+            .iter_mut()
+            .find(|(p, _)| *p == provider)
+            .expect("every provider has a command slot")
+            .1 = command;
+    }
+}
+
+/// Execution knobs for all provider runners. Production uses Default; tests
+/// inject command prefixes and short timings while keeping real containment.
 #[derive(Clone)]
 pub struct ProviderRuntime {
-    /// The codex binary to exec. Overridden in tests by a stub that reproduces
-    /// the hang shapes (answer-then-hang, hang-with-no-answer, pipe-retaining
-    /// descendant) deterministically.
-    pub codex_binary: String,
-    /// The program and leading arguments that run claude; `run_claude`
-    /// appends its own. `["claude"]` in production. A prefix rather than a
-    /// binary because tests run their stub as `/bin/sh <script>` - exec'ing a
-    /// freshly written script races `ETXTBSY` (see `tests/provider_runs.rs`).
-    pub claude_command: Vec<String>,
+    pub commands: ProviderCommands,
     /// Watchdog polling/patience.
     pub timings: crate::watchdog::Timings,
     /// How long a pipe reader gets to finish after the child is reaped before
@@ -220,8 +272,7 @@ pub fn orphan_log_path(
 impl Default for ProviderRuntime {
     fn default() -> Self {
         Self {
-            codex_binary: "codex".to_string(),
-            claude_command: vec!["claude".to_string()],
+            commands: ProviderCommands::default(),
             timings: crate::watchdog::Timings::default(),
             drain_grace: crate::timings::DRAIN_GRACE,
             data_root: None,

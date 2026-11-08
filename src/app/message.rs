@@ -54,7 +54,7 @@ fn resume_record(
 /// What a `review resume` launches with, taken from the session's own last
 /// recorded run: sandbox level, writable roots, model and reasoning effort.
 ///
-/// A resume carries no profile, and the runners default to `read-only`, so a
+/// A resume carries no profile; before restoration was explicit, a
 /// resume used to silently drop the permissions the session was created with: a
 /// `workspace-write` run that died mid-turn came back as a read-only resume that
 /// could not touch the files it had been editing, and the failure surfaced as
@@ -98,13 +98,12 @@ fn inherited_settings(
         return InheritedSettings::default();
     };
     InheritedSettings {
-        sandbox: match provider {
-            provider::Provider::Grok => record
-                .provider_sandbox
-                .clone()
-                .or_else(|| record.sandbox.clone()),
-            provider::Provider::Claude | provider::Provider::Codex => record.sandbox.clone(),
-        },
+        sandbox: Some(provider::Permissions::restore(
+            provider,
+            record.sandbox.as_deref(),
+            record.provider_sandbox.as_deref(),
+            &record.writable_roots,
+        )),
         // For grok these are exactly the roots the session's `review-ws-*`
         // profile is named for, and a resume uses them verbatim rather than
         // re-deriving - see `provider::grok::GrokWrite::Resume`.
@@ -116,7 +115,7 @@ fn inherited_settings(
 
 #[derive(Default)]
 struct InheritedSettings {
-    sandbox: Option<String>,
+    sandbox: Option<provider::Permissions>,
     writable_roots: Vec<String>,
     model: Option<String>,
     effort: Option<String>,
@@ -208,6 +207,9 @@ pub(super) async fn run_message(
     selector: Option<&str>,
     started: std::time::Instant,
 ) -> Result<()> {
+    // Reject unsafe executable identities before locks or interruption. Rows
+    // remain permissive historical evidence and are not changed on disk.
+    let _validated_id = provider::SessionId::parse(session_id)?;
     // Read before interrupting anything: a missing message must not cost the
     // turn in flight.
     let instructions = input::read_stdin()?;
@@ -398,7 +400,11 @@ async fn run_session_resume(
     // announced, because the failure this replaced was entirely silent: the
     // resume simply ran on a different model and nothing said so.
     let inherited = inherited_settings(Some(&record), provider_name);
-    if let Some(ref level) = inherited.sandbox {
+    if let Some(level) = inherited
+        .sandbox
+        .as_ref()
+        .and_then(provider::Permissions::selector)
+    {
         eprintln!("sandbox: {level} (inherited from the session record)");
     }
     if let Some(ref m) = inherited.model {
@@ -421,16 +427,18 @@ async fn run_session_resume(
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
     let invoke = provider::invoke(
         provider_name,
-        session_id,
+        provider::SessionStart::Resume(provider::SessionId::parse(session_id)?),
         inherited.model.as_deref(),
         inherited.effort.as_deref(),
-        inherited.sandbox.as_deref(),
+        inherited
+            .sandbox
+            .clone()
+            .unwrap_or_else(|| provider::Permissions::restore(provider_name, None, None, &[])),
         &inherited.writable_roots,
         codex_home_env.as_ref(),
         &[],
         &stdin_instructions,
         &project_root,
-        false,
         Some(launched_tx),
         &provider_runtime,
     );
@@ -502,7 +510,7 @@ async fn run_session_resume(
             // The permissions this resume actually launched with - inherited
             // from the session's last recorded run, so the next resume in the
             // chain inherits from this row in turn.
-            result.sandbox.as_deref(),
+            result.permissions.as_ref(),
             result.writable_roots.clone(),
             &result.served,
             result.grok_trust.as_deref(),
@@ -581,16 +589,20 @@ mod tests {
             assert_eq!(
                 inherited_settings(Some(&rec), provider::Provider::Grok)
                     .sandbox
-                    .as_deref(),
+                    .as_ref()
+                    .and_then(provider::Permissions::selector),
                 Some(native)
             );
             rec.provider_sandbox = Some(native.to_string());
-            rec.sandbox = crate::provider::recorded_sandbox(provider::Provider::Grok, Some(native))
-                .map(str::to_string);
+            rec.sandbox =
+                provider::Permissions::restore(provider::Provider::Grok, Some(native), None, &[])
+                    .recorded_level()
+                    .map(str::to_string);
             assert_eq!(
                 inherited_settings(Some(&rec), provider::Provider::Grok)
                     .sandbox
-                    .as_deref(),
+                    .as_ref()
+                    .and_then(provider::Permissions::selector),
                 Some(native)
             );
         }
@@ -617,7 +629,12 @@ mod tests {
             "review_version": "0.0.0",
         }));
         let got = inherited_settings(Some(&rec), provider::Provider::Codex);
-        assert_eq!(got.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(
+            got.sandbox
+                .as_ref()
+                .and_then(provider::Permissions::selector),
+            Some("workspace-write")
+        );
         assert_eq!(got.writable_roots, vec!["/home/u/.brokkr", "/srv/cache"]);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(got.effort.as_deref(), Some("low"));
@@ -666,7 +683,12 @@ mod tests {
             "review_version": "0.0.0",
         }));
         let got = inherited_settings(Some(&rec), provider::Provider::Codex);
-        assert_eq!(got.sandbox, None);
+        assert_eq!(
+            got.sandbox
+                .as_ref()
+                .and_then(provider::Permissions::selector),
+            Some("read-only")
+        );
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);
         assert_eq!(got.effort, None);

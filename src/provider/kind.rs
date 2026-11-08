@@ -19,7 +19,7 @@
 //! launch. How a launch's permissions are prepared, translated, recorded and
 //! restored depends on the launch (fresh or resumed, which level), so those
 //! stay exhaustive matches in the runner-facing code (`provider::invoke`,
-//! `config::sandbox_for`, `provider::effective_sandbox`) rather than flags
+//! `provider::Permissions`) rather than flags
 //! here, from which orchestration would have to reconstruct the behaviour.
 
 use std::time::Duration;

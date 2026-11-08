@@ -1,6 +1,7 @@
 mod ids;
 mod load;
 mod parse;
+mod profile;
 mod resolve;
 mod sandbox;
 
@@ -10,7 +11,7 @@ pub use load::{
 };
 pub use parse::parse_file;
 pub use resolve::resolve;
-pub use sandbox::sandbox_for;
+pub use sandbox::SandboxLevel;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -108,11 +109,11 @@ pub struct Profile {
     pub comment: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Sandbox / write-access level, passed as `--sandbox` by both codex (e.g.
-    /// `read-only`, `workspace-write`) and grok (which resolves the name against
-    /// its own built-in and `sandbox.toml` profiles). Defaults to `read-only`
-    /// when unset. Ignored by claude, which has no sandbox on this axis.
-    pub sandbox: Option<String>,
+    /// Review's sandbox vocabulary, resolved into native permissions before
+    /// launch. Custom names reach the provider unchanged. Defaults to read-only
+    /// when unset. Claude profiles must omit this field: it has no filesystem
+    /// sandbox on this axis.
+    pub sandbox: Option<SandboxLevel>,
     pub env: Option<BTreeMap<String, String>>,
     /// Extra codex `-c key=value` overrides, each passed verbatim as its own
     /// `-c`. Codex-only. Lets a profile force config the CLI doesn't expose - in
@@ -126,7 +127,8 @@ pub struct Profile {
     /// this covers what a particular project needs beyond that - a data
     /// directory, a sibling checkout, a generated-asset cache.
     ///
-    /// Ignored unless the profile's `sandbox` is `workspace-write`, because
+    /// Applied to codex workspace-write and fresh grok workspace-write runs.
+    /// Rejected in config for other levels and providers, because
     /// widening a `read-only` profile would contradict the only thing that
     /// profile promises. `~`, `$VAR` and `${VAR}` expand, which is what lets one
     /// hostless profile serve hosts with different layouts.

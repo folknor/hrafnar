@@ -1,7 +1,7 @@
 # Sandbox levels
 
-A profile's `sandbox` says what a run may modify. It defaults to `read-only`,
-so a run with no profile cannot change files. **Claude ignores the setting**:
+A profile's `sandbox` says what a run may modify. It defaults to `read-only`
+for codex and grok. **Claude profiles must omit the setting**:
 what a claude run can touch is decided by Claude Code's own permission
 configuration, and `review` records no level for it.
 
@@ -9,9 +9,9 @@ The levels are `review`'s own names, translated per provider:
 
 | `sandbox` | codex | grok | claude |
 |---|---|---|---|
-| `read-only` | `read-only` | `read-only` | ignored |
-| `workspace-write` | `workspace-write` | `workspace` | ignored |
-| `danger-full-access` | `danger-full-access` | `none` | ignored |
+| `read-only` | `read-only` | `read-only` | unsupported |
+| `workspace-write` | `workspace-write` | `workspace` | unsupported |
+| `danger-full-access` | `danger-full-access` | `none` | unsupported |
 
 Any other value is passed to the provider unchanged, for a provider that
 defines its own named profiles; the provider rejects a name it does not know
@@ -96,7 +96,8 @@ it: a `workspace-write` session stays writable.
   under exactly that profile and its recorded roots, because grok fixes a
   session's sandbox for its lifetime. An older session recorded as plain
   `workspace` resumes that way, with no extra roots; one with no recorded level
-  resumes under whatever grok saved for it.
+  resumes under whatever grok saved for it, and records no sandbox level because
+  review does not know that saved setting.
 
 ## When a write fails
 

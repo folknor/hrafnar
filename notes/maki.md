@@ -40,7 +40,7 @@ ignored"). maki gets the same treatment:
 - What a run may do is decided by maki's own `permissions.toml` (global in its
   config dir, project at `.maki/permissions.toml`), as claude's is decided by
   its settings files.
-- `sandbox_for` drops the profile's `sandbox` for maki, and the sidecar
+- `Permissions::profile` drops the profile's `sandbox` for maki, and the sidecar
   records no sandbox level, as for claude.
 
 Note the defaults differ from claude's: maki's built-in rules pre-allow
@@ -161,12 +161,15 @@ defence.
 
 - `Provider` (src/provider/kind.rs) gains `Maki`; the compiler then lists
   every exhaustive match that must decide for it (dispatch in `invoke`,
-  `effective_sandbox`, `sandbox_for`, `recorded_sandbox`, inheritance,
+  `Permissions::profile`, `Permissions::restore`, their recording projections, inheritance,
   `recovery`, the cutoff). Help text, `review config` and the `man` tables
   follow from the enum; the `man` sandbox table needs a maki column.
 - Profiles: `[maki.<profile>]` with `model` (`provider/model-id`), `env`,
-  `comment`. `sandbox` and `writable_roots` warn as ignored, as for claude.
-  `effort` refused until the upstream patch lands (see above).
+  `comment`. Refuse `sandbox`, non-empty `writable_roots` and non-empty
+  `config` with removal instructions, as for claude.
+  `effort` refused until the upstream patch lands (see above). Extend the
+  exhaustive Profile validation and ModelSpec rendering/projection operations;
+  do not reuse Claude flags that maki silently ignores.
 - `Provider::stale_cutoff` for maki: open. The cache lifetime depends on the
   backend (DeepSeek, Kimi and GLM each differ, and maki sends no cache hints on
   the OpenAI-compatible path, relying on provider-side prefix caching). Start

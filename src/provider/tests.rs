@@ -15,16 +15,15 @@ pub(super) fn exited(code: i32) -> std::process::ExitStatus {
 #[test]
 fn a_resume_result_retains_the_session_id_known_to_its_caller() {
     assert_eq!(
-        super::invocation_session_id(false, None, None, "known-session"),
+        super::SessionStart::Resume(super::SessionId::parse("known-session").expect("test id"))
+            .result_id(None),
         Some("known-session".to_string())
     );
     assert_eq!(
-        super::invocation_session_id(
-            true,
-            Some("provider-session".to_string()),
-            Some("requested-session".to_string()),
-            "",
-        ),
+        super::SessionStart::Fresh {
+            id: Some(super::SessionId::parse("requested-session").expect("test id"))
+        }
+        .result_id(Some("provider-session".to_string())),
         Some("provider-session".to_string())
     );
 }
@@ -207,13 +206,18 @@ fn persisted_sandbox_levels_normalize_known_grok_names() {
         ("custom", "custom"),
     ] {
         assert_eq!(
-            super::recorded_sandbox(super::Provider::Grok, Some(native)),
+            super::Permissions::restore(super::Provider::Grok, Some(native), None, &[])
+                .recorded_level(),
             Some(level)
         );
         assert_eq!(
-            super::recorded_sandbox(super::Provider::Codex, Some(native)),
+            super::Permissions::restore(super::Provider::Codex, Some(native), None, &[])
+                .recorded_level(),
             Some(native)
         );
     }
-    assert_eq!(super::recorded_sandbox(super::Provider::Grok, None), None);
+    assert_eq!(
+        super::Permissions::restore(super::Provider::Grok, None, None, &[]).recorded_level(),
+        None
+    );
 }

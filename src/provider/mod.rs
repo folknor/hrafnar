@@ -2,18 +2,25 @@ mod claude;
 mod codex;
 mod grok;
 mod kind;
+mod model;
 mod output;
+mod permissions;
 mod result;
 mod runtime;
+mod session;
 
 pub use claude::run_claude;
 pub use codex::run_codex_json;
 pub use kind::{Provider, UnknownProvider};
+pub use model::ModelSpec;
 pub use output::{print_result, resume_hint};
+pub use permissions::Permissions;
 pub use result::{Digest, DigestSummary, ProviderResult, RunOutput, Served, Usage, now_epoch_secs};
 pub use runtime::{
-    ProviderRuntime, Unrecorded, install_signal_supervisor, orphan_log_path, stop_requested,
+    ProviderCommand, ProviderCommands, ProviderRuntime, Unrecorded, install_signal_supervisor,
+    orphan_log_path, stop_requested,
 };
+pub use session::{SessionId, SessionStart};
 
 use codex::run_codex;
 use grok::run_grok;
@@ -28,7 +35,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 /// Check whether a provider binary is available on PATH.
 pub fn is_available(provider: Provider) -> bool {
@@ -195,23 +201,6 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// The session associated with an invocation is the echoed/generated ID for a
-/// fresh run, and the requested ID for a resume. Keeping it on resumed results
-/// lets the shared printer name the session and print any interruption hint
-/// without changing resume recording, which uses the caller's ID directly.
-fn invocation_session_id(
-    oneshot: bool,
-    echoed: Option<String>,
-    oneshot_id: Option<String>,
-    requested_id: &str,
-) -> Option<String> {
-    if oneshot {
-        echoed.or(oneshot_id)
-    } else {
-        Some(requested_id.to_string())
-    }
-}
-
 /// Signals the caller that the provider process has actually been spawned.
 ///
 /// The global lock exists to space out provider *launches*, so it has to be held
@@ -224,123 +213,53 @@ pub type LaunchSignal = tokio::sync::oneshot::Sender<()>;
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     provider: Provider,
-    session_id: &str,
+    mut session: SessionStart,
     model: Option<&str>,
     effort: Option<&str>,
-    sandbox: Option<&str>,
+    permissions: Permissions,
     profile_roots: &[String],
     env: Option<&std::collections::BTreeMap<String, String>>,
     config: &[String],
     prompt: &str,
     project_root: &Path,
-    oneshot: bool,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> ProviderResult {
-    // Profiles carry `review`'s own sandbox vocabulary; each provider spells the
-    // levels differently and grok hard-errors on a name it cannot resolve, so
-    // the translation happens once, here, and the runners below only ever see
-    // their own native value.
-    let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
-    let sandbox = sandbox.as_deref();
-    let grok_write = match provider {
-        Provider::Grok => grok::grok_write_launch(oneshot, sandbox),
-        Provider::Claude | Provider::Codex => None,
-    };
-    // Roots are *derived* for a codex write run and a fresh grok write run. A
-    // resumed grok session under a `review-ws-*` profile instead takes the roots
-    // recorded with it, verbatim: the profile name is fixed for the session's
-    // life (grok refuses to switch it) and names exactly one root set, so
-    // re-deriving on another host would describe a different profile.
-    let derives = match provider {
-        Provider::Grok => grok_write == Some(grok::GrokWrite::Fresh),
-        Provider::Codex => sandbox == Some("workspace-write"),
-        Provider::Claude => false,
-    };
-    let resumes_profile = matches!(grok_write, Some(grok::GrokWrite::Resume(_)));
-
-    // Derived here rather than inside the runners so the same values that
-    // widen the run are the ones recorded on the result: a grant that is applied
-    // but not logged is exactly the invisible permission this is meant to avoid.
-    let granted_roots: Vec<crate::writable_roots::GrantedRoot> = if resumes_profile {
-        Vec::new()
-    } else if derives {
-        // Against `project_root`, not the process cwd: every runner spawns
-        // the provider with `.current_dir(project_root)`, and `.review.toml`
-        // discovery deliberately allows launching from a descendant of it.
-        // Deriving from the process cwd inspected `<subdir>/target` instead
-        // of the workspace's, so a run started one directory down silently
-        // failed to grant the root its build needed.
-        crate::writable_roots::derive_with(
-            project_root,
-            &crate::writable_roots::RealHost,
-            profile_roots,
-        )
-    } else {
-        // Silence here would be indistinguishable from the paths having been
-        // granted: an operator who put `writable_roots` on the wrong profile
-        // gets a build that fails for reasons the config appears to rule out.
-        if !profile_roots.is_empty() {
-            eprintln!(
-                "warning: profile writable_roots ignored - they apply only to \
-                     a codex or grok workspace-write profile (this run: {} {})",
-                provider,
-                sandbox.unwrap_or("read-only")
-            );
-        }
-        Vec::new()
-    };
-    let mut root_paths: Vec<String> = if resumes_profile {
-        profile_roots.to_vec()
-    } else {
-        granted_roots.iter().map(|g| g.path.clone()).collect()
-    };
-    // Grok's profile name is a hash of the canonical set, and the recorded
-    // roots must hash back to it on resume - so record them canonically too.
-    if grok_write.is_some() {
-        root_paths = grok::canonical_roots(&root_paths);
+    let selection = ModelSpec::new(provider, model, effort, config);
+    let selection_check = selection.validate(provider);
+    if permissions.provider() != provider || selection_check.is_err() {
+        return ProviderResult {
+            provider,
+            output: Err(selection_check.err().unwrap_or_else(|| {
+                anyhow::anyhow!(
+                    "permission plan belongs to {}, not {provider}",
+                    permissions.provider()
+                )
+            })),
+            session_id: None,
+            codex_home: None,
+            digest: None,
+            completed_epoch: now_epoch_secs(),
+            permissions: None,
+            writable_roots: Vec::new(),
+            model: None,
+            effort: None,
+            served: Served::default(),
+            grok_trust: None,
+            leftovers: crate::contained::Leftovers::default(),
+        };
     }
-    // A profile `config` entry restating the key wins, deliberately - but the
-    // record must follow the run, not the derivation, or the sidecar makes a
-    // confident false claim: a profile overriding to `["/secret"]` would be
-    // logged with the derived roots, and one overriding to `[]` would be logged
-    // as widened when it was not.
-    // `config` is codex `-c` only; grok never sees it.
-    match provider {
-        Provider::Codex => {
-            if let Some(overridden) = config_writable_roots_override(config) {
-                root_paths = overridden;
-            }
-        }
-        Provider::Claude | Provider::Grok => {}
-    }
-
-    // A grok write run needs grok's own config ready before it launches, or it
-    // fails in ways that cost a whole run to discover: trust (else the first
-    // edit cancels the turn) and its roots profile (else every build dies at
-    // the brokkr lock). A setup failure is a launch failure - running anyway
-    // would reproduce those failures more expensively. Blocking file I/O and a
-    // `flock` another `review` may hold, so off the async runtime.
-    let mut trust_grant: Option<String> = None;
-    let mut grok_profile: Option<String> = None;
-    let setup: Result<()> = match grok_write.clone() {
-        None => Ok(()),
-        Some(kind) => {
-            let root = project_root.to_path_buf();
-            let roots = root_paths.clone();
-            let env = env.cloned();
-            let prepared = tokio::task::spawn_blocking(move || {
-                grok::prepare_grok_write(&kind, &root, &roots, env.as_ref())
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("grok setup task failed: {e}"))
-            .and_then(|r| r);
-            prepared.map(|p| {
-                grok_profile = p.profile;
-                trust_grant = p.trust_grant;
-            })
-        }
+    let mut plan =
+        permissions::PermissionPlan::new(permissions, project_root, profile_roots, config);
+    let setup = match session.prepare(provider) {
+        Ok(()) => plan.prepare(project_root, env).await,
+        Err(e) => Err(e),
     };
+    let mut trust_grant = setup.as_ref().ok().cloned().flatten();
+    let derives = plan.derives();
+    let resumes_profile = plan.uses_recorded_roots();
+    let root_paths = &plan.paths;
+    let granted_roots = &plan.granted;
     // Announced once per distinct root set, not once per invocation: a fan-out
     // launches the same profile against several archetypes and would otherwise
     // repeat an identical block per run.
@@ -353,13 +272,13 @@ pub async fn invoke(
     // an override to `[]` printed grants the run did not receive. The whole
     // justification for deriving from ambient environment is that the result is
     // visible rather than inferred, so the line must follow the run.
-    if !root_paths.is_empty() && claim_roots_announcement(&root_paths) {
+    if !root_paths.is_empty() && claim_roots_announcement(root_paths) {
         let other = if resumes_profile {
             "recorded with the session"
         } else {
             "profile config override"
         };
-        for line in announcement_lines(provider, other, &granted_roots, &root_paths) {
+        for line in announcement_lines(provider, other, granted_roots, root_paths) {
             eprintln!("{line}");
         }
     }
@@ -378,24 +297,20 @@ pub async fn invoke(
         );
     }
 
-    let sandbox = grok_profile.as_deref().or(sandbox);
+    let sandbox = plan.permissions.selector();
 
     let result = match setup {
         Err(e) => Err(e),
-        Ok(()) => match provider {
-            // `sandbox` is an OS filesystem sandbox, which codex and grok both have
-            // and claude does not: claude's `--permission-mode` is a tool-approval
-            // policy on a different axis with no honest mapping, so claude ignores
-            // it. `config` (codex `-c`) stays codex-only.
+        Ok(_) => match provider {
+            // Profile validation rejects unsupported fields; native permissions
+            // and model selection have already been prepared for this adapter.
             Provider::Claude => {
                 run_claude(
-                    session_id,
-                    model,
-                    effort,
+                    &session,
+                    &selection,
                     env,
                     prompt,
                     project_root,
-                    oneshot,
                     launched,
                     runtime,
                 )
@@ -403,15 +318,13 @@ pub async fn invoke(
             }
             Provider::Grok => {
                 run_grok(
-                    session_id,
-                    model,
-                    effort,
+                    &session,
+                    &selection,
                     sandbox,
                     trust_grant.is_some(),
                     env,
                     prompt,
                     project_root,
-                    oneshot,
                     launched,
                     runtime,
                 )
@@ -419,16 +332,13 @@ pub async fn invoke(
             }
             Provider::Codex => {
                 run_codex(
-                    session_id,
-                    model,
-                    effort,
-                    sandbox,
-                    &granted_roots,
+                    &session,
+                    &selection,
+                    sandbox.expect("codex permission plan always resolves a selector"),
+                    root_paths,
                     env,
-                    config,
                     prompt,
                     project_root,
-                    oneshot,
                     launched,
                     runtime,
                 )
@@ -461,10 +371,10 @@ pub async fn invoke(
             codex_home: run.codex_home,
             digest: run.digest,
             completed_epoch,
-            sandbox: effective_sandbox(provider, sandbox),
-            writable_roots: root_paths,
-            model: model.map(str::to_string),
-            effort: effort.map(str::to_string),
+            permissions: Some(plan.permissions.clone()),
+            writable_roots: root_paths.clone(),
+            model: selection.model().map(str::to_string),
+            effort: selection.effort().map(str::to_string),
             served: run.served,
             grok_trust: trust_grant,
             leftovers: run.leftovers,
@@ -479,10 +389,10 @@ pub async fn invoke(
             // A launch that failed still launched with these permissions
             // requested, and a row that omitted them would read as a run with
             // none.
-            sandbox: effective_sandbox(provider, sandbox),
-            writable_roots: root_paths,
-            model: model.map(str::to_string),
-            effort: effort.map(str::to_string),
+            permissions: Some(plan.permissions.clone()),
+            writable_roots: root_paths.clone(),
+            model: selection.model().map(str::to_string),
+            effort: selection.effort().map(str::to_string),
             served: Served::default(),
             // Requested, as `sandbox` is: if grok got as far as running, the
             // grant happened before whatever failed.
@@ -560,31 +470,6 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
     )
 }
 
-/// The sandbox level a run will actually be launched under, as opposed to the
-/// one the caller asked for.
-///
-/// The two differ wherever the caller passes no level: the runners still pass
-/// `--sandbox read-only`, so the run genuinely is read-only, and recording the
-/// caller's `None` left such rows invisible to the exact query the sidecar
-/// fields exist to answer, `jq 'select(.sandbox=="read-only")'`. On the
-/// `review resume` path the caller is `app::message::inherited_settings`, which
-/// supplies the level the session was created with; `None` there means the
-/// session's record carries no level to inherit (a row written before levels
-/// were recorded). Claude has no filesystem sandbox on this axis, so it records
-/// none.
-///
-/// This is also the one place that says what an omitted level means for a
-/// provider: `review config` asks it (with `None`) rather than restating a
-/// default, so the advertised default cannot drift from the recorded one.
-// Keep the native selector here for launch and resume. `sessions::record`
-// normalizes the query field and saves this selector separately.
-pub(crate) fn effective_sandbox(provider: Provider, sandbox: Option<&str>) -> Option<String> {
-    match provider {
-        Provider::Codex | Provider::Grok => Some(sandbox.unwrap_or("read-only").to_string()),
-        Provider::Claude => None,
-    }
-}
-
 /// Write prompt to stdin on a spawned task. Returns an error if the write fails.
 async fn write_stdin(
     stdin: tokio::process::ChildStdin,
@@ -611,29 +496,4 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push_str("...");
     out
-}
-
-/// Normalize known Grok sandbox names for persisted queries, retaining custom
-/// names verbatim. The native name must also be saved for exact session resume.
-pub(crate) fn recorded_sandbox(provider: Provider, sandbox: Option<&str>) -> Option<&str> {
-    match provider {
-        Provider::Grok => match sandbox {
-            Some("workspace") => Some("workspace-write"),
-            Some("none") => Some("danger-full-access"),
-            Some(name) if grok::is_generated_profile_name(name) => Some("workspace-write"),
-            _ => sandbox,
-        },
-        Provider::Claude | Provider::Codex => sandbox,
-    }
-}
-
-/// The provider's native sandbox selector, saved beside the normalized level
-/// so a resume can pass it back verbatim. Only grok's differs from the level:
-/// a grok session cannot change profiles, and its `review-ws-*` names do not
-/// round-trip through `review`'s vocabulary.
-pub(crate) fn native_sandbox_to_record(provider: Provider, sandbox: Option<&str>) -> Option<&str> {
-    match provider {
-        Provider::Grok => sandbox,
-        Provider::Claude | Provider::Codex => None,
-    }
 }

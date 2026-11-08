@@ -1,5 +1,12 @@
 # Claude
 
+Session launch intent is typed as SessionStart. The shared invocation owner
+prepares the fresh UUID before dispatch; the runner validates the intent and
+never mints an ID. Resumes carry a checked SessionId. Historical log fields
+and provider-reported evidence remain strings; they are checked before reuse
+as launch input. Fresh results prefer the echoed ID, falling back to the
+requested UUID; resume results keep the requested ID.
+
 How `review` drives Claude Code: its invocation and environment, how a run's
 outcome is read, and how a run is stopped. The cross-provider pieces are in
 [sandbox.md](sandbox.md).
@@ -101,14 +108,14 @@ actually binds. `run_claude` sets `BASH_DEFAULT_TIMEOUT_MS` and
 allowance too); a 150-second command then ran to completion. All three are set
 before the profile's `env`, so a profile can restate any of them.
 
-## `sandbox` is ignored
+## No filesystem sandbox
 
-A profile's `sandbox` has no effect on claude. Claude's `--permission-mode` is a
-tool-approval policy - a different axis from a filesystem sandbox - with no
-honest mapping from `read-only`/`workspace-write`, so `invoke` drops the value
-rather than translating it, and a claude run records no sandbox level in the
-sidecar. What a claude run may touch is decided by the permissions Claude Code
-itself is configured with.
+Claude's `--permission-mode` is a tool-approval policy, a different axis from
+an OS filesystem sandbox. Claude profiles must omit `sandbox` and non-empty
+`writable_roots`; parsing refuses these previously ignored fields with removal
+instructions. Non-empty `config` is likewise refused because it is codex-only.
+A claude run records no sandbox level. What it may touch is decided by the
+permissions Claude Code itself is configured with.
 
 ## Transcript, no watchdog
 
@@ -168,7 +175,7 @@ marker only while it is still the one it wrote, so two runs of one session could
 not hide each other even if they met.
 
 `tests/provider_runs.rs` drives the real `run_claude` against a stub claude
-(`ProviderRuntime::claude_command`) for each of these: the interrupt, an answer
+(`ProviderRuntime.commands` with the Claude prefix) for each of these: the interrupt, an answer
 beating it, a stop after and before the first event, a refused launch after a
 stop, a death after starting, and a stale request before a resume.
 

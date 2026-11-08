@@ -79,7 +79,7 @@ fn record_run(
             result.model.as_deref(),
             result.effort.as_deref(),
             env_keys.to_vec(),
-            result.sandbox.as_deref(),
+            result.permissions.as_ref(),
             result.writable_roots.clone(),
             &result.served,
             result.grok_trust.as_deref(),
@@ -129,7 +129,7 @@ pub(super) struct Launch {
     pub(super) provider: provider::Provider,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
-    pub(super) sandbox: Option<String>,
+    pub(super) sandbox: Option<crate::config::SandboxLevel>,
     pub(super) writable_roots: Vec<String>,
     pub(super) env: Option<std::collections::BTreeMap<String, String>>,
     pub(super) config: Vec<String>,
@@ -140,22 +140,25 @@ pub(super) struct Launch {
 }
 
 impl Launch {
-    /// A fresh run (`session` empty) or the auto-resume of one, on this
+    /// A fresh run or the auto-resume of one, on this
     /// launch's profile. An auto-resume must reuse the profile whole - roots
     /// included - or the retry launches narrower than the run it replaces.
-    async fn invoke(&self, session: &str, prompt: &str) -> provider::ProviderResult {
+    async fn invoke(
+        &self,
+        session: provider::SessionStart,
+        prompt: &str,
+    ) -> provider::ProviderResult {
         provider::invoke(
             self.provider,
             session,
             self.model.as_deref(),
             self.effort.as_deref(),
-            self.sandbox.as_deref(),
+            provider::Permissions::profile(self.provider, self.sandbox.as_ref()),
             &self.writable_roots,
             self.env.as_ref(),
             &self.config,
             prompt,
             &self.root,
-            session.is_empty(),
             // The fan-out serializes launches with its own stagger sleep, and an
             // auto-resume runs inside an already-launched task, so neither needs
             // a launch handshake.
@@ -218,11 +221,11 @@ fn after_run(first: &provider::ProviderResult) -> AfterRun {
         return AfterRun::LeftRunning;
     }
     match &first.session_id {
-        Some(sid) => AfterRun::AutoResume {
+        Some(sid) if provider::SessionId::parse(sid).is_ok() => AfterRun::AutoResume {
             session: sid.clone(),
             nudge,
         },
-        None => AfterRun::Report,
+        Some(_) | None => AfterRun::Report,
     }
 }
 
@@ -280,7 +283,9 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
         tokio::time::sleep(launch.delay).await;
     }
     let prov = launch.provider;
-    let first = launch.invoke("", &launch.prompt).await;
+    let first = launch
+        .invoke(provider::SessionStart::Fresh { id: None }, &launch.prompt)
+        .await;
     let outcome = match after_run(&first) {
         AfterRun::Report => TaskOutcome {
             result: first,
@@ -324,7 +329,15 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
             nudge,
         } => {
             eprintln!("{prov} session {sid} died without a final answer - auto-resuming once");
-            let second = launch.invoke(&sid, nudge).await;
+            let second = launch
+                .invoke(
+                    provider::SessionStart::Resume(
+                        provider::SessionId::parse(&sid)
+                            .expect("auto-resume identity validated before selection"),
+                    ),
+                    nudge,
+                )
+                .await;
             after_auto_resume(first, second)
         }
     };
@@ -396,7 +409,7 @@ mod tests {
                 interrupted,
             }),
             completed_epoch: 0,
-            sandbox: None,
+            permissions: None,
             writable_roots: Vec::new(),
             model: None,
             effort: None,
