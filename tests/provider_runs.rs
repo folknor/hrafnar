@@ -58,7 +58,7 @@ use review::provider::{
     new_output_file, run_claude, run_codex_json,
 };
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The flat persisted form of a run: its outcome over its forensics (or
 /// none), which is what the assertions below read the outcome facts from.
@@ -2262,15 +2262,12 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
             "inspect this prompt"
         );
+        // `PWD` is set to the project root as given (a logical spelling, as a
+        // shell's own `PWD` may be), so compare the directories it names.
+        let pwd = std::fs::read_to_string(scratch.root.join("cwd")).expect("cwd");
         assert_eq!(
-            std::fs::read_to_string(scratch.root.join("cwd"))
-                .expect("cwd")
-                .trim(),
-            scratch
-                .project()
-                .canonicalize()
-                .expect("canonical project")
-                .to_string_lossy()
+            Path::new(pwd.trim()).canonicalize().expect("canonical PWD"),
+            scratch.project().canonicalize().expect("canonical project")
         );
         assert_args(mode, sid);
     }

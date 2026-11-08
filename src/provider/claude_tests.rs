@@ -17,7 +17,9 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
     let head = new_shared_buf();
     let tail = new_shared_buf();
     let metrics = std::sync::Arc::new(std::sync::Mutex::new(super::ClaudeMetrics::default()));
-    let (first_tx, first_rx) = tokio::sync::watch::channel(false);
+    // A lease with no marker: `ready` only records the fact.
+    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let lease = Lease::clone(&owner);
     // The keep must exceed the result line, as production's 8 MiB does; the
     // stream is several times larger, so the tail really is trimmed.
     let keep = 1024;
@@ -29,10 +31,10 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
         std::sync::Arc::clone(&head),
         std::sync::Arc::clone(&tail),
         std::sync::Arc::clone(&metrics),
-        first_tx,
+        lease.clone(),
     )
     .await;
-    assert!(*first_rx.borrow(), "the init event is seen");
+    assert!(lease.is_ready(), "the init event is seen");
     let head = head.lock().expect("head").clone();
     let tail = tail.lock().expect("tail").clone();
     assert_eq!(head.len(), 100, "the head is capped");

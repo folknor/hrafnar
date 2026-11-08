@@ -2,6 +2,7 @@ mod claude;
 mod codex;
 mod grok;
 mod kind;
+mod lifecycle;
 mod model;
 mod outcome;
 mod output;
@@ -13,6 +14,8 @@ mod session;
 pub use claude::run_claude;
 pub use codex::run_codex_json;
 pub use kind::{Provider, UnknownProvider};
+use lifecycle::{Lease, LeaseUse, Run};
+pub use lifecycle::{ProcessSpec, Stdin};
 pub use model::ModelSpec;
 pub use outcome::{Answer, EndedBy, OPERATOR_INTERRUPT, Outcome, SIGNAL_STOP, StatusFacts, Turn};
 pub use output::{print_result, resume_hint};
@@ -33,7 +36,6 @@ mod tests;
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 
 /// Check whether a provider binary is available on PATH.
@@ -473,23 +475,15 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
     )
 }
 
-/// Write prompt to stdin on a spawned task. Returns an error if the write fails.
+/// Write the prompt to stdin and close it. Run on the task `lifecycle::Run`
+/// owns, so aborting that task cancels the write itself.
 async fn write_stdin(
-    stdin: tokio::process::ChildStdin,
+    mut stdin: tokio::process::ChildStdin,
     prompt_bytes: Vec<u8>,
 ) -> Result<(), anyhow::Error> {
-    let handle = tokio::spawn(async move {
-        let mut stdin = stdin;
-        let result = stdin.write_all(&prompt_bytes).await;
-        drop(stdin);
-        result
-    });
-
-    match handle.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::anyhow!("failed to write prompt to stdin: {e}")),
-        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
-    }
+    let result = stdin.write_all(&prompt_bytes).await;
+    drop(stdin);
+    result.map_err(|e| anyhow::anyhow!("failed to write prompt to stdin: {e}"))
 }
 
 fn truncate(s: &str, max: usize) -> String {

@@ -118,7 +118,7 @@ fn record_claude_metric_bytes(
 
 /// Read claude's stream like `read_capped`, with two differences.
 ///
-/// `first` flips once claude's `init` event has arrived: that event is what
+/// `lease.ready()` fires once claude's `init` event has arrived: that event is what
 /// makes it safe to signal, and what shows its session exists (see
 /// `run_claude`).
 ///
@@ -137,7 +137,7 @@ async fn read_claude_stream<R>(
     head: SharedBuf,
     tail: SharedBuf,
     metrics: SharedClaudeMetrics,
-    first: tokio::sync::watch::Sender<bool>,
+    lease: Lease,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -172,7 +172,7 @@ async fn read_claude_stream<R>(
                         }
                     }
                     if found {
-                        first.send_replace(true);
+                        lease.ready();
                         scanning = None;
                     } else if pending.len() > CLAUDE_INIT_SCAN_MAX {
                         // One unterminated line this long is not an init
@@ -286,10 +286,9 @@ pub async fn run_claude(
     }
     args.extend_from_slice(selection.args());
 
-    let mut cmd = runtime.commands.get(Provider::Claude).build();
     // Launched under a keeper (`contained::spawn`), which gives claude its own
     // process group and tears down every shell it started when the run ends.
-    cmd.args(&args).current_dir(project_root);
+    //
     // Keep the model's shell commands in the foreground, where their output
     // reaches it. `--print` does not wait for a background Bash command when the
     // model ends its turn: it *kills* it and exits 0. Probed on Claude Code
@@ -311,110 +310,75 @@ pub async fn run_claude(
     // maximum is raised with it, for a model that is allowed to pass a timeout.
     // Set before the profile env so a profile can restate any of them.
     let wait_ms = (CLAUDE_COMMAND_WAIT_SECS * 1000).to_string();
-    cmd.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
-        .env("BASH_DEFAULT_TIMEOUT_MS", &wait_ms)
-        .env("BASH_MAX_TIMEOUT_MS", &wait_ms);
-    if let Some(vars) = env {
-        cmd.envs(vars);
-    }
-    // A request left over from an earlier run of this session (its `review`
-    // killed before consuming it) is not aimed at this one, and would mark a
-    // failed resume as interrupted, hiding claude's stated reason. A fresh run
-    // needs no check: its session id is new. As in `run_codex_json`.
-    if !session.is_fresh() {
-        let _ = crate::inflight::take_interrupt_request(session_id, runtime.data_root.as_deref());
-    }
-    // A run still waiting on the lock or its stagger when `review` was told to
-    // stop would otherwise launch claude only to kill it before its first event
-    // - and, a stopped run being recorded as interrupted, file a sidecar row and
-    // print a resume command for a session claude may never have written.
-    if *runtime.stop.borrow() {
-        anyhow::bail!("not launched: review was signalled to stop");
-    }
+    let spec = ProcessSpec::new(
+        runtime.commands.get(Provider::Claude),
+        args,
+        project_root,
+        &[
+            ("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1".to_string()),
+            ("BASH_DEFAULT_TIMEOUT_MS", wait_ms.clone()),
+            ("BASH_MAX_TIMEOUT_MS", wait_ms),
+        ],
+        env,
+        &[],
+        Stdin::Pipe(prompt.as_bytes().to_vec()),
+    );
+    // The lifecycle clears a stale interrupt request on a resume (one would
+    // mark a failed resume as interrupted, hiding claude's stated reason), and
+    // refuses to launch once `review` was told to stop: a launch then would
+    // only be killed before its first event - and, a stopped run being
+    // recorded as interrupted, file a row and print a resume command for a
+    // session claude may never have written.
+    //
     // The session id is known before the run starts - generated for a fresh
     // run, passed in for a resume - so the in-flight marker goes up before the
     // spawn. That ordering is load-bearing: `review message` releases its
     // session launch lock when the launch signal below fires, and a second
     // message must then find this marker, or it launches beside this run
-    // instead of interrupting it. Dropped (removing the marker) on any early
-    // return below.
+    // instead of interrupting it. Removed on any early return below.
+    //
+    // The keeper's pid is offered on the marker for `review interrupt` only
+    // once claude has printed its `init` event (`lease.ready()` in the
+    // reader). A SIGINT before claude installs its handler takes the default
+    // action and kills it with nothing printed; after, it ends the turn with a
+    // result object.
     let marker_sid = fresh_id.clone().unwrap_or_else(|| session_id.to_string());
-    let marker = crate::inflight::mark(
+    let owner = Lease::known(
         &marker_sid,
         Provider::Claude,
-        &project_root.to_string_lossy(),
+        project_root,
         runtime.data_root.as_deref(),
     );
-    let mut contained = crate::contained::spawn(
-        &cmd,
-        Stdio::piped(),
-        &runtime.teardown,
-        &format!("the claude run of session {marker_sid}"),
-        runtime.orphan_log.clone(),
+    let lease = Lease::clone(&owner);
+    let (mut run, pipes) = Run::spawn(
+        Provider::Claude,
+        &spec,
+        session,
+        LeaseUse::Owned(owner),
+        runtime,
     )?;
-    let mut marker = marker;
-    marker.record_keeper(contained.pid());
-    let stdin = contained
-        .child
-        .stdin
-        .take()
-        .context("failed to open claude stdin")?;
-    let stdout_pipe = contained
-        .child
-        .stdout
-        .take()
-        .context("failed to open claude stdout")?;
-    let stderr_pipe = contained
-        .child
-        .stderr
-        .take()
-        .context("failed to open claude stderr")?;
-    let mut contained = contained.launch().await?;
-    // Launch has happened: the caller may release the global lock. Dropping the
-    // sender instead (on the `?` above) tells it the same thing.
-    if let Some(signal) = launched {
-        let _ = signal.send(());
-    }
-    // The keeper: what `review interrupt` signals, and which forwards the
-    // SIGINT to claude once.
-    let pid = Some(contained.pid());
-
-    let (first_tx, first_rx) = tokio::sync::watch::channel(false);
-    // Offers claude's pid on the marker for `review interrupt` only once claude
-    // has printed its first event. A SIGINT before claude installs its handler
-    // takes the default action and kills it with nothing printed; after, it
-    // ends the turn with a result object (see the wait loop). The task holds
-    // the marker until it is aborted, which deletes it.
-    let marker_task = tokio::spawn({
-        let mut first_rx = first_rx.clone();
-        let mut guard = marker;
-        async move {
-            if first_rx.wait_for(|seen| *seen).await.is_ok() {
-                guard.record_child_pid(pid);
-            }
-            std::future::pending::<()>().await;
-        }
-    });
 
     let stdout_shared = new_shared_buf();
     let stdout_tail = new_shared_buf();
     let claude_metrics = std::sync::Arc::new(std::sync::Mutex::new(ClaudeMetrics::default()));
     let stderr_shared = new_shared_buf();
     let stdout_task = tokio::spawn(read_claude_stream(
-        stdout_pipe,
+        pipes.stdout,
         STDOUT_CAPTURE_CAP,
         CLAUDE_TAIL_KEEP,
         std::sync::Arc::clone(&stdout_shared),
         std::sync::Arc::clone(&stdout_tail),
         std::sync::Arc::clone(&claude_metrics),
-        first_tx,
+        lease.clone(),
     ));
     let stderr_task = tokio::spawn(read_capped(
-        stderr_pipe,
+        pipes.stderr,
         STDERR_CAPTURE_CAP,
         std::sync::Arc::clone(&stderr_shared),
     ));
-    let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
+    run.track(&stdout_task);
+    run.track(&stderr_task);
+    run.launch(launched).await?;
 
     // Wait for claude, but end the turn if `review` is signalled to stop.
     // Probed on Claude Code 2.1.284 mid-command: a SIGINT to claude ends the
@@ -423,39 +387,16 @@ pub async fn run_claude(
     // which then resumes normally. A SIGTERM also leaves a resumable session but
     // prints nothing, so there would be no result to record. Before claude's
     // first event it may not have a handler yet, so then the group is killed
-    // instead, as codex's is.
-    let mut stop_rx = runtime.stop.clone();
-    let mut stopped_by_signal = false;
-    let keeper_status = loop {
-        tokio::select! {
-            status = contained.wait() => break status,
-            Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
-                stopped_by_signal = true;
-                if *first_rx.borrow() {
-                    contained.interrupt();
-                } else {
-                    contained.terminate();
-                }
-            }
-        }
-    };
-    // Consumed whatever became of the run, before the marker goes (`read_live`
-    // discards a request with no marker beside it): left behind, it would mark
-    // the session's next run as interrupted.
-    let interrupt_requested =
-        crate::inflight::take_interrupt_request(&marker_sid, runtime.data_root.as_deref())
-            || stopped_by_signal;
-    // Awaited after the abort, which only requests cancellation: the marker
-    // guard must be gone before this run returns, not whenever the runtime
-    // next polls the task.
-    marker_task.abort();
-    let _ = marker_task.await;
-    let finished = contained.finish(&keeper_status).await;
-    let leftovers = finished.leftovers;
+    // instead, as codex's is (`Run::wait`'s stop arm).
+    run.wait(std::future::pending::<()>()).await;
+    let ended = run.finish().await;
+    let interrupt_requested = ended.interrupt_requested;
+    let stopped_by_signal = ended.stopped_by_signal;
+    let leftovers = ended.leftovers;
     // `None` when the keeper could not report it. The run still goes on to
     // what claude printed - its answer and session survive an unknown
     // teardown, which the ledger already fails the command for.
-    let status = finished.status;
+    let status = ended.status;
     let mut stdout_buf = collect_reader(
         stdout_task,
         &stdout_shared,
@@ -478,10 +419,7 @@ pub async fn run_claude(
         "claude stderr",
     )
     .await;
-    let write_res = match write_task.await {
-        Ok(r) => r,
-        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
-    };
+    let write_res = ended.stdin;
     let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
     let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
 
@@ -535,7 +473,7 @@ pub async fn run_claude(
     // Whether claude printed its first event, which carries the session id:
     // past that point the session exists (its transcript is on disk), so a run
     // that then ends without a result still has a session worth keeping.
-    let started = *first_rx.borrow();
+    let started = lease.is_ready();
 
     let (text, outcome, session_id) = match interpret_claude_output(&stdout, &stderr) {
         Ok(ClaudeOutcome::Answered { text, session_id }) => {

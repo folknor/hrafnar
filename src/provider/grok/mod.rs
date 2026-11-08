@@ -122,14 +122,10 @@ pub(super) async fn run_grok(
     // refusing, as its help says, instead of launching a second turn on the
     // session beside this one - and `review sessions` showing it. A resume
     // marks before launch, including fresh caller-minted identities. If the
-    // provider echoes a different identity, retain both guards through wakes.
-    let project = project_root.to_string_lossy().into_owned();
-    let mut _marker = Some(crate::inflight::mark(
-        session_id,
-        Provider::Grok,
-        &project,
-        data_root,
-    ));
+    // provider echoes a different identity, the lease holds a marker for both
+    // through the wakes, each kept current with the turn's keeper. One lease
+    // for the whole run, closed when this function returns however it does.
+    let lease = Lease::known(session_id, Provider::Grok, project_root, data_root);
     let (mut first, first_turns, first_usage) = run_grok_turn(
         session,
         selection,
@@ -140,7 +136,7 @@ pub(super) async fn run_grok(
         project_root,
         launched,
         runtime,
-        _marker.as_mut(),
+        &lease,
     )
     .await?;
     // A fresh run reports its new id (grok's echo, else the one we minted); a
@@ -149,16 +145,9 @@ pub(super) async fn run_grok(
         .session_id
         .clone()
         .unwrap_or_else(|| session_id.to_string());
-    let _echo_marker = if sid != session_id {
-        Some(crate::inflight::mark(
-            &sid,
-            Provider::Grok,
-            &project,
-            data_root,
-        ))
-    } else {
-        None
-    };
+    if sid != session_id {
+        lease.alias(&sid);
+    }
     // Fail closed: without grok's home the results cannot be checked, and an
     // unchecked run must not pass as one whose results were seen.
     let grok = match state::Grok::resolve(env) {
@@ -252,7 +241,7 @@ pub(super) async fn run_grok(
             project_root,
             None,
             runtime,
-            _marker.as_mut(),
+            &lease,
         )
         .await
         {
@@ -326,7 +315,7 @@ async fn run_grok_turn(
     project_root: &Path,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
-    marker: Option<&mut crate::inflight::Guard>,
+    lease: &Lease,
 ) -> Result<(RunOutput, u32, Usage)> {
     selection.validate(Provider::Grok)?;
     session.validate(Provider::Grok)?;
@@ -416,11 +405,18 @@ async fn run_grok_turn(
     // result it missed. Set before the profile env so a profile can restate
     // either.
     let wait_ms = (GROK_COMMAND_WAIT_SECS * 1000).to_string();
-    cmd.env("GROK_FOREGROUND_BLOCK_BUDGET_MS", &wait_ms)
-        .env("GROK_MAX_FOREGROUND_BLOCK_MS", &wait_ms);
-    if let Some(vars) = env {
-        cmd.envs(vars);
-    }
+    let spec = ProcessSpec::new(
+        runtime.commands.get(Provider::Grok),
+        args,
+        project_root,
+        &[
+            ("GROK_FOREGROUND_BLOCK_BUDGET_MS", wait_ms.clone()),
+            ("GROK_MAX_FOREGROUND_BLOCK_MS", wait_ms),
+        ],
+        env,
+        &[],
+        Stdin::Null,
+    );
     let grok = state::Grok::resolve(env).ok();
     // Re-checked immediately before spawn. `check_trust` in `invoke` and grok's
     // own grant are two separate reads of the store, and grok's grant overwrites
@@ -431,61 +427,41 @@ async fn run_grok_turn(
     if trust && let Some(ref g) = grok {
         g.check_trust(project_root)?;
     }
-    // Check the runner's stop channel immediately before launch. The keeper
-    // gate below also checks process-wide shutdown under its registry lock,
-    // closing the race between this check and spawn.
-    if *runtime.stop.borrow() {
-        anyhow::bail!("not launched: review was signalled to stop");
-    }
-    let label = match &fresh_id {
-        Some(id) => format!("the grok run of session {id}"),
-        None => format!("the grok run of session {session_id}"),
-    };
-    let mut contained = crate::contained::spawn(
-        &cmd,
-        Stdio::null(),
-        &runtime.teardown,
-        &label,
-        runtime.orphan_log.clone(),
+    // The lifecycle checks the stop channel immediately before launch, and
+    // records this turn's keeper on the run's lease (every marker it holds)
+    // before grok starts. Grok is not interruptible, so the run has no stop
+    // arm: the signal supervisor terminates its keeper.
+    let (mut run, pipes) = Run::spawn(
+        Provider::Grok,
+        &spec,
+        session,
+        LeaseUse::Shared(lease.clone()),
+        runtime,
     )?;
-    if let Some(marker) = marker {
-        marker.record_keeper(contained.pid());
-    }
-    let stdout_pipe = contained
-        .child
-        .stdout
-        .take()
-        .context("failed to open grok stdout")?;
-    let stderr_pipe = contained
-        .child
-        .stderr
-        .take()
-        .context("failed to open grok stderr")?;
     // Read while the run goes, not after: the keeper is reaped only once the
     // teardown is done, and a reader started late could leave grok blocked on
     // a full pipe.
     let stdout_shared = new_shared_buf();
     let stderr_shared = new_shared_buf();
     let stdout_task = tokio::spawn(read_capped(
-        stdout_pipe,
+        pipes.stdout,
         STDOUT_CAPTURE_CAP,
         std::sync::Arc::clone(&stdout_shared),
     ));
     let stderr_task = tokio::spawn(read_capped(
-        stderr_pipe,
+        pipes.stderr,
         STDERR_CAPTURE_CAP,
         std::sync::Arc::clone(&stderr_shared),
     ));
-    let mut contained = contained.launch().await?;
-    if let Some(signal) = launched {
-        let _ = signal.send(());
-    }
-    let keeper_status = contained.wait().await;
-    let finished = contained.finish(&keeper_status).await;
-    let leftovers = finished.leftovers;
+    run.track(&stdout_task);
+    run.track(&stderr_task);
+    run.launch(launched).await?;
+    run.wait(std::future::pending::<()>()).await;
+    let ended = run.finish().await;
+    let leftovers = ended.leftovers;
     // `None` when the keeper could not report it; what grok printed still
     // stands, and the ledger fails the command for the unknown teardown.
-    let status = finished.status;
+    let status = ended.status;
     let stdout_buf = collect_reader(
         stdout_task,
         &stdout_shared,

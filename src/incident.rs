@@ -18,8 +18,14 @@ use std::path::{Path, PathBuf};
 /// Everything known about a finished provider run, handed to the bundle writer.
 pub struct Incident<'a> {
     pub provider: &'a str,
-    /// The binary invoked (e.g. "codex") - argv[0] of the replayable command.
-    pub binary: &'a str,
+    /// The process as it was spawned: argv[0] and the args, the working
+    /// directory and the env overrides (adapter defaults, profile, forced,
+    /// `PWD`). The replay command and the env list are rendered from it, so
+    /// nothing a runner injects can be missing from them. What it cannot
+    /// carry: the environment the child inherited from `review` (only the
+    /// overrides are recorded), and the contents of runner-created temp files
+    /// named in argv (codex's `-o` file, grok's prompt file).
+    pub process: &'a crate::provider::ProcessSpec,
     /// `<binary> <leading args> --version`, best-effort; deaths may be version-specific. It
     /// probes the binary that actually ran, not the provider name: those differ
     /// whenever the binary is overridden (the test harness runs a stub), and
@@ -28,15 +34,9 @@ pub struct Incident<'a> {
     /// any provider process.
     pub codex_version: Option<String>,
     pub session_id: Option<&'a str>,
-    /// The args passed to the binary (not including argv[0]).
-    pub argv: &'a [String],
     /// The prompt piped on the child's stdin - part of the invocation, so a
     /// replay is impossible without it.
     pub prompt: &'a str,
-    pub cwd: &'a Path,
-    /// Profile env (names always recorded; values redacted when the name looks
-    /// secret, so the bundle never leaks tokens).
-    pub env: Option<&'a std::collections::BTreeMap<String, String>>,
     pub exit_code: Option<i32>,
     pub signal: Option<&'a str>,
     /// `Some` if writing the prompt to the child's stdin failed (e.g. a broken
@@ -226,9 +226,14 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     if let Err(error) = write_file(&dir, "prompt.txt", inc.prompt.as_bytes()) {
         failures.push(error);
     }
-    let mut full_argv = vec![inc.binary.to_string()];
-    full_argv.extend(inc.argv.iter().cloned());
-    let command = replay_command(&full_argv, inc.env, inc.cwd, &dir.join("prompt.txt"));
+    let mut full_argv = vec![inc.process.program.clone()];
+    full_argv.extend(inc.process.args.iter().cloned());
+    let command = replay_command(
+        &full_argv,
+        &inc.process.env,
+        &inc.process.cwd,
+        &dir.join("prompt.txt"),
+    );
 
     // Raw NDJSON stream, tail-capped. The interesting part is where it stops.
     let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
@@ -260,16 +265,14 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     let final_answer_present = inc.final_answer_present;
 
     let env = inc
+        .process
         .env
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| EnvVar {
-                    name: k.clone(),
-                    value: (!looks_secret(k)).then(|| v.clone()),
-                })
-                .collect()
+        .iter()
+        .map(|(k, v)| EnvVar {
+            name: k.clone(),
+            value: (!looks_secret(k)).then(|| v.clone()),
         })
-        .unwrap_or_default();
+        .collect();
 
     let meta = Meta {
         schema: INCIDENT_SCHEMA,
@@ -280,7 +283,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         codex_version: inc.codex_version.clone(),
         argv: full_argv,
         command,
-        cwd: inc.cwd.to_string_lossy().into_owned(),
+        cwd: inc.process.cwd.to_string_lossy().into_owned(),
         prompt_bytes: inc.prompt.len(),
         exit_code: inc.exit_code,
         signal: inc.signal.map(str::to_string),
@@ -375,27 +378,26 @@ fn scan_rate_limits(content: &str) -> Option<serde_json::Value> {
 }
 
 /// Build a copy-pasteable shell command that reproduces the run: `cd` to the
-/// recorded cwd (codex resolves rules/sandbox root from it), the injected
-/// `RUST_BACKTRACE=1` plus profile env, the quoted argv, and stdin redirected
-/// from the bundle's absolute `prompt.txt`. Secret env values become
-/// `<redacted>` so the string is safe to keep. Self-contained: runnable from
-/// anywhere, and it can't pick up the wrong repo or the wrong prompt.
+/// recorded cwd (codex resolves rules/sandbox root from it), every env
+/// override the spawn applied (the runner's own and the profile's alike), the
+/// quoted argv, and stdin redirected from the bundle's absolute `prompt.txt`.
+/// Secret env values become `<redacted>` so the string is safe to keep.
+/// Self-contained: runnable from anywhere, and it can't pick up the wrong repo
+/// or the wrong prompt.
 fn replay_command(
     full_argv: &[String],
-    env: Option<&std::collections::BTreeMap<String, String>>,
+    env: &std::collections::BTreeMap<String, String>,
     cwd: &Path,
     prompt_path: &Path,
 ) -> String {
-    let mut parts = vec!["RUST_BACKTRACE=1".to_string()];
-    if let Some(m) = env {
-        for (k, v) in m {
-            let val = if looks_secret(k) {
-                "<redacted>"
-            } else {
-                v.as_str()
-            };
-            parts.push(format!("{k}={}", shell_quote(val)));
-        }
+    let mut parts = Vec::new();
+    for (k, v) in env {
+        let val = if looks_secret(k) {
+            "<redacted>"
+        } else {
+            v.as_str()
+        };
+        parts.push(format!("{k}={}", shell_quote(val)));
     }
     parts.extend(full_argv.iter().map(|a| shell_quote(a)));
     format!(
@@ -686,6 +688,7 @@ mod tests {
             "read-only".to_string(),
         ];
         let mut env = std::collections::BTreeMap::new();
+        env.insert("RUST_BACKTRACE".to_string(), "1".to_string());
         env.insert("CODEX_HOME".to_string(), "/home/x/.codex".to_string());
         env.insert(
             "ANTHROPIC_API_KEY".to_string(),
@@ -693,11 +696,12 @@ mod tests {
         );
         let cmd = replay_command(
             &argv,
-            Some(&env),
+            &env,
             Path::new("/home/x/proj"),
             Path::new("/data/incidents/x/prompt.txt"),
         );
-        assert!(cmd.starts_with("cd /home/x/proj && RUST_BACKTRACE=1 "));
+        assert!(cmd.starts_with("cd /home/x/proj && "));
+        assert!(cmd.contains("RUST_BACKTRACE=1"), "cmd was: {cmd}");
         assert!(cmd.contains("CODEX_HOME=/home/x/.codex"));
         assert!(cmd.contains("ANTHROPIC_API_KEY='<redacted>'"));
         assert!(!cmd.contains("sk-super-secret"), "secret leaked: {cmd}");

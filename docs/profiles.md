@@ -81,7 +81,9 @@ are accepted everywhere.
   includes the settings behind the sandbox guarantees. Codex runs ignore the
   operator's own codex `config.toml`, so anything an override refers to, such
   as a custom `model_provider`, must be defined by overrides here too.
-- `env`: environment variables set for the provider process. The session log
+- `env`: environment variables set for the provider process. They override
+  the defaults `review` sets for a provider, but not `PWD`, which is always
+  the project root the provider runs in. The session log
   and `review config` show only their names, since values can carry secrets.
   A codex incident bundle keeps values too, except for names that look
   secret, so it can replay the run.

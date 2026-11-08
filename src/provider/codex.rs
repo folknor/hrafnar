@@ -18,7 +18,7 @@ pub(super) fn recovery(r: &ProviderResult) -> Option<&'static str> {
 
 /// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
 /// the NDJSON for the `thread.started` event and publish the session id on
-/// `sid_tx` the moment it appears.
+/// the run's lease the moment it appears.
 ///
 /// The watchdog (`crate::watchdog`) needs the session id to locate the rollout
 /// transcript. On a resume we already know it, but on a fresh run codex only
@@ -27,16 +27,15 @@ pub(super) fn recovery(r: &ProviderResult) -> Option<&'static str> {
 /// wedged run. Scanning stops as soon as the id is found, so the steady-state
 /// cost is the same byte-copy loop as before.
 ///
-/// The published id also survives a reader that never reaches EOF: it goes out
-/// on the watch channel as soon as it is seen, so a truncated `stdout_buf` can
+/// The published id also survives a reader that never reaches EOF: it is a
+/// lease fact as soon as it is seen, so a truncated `stdout_buf` can
 /// no longer cost us the session id (and with it the transcript, the recovery
 /// path and the sidecar row).
 async fn read_capped_stdout<R>(
     mut r: R,
     cap: usize,
     out: SharedBuf,
-    sid_tx: tokio::sync::watch::Sender<Option<String>>,
-    first_output: tokio::sync::watch::Sender<bool>,
+    lease: Lease,
     mut scanning: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
@@ -45,12 +44,16 @@ async fn read_capped_stdout<R>(
     let mut chunk = [0u8; 16384];
     // Carry for a line split across two reads; only maintained while scanning.
     let mut partial: Vec<u8> = Vec::new();
+    let mut seen_output = false;
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                // `send_if_modified` so only the first chunk wakes the watcher.
-                first_output.send_if_modified(|seen| !std::mem::replace(seen, true));
+                // Codex's first byte, not its first line, is readiness: output
+                // proves the node wrapper got far enough to forward SIGINT.
+                if !std::mem::replace(&mut seen_output, true) {
+                    lease.ready();
+                }
                 if scanning {
                     partial.extend_from_slice(&chunk[..n]);
                     // Process whole lines; keep the trailing fragment.
@@ -60,8 +63,8 @@ async fn read_capped_stdout<R>(
                             && val.get("type").and_then(|t| t.as_str()) == Some("thread.started")
                             && let Some(id) = val.get("thread_id").and_then(|t| t.as_str())
                         {
-                            // A closed receiver just means nobody is watching.
-                            let _ = sid_tx.send(Some(id.to_string()));
+                            // Puts the marker up and wakes the watchdog.
+                            lease.set_session(id);
                             scanning = false;
                             partial.clear();
                             break;
@@ -374,21 +377,24 @@ pub async fn run_codex_json(
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
     let command = runtime.commands.get(Provider::Codex);
-    let mut cmd = command.build();
-    cmd.args(&args)
-        .current_dir(project_root)
-        // Make a codex panic legible: without this it exits 1 with no trace,
-        // which is exactly the "no recorded reason" we kept hitting. Set before
-        // the profile env so an explicit override still wins.
-        .env("RUST_BACKTRACE", "1");
     // Launched under a keeper (`contained::spawn`), which puts codex in a
     // process group of its own, out of reach of a terminal SIGINT - the signal
     // supervisor stops runs instead - and tears down everything codex started
     // (exec-server, unified-exec cells, sandboxed shells in sessions of their
     // own, MCP servers) when the run ends, however it ends.
-    if let Some(vars) = env {
-        cmd.envs(vars);
-    }
+    let spec = ProcessSpec::new(
+        command,
+        args,
+        project_root,
+        // Make a codex panic legible: without this it exits 1 with no trace,
+        // which is exactly the "no recorded reason" we kept hitting. A
+        // default, so an explicit profile override still wins; and part of the
+        // spec, so the incident replay carries it by construction.
+        &[("RUST_BACKTRACE", "1".to_string())],
+        env,
+        &[],
+        Stdin::Pipe(prompt.as_bytes().to_vec()),
+    );
     // Size of the rollout transcript *before* this run appends to it. A resume
     // writes into the same file as every earlier turn, so the watchdog needs to
     // know where this run's events begin - otherwise a previous turn's
@@ -460,144 +466,52 @@ pub async fn run_codex_json(
         );
     }
 
-    // A request left over from an earlier run of this session (its `review`
-    // killed before consuming it) is not aimed at this one. A fresh run needs
-    // no such check: its session id is new.
-    if let Some(sid) = known_session_id.as_deref() {
-        let _ = crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref());
-    }
-
     let start = std::time::Instant::now();
     // (Gating transcript recovery to this run's turn is done by byte offset -
     // `rollout_baseline` above - not by a wall-clock stamp, which was too coarse
     // to separate a resume from an answer written in the same second.)
-    // A run still waiting on the lock or its stagger when `review` was told to
-    // stop would otherwise start a turn nobody will see the end of.
-    if *runtime.stop.borrow() {
-        // The cleanup guard is installed below, so remove the file on this path.
-        let _ = std::fs::remove_file(last_msg_path);
-        anyhow::bail!("not launched: review was signalled to stop");
-    }
+    //
+    // Installed before anything can return, so the `-o` file goes on every
+    // path, the lifecycle's stop refusal included.
+    let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
     // A resume knows its session id, so its in-flight marker goes up before the
     // spawn: `review message` releases its session launch lock when the launch
-    // signal below fires, and a second message must then find this marker to
-    // interrupt the run rather than launch beside it. A fresh run's marker waits
-    // for the id in the marker task below; nobody can message a session whose
-    // id has not been printed. Dropped (removing the marker) on any early
-    // return.
-    let early_marker = known_session_id.as_deref().map(|sid| {
-        crate::inflight::mark(
+    // signal fires, and a second message must then find this marker to
+    // interrupt the run rather than launch beside it. A fresh run's marker goes
+    // up when `thread.started` reaches the reader (`Lease::set_session`);
+    // nobody can message a session whose id has not been printed. The marker
+    // shows `review sessions` the turn in flight instead of the previous
+    // turn's response - the ambiguity that made a 10-hour hang look identical
+    // to an idle session.
+    //
+    // The keeper's pid is offered on the marker only from codex's first stdout
+    // byte. Until then the pid may front a node wrapper that has not installed
+    // the handler forwarding SIGINT to the native binary, so interrupting it
+    // could kill the wrapper and orphan codex - still holding the session's
+    // writer lock, which would make the resume `review interrupt` hands back
+    // fail.
+    let session = match known_session_id.as_deref() {
+        Some(sid) => SessionStart::Resume(SessionId::parse(sid)?),
+        None => SessionStart::Fresh { id: None },
+    };
+    let owner = match known_session_id.as_deref() {
+        Some(sid) => Lease::known(
             sid,
             Provider::Codex,
-            &project_root.to_string_lossy(),
+            project_root,
             runtime.data_root.as_deref(),
-        )
-    });
-    // The explicit stop path above is the only pre-guard return. This covers
-    // every later return, including spawn errors before the normal read.
-    let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
-    let label = match known_session_id.as_deref() {
-        Some(sid) => format!("the codex run of session {sid}"),
-        None => "a codex run".to_string(),
+        ),
+        None => Lease::learned(Provider::Codex, project_root, runtime.data_root.as_deref()),
     };
-    let mut contained = crate::contained::spawn(
-        &cmd,
-        Stdio::piped(),
-        &runtime.teardown,
-        &label,
-        runtime.orphan_log.clone(),
-    )?;
-    let mut early_marker = early_marker;
-    if let Some(marker) = early_marker.as_mut() {
-        marker.record_keeper(contained.pid());
-    }
-    let stdin = contained
-        .child
-        .stdin
-        .take()
-        .context("failed to open codex stdin")?;
-    let stdout_pipe = contained
-        .child
-        .stdout
-        .take()
-        .context("failed to open codex stdout")?;
-    let stderr_pipe = contained
-        .child
-        .stderr
-        .take()
-        .context("failed to open codex stderr")?;
-    let mut contained = contained.launch().await?;
-    // Launch has happened: the caller may release the global lock. Dropping the
-    // sender instead (on the `?` above) tells it the same thing.
-    if let Some(signal) = launched {
-        let _ = signal.send(());
-    }
-
-    // Publishes the session id as soon as it is known: immediately on a resume,
-    // or when `thread.started` arrives on stdout for a fresh run. The watchdog
-    // needs it to find the rollout transcript.
-    let (sid_tx, sid_rx) = tokio::sync::watch::channel(known_session_id.clone());
+    let lease = Lease::clone(&owner);
     let scanning_for_session_id = known_session_id.is_none();
-    // Kept for after the wait, so the id survives a stdout reader that never
-    // reached EOF (see where `session_id` is resolved).
-    let sid_rx_final = sid_rx.clone();
-    // The keeper: what the in-flight marker records for `review interrupt` to
-    // signal, and which forwards that SIGINT to codex once.
-    let keeper_pid = contained.pid();
-    let child_pid = Some(keeper_pid);
-    // Flips on codex's first stdout. Until then the pid may be a node wrapper
-    // that has not yet installed the handler forwarding SIGINT to the native
-    // binary, so interrupting it could kill the wrapper and orphan codex -
-    // still holding the session's writer lock, which would make the resume
-    // `review interrupt` hands back fail. Output from codex proves the wrapper
-    // got that far, so the marker only offers the pid from then on.
-    let (first_output_tx, mut first_output_rx) = tokio::sync::watch::channel(false);
-    // The same safety question for a signal-driven stop, which asks it later.
-    let first_output_seen = first_output_rx.clone();
-
-    // Mark the run as in flight so `review sessions` can report "turn in flight
-    // since <time>" instead of showing the *previous* turn's response while this
-    // one runs - the exact ambiguity that made a 10-hour hang look identical to
-    // an idle session.
-    //
-    // This lives in its own task because a fresh run does not learn its session
-    // id until `thread.started` arrives mid-stream. The task parks forever
-    // holding the marker guard; aborting it after the run drops the guard, which
-    // deletes the marker. That covers every normal exit path, and `read_live`
-    // discards markers whose owning pid is gone for the ones it cannot.
-    let marker_task = tokio::spawn({
-        let mut rx = sid_rx.clone();
-        let project = project_root.to_string_lossy().into_owned();
-        let data_root = runtime.data_root.clone();
-        async move {
-            let mut guard = match early_marker {
-                Some(guard) => guard,
-                None => {
-                    let sid = loop {
-                        if let Some(sid) = rx.borrow_and_update().clone() {
-                            break sid;
-                        }
-                        if rx.changed().await.is_err() {
-                            return;
-                        }
-                    };
-                    let mut guard = crate::inflight::mark(
-                        &sid,
-                        Provider::Codex,
-                        &project,
-                        data_root.as_deref(),
-                    );
-                    guard.record_keeper(keeper_pid);
-                    guard
-                }
-            };
-            if first_output_rx.wait_for(|seen| *seen).await.is_ok() {
-                guard.record_child_pid(child_pid);
-            }
-            // Hold the marker until this task is aborted.
-            std::future::pending::<()>().await;
-        }
-    });
+    let (mut run, pipes) = Run::spawn(
+        Provider::Codex,
+        &spec,
+        &session,
+        LeaseUse::Owned(owner),
+        runtime,
+    )?;
 
     // Bound in-memory buffering: a runaway/noisy provider could otherwise OOM
     // `review` long before the 1 MiB forensic tail is applied. Buffer up to a
@@ -610,19 +524,20 @@ pub async fn run_codex_json(
     let stdout_shared = new_shared_buf();
     let stderr_shared = new_shared_buf();
     let stdout_task = tokio::spawn(read_capped_stdout(
-        stdout_pipe,
+        pipes.stdout,
         STDOUT_CAPTURE_CAP,
         std::sync::Arc::clone(&stdout_shared),
-        sid_tx,
-        first_output_tx,
+        lease.clone(),
         scanning_for_session_id,
     ));
     let stderr_task = tokio::spawn(read_capped(
-        stderr_pipe,
+        pipes.stderr,
         STDERR_CAPTURE_CAP,
         std::sync::Arc::clone(&stderr_shared),
     ));
-    let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
+    run.track(&stdout_task);
+    run.track(&stderr_task);
+    run.launch(launched).await?;
 
     // Records that *we* ended the run, and why. See `Outcome::ended`.
     let mut terminated_by_review: Option<String> = None;
@@ -631,10 +546,6 @@ pub async fn run_codex_json(
     let mut watchdog_answer: Option<String> = None;
     let mut quiet_secs: Option<u64> = None;
     let mut last_rollout_event: Option<String> = None;
-    // Set when `review` itself was signalled and ended this turn in response
-    // (see `install_signal_supervisor`); counts as an interrupt request.
-    let mut stopped_by_signal = false;
-    let mut stop_rx = runtime.stop.clone();
 
     // Wait for codex, but stay interruptible.
     //
@@ -647,93 +558,53 @@ pub async fn run_codex_json(
     //     computed below this point.
     //   - the operator kills `review`, and codex - a separate process - keeps
     //     running detached, still modifying the tree.
-    // The watchdog arm below fixes the first; the second is handled process-wide
-    // by `install_signal_supervisor`.
-    {
+    // The watchdog, as the run's kill arm, fixes the first; the second is
+    // handled process-wide by `install_signal_supervisor`, and a signalled
+    // `review` ends the turn as `review interrupt` would through the
+    // lifecycle's stop arm.
+    //
+    // codex has demonstrably produced its answer but will not exit: the run is
+    // terminated, reaped, and the recovered `final_answer` reported as usual.
+    // The watchdog judges codex only, never the teardown of what it left.
+    let watchdog = {
         let watchdog = crate::watchdog::wait_for_stranded_completion(
-            sid_rx,
+            lease.session_watch(),
             codex_home.clone(),
             rollout_baseline,
             runtime.timings,
         );
-        tokio::pin!(watchdog);
-        loop {
-            tokio::select! {
-                // Normal path: codex exited on its own. The teardown of what it
-                // left is waited for below, outside the watchdog's view.
-                () = contained.wait_provider() => break,
-
-                // codex has demonstrably produced its answer but will not exit.
-                // Kill the group; the loop then reaps it on the next iteration
-                // and the recovered `final_answer` is reported as usual. The
-                // guard disables this arm once it has fired, so the completed
-                // future is never polled again.
-                verdict = &mut watchdog, if terminated_by_review.is_none() => {
-                    eprintln!("watchdog: {}", verdict.reason);
-                    terminated_by_review = Some(match verdict.kind {
-                        crate::watchdog::Kind::Stranded => {
-                            "watchdog: stranded completion".to_string()
-                        }
-                        // Named a stall *timeout* on purpose: it is one, and
-                        // saying so keeps a future codex cadence change
-                        // diagnosable instead of mysterious.
-                        crate::watchdog::Kind::Stalled => {
-                            format!("watchdog: stall timeout ({}s silent)", verdict.quiet_secs)
-                        }
-                    });
-                    watchdog_answer = verdict.final_answer;
-                    quiet_secs = Some(verdict.quiet_secs);
-                    last_rollout_event = verdict.last_event.clone();
-                    contained.terminate();
-                }
-
-                // `review` was signalled: end the turn as `review interrupt`
-                // would - SIGINT to the leader alone - so codex frees the
-                // session and we get to record it. Before codex's first output
-                // the leader may be a node wrapper that would die on SIGINT and
-                // orphan codex, so then the group is killed instead.
-                // (An `Err` - no sender left, so no stop can ever come - does
-                // not match, and select disables the arm.)
-                Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
-                    stopped_by_signal = true;
-                    if *first_output_seen.borrow() {
-                        contained.interrupt();
-                    } else {
-                        contained.terminate();
-                    }
-                }
-            }
+        async move {
+            let verdict = watchdog.await;
+            eprintln!("watchdog: {}", verdict.reason);
+            verdict
         }
+    };
+    if let Some(verdict) = run.wait(watchdog).await {
+        terminated_by_review = Some(match verdict.kind {
+            crate::watchdog::Kind::Stranded => "watchdog: stranded completion".to_string(),
+            // Named a stall *timeout* on purpose: it is one, and saying so
+            // keeps a future codex cadence change diagnosable instead of
+            // mysterious.
+            crate::watchdog::Kind::Stalled => {
+                format!("watchdog: stall timeout ({}s silent)", verdict.quiet_secs)
+            }
+        });
+        watchdog_answer = verdict.final_answer;
+        quiet_secs = Some(verdict.quiet_secs);
+        last_rollout_event = verdict.last_event.clone();
     }
-    // codex has exited; its keeper exits once whatever it left is torn down.
-    // Waited for before the marker goes, so the session reads as in flight
-    // until nothing of the run is left: a message arriving meanwhile waits for
-    // it rather than launching beside the teardown.
-    let keeper_status = contained.wait().await;
-    let watched_session_id = sid_rx_final.borrow().clone();
-    // Consumed now that codex is reaped, whatever became of it: a request left
-    // behind would mark the session's *next* run as interrupted. Before the
-    // marker goes, because `read_live` discards a request with no marker beside
-    // it. Whether it *counts* waits until we know if an answer was produced.
-    let interrupt_requested = watched_session_id.as_deref().is_some_and(|sid| {
-        crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref())
-    }) || stopped_by_signal;
-    // Run is over: drop the in-flight marker, before the `?` below so a failed
-    // wait cannot leak it. `abort` only requests cancellation - the guard drops
-    // when the runtime next polls the task - so the handle is awaited, or the
-    // marker could outlive the run that returned.
-    marker_task.abort();
-    let _ = marker_task.await;
-    if let Some(sid) = watched_session_id.as_deref() {
-        contained.set_label(format!("the codex run of session {sid}"));
-    }
-    let finished = contained.finish(&keeper_status).await;
-    let mut leftovers = finished.leftovers;
+    // The keeper was waited for before the marker goes, so the session read
+    // as in flight until nothing of the run was left. Whether the consumed
+    // interrupt request *counts* waits until we know if an answer was produced.
+    let ended = run.finish().await;
+    let interrupt_requested = ended.interrupt_requested;
+    let stopped_by_signal = ended.stopped_by_signal;
+    let mut leftovers = ended.leftovers;
     // `None` when the keeper could not report it: the digest then shows no
     // exit code, the run reads as suspicious (bundled, transcript read), and
     // its session and any answer survive - the ledger already fails the
     // command for the unknown teardown.
-    let status = finished.status;
+    let status = ended.status;
 
     // The child is reaped, so the run is over regardless of what the pipes do.
     //
@@ -759,10 +630,10 @@ pub async fn run_codex_json(
         "codex stderr",
     )
     .await;
-    let write_res = match write_task.await {
-        Ok(r) => r,
-        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
-    };
+    let write_res = ended.stdin;
+    // Read after the drain: a `thread.started` the reader saw late is still
+    // this run's id, though it no longer puts a marker up.
+    let watched_session_id = lease.session();
     let duration_ms = start.elapsed().as_millis();
     // A failed prompt write (e.g. broken pipe because codex exited first) is a
     // forensic signal, not a fatal error - the digest still reports what ran.
@@ -975,20 +846,16 @@ pub async fn run_codex_json(
             &runtime.teardown,
         )
         .await;
-        let replay_args: Vec<String> = command.leading_args.iter().chain(&args).cloned().collect();
         leftovers.merge(probe_leftovers);
         match crate::incident::write_bundle(&crate::incident::Incident {
             codex_version,
             provider: "codex",
-            // The binary actually executed, which is not always "codex": a
-            // stub overrides it. `command` in meta.json has to replay the
-            // process that really ran.
-            binary: &command.program,
+            // The process exactly as it was spawned - program, argv, cwd and
+            // every env override, the runner's own included - so the replay
+            // in meta.json is the spawn by construction.
+            process: &spec,
             session_id: session_id.as_deref(),
-            argv: &replay_args,
             prompt,
-            cwd: project_root,
-            env,
             exit_code,
             signal: signal.as_deref(),
             stdin_write_error: stdin_write_error.as_deref(),

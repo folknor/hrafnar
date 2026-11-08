@@ -17,18 +17,6 @@ hunter's reading of the code, and some say so explicitly.
    and they are never deduplicated through git history. Carry the context
    inline instead.
 
-## BUG-017 - The incident replay command omits runner-injected env
-
-Reported by: forensics.
-
-`replay_command` records only the profile env. Anything the runner injects
-never reaches the replay; `RUST_BACKTRACE` is hard-coded on both sides by
-agreement. For opencode, whose isolation is entirely runner-injected env
-(disabled project config, private DB, `PWD`), a replay built this way would
-attach to the operator's real config and DB: not a reproduction, and mildly
-dangerous. The proposed fix, building the replay from the actual spawned
-`Command`, is in `notes/structural.md` under the incident split.
-
 ## BUG-050 - Claude cost is now summed across result events, unverified
 
 Reported by: a wave reviewer (lateral).

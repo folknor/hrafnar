@@ -276,125 +276,71 @@ Reported by: grok-man.
 
 ## Moves and rewrites
 
-## STR-024 - Split `provider.rs` into a lifecycle driver and per-provider adapters
+## STR-024 - Provider adapters: the parts the lifecycle driver left behind
 
-Reported by: providers, forensics, grok-man, orchestration. Narrowed: the file
-has been split mechanically into `src/provider/` (one runner per provider,
-results, runtime, output) with every path kept; what remains is the design
-below, the shared lifecycle driver and adapters.
+Reported by: providers, forensics, grok-man, orchestration. Narrowed twice: the
+file was split mechanically into `src/provider/`, and the shared lifecycle now
+exists as `src/provider/lifecycle.rs` (`ProcessSpec`, `Lease`, `Run`), which
+all three runners drive. The driver is a handle the adapter calls into, not an
+`Adapter` trait the driver calls: codex's rollout baseline before spawn and
+recovery after, and grok's multi-turn wake loop with its marker alias, are
+adapter control flow a trait would have to expose as a hook per step with
+shared state between them.
 
-`provider.rs` is about 3600 lines that the providers hunter reads as five
-modules: process I/O plumbing, the signal supervisor, the permission front end
-(`invoke`), three runners, and output rendering. The runners do not share a
-skeleton: each re-implements the same lifecycle (mint or learn a session id,
-clear stale interrupt requests, check stop, mark in flight, spawn under a
-keeper, signal launch, wait with a stop arm, consume the interrupt request,
-drop the marker, drain the pipes, classify, build a codex-shaped `Digest`),
-each ordering the steps slightly differently. Adding maki means copying
-`run_claude`; adding opencode means a fourth lifecycle by hand.
-
-Proposed layout (providers):
-- `provider/mod.rs`: the enum, the capability table, `invoke` as a thin
-  driver.
-- `provider/lifecycle.rs`: one async driver taking an `Adapter`, owning
-  stop-before-launch, the marker policy, keeper spawn, the launch signal, the
-  stop/interrupt arm, interrupt-request consumption, the drain, and outcome
-  assembly from the classifier verdict plus interrupt facts (the home for the
-  interrupt, marker, stop and shutdown questions in
-  `notes/consolidations.md`).
-- `provider/io.rs`: `SharedBuf`, `read_capped`, `collect_reader`,
-  `write_stdin`, `TempFile`. The three hand-written stream readers
-  (`read_capped`; `read_claude_stream` with head/tail and init scan;
-  `read_capped_stdout` with id scan and first-byte watch) become one
-  line-splitting reader with a pluggable `LineObserver` (publishes the id,
-  flips readiness) and a buffer policy (head-capped, or head plus tail).
-- `provider/{claude,codex,grok,maki,opencode}.rs`: each provides
-  `argv(&Launch)`, `env(&Launch)`, its `LineObserver`, and
-  `classify(stdout, stderr, status) -> Verdict`; the JSON event formats stay
-  local.
+What remains:
+- One line-splitting stream reader with a capture policy (head cap, or head
+  plus rolling tail) and a per-adapter observer, replacing `read_capped`,
+  `read_claude_stream` and codex's `read_capped_stdout`. Its framing rules,
+  each load-bearing today: raw capture continues after the observer stops
+  scanning; observer parsing continues after capture fills; line accumulation
+  is bounded independently of capture; an oversized line is discarded through
+  its delimiter, never parsed from an arbitrary suffix; an unterminated final
+  line is still offered at EOF (claude's metrics need it); observer facts
+  survive reader cancellation; claude's head and tail are joined with a
+  delimiter so fragments cannot combine into a fabricated JSON line; codex's
+  readiness is its first byte, not its first line.
+- A `claude_stream` decoder (`last_claude_result`, `ClaudeResult`,
+  `interpret_claude_output`, `ClaudeMetrics`, `is_claude_init`) shared by the
+  claude and maki adapters, whose argv builders stay separate (maki ignores
+  `--effort`, `--permission-mode` and others). `result_served` is shared by
+  grok and claude by field-name coincidence.
+- A `prepare(&Launch)` hook per adapter for permission setup (grok's
+  `prepare_grok_write` and trust re-read, codex's
+  `config_writable_roots_override`, maki's permissions config and per-run
+  effort config, opencode's agent definition and private config and DB), so
+  `invoke` stops carrying the grok-only `grok_trust` field and its post-run
+  trust check.
+- Grok's wake loop merges usage, cost, turns and leftovers by hand;
+  `RunOutput::absorb(next)` on the types.
 - `provider/render.rs`: `print_result`, `print_digest`, `resume_hint`, merged
   with `app`'s summary rendering.
-- The signal supervisor, `STOP` and `Unrecorded` move out of `provider` (see
-  the lifecycle module below).
-- `invoke`'s grok write preparation (`GrokWrite`, `prepare_grok_write`, the
-  trust re-read) and codex's `config_writable_roots_override` move into the
-  grok and codex adapters behind a `prepare(&Launch) -> Prepared` hook, so
-  `invoke` stops branching on provider strings. The grok-man hunter adds that
-  `ProviderResult` has a grok-only field (`grok_trust`) and that maki (its
-  permissions config) and opencode (a custom agent definition, a private
-  config and DB dir) need the same kind of hook.
+- `run_codex_json`, `run_claude`, `RunOutput` and `new_output_file` are `pub`
+  only for `tests/provider_runs.rs`; a test seam through `invoke` (or a
+  lifecycle-level stub suite) lets them go.
 
-The forensics hunter proposes the same seam from the other side: per-provider
-directories (`src/codex/{mod.rs runner, stream.rs, rollout.rs, transcript.rs,
-watchdog.rs, outcome.rs}`, `src/claude/`, `src/grok/`, `src/maki/`,
-`src/opencode/`), `src/forensics/{incident.rs, replay.rs}`, and a
-provider-agnostic `src/outcome.rs`. Today codex's NDJSON stream parser is
-inline in a 600-line `run_codex_json` while its rollout parser is a separate
-top-level module, a split that follows "which file on disk" rather than "which
-provider".
+## STR-025 - Lifecycle module moves around the `Run` handle
 
-Within this: claude and maki share a wire format, not an argv.
-`last_claude_result`, `ClaudeResult`, `interpret_claude_output`,
-`claude_usage`, `result_served`, `is_claude_init` and `read_claude_stream`
-become a `claude_stream` decoder shared by both adapters, while the argv
-builder is not shared (maki ignores `--effort`, `--permission-mode` and
-others). `result_served` is already shared between grok and claude by
-field-name coincidence (`modelUsage`, `total_cost_usd`); it would return empty
-for maki, correctly, but by luck. Grok's wake loop (`run_grok` wrapping
-`run_grok_turn` and merging usage, cost, turns and leftovers by hand) becomes a
-general multi-turn wrapper with outcome merging, or at least
-`RunOutput::absorb(next)` on the types. `run_codex_json`, `run_claude`,
-`RunOutput` and `new_output_file` are `pub` only for `tests/provider_runs.rs`;
-`lifecycle::run(adapter, stub_command)` is a better seam and the per-runner
-`pub`s go.
+Reported by: lifecycle, providers. Narrowed: the `Run` handle exists as
+`provider::lifecycle::Run` with its `Lease` (marker, readiness and session
+facts, interrupt-request consumption, one-shot stop and kill arms); a runner's
+lifecycle is `Run::spawn`, `launch`, `wait`, `finish`, and the ordering
+invariants are unit-tested on the lease without a provider stub.
 
-## STR-025 - A `src/lifecycle/` module with a `Run` handle
-
-Reported by: lifecycle, providers.
-
-The lifecycle hunter calls the keeper the best-built part of the code base and
-not in need of rewrite, and the trouble around it the problem: the run
-lifecycle (stop requested, launched, signal-safe, interrupted, provider
-exited, torn down, recorded) is a state machine no type owns. Where it lives
-today:
-- `keeper.rs`: the subreaper, cohesive.
-- `contained.rs`: three unrelated jobs (the parent-side keeper client, the
-  process-wide ledger and its human report, the registry and admission gate)
-  plus `version_probe`, an incident feature.
-- `provider.rs`: `STOP`, `UNRECORDED`/`Unrecorded`, `install_signal_supervisor`,
-  there because codex ran first.
-- `inflight.rs`: markers, launch locks and interrupt requests sharing a
-  directory, plus the process-identity helpers the keeper and `interrupt_cmd`
-  also need.
-- `interrupt_cmd.rs`: the verb plus `interruptible` and
-  `cleanup_pending_message`, policy owned by a CLI verb and imported by `app`.
-- The runners: the load-bearing per-run ordering, commented as such in both.
-
-Proposed `src/lifecycle/`:
+What remains is placement, not mechanism:
 - `process.rs`: `Pid`, `ProcessIdentity`, `PinnedProcess`, pidfd and `/proc`
-  primitives, moved out of `keeper.rs`.
-- `keeper.rs`: unchanged in substance, owning `Spec`, `Control`, `Event`,
-  `Teardown`, `TeardownSchedule`.
-- `client.rs`: `spawn`/`Contained`, extended into a `Run` handle owning the
-  marker, readiness, the graceful-stop decision, the interrupt fact and the
-  label, so a runner's lifecycle shrinks to
-  `let run = Run::start(cmd, session, provider).await?; ... run.signal_ready(); ... let end = run.finish().await;`,
-  with the marker/keeper ordering invariants in one function testable without
-  a provider stub.
-- `supervisor.rs`: the `Shutdown` state, registry, `Unrecorded`, ledger and
-  signal handler: one module answering "what happens when `review` is told to
-  stop".
+  primitives, out of `keeper/` and `inflight.rs`, which `interrupt_cmd` also
+  needs.
+- `supervisor.rs`: the `STOP` channel, `Unrecorded`, the registry and
+  admission gate, the ledger and `install_signal_supervisor` (today split
+  between `provider/runtime.rs` and `contained.rs`): one module answering
+  "what happens when `review` is told to stop". See STR-027 for making it a
+  value.
 - `store.rs` (from `inflight`): markers, launch locks and interrupt requests
   keyed by `SessionId`, returning a typed run state.
-- `report.rs`: `report_lines`, moved out of the ledger.
-- `version_probe` moves to `incident.rs`.
-
-The hunter calls it a big move and the right one: each new provider then
-contributes only its argv, env, stream parser and readiness trigger, instead
-of copying about 150 lines of lifecycle ordering per runner. It overlaps the
-providers hunter's `provider/lifecycle.rs` in the entry above; the two
-readings differ on where the driver lives, and both put the supervisor beside
-`contained`.
+- `report.rs`: `report_lines`, out of the ledger.
+- `contained::version_probe` moves beside the incident writer.
+- `interrupt_cmd`'s `cleanup_pending_message` is policy owned by a CLI verb
+  and imported by `app`.
 
 ## STR-026 - Stop using the sidecar log as an IPC channel
 
@@ -692,26 +638,19 @@ Reported by: providers, lifecycle, forensics, grok-man, config.
 
 ## STR-037 - Requirements the new providers bring that no current runner has
 
-Reported by: providers, lifecycle.
+Reported by: providers, lifecycle. Narrowed: env ordering is explicit
+(`ProcessSpec` layers adapter defaults, then profile, then adapter-forced
+values, so opencode's isolation goes in the forced layer and a profile cannot
+undo it), `PWD` is set to the working directory for every provider, readiness
+is a lease fact the adapter's reader sets (maki after `init`, opencode after
+its first event), and `Ended.status` is documented as forensics only.
 
-- opencode's isolation env must be applied after the profile env, or a
-  profile could undo it: the opposite of the "set before profile env so a
-  profile can restate it" ordering every current runner uses, so a new
-  ordering policy that needs to be explicit.
+What remains, each landing with its provider:
 - opencode's `--standalone` must be non-optional, because without it the run
   attaches to a background service outside the keeper's tree, whose "clean"
   verdict would then be true but meaningless. Nothing in the lifecycle can
-  detect a violation, so the lifecycle hunter proposes encoding the rule in the
-  opencode argv builder with a test.
-- opencode exits 130 on interrupt and maki exits 0 on error, so the keeper's
-  `Finished.status` must stay advisory and outcome classification must stay in
-  the stream parsers.
+  detect a violation: encode it in the opencode argv builder with a test.
 - opencode's read-only is an agent definition: a third permission mechanism
-  beside an OS sandbox and none (the permission plan in the sandbox entry
-  above).
-- maki's readiness comes after `init` (its SIGINT handler is installed by
-  then), opencode's after its first event; both are SIGINT-once, and the
-  keeper's forward-once suits both, since maki's second SIGINT kills it.
-- Effort via maki's config would mean writing maki's config per run, another
-  setup step like grok's `prepare_grok_write` (now in the grok runner), which
-  a general `prepare` hook would give every provider a place for.
+  beside an OS sandbox and none.
+- Effort via maki's config means writing maki's config per run, a setup step
+  for the `prepare` hook in STR-024.

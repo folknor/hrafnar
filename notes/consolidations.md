@@ -67,72 +67,17 @@ fourth copy.
 
 Reported by: providers, lifecycle.
 
-Sources of the fact:
-- The `.interrupt` request file, written by `interrupt_cmd` before signalling
-  and consumed by each runner.
-- `stopped_by_signal` in each runner.
-- The keeper's private `interrupted` flag, which is never reported.
+Request handling has one owner: `provider::lifecycle` clears a stale request
+when a resume spawns and consumes the request in `Lease::settle`, under the
+lease lock and before the marker goes, for every provider. `stopped_by_signal`
+is the lifecycle's stop arm. Still separate sources of the one fact:
+- The keeper's private `interrupted` flag, which is never reported. The
+  proposal stands: the keeper reports whether it delivered a SIGINT
+  (`Event::Interrupted { by: Control | Signal }` or a field on `Done`), and the
+  request file then only says an external SIGINT was operator intent.
 - `interrupt_cmd`'s row scan for `digest.interrupted`.
-- Stale-request cleanup in two places: `read_live` drops orphaned requests,
-  and each runner drops a leftover request at resume start
-  (`take_interrupt_request` before launch, claude and codex separately).
-- `take_interrupt_request` after the wait, keyed on `marker_sid` in claude and
-  on `watched_session_id` in codex; grok does neither (harmless while a grok
-  request cannot be made, but a step a new runner will forget).
-
-What an interrupted run says: the answer-wins rule and the two termination
-strings now live once, in `Outcome::ended`. The "(interrupted by the operator
-before a final answer)" placeholder text is still written by claude and codex
-separately (see CON-007).
-
-Owner proposed: the keeper reports whether it delivered a SIGINT
-(`Event::Interrupted { by: Control | Signal }` or a field on `Done`), making
-"interrupted" one fact from one source; the request file then only tells the
-owner that an external SIGINT was operator intent, and even that can go if
-`interrupt_cmd` writes `i` down a path the owner reads. The interrupt text
-moves into the shared lifecycle driver.
-
-## CON-011 - When does the in-flight marker go up, and when is the pid offered?
-
-Reported by: providers, lifecycle.
-
-| Provider | Marker goes up | Pid offered |
-|---|---|---|
-| claude | always before spawn | after the `init` event |
-| codex | before spawn on resume; in a task once `thread.started` arrives on a fresh run | after the first stdout byte |
-| grok | before spawn on resume; after the whole first turn on a fresh run | never |
-
-The real rule, per the providers hunter, is "before spawn when the id is
-known, otherwise when it is learned; offer the pid once the provider has shown
-its handler is installed". A fresh grok run is invisible to `review sessions`
-for its entire first turn, which may be the longest. Both runners keep the
-marker alive by moving the guard into a task parked on `future::pending()`,
-then `abort()` plus `await` to drop it at the right time, with ordering
-comments in both. Owner proposed: one lifecycle function parameterised by the
-session-id policy and a readiness signal from the stream decoder; the
-lifecycle hunter's `Run` handle owns the marker and takes `set_session(id)` and
-`signal_ready()` as method calls, removing the parked task.
-
-## CON-012 - How is a run stopped when `review` is signalled?
-
-Reported by: lifecycle, providers.
-
-The claude and codex wait loops each contain the same arm:
-
-```rust
-Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
-    stopped_by_signal = true;
-    if *first_seen.borrow() { contained.interrupt() } else { contained.terminate() }
-}
-```
-
-Each also has its own first-output watch channel (`first_tx` in claude,
-`first_output_tx` in codex), its own parked marker task, and its own
-`take_interrupt_request(..) || stopped_by_signal`. This is the part maki and
-opencode would copy. Owner proposed: `Contained`, told `signal_ready()` once
-(which also writes the marker's readiness), exposing `stop_gracefully()` that
-interrupts or terminates by readiness; the supervisor reaches every contained
-run through the registry rather than a per-runner `select!` arm.
+- The "(interrupted by the operator before a final answer)" placeholder text,
+  still written by claude and codex separately (see CON-007).
 
 ## CON-013 - Is shutdown under way?
 
