@@ -16,7 +16,10 @@ cannot be launched.
 
 `review interrupt <ID>` ends a codex or claude turn without a message, waits
 for its run to record the session, and prints the `review message` command that
-continues it.
+continues it. A run already finishing waits for its exact handoff, without
+sending another signal. Active runs from an older review without handoff
+support are refused before signalling; wait for them to finish. Old recorded
+sessions remain readable and can still be continued.
 
 **Never stop or kill the `review` process to interrupt an agent.** A first
 SIGINT or SIGTERM makes `review` try to end its codex and claude turns

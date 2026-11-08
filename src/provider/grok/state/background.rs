@@ -1,3 +1,54 @@
+use super::Grok;
+
+/// The existing update fold found no unread work, found work to deliver, or
+/// could not inspect the log. Clean does not claim log completeness: empty
+/// logs and future JSON objects retain their historical acceptance.
+#[derive(Debug)]
+pub(in crate::provider::grok) enum WakeCheck {
+    Clean,
+    Unread(Vec<Unread>),
+    Unverifiable(WakeReason),
+}
+
+#[derive(Debug)]
+pub(in crate::provider::grok) enum WakeReason {
+    UnavailableLog {
+        session: String,
+    },
+    InvalidLog {
+        line: usize,
+        source: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for WakeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnavailableLog { session } => {
+                write!(f, "cannot read update log for grok session {session}")
+            }
+            Self::InvalidLog { line, source } => {
+                write!(f, "grok update log line {line} is not valid JSON: {source}")
+            }
+        }
+    }
+}
+
+impl Grok {
+    pub(in crate::provider::grok) fn wake_check(&self, session: &str) -> WakeCheck {
+        let Some(log) = super::events::session_updates(&self.home, session) else {
+            return WakeCheck::Unverifiable(WakeReason::UnavailableLog {
+                session: session.to_string(),
+            });
+        };
+        match unread_background_results(&log) {
+            Ok(items) if items.is_empty() => WakeCheck::Clean,
+            Ok(items) => WakeCheck::Unread(items),
+            Err(reason) => WakeCheck::Unverifiable(reason),
+        }
+    }
+}
+
 /// Prompt ids grok gives the turns it starts itself when background work
 /// finishes (`notification_bridge.rs`), as opposed to the UUID of a turn a
 /// caller started.
@@ -142,7 +193,7 @@ impl Unread {
 /// unread" would make the guarantee fail open exactly when it cannot be checked.
 pub(in crate::provider::grok) fn unread_background_results(
     updates: &str,
-) -> Result<Vec<Unread>, String> {
+) -> Result<Vec<Unread>, WakeReason> {
     let mut started: Vec<(usize, WorkId, serde_json::Value)> = Vec::new();
     let mut finished: Vec<(usize, Unread)> = Vec::new();
     // Shell completions the model was not waiting for (`will_wake`): grok
@@ -154,8 +205,12 @@ pub(in crate::provider::grok) fn unread_background_results(
         if line.trim().is_empty() {
             continue;
         }
-        let v = serde_json::from_str::<serde_json::Value>(line)
-            .map_err(|e| format!("grok update log line {} is not valid JSON: {e}", i + 1))?;
+        let v = serde_json::from_str::<serde_json::Value>(line).map_err(|source| {
+            WakeReason::InvalidLog {
+                line: i + 1,
+                source,
+            }
+        })?;
         let update = &v["params"]["update"];
         let text = |key: &str| update[key].as_str().map(str::to_string);
         match update["sessionUpdate"].as_str() {
@@ -419,6 +474,36 @@ mod tests {
             .iter()
             .map(Unread::id)
             .collect()
+    }
+
+    #[test]
+    fn wake_check_classifies_unavailable_invalid_clean_and_unread_logs() {
+        use super::super::test_support::{grok_at, scratch};
+        let home = scratch();
+        let grok = grok_at(&home);
+        assert!(matches!(
+            grok.wake_check("missing"),
+            WakeCheck::Unverifiable(WakeReason::UnavailableLog { .. })
+        ));
+        let dir = home.join("sessions/fixture/session");
+        std::fs::create_dir_all(&dir).expect("session directory");
+        let path = dir.join("updates.jsonl");
+        std::fs::write(&path, "{}\n{broken").expect("invalid log");
+        assert!(matches!(
+            grok.wake_check("session"),
+            WakeCheck::Unverifiable(WakeReason::InvalidLog { line: 2, .. })
+        ));
+        for log in ["", "{}", "{}\n"] {
+            std::fs::write(&path, log).expect("accepted log");
+            assert!(matches!(grok.wake_check("session"), WakeCheck::Clean));
+        }
+        std::fs::write(
+            &path,
+            r#"{"params":{"update":{"sessionUpdate":"task_backgrounded","task_id":"task"}}}"#,
+        )
+        .expect("unread work");
+        assert!(matches!(grok.wake_check("session"), WakeCheck::Unread(items) if items.len() == 1));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

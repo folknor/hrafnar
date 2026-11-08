@@ -315,20 +315,30 @@ mod tests {
     #[test]
     fn the_sandbox_table_states_each_providers_level() {
         use crate::provider::Provider;
-        let columns: Vec<&str> = [Provider::Codex, Provider::Grok, Provider::Claude]
-            .iter()
-            .map(|p| p.as_str())
+        // Documentation remains an independent oracle. Derive only its
+        // vocabulary/order from the header, not the expected permission cells.
+        let header = topic("sandbox")
+            .lines()
+            .find(|line| line.starts_with("| `sandbox` |"))
+            .expect("sandbox header");
+        let columns: Vec<&str> = header
+            .trim_matches('|')
+            .split('|')
+            .skip(1)
+            .map(str::trim)
             .collect();
-        let mut sorted = columns.clone();
-        sorted.sort_unstable();
-        let mut all: Vec<&str> = Provider::all().iter().map(|p| p.as_str()).collect();
+        let mut documented: Vec<Provider> = columns
+            .iter()
+            .map(|name| name.parse().expect("documented provider"))
+            .collect();
+        documented.sort_unstable();
+        let mut all = Provider::all().to_vec();
         all.sort_unstable();
         assert_eq!(
-            sorted, all,
-            "the sandbox table needs one column per provider"
+            documented, all,
+            "the sandbox table needs exactly one column per provider"
         );
-        let header = format!("| `sandbox` | {} |", columns.join(" | "));
-        let rows = table(topic("sandbox"), &header);
+        let rows = table(topic("sandbox"), header);
         let levels: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
         assert_eq!(
             levels,
@@ -338,6 +348,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         for r in &rows {
+            assert_eq!(r.len(), columns.len() + 1, "one cell per provider: {r:?}");
             for (i, name) in columns.iter().enumerate() {
                 let p: Provider = name.parse().expect("a provider");
                 let cell = &r[i + 1];
@@ -354,9 +365,15 @@ mod tests {
 
     #[test]
     fn the_reserved_words_table_is_reserved_names_exactly() {
+        // Clap owns names; the separately authored operator table must still
+        // be checked against it. Generating its expected cells would hide drift.
         let rows = table(topic("config"), "| Reserved word | Why |");
         let documented: BTreeSet<&str> = rows.iter().map(|r| r[0].as_str()).collect();
-        let actual: BTreeSet<&str> = crate::config::RESERVED_NAMES.iter().copied().collect();
+        assert_eq!(documented.len(), rows.len(), "duplicate reserved word rows");
+        let actual: BTreeSet<&str> = crate::config::reserved_names()
+            .iter()
+            .map(String::as_str)
+            .collect();
         assert_eq!(documented, actual);
     }
 }

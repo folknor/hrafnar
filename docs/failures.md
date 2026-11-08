@@ -80,7 +80,7 @@ What could not be ended is printed above the `runtime:` line, and the command
 exits `3` even if every run answered:
 
 - `left running: N processes <run> started survived teardown`, then one line per
-  process with its pid and command line. `at least N` means more remain that
+  process with its pid and command line. `at least N` means more may remain that
   could not be identified.
 - `teardown outcome unknown: <run> (keeper pid N) - <reason>`: `review` could
   not confirm the teardown, so processes the run started may still be running;

@@ -1,6 +1,4 @@
-use anyhow::Result;
 use serde::Serialize;
-use std::path::Path;
 
 #[derive(Serialize)]
 struct AuditEntry {
@@ -22,95 +20,53 @@ struct AuditEntry {
     leftovers: Option<crate::contained::Leftovers>,
 }
 
-fn audit_dir(project_root: &Path, private: bool, audit_id: &str) -> Option<std::path::PathBuf> {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-        })
-        .ok()?;
-
-    let hostname = crate::config::hostname();
-    let project_name = project_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let dir_name = format!("{hostname}-{project_name}-{audit_id}");
-
-    let base = if private {
-        data_dir.join("review").join("audit-private")
-    } else {
-        data_dir.join("review").join("audit")
-    };
-
-    Some(base.join(dir_name))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn log_result(
-    project_root: &Path,
-    private: bool,
-    audit_id: &str,
-    archetype: &str,
-    provider: &str,
-    session: &str,
-    prompt: &str,
-    result: &Result<crate::provider::Turn>,
-    digest: Option<&crate::provider::DigestSummary>,
-    leftovers: &crate::contained::Leftovers,
-) {
-    let dir = match audit_dir(project_root, private, audit_id) {
+pub(crate) fn log_result(
+    data: &crate::data::DataDir,
+    scope: &crate::data::LogScope,
+    row: &crate::sessions::SessionRow,
+) -> bool {
+    let project_root = std::path::Path::new(&row.project);
+    let dir = match data.audit(project_root, scope) {
         Some(d) => d,
         None => {
             eprintln!("warning: could not determine audit directory (HOME not set)");
-            return;
+            return false;
         }
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("warning: failed to create audit dir: {e}");
-        return;
+        return false;
     }
 
     let path = dir.join("audit.jsonl");
 
     let entry = AuditEntry {
-        timestamp: chrono_now(),
-        project: project_root.to_string_lossy().to_string(),
-        archetype: archetype.to_string(),
-        provider: provider.to_string(),
-        session: session.to_string(),
-        prompt: prompt.to_string(),
-        response: result.as_ref().ok().map(|turn| turn.text.clone()),
-        error: result.as_ref().err().map(ToString::to_string),
-        digest: digest.cloned(),
-        leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),
+        timestamp: row.timestamp.clone(),
+        project: row.project.clone(),
+        archetype: row.archetype.clone(),
+        provider: row.provider.clone(),
+        session: row.session_id.clone(),
+        prompt: row.assembled_prompt.clone(),
+        response: row.response.clone(),
+        error: row.error.clone(),
+        digest: row.digest.clone(),
+        leftovers: row.leftovers.clone(),
     };
 
     let line = match serde_json::to_string(&entry) {
         Ok(json) => json,
         Err(e) => {
             eprintln!("warning: failed to serialize audit entry: {e}");
-            return;
+            return false;
         }
     };
 
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(f) => f,
+    match crate::fsutil::append_jsonl(&path, line.as_bytes()) {
+        Ok(()) => true,
         Err(e) => {
-            eprintln!("warning: failed to open audit log: {e}");
-            return;
+            eprintln!("warning: failed to append audit entry: {e}");
+            false
         }
-    };
-
-    // One `write_all` of the whole line - see `sessions::record`.
-    use std::io::Write;
-    if let Err(e) = file.write_all(format!("{line}\n").as_bytes()) {
-        eprintln!("warning: failed to write audit entry: {e}");
     }
 }
 

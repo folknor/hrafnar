@@ -13,7 +13,7 @@
 //! holds the stdout pipe open and ignores `SIGTERM`. None of that can be
 //! exercised by faking a return value - it needs a real child process, a real
 //! pipe, a real process group and a real kill. So these tests run the actual
-//! `run_codex_json` against a shell script that reproduces each hang shape
+//! `invoke` against a shell script that reproduces each hang shape
 //! deterministically.
 //!
 //! This matters because the watchdog *kills a live codex*. Before this file the
@@ -31,7 +31,7 @@
 //! Scratch files live under `target/test-scratch/<uuid>/` (per the project rule
 //! that data lives in the repo rather than `/tmp`) and are removed on success.
 //!
-//! `ProviderRuntime::data_root` is also redirected there, and that is load-bearing
+//! `ProviderRuntime::data` is also redirected there, and that is load-bearing
 //! rather than tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s
 //! own data paths still resolved from the test process's real
 //! `HOME`/`XDG_DATA_HOME`. Before the override existed, running this suite
@@ -52,17 +52,45 @@
 //! `incident::version_probe` must keep its stdin set to null so a shell that
 //! handles an unknown option by reading stdin cannot hang the bundle write.
 
+#[path = "support/codex.rs"]
+mod fixtures;
+
 use anyhow::Result;
 use review::provider::{
-    Digest, Provider, ProviderCommand, ProviderCommands, ProviderRuntime, RunOutput,
-    new_output_file, run_claude, run_codex_json,
+    Digest, Provider, ProviderCommand, ProviderCommands, ProviderResult, ProviderRuntime, invoke,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Retain the invocation reservation through receipt publication and assertions.
+/// Assertion fields may be moved independently; the owner stays in this scope.
+struct FixtureRun {
+    text: String,
+    outcome: review::provider::Outcome,
+    session_id: Option<String>,
+    digest: Option<Digest>,
+    leftovers: review::contained::Leftovers,
+    owner: ProviderResult,
+}
+
+fn fixture_run(mut owner: ProviderResult) -> Result<FixtureRun> {
+    let turn = std::mem::replace(
+        &mut owner.output,
+        Err(anyhow::anyhow!("fixture extracted turn")),
+    )?;
+    Ok(FixtureRun {
+        text: turn.text,
+        outcome: turn.outcome,
+        session_id: owner.session_id.take(),
+        digest: owner.digest.take(),
+        leftovers: std::mem::take(&mut owner.leftovers),
+        owner,
+    })
+}
+
 /// The flat persisted form of a run: its outcome over its forensics (or
 /// none), which is what the assertions below read the outcome facts from.
-fn summary_of(run: &RunOutput) -> review::provider::DigestSummary {
+fn summary_of(run: &FixtureRun) -> review::provider::DigestSummary {
     match &run.digest {
         Some(d) => d.summary(&run.outcome),
         None => Digest::default().summary(&run.outcome),
@@ -178,11 +206,12 @@ impl Scratch {
             .expect("create rollout directory");
         std::fs::write(
             rollout,
-            concat!(
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"OLD PREVIOUS ANSWER\",\"phase\":\"final_answer\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"OLD PREVIOUS ANSWER\"}}\n",
-                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"primary\":{\"used_percent\":99.0}}}}\n",
+            format!("{}\n{}\n{}\n{}\n{}\n",
+                fixtures::metadata(STUB_SESSION),
+                fixtures::event(Some("event_msg"), "task_started"),
+                fixtures::legacy_message("OLD PREVIOUS ANSWER", "final_answer"),
+                fixtures::event(Some("event_msg"), "task_complete"),
+                r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":99.0}}}}"#,
             ),
         )
         .expect("seed previous rollout turn");
@@ -208,6 +237,9 @@ impl Drop for Scratch {
 /// Shell fragment: emit `thread.started` on stdout and create the rollout with
 /// a `task_started`. Shared by every stub.
 fn stub_preamble() -> String {
+    let metadata = fixtures::metadata(STUB_SESSION);
+    let started = fixtures::event(Some("event_msg"), "task_started");
+    let message = fixtures::legacy_message("MESSAGE_PLACEHOLDER", "PHASE_PLACEHOLDER");
     format!(
         r#"
 # Record our own pid so a test that deliberately leaves this process unreaped
@@ -218,8 +250,13 @@ cat > /dev/null
 ROLL_DIR="$CODEX_HOME/sessions/2026/01/01"
 mkdir -p "$ROLL_DIR"
 ROLL="$ROLL_DIR/rollout-2026-01-01T00-00-00-{STUB_SESSION}.jsonl"
+rollout_started() {{ printf '%s\n' '{started}' >> "$ROLL"; }}
+rollout_message() {{
+    printf '%s\n' '{message}' | sed "s/MESSAGE_PLACEHOLDER/$1/;s/PHASE_PLACEHOLDER/$2/" >> "$ROLL"
+}}
+if [ ! -s "$ROLL" ]; then printf '%s\n' '{metadata}' > "$ROLL"; fi
 printf '%s\n' '{{"type":"thread.started","thread_id":"{STUB_SESSION}"}}'
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$ROLL"
+rollout_started
 "#
     )
 }
@@ -229,6 +266,9 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$
 /// comfortably shorter than the quiet grace).
 fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
     ProviderRuntime {
+        run_id: review::sessions::handoff::RunId::default(),
+        reservation: None,
+        predecessor: None,
         // Execute the stable system shell, not the fixture file another test
         // thread may still have open for writing. The script path is argv[0]
         // from the shell's perspective; see `run_stub_with`.
@@ -254,11 +294,11 @@ fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
             stall_grace: Some(std::time::Duration::from_millis(600)),
         },
         drain_grace: std::time::Duration::from_millis(300),
-        data_root: Some(scratch.data_root()),
+        data: review::data::DataDir::at(scratch.data_root()),
+        log_family: review::data::LogFamily::Public,
         // One domain per fixture, shared by its turns and version probes.
         lifecycle: review::supervisor::Lifecycle::default(),
         teardown: fast_teardown(),
-        orphan_log: Some(scratch.data_root().join("review/teardowns.jsonl")),
     }
 }
 
@@ -268,18 +308,21 @@ fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
 fn fast_teardown() -> review::contained::Settings {
     review::contained::Settings {
         keeper: PathBuf::from(env!("CARGO_BIN_EXE_review")),
-        leftover_grace: std::time::Duration::from_millis(200),
-        terminate_grace: std::time::Duration::from_millis(400),
-        kill_phase: std::time::Duration::from_millis(600),
-        beat: std::time::Duration::from_millis(20),
+        schedule: review::keeper::TeardownSchedule {
+            leftover_grace: std::time::Duration::from_millis(200),
+            terminate_grace: std::time::Duration::from_millis(400),
+            kill_phase: std::time::Duration::from_millis(600),
+            beat: std::time::Duration::from_millis(20),
+            flush: std::time::Duration::from_secs(2),
+        },
         startup: std::time::Duration::from_secs(10),
-        flush: std::time::Duration::from_secs(2),
+        probe_timeout: std::time::Duration::from_secs(10),
     }
 }
 
 /// Run the stub through the real codex path as a fresh (oneshot) run, with the
 /// default fast timings.
-async fn run_stub(scratch: &Scratch, script: String) -> Result<RunOutput> {
+async fn run_stub(scratch: &Scratch, script: String) -> Result<FixtureRun> {
     let runtime = fast_runtime(scratch);
     run_stub_with(scratch, &script, &runtime).await
 }
@@ -290,104 +333,107 @@ async fn run_stub_with(
     scratch: &Scratch,
     script: &str,
     runtime: &ProviderRuntime,
-) -> Result<RunOutput> {
-    let out_file = new_output_file().expect("create -o file");
-    let mut env = BTreeMap::new();
-    env.insert(
-        "CODEX_HOME".to_string(),
-        scratch.codex_home().to_string_lossy().into_owned(),
-    );
-    // The real codex learns its `-o` path from argv; the stub takes it from the
-    // environment so it does not have to parse arguments.
-    env.insert("LAST_MSG".to_string(), out_file.clone());
-    // Where a stub records the pid of a process it intentionally leaves behind.
-    env.insert(
-        "LINGER_PID".to_string(),
-        scratch
-            .root
-            .join("linger.pid")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    let project = scratch.project();
-    run_codex_json(
-        &review::provider::LaunchSpec {
-            provider: Provider::Codex,
-            start: review::provider::SessionStart::Fresh { id: None },
-            settings: fixture_settings(
-                Provider::Codex,
-                review::config::Profile {
-                    env: Some(env.clone()),
-                    ..Default::default()
-                },
-            ),
-            prompt: ("review this").to_owned(),
-            root: project.clone(),
-        },
-        vec![
-            script.to_string(),
-            "exec".to_string(),
-            "--json".to_string(),
-            "-o".to_string(),
-            out_file.clone(),
-        ],
-        &out_file,
-        None,
-        None,
-        runtime,
-    )
-    .await
+) -> Result<FixtureRun> {
+    run_codex_stub(scratch, script, runtime, None, None).await
 }
 
-/// Resume an existing stub session so the runner scopes its transcript from
-/// the rollout's pre-launch byte length.
-async fn run_resume_stub(scratch: &Scratch, script: &str) -> Result<RunOutput> {
-    let out_file = new_output_file().expect("create -o file");
-    let mut env = BTreeMap::new();
-    env.insert(
-        "CODEX_HOME".to_string(),
-        scratch.codex_home().to_string_lossy().into_owned(),
+// This prefix learns the output path from the real adapter argv, rather than
+// manufacturing a second launch specification in the test.
+const CODEX_STUB_ARGS: &str = r#"
+printf '%s\n' "$@" > "$CODEX_HOME/args"
+LAST_MSG=
+expect_output=0
+output_flags=0
+for a in "$@"; do
+    if [ "$expect_output" = 1 ]; then
+        LAST_MSG=$a
+        expect_output=0
+    elif [ "$a" = -o ]; then
+        output_flags=$((output_flags+1))
+        expect_output=1
+    fi
+done
+[ "$expect_output" = 0 ] && [ "$output_flags" = 1 ] && [ -n "$LAST_MSG" ] || exit 92
+export LAST_MSG
+"#;
+
+async fn run_codex_stub(
+    scratch: &Scratch,
+    script: &str,
+    runtime: &ProviderRuntime,
+    resume: Option<&str>,
+    launched: Option<review::provider::LaunchSignal>,
+) -> Result<FixtureRun> {
+    let shim = scratch.root.join("codex-argv.sh");
+    std::fs::write(&shim, format!("{CODEX_STUB_ARGS}\n. \"$STUB_BODY\"\n"))
+        .expect("write argv shim");
+    let mut runtime = runtime.clone();
+    let mut command = runtime.commands.get(Provider::Codex).clone();
+    // This scenario helper accepts a bare shell, or an invalid executable for
+    // refusal tests. Arbitrary prefixes are exercised separately through invoke.
+    assert!(
+        command.leading_args.is_empty(),
+        "scenario helper needs a bare interpreter"
     );
-    env.insert("LAST_MSG".to_string(), out_file.clone());
-    env.insert(
-        "LINGER_PID".to_string(),
-        scratch
-            .root
-            .join("linger.pid")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    let project = scratch.project();
-    let runtime = fast_runtime(scratch);
-    run_codex_json(
-        &review::provider::LaunchSpec {
-            provider: Provider::Codex,
-            start: review::provider::SessionStart::Resume(
-                review::provider::SessionId::parse(STUB_SESSION).expect("test id"),
-            ),
-            settings: fixture_settings(
-                Provider::Codex,
-                review::config::Profile {
-                    env: Some(env.clone()),
-                    ..Default::default()
-                },
-            ),
-            prompt: ("continue review").to_owned(),
-            root: project.clone(),
-        },
-        vec![
-            script.to_string(),
-            "exec".to_string(),
-            "resume".to_string(),
-            STUB_SESSION.to_string(),
-            "--json".to_string(),
-            "-o".to_string(),
-            out_file.clone(),
-        ],
-        &out_file,
-        Some(STUB_SESSION.to_string()),
+    command
+        .leading_args
+        .push(shim.to_string_lossy().into_owned());
+    runtime.commands.set(Provider::Codex, command);
+    let env = BTreeMap::from([
+        (
+            "CODEX_HOME".into(),
+            scratch.codex_home().to_string_lossy().into_owned(),
+        ),
+        ("STUB_BODY".into(), script.to_owned()),
+        (
+            "LINGER_PID".into(),
+            scratch
+                .root
+                .join("linger.pid")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    let start = match resume {
+        Some(id) => review::provider::SessionStart::Resume(review::provider::SessionId::parse(id)?),
+        None => review::provider::SessionStart::Fresh { id: None },
+    };
+    fixture_run(
+        invoke(
+            review::provider::LaunchSpec {
+                provider: Provider::Codex,
+                start,
+                settings: fixture_settings(
+                    Provider::Codex,
+                    review::config::Profile {
+                        env: Some(env),
+                        ..Default::default()
+                    },
+                ),
+                prompt: if resume.is_some() {
+                    "continue review"
+                } else {
+                    "review this"
+                }
+                .into(),
+                root: scratch.project(),
+            },
+            launched,
+            &runtime,
+            None,
+        )
+        .await,
+    )
+}
+
+/// Resume with the real pre-launch rollout baseline and production argv.
+async fn run_resume_stub(scratch: &Scratch, script: &str) -> Result<FixtureRun> {
+    run_codex_stub(
+        scratch,
+        script,
+        &fast_runtime(scratch),
+        Some(STUB_SESSION),
         None,
-        &runtime,
     )
     .await
 }
@@ -429,7 +475,7 @@ async fn stranded_completion_is_killed_and_recovered() {
     let scratch = Scratch::new();
     let stub = scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"STRANDED ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "STRANDED ANSWER" "final_answer"
 printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete"}}}}' >> "$ROLL"
 # Finished the work, now refuse to exit - the 0.147.0 hang.
 sleep 3600
@@ -477,9 +523,9 @@ async fn stranded_answer_survives_a_trailing_turn_with_content() {
         let scratch = Scratch::new();
         let stub = scratch.write_stub(&format!(
             r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"STRANDED ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "STRANDED ANSWER" "final_answer"
 printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete"}}}}' >> "$ROLL"
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$ROLL"
+rollout_started
 printf '%s\n' '{trailing}' >> "$ROLL"
 printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete"}}}}' >> "$ROLL"
 sleep 3600
@@ -524,7 +570,7 @@ async fn an_answered_run_is_stranded_even_with_a_shorter_stall_grace() {
     let scratch = Scratch::new();
     let stub = scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "ANSWER" "final_answer"
 sleep 3600
 "#,
         preamble = stub_preamble()
@@ -565,7 +611,7 @@ async fn a_mid_turn_wedge_trips_the_stall_timeout() {
         r#"{preamble}
 # An interim note only. codex tags these "commentary"; treating one as a result
 # would report "I am now doing X" as the review.
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}}}' >> "$ROLL"
+rollout_message "I am now regenerating the pilot." "commentary"
 printf '%s\n' '{{"type":"response_item","payload":{{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"{{}}"}}}}' >> "$ROLL"
 # Wedged mid-tool-call: silent from here, exactly like the field rollout that
 # stopped dead with a background cell still running.
@@ -606,7 +652,13 @@ sleep 3600
         "the observed silence duration must be recorded"
     );
     assert_eq!(
-        digest.codex().expect("codex").last_rollout_event.as_deref(),
+        digest
+            .codex()
+            .expect("codex")
+            .last_rollout_event
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
         Some("response_item/custom_tool_call"),
         "the last thing codex was doing must be recorded"
     );
@@ -626,7 +678,7 @@ async fn incident_bundle_scopes_resumed_rollout_and_uses_phase_aware_answers() {
     let cases = [
         (
             "commentary-only",
-            r#"printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"CURRENT COMMENTARY","phase":"commentary"}}' >> "$ROLL"
+            r#"rollout_message "CURRENT COMMENTARY" "commentary"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"CURRENT COMMENTARY"}}' >> "$ROLL"
 "#,
             false,
@@ -634,9 +686,9 @@ printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","last_agent
         ),
         (
             "answer-before-phantom",
-            r#"printf '%s\n' '{"type":"event_msg","payload":{"type":"agent_message","message":"CURRENT FINAL","phase":"final_answer"}}' >> "$ROLL"
+            r#"rollout_message "CURRENT FINAL" "final_answer"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"CURRENT FINAL"}}' >> "$ROLL"
-printf '%s\n' '{"type":"event_msg","payload":{"type":"task_started"}}' >> "$ROLL"
+rollout_started
 printf '%s\n' '{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>"}]}}' >> "$ROLL"
 printf '%s\n' '{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}' >> "$ROLL"
 "#,
@@ -739,7 +791,7 @@ async fn a_disabled_stall_timeout_never_fires() {
     let scratch = Scratch::new();
     let stub = scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"working","phase":"commentary"}}}}' >> "$ROLL"
+rollout_message "working" "commentary"
 sleep 3600
 "#,
         preamble = stub_preamble()
@@ -786,7 +838,7 @@ async fn an_advancing_rollout_is_never_killed() {
         r#"{preamble}
 # The answer exists from here on, so the answer gate is satisfied for the whole
 # remainder of the run.
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"REAL ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "REAL ANSWER" "final_answer"
 # Now keep working, well past quiet_grace, exactly as a live codex does (it
 # cannot stay silent for long). Killing here would be a false positive.
 i=0
@@ -842,7 +894,7 @@ async fn a_pipe_retaining_child_does_not_block_reaping_or_lose_output() {
     let scratch = Scratch::new();
     let stub = scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"PARTIAL","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "PARTIAL" "final_answer"
 # A non-JSON stdout line, which the digest surfaces as a log line. It is written
 # *before* the pipe is stranded, so it is the evidence that output captured
 # ahead of the drain-grace expiry is preserved rather than discarded.
@@ -938,7 +990,7 @@ async fn group_escalation_kills_a_sigterm_ignoring_descendant() {
     let scratch = Scratch::new();
     let stub = scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "ANSWER" "final_answer"
 # A descendant that refuses SIGTERM outright. Only the keeper's SIGKILL
 # escalation can reap it.
 sh -c 'trap "" TERM; echo $$ > "$LINGER_PID"; sleep 300' &
@@ -1012,7 +1064,7 @@ If this seems wrong, try rephrasing your request.";
 # which is what makes this indistinguishable from a mid-turn death without the
 # error events.
 printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"I am now mapping the parser tests."}}}}'
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now mapping the parser tests.","phase":"commentary"}}}}' >> "$ROLL"
+rollout_message "I am now mapping the parser tests." "commentary"
 # Codex says why it is stopping, as a pair of events carrying the same message.
 printf '%s\n' '{{"type":"error","message":"{refusal}"}}'
 printf '%s\n' '{{"type":"turn.failed","error":{{"message":"{refusal}"}}}}'
@@ -1068,7 +1120,7 @@ exit 1
 fn interruptible_stub(scratch: &Scratch, before: &str) -> String {
     scratch.write_stub(&format!(
         r#"{preamble}
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now working.","phase":"commentary"}}}}' >> "$ROLL"
+rollout_message "I am now working." "commentary"
 {before}
 trap 'printf "%s\n" "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"reason\":\"interrupted\"}}}}" >> "$ROLL"; exit 1' INT
 # Short sleeps, so the trap runs promptly: sh defers it until the foreground
@@ -1081,33 +1133,58 @@ while :; do sleep 0.05; done
 
 /// Run `stub` as the owner and `interrupt_cmd::interrupt` against it, the way
 /// `review interrupt` would from another process. The owner's sidecar row -
-/// which `run_codex_json` does not write itself - is appended when its run
+/// which `invoke` does not write itself - is appended when its run
 /// returns, as the fan-out task does.
+fn publish_stub_handoff(runtime: &ProviderRuntime, run: &FixtureRun) {
+    // These tests drive invoke without the app recording layer. Model the app's durable append
+    // before publishing the exact invocation handoff, rather than fake a log
+    // polling closure; app recording itself has an injected-domain test.
+    let path = runtime
+        .data
+        .sessions(review::data::LogFamily::Public)
+        .expect("sessions path");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let row = serde_json::json!({
+        "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
+        "audit_id": "a", "provider": run.owner.provider.as_str(), "archetype": "bare",
+        "session_id": run.session_id, "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
+    });
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("log")
+        .write_all(format!("{row}\n").as_bytes())
+        .expect("append");
+    review::sessions::handoff::publish(
+        &runtime.data,
+        &review::sessions::handoff::Handoff {
+            schema: review::sessions::handoff::PROTOCOL,
+            requested: run.owner.run_id.clone().expect("invoke run id"),
+            interrupted: run.outcome.interrupted(),
+            final_session: run.session_id.clone(),
+            sidecar_written: true,
+        },
+    )
+    .expect("publish handoff");
+}
+
 async fn interrupt_stub(
     scratch: &Scratch,
     stub: &str,
-) -> (RunOutput, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
     let mut runtime = fast_runtime(scratch);
     // The stub is silent while it waits to be interrupted; the stall timeout
     // must not be what ends it.
     runtime.timings.stall_grace = None;
     let data_root = scratch.data_root();
-    let rows = std::sync::Mutex::new(Vec::<review::sessions::SessionRecord>::new());
 
     let owner = async {
         let run = run_stub_with(scratch, stub, &runtime)
             .await
             .expect("run completes");
-        let row = serde_json::json!({
-            "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
-            "audit_id": "a", "provider": "codex", "archetype": "bare",
-            "session_id": run.session_id.clone().expect("session id"),
-            "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
-            "digest": run.digest.as_ref().map(|d| d.summary(&run.outcome)),
-        });
-        rows.lock()
-            .expect("rows")
-            .push(serde_json::from_value(row).expect("row parses"));
+        publish_stub_handoff(&runtime, &run);
         run
     };
     let interrupter = async {
@@ -1115,7 +1192,8 @@ async fn interrupt_stub(
         // wait for it the way an operator would retry.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while review::inflight::live_marker(STUB_SESSION, Some(&data_root))
-            .and_then(|m| m.child_pid)
+            .filter(|m| m.signal_ready)
+            .and_then(|m| m.keeper.map(review::process::ProcessIdentity::pid))
             .is_none()
         {
             assert!(
@@ -1124,10 +1202,7 @@ async fn interrupt_stub(
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        review::interrupt_cmd::interrupt(STUB_SESSION, Some(&data_root), || {
-            rows.lock().expect("rows").clone()
-        })
-        .await
+        review::interrupt_cmd::interrupt(STUB_SESSION, Some(&data_root)).await
     };
     tokio::join!(owner, interrupter)
 }
@@ -1185,7 +1260,8 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
         // spoken; before that the group is killed instead.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while review::inflight::live_marker(STUB_SESSION, Some(&data_root))
-            .and_then(|m| m.child_pid)
+            .filter(|m| m.signal_ready)
+            .and_then(|m| m.keeper.map(review::process::ProcessIdentity::pid))
             .is_none()
         {
             assert!(
@@ -1252,7 +1328,7 @@ async fn a_run_that_already_answered_is_not_marked_interrupted() {
 // claude runner, against a stub `claude`
 //
 // The same process behaviours as codex - signals, process groups, the in-flight
-// marker, interrupt requests - driven through the real `run_claude`. The stub
+// marker, interrupt requests - driven through `invoke`. The stub
 // speaks claude's `stream-json`: an `init` event, then a `result`.
 // ---------------------------------------------------------------------------
 
@@ -1297,14 +1373,14 @@ while :; do sleep 0.05; done"#,
     )
 }
 
-/// Run `body` as claude through the real `run_claude`: a fresh run, or a resume
+/// Run `body` as claude through `invoke`: a fresh run, or a resume
 /// of `resume`.
 async fn run_claude_stub(
     scratch: &Scratch,
     body: &str,
     runtime: &ProviderRuntime,
     resume: Option<&str>,
-) -> Result<RunOutput> {
+) -> Result<FixtureRun> {
     let script = scratch.write_stub(&format!("{CLAUDE_STUB_PREAMBLE}\n{body}"));
     let mut runtime = runtime.clone();
     runtime.commands.set(
@@ -1319,33 +1395,34 @@ async fn run_claude_stub(
         "STUB_DIR".to_string(),
         scratch.root.to_string_lossy().into_owned(),
     );
-    run_claude(
-        &review::provider::LaunchSpec {
-            provider: Provider::Claude,
-            start: {
-                let mut start = match resume {
-                    Some(id) => review::provider::SessionStart::Resume(
-                        review::provider::SessionId::parse(id)?,
-                    ),
-                    None => review::provider::SessionStart::Fresh { id: None },
-                };
-                start.prepare(review::provider::Provider::Claude)?;
-                start
-            },
-            settings: fixture_settings(
-                Provider::Claude,
-                review::config::Profile {
-                    env: Some(env.clone()),
-                    ..Default::default()
+    fixture_run(
+        invoke(
+            review::provider::LaunchSpec {
+                provider: Provider::Claude,
+                start: {
+                    match resume {
+                        Some(id) => review::provider::SessionStart::Resume(
+                            review::provider::SessionId::parse(id)?,
+                        ),
+                        None => review::provider::SessionStart::Fresh { id: None },
+                    }
                 },
-            ),
-            prompt: ("review this").to_owned(),
-            root: scratch.project(),
-        },
-        None,
-        &runtime,
+                settings: fixture_settings(
+                    Provider::Claude,
+                    review::config::Profile {
+                        env: Some(env.clone()),
+                        ..Default::default()
+                    },
+                ),
+                prompt: ("review this").to_owned(),
+                root: scratch.project(),
+            },
+            None,
+            &runtime,
+            None,
+        )
+        .await,
     )
-    .await
 }
 
 #[tokio::test]
@@ -1369,9 +1446,9 @@ async fn claude_signalable(scratch: &Scratch) -> String {
     loop {
         if let Some(m) = review::inflight::read_live(Some(&data_root))
             .into_iter()
-            .find(|m| m.provider == "claude" && m.child_pid.is_some())
+            .find(|m| m.provider == "claude" && m.signal_ready)
         {
-            return m.session_id;
+            return m.session_id.clone();
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1387,7 +1464,7 @@ async fn claude_signalable(scratch: &Scratch) -> String {
 async fn claude_interrupt_stub(
     scratch: &Scratch,
     body: &str,
-) -> (RunOutput, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
     claude_interrupt_stub_at(scratch, body, true).await
 }
 
@@ -1398,24 +1475,14 @@ async fn claude_interrupt_stub_at(
     scratch: &Scratch,
     body: &str,
     after_pid: bool,
-) -> (RunOutput, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
     let runtime = fast_runtime(scratch);
     let data_root = scratch.data_root();
-    let rows = std::sync::Mutex::new(Vec::<review::sessions::SessionRecord>::new());
     let owner = async {
         let run = run_claude_stub(scratch, body, &runtime, None)
             .await
             .expect("run completes");
-        let row = serde_json::json!({
-            "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
-            "audit_id": "a", "provider": "claude", "archetype": "bare",
-            "session_id": run.session_id.clone().expect("session id"),
-            "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
-            "digest": run.digest.as_ref().map(|d| d.summary(&run.outcome)),
-        });
-        rows.lock()
-            .expect("rows")
-            .push(serde_json::from_value(row).expect("row parses"));
+        publish_stub_handoff(&runtime, &run);
         run
     };
     let interrupter = async {
@@ -1425,17 +1492,14 @@ async fn claude_interrupt_stub_at(
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 if let Some(m) = review::inflight::read_live(Some(&data_root)).pop() {
-                    assert!(m.child_pid.is_none(), "the stub has not spoken yet");
-                    break m.session_id;
+                    assert!(!m.signal_ready, "the stub has not spoken yet");
+                    break m.session_id.clone();
                 }
                 assert!(std::time::Instant::now() < deadline, "no marker");
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        review::interrupt_cmd::interrupt(&sid, Some(&data_root), || {
-            rows.lock().expect("rows").clone()
-        })
-        .await
+        review::interrupt_cmd::interrupt(&sid, Some(&data_root)).await
     };
     tokio::join!(owner, interrupter)
 }
@@ -1471,8 +1535,10 @@ async fn a_claude_run_launches_with_background_off_and_reports_its_answer() {
         assert!(env.lines().any(|l| l == var), "{var} must reach claude");
     }
     assert!(
-        review::inflight::read_live(Some(&scratch.data_root())).is_empty(),
-        "the in-flight marker goes when the run does"
+        review::inflight::read_live(Some(&scratch.data_root()))
+            .iter()
+            .all(|m| m.phase == review::inflight::Phase::HandoffPending),
+        "invoke retains pending evidence until recording or result drop"
     );
 }
 
@@ -1733,10 +1799,10 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
         root: project.clone(),
     };
     let (run, marked) = tokio::join!(
-        run_claude(&launch, Some(tx), &runtime),
+        invoke(launch, Some(tx), &runtime, None),
         marked_at_launch(rx, sid, &data_root)
     );
-    assert!(run.is_ok_and(|r| r.text == "ok"));
+    assert!(run.output.is_ok_and(|r| r.text == "ok"));
     assert!(marked, "the marker must exist when the launch is signalled");
 }
 
@@ -1748,40 +1814,10 @@ async fn a_codex_resume_is_marked_in_flight_before_it_launches() {
         stub_preamble()
     ));
     let runtime = fast_runtime(&scratch);
-    let out_file = new_output_file().expect("create -o file");
-    let mut env = BTreeMap::new();
-    env.insert(
-        "CODEX_HOME".to_string(),
-        scratch.codex_home().to_string_lossy().into_owned(),
-    );
-    env.insert("LAST_MSG".to_string(), out_file.clone());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let data_root = scratch.data_root();
-    let project = scratch.project();
-    let launch = review::provider::LaunchSpec {
-        provider: Provider::Codex,
-        start: review::provider::SessionStart::Resume(
-            review::provider::SessionId::parse(STUB_SESSION).expect("test id"),
-        ),
-        settings: fixture_settings(
-            Provider::Codex,
-            review::config::Profile {
-                env: Some(env),
-                ..Default::default()
-            },
-        ),
-        prompt: "more".into(),
-        root: project,
-    };
     let (run, marked) = tokio::join!(
-        run_codex_json(
-            &launch,
-            vec![stub, "exec".to_string(), "resume".to_string()],
-            &out_file,
-            Some(STUB_SESSION.to_string()),
-            Some(tx),
-            &runtime
-        ),
+        run_codex_stub(&scratch, &stub, &runtime, Some(STUB_SESSION), Some(tx)),
         marked_at_launch(rx, STUB_SESSION, &data_root)
     );
     assert!(run.is_ok());
@@ -1802,7 +1838,7 @@ async fn a_hung_process_in_its_own_session_is_ended_when_the_run_ends() {
 setsid sh -c 'trap "" TERM; echo $$ > "$LINGER_PID"; while :; do sleep 1; done' &
 # Wait until it has recorded itself, so the test can find it.
 while [ ! -s "$LINGER_PID" ]; do sleep 0.01; done
-printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"DONE","phase":"final_answer"}}}}' >> "$ROLL"
+rollout_message "DONE" "final_answer"
 printf '%s' 'DONE' > "$LAST_MSG"
 exit 0
 "#,
@@ -1998,6 +2034,7 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
         },
         None,
         &runtime,
+        None,
     )
     .await;
     assert_eq!(result.output.expect("answer").text, "ok");
@@ -2033,6 +2070,7 @@ async fn invalid_model_selection_is_refused_before_a_session_launches() {
         },
         None,
         &fast_runtime(&scratch),
+        None,
     )
     .await;
     let error = result
@@ -2085,7 +2123,8 @@ if [ "$1" = --version ]; then
     printf 'fixture-version\n'
     exit 0
 fi
-[ "$1" = exec ] && [ "$2" = --json ] || exit 63
+[ "$1" = exec ] || exit 63
+printf '%s\n' "$@" > "$CODEX_HOME/args"
 cat >/dev/null
 printf '%s\n' '{"type":"error","message":"fixture refusal"}' '{"type":"turn.failed","error":{"message":"fixture refusal"}}'
 exit 1
@@ -2102,30 +2141,36 @@ exit 1
             leading_args: prefix.clone(),
         },
     );
-    let out_file = new_output_file().expect("output file");
-    let args = vec!["exec".into(), "--json".into()];
-    let run = run_codex_json(
-        &review::provider::LaunchSpec {
-            provider: Provider::Codex,
-            start: review::provider::SessionStart::Fresh { id: None },
-            settings: fixture_settings(
-                Provider::Codex,
-                review::config::Profile {
-                    env: None,
-                    ..Default::default()
-                },
-            ),
-            prompt: ("prompt").to_owned(),
-            root: scratch.project(),
-        },
-        args.clone(),
-        &out_file,
-        None,
-        None,
-        &runtime,
+    let run = fixture_run(
+        invoke(
+            review::provider::LaunchSpec {
+                provider: Provider::Codex,
+                start: review::provider::SessionStart::Fresh { id: None },
+                settings: fixture_settings(
+                    Provider::Codex,
+                    review::config::Profile {
+                        env: Some(BTreeMap::from([(
+                            "CODEX_HOME".into(),
+                            scratch.codex_home().to_string_lossy().into_owned(),
+                        )])),
+                        ..Default::default()
+                    },
+                ),
+                prompt: ("prompt").to_owned(),
+                root: scratch.project(),
+            },
+            None,
+            &runtime,
+            None,
+        )
+        .await,
     )
-    .await
     .expect("fixture ran");
+    let args: Vec<String> = std::fs::read_to_string(scratch.codex_home().join("args"))
+        .expect("observed argv")
+        .lines()
+        .map(str::to_owned)
+        .collect();
     assert!(
         run.outcome
             .stated
@@ -2167,7 +2212,10 @@ async fn empty_command_program_fails_to_launch() {
         Ok(_) => panic!("empty executable must fail"),
         Err(error) => error,
     };
-    assert!(err.to_string().contains("failed to launch"), "{err:#}");
+    assert!(
+        err.to_string().contains("invalid keeper launch bytes"),
+        "{err:#}"
+    );
 }
 
 #[tokio::test]
@@ -2274,8 +2322,9 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             "prompt removed on return"
         );
         assert!(
-            review::inflight::live_marker(expected_sid, Some(&scratch.data_root())).is_none(),
-            "marker removed on return"
+            review::inflight::live_marker(expected_sid, Some(&scratch.data_root()))
+                .is_some_and(|m| m.phase == review::inflight::Phase::HandoffPending),
+            "provider return keeps handoff pending until the app records and publishes"
         );
     };
     for (start, mode, stop) in [
@@ -2316,6 +2365,7 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             },
             None,
             &runtime,
+            None,
         )
         .await;
         assert!(result.output.is_ok(), "fixture ran");
@@ -2389,6 +2439,7 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
         },
         None,
         &runtime,
+        None,
     )
     .await;
     assert_eq!(result.session_id.as_deref(), Some(wake_sid));
@@ -2487,6 +2538,7 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
             },
             None,
             &runtime,
+            None,
         )
         .await;
         assert!(base.join("launched").exists());
@@ -2534,6 +2586,7 @@ async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
         },
         None,
         &fast_runtime(&scratch),
+        None,
     )
     .await;
     assert!(
@@ -2552,4 +2605,636 @@ async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
             .selector(),
         Some("read-only")
     );
+}
+
+/// One fixture per wire protocol, sharing only process observation/transport.
+/// Every adapter still builds its entire argv and permission plan in invoke.
+fn protocol_fixture(
+    scratch: &Scratch,
+    provider: Provider,
+    resume: bool,
+    level: Option<review::config::SandboxLevel>,
+    mode: &str,
+) -> (review::provider::LaunchSpec, ProviderRuntime) {
+    let protocol = match provider {
+        Provider::Codex => {
+            r#"
+printf '%s\n' '{"type":"thread.started","thread_id":"01920000-0000-7000-8000-000000000001"}'
+[ "$STUB_MODE" != death ] || exit 7
+printf '%s' 'fixture answer' > "$out"
+"#
+        }
+        Provider::Claude => {
+            r#"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
+[ "$STUB_MODE" != death ] || exit 7
+printf '{"type":"result","is_error":false,"result":"fixture answer","session_id":"%s","num_turns":1}\n' "$sid"
+"#
+        }
+        // Grok has a single result, not an init stream. EOF before that object
+        // establishes no turn; this intentionally differs from the other two.
+        Provider::Grok => {
+            r#"
+[ "$STUB_MODE" != death ] || exit 7
+mkdir -p "$GROK_HOME/sessions/fixture/$sid"
+: > "$GROK_HOME/sessions/fixture/$sid/updates.jsonl"
+printf '{"text":"fixture answer","stopReason":"end_turn","sessionId":"%s","numTurns":1}\n' "$sid"
+"#
+        }
+    };
+    let script = scratch.write_stub(&format!(
+        r#"
+[ "$1" = 'prefix with spaces' ] || exit 81
+shift
+if [ "$1" = --version ]; then printf 'fixture-version\n'; exit 0; fi
+printf '%s\n' "$@" > "$STUB_DIR/argv"
+printf '%s\n' "$PWD" > "$STUB_DIR/pwd"
+pwd > "$STUB_DIR/cwd"
+printf '%s\n' "$$" > "$STUB_DIR/child-pid"
+out= prompt= sid=
+prev=
+for a in "$@"; do
+    case "$prev" in
+        -o) [ -z "$out" ] || exit 82; out=$a ;;
+        --prompt-file) [ -z "$prompt" ] || exit 83; prompt=$a ;;
+        --session-id|--resume) sid=$a ;;
+    esac
+    prev=$a
+done
+if [ -n "$prompt" ]; then cat "$prompt" > "$STUB_DIR/prompt"; else cat > "$STUB_DIR/prompt"; fi
+if [ "$STUB_MODE" = barrier ]; then
+    n=0
+    while [ ! -f "$STUB_DIR/release" ]; do
+        n=$((n+1)); [ "$n" -lt "$STUB_BARRIER_POLLS" ] || exit 84
+        sleep "$STUB_BARRIER_BEAT"
+    done
+fi
+{protocol}
+"#
+    ));
+    let mut runtime = fast_runtime(scratch);
+    runtime.commands.set(
+        provider,
+        ProviderCommand {
+            program: "/bin/sh".into(),
+            leading_args: vec![script, "prefix with spaces".into()],
+        },
+    );
+    let external = scratch.root.join("external root");
+    std::fs::create_dir_all(&external).expect("external root");
+    // A separate automatic derivation input, independent of configured roots
+    // and ambient HOME/CARGO_TARGET_DIR. Keep its native target observable.
+    let automatic = scratch.root.join("automatic target");
+    std::fs::create_dir_all(&automatic).expect("automatic target");
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(&automatic).expect("native target"),
+        scratch.project().join("target"),
+    )
+    .expect("project target symlink");
+    let env = BTreeMap::from([
+        (
+            "STUB_DIR".into(),
+            scratch.root.to_string_lossy().into_owned(),
+        ),
+        (
+            "CODEX_HOME".into(),
+            scratch.codex_home().to_string_lossy().into_owned(),
+        ),
+        (
+            "GROK_HOME".into(),
+            std::fs::canonicalize(&scratch.root)
+                .expect("native scratch path")
+                .join("grok-home")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("STUB_MODE".into(), mode.into()),
+        ("STUB_BARRIER_POLLS".into(), "1000".into()),
+        ("STUB_BARRIER_BEAT".into(), "0.01".into()),
+        ("PWD".into(), "/wrong-profile-pwd".into()),
+    ]);
+    let config = match provider {
+        Provider::Codex if mode != "derived" => vec![
+            "model=\"raw-model\"".into(),
+            "model_reasoning_effort=\"low\"".into(),
+            "sandbox_workspace_write.network_access=false".into(),
+            format!(
+                "sandbox_workspace_write.writable_roots={}",
+                toml::Value::Array(vec![toml::Value::String(
+                    external.to_string_lossy().into_owned()
+                )])
+            ),
+        ],
+        Provider::Codex | Provider::Claude | Provider::Grok => Vec::new(),
+    };
+    let launch = review::provider::LaunchSpec {
+        provider,
+        start: if resume {
+            review::provider::SessionStart::Resume(
+                review::provider::SessionId::parse(STUB_SESSION).expect("id"),
+            )
+        } else {
+            review::provider::SessionStart::Fresh { id: None }
+        },
+        settings: fixture_settings(
+            provider,
+            review::config::Profile {
+                model: Some("chosen-model".into()),
+                effort: Some("high".into()),
+                sandbox: level,
+                env: Some(env),
+                config,
+                writable_roots: vec![external.to_string_lossy().into_owned()],
+                ..Default::default()
+            },
+        ),
+        prompt: "prompt with spaces\nand a second line".into(),
+        root: scratch.project(),
+    };
+    (launch, runtime)
+}
+
+fn observed_args(scratch: &Scratch) -> Vec<String> {
+    std::fs::read_to_string(scratch.root.join("argv"))
+        .expect("argv")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Normalize only nondeterministic transport values, preserving every flag,
+/// argument boundary, duplication and precedence position in the oracle.
+fn normalized_args(scratch: &Scratch, result: &ProviderResult) -> Vec<String> {
+    let mut args = observed_args(scratch);
+    let mut previous = String::new();
+    for arg in &mut args {
+        let flag = arg.clone();
+        if previous == "-o" || previous == "--prompt-file" {
+            assert!(!Path::new(arg).exists(), "transport file removed on return");
+            *arg = "<file>".into();
+        } else if previous == "--session-id" || previous == "--resume" {
+            assert_eq!(Some(arg.as_str()), result.session_id.as_deref());
+            *arg = "<session>".into();
+        }
+        previous = flag;
+    }
+    args
+}
+
+#[tokio::test]
+async fn codex_launch_argv_table_covers_permissions_overrides_and_resume_output() {
+    use review::config::SandboxLevel;
+    for requested in std::iter::once(None).chain(SandboxLevel::NAMED.into_iter().map(Some)) {
+        let level = requested.clone().unwrap_or_default();
+        for resume in [false, true] {
+            let scratch = Scratch::new();
+            let (launch, runtime) = protocol_fixture(
+                &scratch,
+                Provider::Codex,
+                resume,
+                requested.clone(),
+                "answer",
+            );
+            assert!(
+                launch.settings.origin().is_some(),
+                "fixture selects a real profile"
+            );
+            let result = invoke(launch, None, &runtime, None).await;
+            if resume {
+                assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
+            }
+            assert_eq!(result.output.as_ref().expect("turn").text, "fixture answer");
+            assert_eq!(result.model.as_deref(), Some("chosen-model"));
+            assert_eq!(result.effort.as_deref(), Some("low"));
+            assert_eq!(
+                result.permissions.as_ref().and_then(|p| p.selector()),
+                Some(level.as_str())
+            );
+            let external = scratch
+                .root
+                .join("external root")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                result.writable_roots.as_slice(),
+                std::slice::from_ref(&external)
+            );
+            let mut expected: Vec<String> = [
+                "exec",
+                "--skip-git-repo-check",
+                "-c",
+                "approval_policy=\"never\"",
+                "--ignore-rules",
+                "--ignore-user-config",
+                "-c",
+                "model_reasoning_summary=\"detailed\"",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            match level {
+                SandboxLevel::ReadOnly => expected.extend(
+                    [
+                        "-c",
+                        "permissions.review-read-only.extends=\":read-only\"",
+                        "-c",
+                        "permissions.review-read-only.network.enabled=true",
+                        "-c",
+                        "default_permissions=\"review-read-only\"",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned),
+                ),
+                SandboxLevel::WorkspaceWrite | SandboxLevel::DangerFullAccess => {
+                    expected.extend(["--sandbox".into(), level.as_str().into()]);
+                }
+                SandboxLevel::Custom(_) => panic!("named levels only"),
+            }
+            expected.extend(
+                [
+                    "-m",
+                    "chosen-model",
+                    "-c",
+                    "model_reasoning_effort=\"high\"",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            // The generated effective roots and original raw override both reach
+            // the process. The independent literal pins their order/spelling.
+            let roots = format!("sandbox_workspace_write.writable_roots=[\"{external}\"]");
+            expected.extend(["-c".into(), roots]);
+            if level == SandboxLevel::WorkspaceWrite {
+                expected.extend([
+                    "-c".into(),
+                    "sandbox_workspace_write.network_access=true".into(),
+                ]);
+            }
+            expected.extend(
+                [
+                    "-c",
+                    "model=\"raw-model\"",
+                    "-c",
+                    "model_reasoning_effort=\"low\"",
+                    "-c",
+                    "sandbox_workspace_write.network_access=false",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            expected.extend([
+                "-c".into(),
+                format!(
+                    "sandbox_workspace_write.writable_roots={}",
+                    toml::Value::Array(vec![toml::Value::String(external)])
+                ),
+            ]);
+            if resume {
+                expected.extend(["resume".into(), STUB_SESSION.into()]);
+            }
+            expected.extend(["--json", "-o", "<file>"].into_iter().map(str::to_owned));
+            assert_eq!(
+                normalized_args(&scratch, &result),
+                expected,
+                "{level:?} resume={resume}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
+                "prompt with spaces\nand a second line"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn claude_launch_argv_table_keeps_permissions_and_session_modes_explicit() {
+    for requested in
+        std::iter::once(None).chain(review::config::SandboxLevel::NAMED.into_iter().map(Some))
+    {
+        for resume in [false, true] {
+            let scratch = Scratch::new();
+            let (launch, runtime) = protocol_fixture(
+                &scratch,
+                Provider::Claude,
+                resume,
+                requested.clone(),
+                "answer",
+            );
+            let result = invoke(launch, None, &runtime, None).await;
+            if resume {
+                assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
+            }
+            assert_eq!(result.output.as_ref().expect("turn").text, "fixture answer");
+            assert_eq!(result.model.as_deref(), Some("chosen-model"));
+            assert_eq!(result.effort.as_deref(), Some("high"));
+            assert_eq!(result.permissions.as_ref().and_then(|p| p.selector()), None);
+            assert!(result.writable_roots.is_empty());
+            let expected: Vec<_> = [
+                if resume { "--resume" } else { "--session-id" },
+                "<session>",
+                "--print",
+                "--permission-mode",
+                "dontAsk",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "chosen-model",
+                "--effort",
+                "high",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            assert_eq!(normalized_args(&scratch, &result), expected);
+            assert_eq!(
+                std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
+                "prompt with spaces\nand a second line"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
+    use review::config::SandboxLevel;
+    for requested in std::iter::once(None).chain(SandboxLevel::NAMED.into_iter().map(Some)) {
+        let level = requested.clone().unwrap_or_default();
+        for resume in [false, true] {
+            let scratch = Scratch::new();
+            let (launch, runtime) = protocol_fixture(
+                &scratch,
+                Provider::Grok,
+                resume,
+                requested.clone(),
+                "answer",
+            );
+            let result = invoke(launch, None, &runtime, None).await;
+            if resume {
+                assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
+            }
+            assert_eq!(result.output.as_ref().expect("turn").text, "fixture answer");
+            let selector = result
+                .permissions
+                .as_ref()
+                .and_then(|p| p.selector())
+                .expect("selector");
+            match level {
+                SandboxLevel::ReadOnly => {
+                    assert_eq!(selector, "read-only");
+                    assert!(result.writable_roots.is_empty());
+                }
+                SandboxLevel::DangerFullAccess => {
+                    assert_eq!(selector, "none");
+                    assert!(result.writable_roots.is_empty());
+                }
+                SandboxLevel::WorkspaceWrite => {
+                    assert!(selector.starts_with("review-ws-"));
+                    let automatic = std::fs::canonicalize(scratch.root.join("automatic target"))
+                        .expect("automatic grant");
+                    assert!(
+                        result
+                            .writable_roots
+                            .iter()
+                            .any(|p| Path::new(p) == automatic)
+                    );
+                    assert!(
+                        result.writable_roots.contains(
+                            &std::fs::canonicalize(scratch.root.join("external root"))
+                                .expect("resolved grant")
+                                .to_string_lossy()
+                                .into_owned()
+                        )
+                    );
+                    let profiles: toml::Table =
+                        std::fs::read_to_string(scratch.root.join("grok-home/sandbox.toml"))
+                            .expect("generated profiles")
+                            .parse()
+                            .expect("profiles TOML");
+                    assert_eq!(
+                        profiles["profiles"][selector]["extends"].as_str(),
+                        Some("workspace")
+                    );
+                    let actual = profiles["profiles"][selector]["read_write"]
+                        .as_array()
+                        .expect("roots");
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|v| v.as_str().expect("path"))
+                            .collect::<Vec<_>>(),
+                        result
+                            .writable_roots
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                SandboxLevel::Custom(_) => panic!("named levels only"),
+            }
+            let mut expected: Vec<String> = [
+                if resume { "--resume" } else { "--session-id" },
+                "<session>",
+                "--prompt-file",
+                "<file>",
+                "--output-format",
+                "json",
+                "--permission-mode",
+                "dontAsk",
+                "--sandbox",
+                selector,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+            if level == SandboxLevel::WorkspaceWrite {
+                expected.push("--trust".into());
+            }
+            expected.extend(
+                [
+                    "-m",
+                    "chosen-model",
+                    "--reasoning-effort",
+                    "high",
+                    "--background-wait-timeout",
+                    "1200",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            assert_eq!(normalized_args(&scratch, &result), expected);
+            assert_eq!(result.model.as_deref(), Some("chosen-model"));
+            assert_eq!(result.effort.as_deref(), Some("high"));
+            assert_eq!(
+                std::fs::read_to_string(scratch.root.join("prompt")).expect("prompt"),
+                "prompt with spaces\nand a second line"
+            );
+            assert!(
+                result.grok_trust.is_none(),
+                "a flag alone proves no durable grant"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
+    use review::config::SandboxLevel;
+    for provider in Provider::all() {
+        let scratch = Scratch::new();
+        let (launch, runtime) = protocol_fixture(
+            &scratch,
+            *provider,
+            true,
+            Some(SandboxLevel::ReadOnly),
+            "barrier",
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let observer = async {
+            rx.await.expect("launch handshake");
+            let marker = review::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
+                .expect("resume marked by launch notification");
+            assert_eq!(marker.phase, review::inflight::Phase::Running);
+            std::fs::write(scratch.root.join("release"), "go").expect("release fixture");
+        };
+        let (result, ()) = tokio::join!(invoke(launch, Some(tx), &runtime, None), observer);
+        assert!(
+            !result
+                .output
+                .as_ref()
+                .expect("established turn")
+                .outcome
+                .failed(),
+            "{provider}"
+        );
+        let marker = review::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
+            .expect("pending");
+        assert_eq!(
+            marker.run_id,
+            result.run_id.as_ref().expect("run id").as_str()
+        );
+        assert_eq!(marker.phase, review::inflight::Phase::HandoffPending);
+        for file in ["pwd", "cwd"] {
+            assert_eq!(
+                std::fs::read_to_string(scratch.root.join(file))
+                    .expect("cwd observation")
+                    .trim(),
+                scratch.project().to_str().expect("project")
+            );
+        }
+        let pid = std::fs::read_to_string(scratch.root.join("child-pid"))
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        assert!(!pid_alive(pid), "keeper reaped {provider}");
+        assert!(result.leftovers.is_clean());
+        assert!(runtime.lifecycle.unresolved().is_empty());
+        drop(result);
+        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+
+        let scratch = Scratch::new();
+        let (launch, runtime) = protocol_fixture(
+            &scratch,
+            *provider,
+            false,
+            Some(SandboxLevel::ReadOnly),
+            "answer",
+        );
+        runtime.lifecycle.request_stop();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let result = invoke(launch, Some(tx), &runtime, None).await;
+        assert!(
+            result.output.is_err(),
+            "stopped {provider} must refuse before spawn"
+        );
+        assert!(rx.await.is_err());
+        assert!(!scratch.root.join("child-pid").exists());
+        drop(result);
+        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+
+        let scratch = Scratch::new();
+        let (launch, runtime) = protocol_fixture(
+            &scratch,
+            *provider,
+            false,
+            Some(SandboxLevel::ReadOnly),
+            "death",
+        );
+        let result = invoke(launch, None, &runtime, None).await;
+        match provider {
+            Provider::Codex | Provider::Claude => {
+                let turn = result
+                    .output
+                    .as_ref()
+                    .expect("initial event established the turn");
+                assert!(!turn.outcome.has_answer());
+                assert!(turn.outcome.failed());
+                assert_eq!(
+                    result.digest.as_ref().expect("death digest").exit.code(),
+                    Some(7)
+                );
+                assert!(result.session_id.is_some());
+            }
+            Provider::Grok => assert!(
+                result.output.is_err(),
+                "EOF without its result established no Grok turn"
+            ),
+        }
+        assert!(runtime.lifecycle.unresolved().is_empty());
+        drop(result);
+        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn codex_derived_roots_reach_both_the_process_and_record_projection() {
+    let scratch = Scratch::new();
+    let (launch, runtime) = protocol_fixture(
+        &scratch,
+        Provider::Codex,
+        false,
+        Some(review::config::SandboxLevel::WorkspaceWrite),
+        "derived",
+    );
+    let result = invoke(launch, None, &runtime, None).await;
+    assert_eq!(result.output.as_ref().expect("turn").text, "fixture answer");
+    let external =
+        std::fs::canonicalize(scratch.root.join("external root")).expect("canonical root");
+    assert!(
+        result
+            .writable_roots
+            .iter()
+            .any(|p| Path::new(p) == external)
+    );
+    let automatic =
+        std::fs::canonicalize(scratch.root.join("automatic target")).expect("automatic grant");
+    assert!(
+        result
+            .writable_roots
+            .iter()
+            .any(|p| Path::new(p) == automatic)
+    );
+    let args = observed_args(&scratch);
+    let overrides: Vec<_> = args
+        .iter()
+        .filter(|s| s.starts_with("sandbox_workspace_write.writable_roots="))
+        .collect();
+    assert_eq!(overrides.len(), 1, "no raw override in this case");
+    let parsed: toml::Table = overrides[0].parse().expect("generated TOML");
+    let roots = parsed["sandbox_workspace_write"]["writable_roots"]
+        .as_array()
+        .expect("array");
+    assert_eq!(
+        roots
+            .iter()
+            .map(|s| s.as_str().expect("path"))
+            .collect::<Vec<_>>(),
+        result
+            .writable_roots
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.effort.as_deref(), Some("high"));
 }

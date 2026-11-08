@@ -89,6 +89,8 @@ pub const TEARDOWN_BEAT: Duration = Duration::from_millis(50);
 
 /// How long a provider may take to exec under its keeper before the launch is
 /// failed, so a stuck exec cannot hold the global launch lock.
+pub const VERSION_PROBE: Duration = Duration::from_secs(30);
+
 pub const KEEPER_STARTUP: Duration = Duration::from_secs(30);
 
 /// How long a keeper's final report may take to drain to `review`.

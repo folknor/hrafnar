@@ -57,8 +57,11 @@ crate's unit tests are not given that path - checked).
 ## The keeper
 
 One process per invocation, between `review` and the provider: `review __keep
-<spec-json>`, dispatched by `main` before any tokio runtime or signal
-supervisor exists. It is synchronous and single-threaded, and owns every wait
+<spec-fd>`, dispatched by `main` before any tokio runtime or signal
+supervisor exists. The spec is read from a sealed anonymous memory file (16 MiB
+internal transport limit), then its descriptor is closed before provider creation.
+Only its descriptor number is in argv; environment values are never put there.
+It is synchronous and single-threaded, and owns every wait
 status in its tree (one `waitpid(-1)` loop), so nothing competes with it.
 
 - **Subreaper.** `PR_SET_CHILD_SUBREAPER`: whatever a provider descendant does
@@ -107,6 +110,17 @@ status in its tree (one `waitpid(-1)` loop), so nothing competes with it.
 
 ## Protocol
 
+The shared `keeper::Launcher` prepares the signal mask, process group and
+inherited descriptors for both production and protocol tests. Provider program,
+argv, cwd and environment preserve Unix bytes. Parent-side environment intent is
+explicit: inherit with ordered sets/removals, or exact entries. It is resolved
+once before spawning; the wire contains only the exact environment. The keeper
+keeps its own environment and sends the provider's through execve. PWD is forced
+to the byte-preserving cwd. PATH lookup uses that exact environment and child cwd;
+empty and relative components, including literal ~, resolve there. An absent PATH
+uses /bin:/usr/bin, while an empty PATH searches only the child cwd. Inputs with
+NULs or invalid environment keys are refused before spawn.
+
 Two pipes beyond stdio, numbered at least 3 so a spawn's stdio setup cannot
 overwrite them, their numbers in the spec, private to the keeper once it starts
 (the provider inherits neither):
@@ -116,13 +130,18 @@ overwrite them, their numbers in the spec, private to the keeper once it starts
   the keeper's identity in the in-flight marker first.
 - **events**, keeper to `review`, one JSON line each: `spawned`,
   `exec_failed`, `exited` (the provider itself has been reaped), one
-  `survivor` per process still alive, and `done` with the outcome. The keeper
+  `survivor` per process still alive, one `killed` per ended process named in
+  accounting, and compact `done` with the verdict and both event counts. The keeper
   queues events and writes on writability, so backpressure never blocks a
   teardown; only a closed reader means `review` is gone. `review` reads them
   concurrently from launch.
 
-An interrupt is forwarded once, as SIGINT through the provider's pidfd, while it
-runs; later ones are ignored, and none is forwarded after the provider exits.
+An interrupt is forwarded as SIGINT through the provider's pidfd while it runs;
+after a successful delivery later requests are ignored, and none is forwarded
+after the provider exits. Done reports successful delivery, not proof that the
+provider handled it. A damaged or missing Done leaves delivery unknown. Caller
+stop intent and interrupt-request intent remain separate and are preserved even
+when delivery cannot be confirmed.
 `review interrupt` signals the keeper (the owning `review`'s child, leader of
 its own group, as the marker records it), which forwards.
 
@@ -133,17 +152,39 @@ load-bearing. The codex watchdog judges whether *codex* refuses to exit; it
 waits on `exited`, then the runner waits out the teardown. Waiting on the keeper
 alone made a leftover that needed the SIGKILL rounds look like a stranded codex,
 so a clean run was killed by the watchdog and filed as an incident. The
-in-flight marker stays until the keeper is reaped, so a `review message`
+in-flight marker stays until the keeper is reaped, then remains handoff pending
+through recording, so a `review message`
 arriving during the teardown finds the session in flight instead of launching
 beside its leftovers.
 
-A run's verdict is complete only with a valid `done`, a matching number of
-`survivor` events, and the keeper reaped with a normal exit. Anything less - a
+The keeper constructs one typed Teardown verdict: Clean, Survived (named
+processes and whether others may remain), or Unknown (all reasons and known
+survivors). Only ECHILD proves Clean. Without that proof, discovery cannot rule
+out unseen members even when every read succeeded; surviving reports therefore
+conservatively set the incomplete flag. Orphan logging uses this same immutable
+verdict rather than discovering survivors again.
+
+A run's verdict is complete only with a valid final `done`, matching counts of
+`survivor` and `killed` events, unique final survivor PIDs, and the keeper reaped
+with a normal exit. The process-event streams carry identities; Done carries
+counts rather than an unbounded duplicate list. Killed records cover different
+times, so PID reuse within them, or between killed and survivor records, is valid.
+Each physical event is bounded; the total number of survivors is uncapped.
+Duplicate terminal events, events after Done, reader failures, truncated lines and contradictory verdicts make the
+outcome unknown. Cancellation aborts the owned reader and preserves every
+already collected process record. Anything less - a
 dead keeper, truncated or malformed events, a run abandoned before its teardown
 was confirmed (`Contained` dropped unfinished, which also tells the keeper to
 terminate) - is an unknown outcome, never a clean one.
 
 ## Recording and reporting
+
+The persisted leftovers shape stays flat for existing audit and sidecar readers;
+conversion from the live verdict is explicit. Joining independent invocations
+preserves every unknown reason in the existing unknown string and every survivor
+record; a reused PID across invocations is not evidence of a duplicate process.
+The historical killed field means observed ended during cleanup, not proof of
+signal causality.
 
 Every invocation's non-clean verdict goes into its command's ledger
 (`supervisor::Lifecycle::unresolved`), whichever result is reported: an auto-resume, a grok
@@ -171,14 +212,41 @@ The command installs one signal supervisor capturing that lifecycle. Its first
 signal closes admission and publishes stop under the same mutex used for spawn
 and recording-guard registration. Existing interruptible turns retain recording
 guards through their sidecar writes; guards cannot register after stop. The count
-then determines whether to wait gracefully. Escalation separately terminates every
-live keeper, waits up to the keepers' bound, prints the ledger and names any keeper
+then determines whether to wait gracefully. Escalation separately requests termination of every
+live keeper, waits up to the maximum bound registered with the currently live
+keepers, prints the ledger and names any keeper
 still tearing down. Process signal registration remains process-wide; lifecycle
 state has no process-wide mutable fallback.
 
+Admission closure, graceful notification and completed teardown are distinct.
+The registry's closed latch is the authority for keeper admission; stop watch
+reads are notification snapshots, never permission to launch. The shared run's
+early check avoids remaining preparation after an observed stop; Grok's wake
+check instead preserves its answer while failing unread background results.
+The app uses the notification to print a continuation hint after recording.
+Forced termination can close admission without publishing graceful notification;
+the signal supervisor deliberately requests graceful stop before escalating.
+Escalation requests termination and does not prove completion. No phase enum is
+needed by these callers: each keeper's completion and ledger supply that evidence.
+The gate serializes keeper admission, not provider execution. An admitted keeper
+may still receive `go` after stop; it retains its owner and is handled by the
+run's stop arm or supervisor escalation.
+
+TeardownSchedule is serialized in the spec and owns execution deadlines (term,
+leaves-first, kill, two settle beats) and parent waiting allowances (flush plus
+two transport beats). A terminate during cleanup does not restart its deadlines;
+its waiting allowance covers either possible grace. These are cooperative
+schedules and enforced parent wait limits, not guarantees against blocking
+syscalls. The version probe has a separate whole-operation budget, followed by
+the admitted teardown allowance; startup still means time to exec.
+
 Shared pidfd and `/proc` identity primitives live in `process.rs`. The keeper
 retains tree-membership policy and discovery; the interrupt verb retains its
-keeper-ownership checks. `inflight.rs` remains the marker/request/launch-lock store:
+keeper-ownership checks. ProcessIdentity separates Alive/Gone/Unknown observation
+from pinned signalling authority; unknown failures preserve markers, and signalling
+requires a recorded start plus a pinned owner/keeper ownership check. Keeper
+admission still proves tree membership independently; a marker is not that proof.
+`inflight.rs` remains the marker/request/launch-lock store:
 its lock protocol and the host-wide launch lock are unchanged.
 
 ## Limits
@@ -208,15 +276,76 @@ its lock protocol and the host-wide launch lock are unchanged.
 
 ## Tests
 
-`tests/provider_runs.rs` drives the real runners against stub providers with the
+`tests/provider_runs.rs` drives `invoke` and the complete adapters against stub providers with the
 built binary as keeper: a SIGTERM-ignoring script in its own session (the
 ticket's case), a double-forked daemon, a pipe-holding leftover, a keeper that
 dies (unknown outcome), a provider that cannot exec. `tests/keeper.rs` drives a
 keeper over its protocol for owner death (tears down, writes the orphan log) and
-for an owner gone before `g` (launches nothing).
+for an owner gone before `g` (launches nothing). Both use the production
+Launcher. Protocol regressions also cover byte preservation, exact environments,
+large spec transport, child PATH/cwd resolution and successful interrupt delivery.
+Pure policy tests exercise synthetic tree targeting, kernel-emptiness verdicts,
+independent-invocation joins and schedule bounds; containment tests exercise
+terminal-report validation and historical flat rows. Membership admission itself
+requires live kernel identity checks, covered through real-process containment
+rather than simulated pidfds.
 
 Lifecycle unit tests cover independent runtime domains, clone sharing, stop and
 recording registration ordering, late stop subscribers, exact registration
 ownership, poisoned-state evidence preservation and admission refusal. Existing
 runner stubs exercise graceful stop with real containment using the same lifecycle
 as production. Run::wait retains its stop arm in both provider and keeper phases.
+
+### Review data location
+
+`data::DataDir` snapshots the parent process's XDG data base once, with HOME's
+`.local/share` fallback. It derives the review sessions, audit, incidents,
+inflight and teardown locations; injected domains have the same layout.
+Unavailable storage remains unavailable, without retrying ambient resolution.
+`LogScope` binds an ensured audit identity to its public/private log family.
+Runtime retains that family and its DataDir; the orphan destination is derived
+and owned before keeper spawn, rather than configured independently of markers.
+The keeper still receives the owned destination in Spec. Provider homes remain
+provider-owned. The host launch lock remains at temp_dir()/review.lock and is
+outside DataDir. Inflight's existing launch-lock protocol is unchanged.
+
+## Session handoff ownership
+
+Each invocation reserves its namespace before spawn, including fresh Codex
+before its session ID is learned. Reservation failures in resolved storage refuse
+launch. Markers are atomically published at <session>.<run_id>.json with one
+owner identity, one keeper identity and separate signal readiness. The legacy
+child_pid field is decoded only as readiness when it equals the keeper; an old
+marker lacks the new protocol capability and cannot be interrupted by this build.
+
+Lease closure consumes exact <session>.<run_id>.interrupt requests and changes
+markers to HandoffPending without unlinking them. The invocation reservation
+registers only paths it exclusively created, and ProviderResult retains it through
+recovery and recording. After atomic receipt publication the app removes those
+pending markers. Final reservation drop cleans owned paths on other paths. Raw
+stream IDs remain evidence; only checked SessionId values reach marker builders.
+
+An automatic recovery explicitly names its predecessor. The state resolver can
+select the successor from exactly two matching owner/session/project/provider
+observations when the predecessor is pending; two Running markers or unrelated
+observations are ambiguous. This never redirects a captured receipt waiter.
+
+Receipts contain no prompt or answer. They identify the requested invocation,
+its interruption outcome, the final session and final sidecar append success.
+All recording attempts precede every receipt. Publication is atomic and refuses
+replacement; reads are bounded and check schema and run identity. Owner death
+requires a final receipt read before an incomplete-handoff refusal. Completed
+receipts age out after a day. Abandoned exact requests/reservations may remain as
+namespace tombstones; observation never deletes a request because a non-atomic
+directory scan missed its marker. Legacy session-wide request consumption remains
+a weaker compatibility facade, separate from production exact targeting.
+
+Audit and session JSONL appends share an exclusive flock on the log inode.
+The lock covers tail inspection, newline repair and the entire append, including
+short writes. An incomplete tail is isolated by a newline without deleting any
+old byte. Shared reader locks snapshot bytes; session decoding splits physical
+lines before UTF-8/JSON parsing so a partial multibyte character damages only
+its own fragment. A successful sidecar append therefore supplies a complete,
+readable row among cooperating writers. Old builds do not acquire these locks;
+no cross-version concurrent-writer atomicity or fsync durability is claimed.
+These log locks are independent of the frozen launch-lock policy.

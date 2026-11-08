@@ -11,6 +11,7 @@ pub mod config;
 pub mod config_cmd;
 pub mod config_write;
 pub mod contained;
+pub mod data;
 pub mod exit;
 mod fsutil;
 pub mod incident;
@@ -35,3 +36,7 @@ pub mod supervisor;
 
 mod ids;
 mod toml_key;
+
+#[cfg(test)]
+#[path = "../tests/support/codex.rs"]
+mod codex_fixtures;

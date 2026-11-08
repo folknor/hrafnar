@@ -1,9 +1,9 @@
 //! Session artifacts, recent sessions, and incident listings.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use super::selected_root;
-use crate::{config, incident, inflight, project, provider, sessions};
+use crate::{config, incident, project, provider, sessions};
 
 /// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
 /// dead run is triageable at a glance instead of buried under the incidents dir.
@@ -66,27 +66,13 @@ pub(super) fn run_incidents(limit: usize) -> Result<()> {
 /// and a checkout that has since been deleted still shows. `-C` is an
 /// assertion that the session belongs to the selected project.
 pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Result<()> {
-    let mut records: Vec<sessions::SessionRecord> = sessions::read_all()
-        .into_iter()
-        .filter(|r| r.session_id == session_id)
-        .collect();
-    if records.is_empty() {
-        bail!(
-            "no sidecar record for session {session_id}\n  \
-             (run `review sessions` to list known sessions)"
-        );
-    }
-    records.sort_by_key(|r| r.epoch_secs);
-    let latest = records.last().expect("non-empty");
+    let snapshot = sessions::query::Snapshot::read();
+    let session = snapshot.require(session_id)?;
+    let records = &session.rows;
+    let latest = session.latest();
     if let Some(sel) = selector {
         let selected = selected_root(sel)?;
-        if !project::same_project(&latest.project, &selected) {
-            bail!(
-                "session {session_id} belongs to {}, not {} (-C {sel})",
-                latest.project,
-                selected.display()
-            );
-        }
+        sessions::query::assert_project(session_id, &latest.project, selected.as_path(), sel)?;
     }
 
     let now = provider::now_epoch_secs();
@@ -153,7 +139,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
         // (A registered `-C` name does read the global file, to find it.)
         let sel = project::select(selector)?;
         Some(match config::project_root(&sel)? {
-            Some(root) => root,
+            Some(root) => root.to_path_buf(),
             None => sel.dir().to_path_buf(),
         })
     };
@@ -169,18 +155,51 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
     // touch count that has not moved. During the codex hang that motivated the
     // watchdog, that ambiguity is what made a wedged 10-hour run look like
     // nothing was happening at all.
-    let mut live = inflight::read_live(None);
-    live.retain(|m| in_filter(&m.project));
+    let snapshot = sessions::query::Snapshot::read();
+    let observation = sessions::query::Observation::capture(None);
+    let ids: std::collections::BTreeSet<_> = observation
+        .live
+        .iter()
+        .map(|m| m.session_id.as_str())
+        .collect();
+    let mut live = Vec::new();
+    for id in ids {
+        match observation.state(id, &snapshot) {
+            sessions::query::State::InFlight(m)
+            | sessions::query::State::CleanupPending(m)
+            | sessions::query::State::HandoffPending(m) => {
+                if in_filter(&m.project) {
+                    live.push(m.clone());
+                }
+            }
+            sessions::query::State::Ambiguous => {
+                if observation
+                    .live
+                    .iter()
+                    .any(|m| m.session_id == id && in_filter(&m.project))
+                {
+                    println!(
+                        "[ambiguous] session: {id} / multiple live-run observations; retry shortly"
+                    );
+                }
+            }
+            sessions::query::State::Queued(_)
+            | sessions::query::State::Idle(_)
+            | sessions::query::State::Unknown => {}
+        }
+    }
     let now = provider::now_epoch_secs();
     if !live.is_empty() {
         live.sort_by_key(|m| m.started_epoch);
         for m in &live {
             let since = sessions::format_age(now.saturating_sub(m.started_epoch));
-            if m.cleanup_pending {
+            if m.cleanup_pending() {
                 println!(
                     "[cleanup pending] {} / its review is gone; processes still being torn down",
                     m.provider
                 );
+            } else if m.phase == crate::inflight::Phase::HandoffPending {
+                println!("[recording] {} / waiting for the run handoff", m.provider);
             } else {
                 println!("[in flight] {} / turn in flight since {since}", m.provider);
             }
@@ -195,11 +214,11 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
     // Messages queued behind the global lock: no marker yet, so without this
     // they appear nowhere until they launch. A queued message only holds a
     // session id; its project comes from the session's own record.
-    for sid in inflight::pending_launches(None) {
-        if live.iter().any(|m| m.session_id == sid) {
+    for sid in &observation.queued {
+        let sessions::query::State::Queued(row) = observation.state(sid, &snapshot) else {
             continue;
-        }
-        let project = sessions::latest_for_session(&sid).map(|r| r.project);
+        };
+        let project = row.map(|r| r.project.clone());
         if project_filter.is_some() && !project.as_deref().is_some_and(in_filter) {
             continue;
         }
@@ -211,10 +230,12 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
         println!();
     }
 
-    let mut records = sessions::read_all();
-    records.retain(|r| in_filter(&r.project));
+    let mut snapshot = snapshot;
+    if let Some(root) = &project_filter {
+        snapshot.retain_project(root);
+    }
 
-    if records.is_empty() {
+    if snapshot.rows.is_empty() {
         if live.is_empty() {
             if project_filter.is_some() {
                 eprintln!("no sessions recorded for this project (try --all)");
@@ -225,36 +246,20 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
         return Ok(());
     }
 
-    // Group by session_id.
-    let mut groups: std::collections::HashMap<String, Vec<sessions::SessionRecord>> =
-        std::collections::HashMap::new();
-    for rec in records {
-        groups.entry(rec.session_id.clone()).or_default().push(rec);
-    }
-
-    struct Row {
+    struct Row<'a> {
         latest_secs: Option<u64>,
-        opener: sessions::SessionRecord,
-        latest: sessions::SessionRecord,
+        opener: &'a sessions::SessionRow,
+        latest: &'a sessions::SessionRow,
         touches: usize,
     }
-
-    let mut rows: Vec<Row> = groups
-        .into_values()
-        .map(|mut entries| {
-            entries.sort_by_key(|r| r.epoch_secs);
-            let touches = entries.len();
-            // Chronologically first entry is the opener (the fresh run that
-            // created the session); a session touch in pathological cases where
-            // the creation row is missing.
-            let opener = entries[0].clone();
-            let latest = entries.last().cloned().expect("non-empty group");
-            Row {
-                latest_secs: latest.epoch_secs,
-                opener,
-                latest,
-                touches,
-            }
+    let mut rows: Vec<_> = snapshot
+        .sessions()
+        .into_iter()
+        .map(|session| Row {
+            latest_secs: session.latest().epoch_secs,
+            opener: session.opener(),
+            latest: session.latest(),
+            touches: session.rows.len(),
         })
         .collect();
 

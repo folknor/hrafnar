@@ -54,7 +54,7 @@ fn print_digest(outcome: &Outcome, d: &Digest) {
         }
     }
     if let Some(ref path) = d.incident_path {
-        println!("incident: {path}");
+        println!("incident: {}", path.display());
     }
 }
 

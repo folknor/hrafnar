@@ -13,72 +13,11 @@ fn outcome_of(r: &provider::ProviderResult) -> Option<&provider::Outcome> {
     r.output.as_ref().ok().map(|turn| &turn.outcome)
 }
 
-/// Write one provider run to the audit log and, if it captured a session, the
-/// sidecar. Shared so an auto-resume can persist *both* of its invocations.
-#[allow(clippy::too_many_arguments)]
-fn record_run(
-    project_root: &std::path::Path,
-    private: bool,
-    audit_id: &str,
-    archetype: &str,
-    env_keys: &[String],
-    profile_origin: Option<&provider::ProfileOrigin>,
-    operator_prompt: &str,
-    prompt: &str,
-    result: &provider::ProviderResult,
-    kind: sessions::SessionKind,
-) {
-    let session_for_log = result.session_id.as_deref().unwrap_or("");
-    let digest_summary = summary_of(result);
-    audit::log_result(
-        project_root,
-        private,
-        audit_id,
-        archetype,
-        result.provider.as_str(),
-        session_for_log,
-        prompt,
-        &result.output,
-        digest_summary.as_ref(),
-        &result.leftovers,
-    );
-    if let Some(ref sid) = result.session_id {
-        sessions::record_with_kind(
-            project_root,
-            private,
-            audit_id,
-            archetype,
-            result.provider,
-            sid,
-            kind,
-            result.completed_epoch,
-            // From the result, not from the caller's profile: the recorded
-            // model must be the one the run launched with, for the same reason
-            // the sandbox level is - a resume inherits this row, and inheriting
-            // a request rather than an outcome is what this fix is about.
-            result.model.as_deref(),
-            result.effort.as_deref(),
-            env_keys.to_vec(),
-            result.permissions.as_ref(),
-            result.writable_roots.clone(),
-            &result.served,
-            result.grok_trust.as_deref(),
-            operator_prompt,
-            prompt,
-            &result.output,
-            digest_summary.as_ref(),
-            &result.leftovers,
-            result.codex_home.as_deref(),
-            profile_origin,
-        );
-    }
-}
-
 /// What one fan-out task needs to record its runs.
 pub(super) struct RecordCtx {
     pub(super) project_root: std::path::PathBuf,
-    pub(super) private: bool,
-    pub(super) audit_id: String,
+    pub(super) data: crate::data::DataDir,
+    pub(super) scope: crate::data::LogScope,
     pub(super) archetype: String,
     pub(super) env_keys: Vec<String>,
     pub(super) profile_origin: Option<provider::ProfileOrigin>,
@@ -87,27 +26,118 @@ pub(super) struct RecordCtx {
 
 impl RecordCtx {
     pub(super) fn record(&self, result: &provider::ProviderResult, prompt: &str) {
-        self.record_as(result, sessions::SessionKind::Run, prompt);
+        let _ = self.record_as(result, sessions::SessionKind::Run, prompt);
     }
 
-    fn record_as(
+    pub(super) fn record_as(
         &self,
         result: &provider::ProviderResult,
         kind: sessions::SessionKind,
         prompt: &str,
-    ) {
-        record_run(
-            &self.project_root,
-            self.private,
-            &self.audit_id,
-            &self.archetype,
-            &self.env_keys,
-            self.profile_origin.as_ref(),
-            &self.operator_prompt,
-            prompt,
-            result,
+    ) -> bool {
+        // Failed resumes did not warm the cache. This applies to automatic
+        // and manual resumes alike; a requested ID is not proof a turn ran.
+        let sidecar = kind != sessions::SessionKind::Resume || result.output.is_ok();
+        self.record_policy(result, kind, prompt, sidecar)
+    }
+
+    fn record_policy(
+        &self,
+        result: &provider::ProviderResult,
+        kind: sessions::SessionKind,
+        prompt: &str,
+        sidecar: bool,
+    ) -> bool {
+        let row = sessions::SessionRow {
+            timestamp: audit::chrono_utc(result.completed_epoch),
+            epoch_secs: Some(result.completed_epoch),
+            project: self.project_root.to_string_lossy().into_owned(),
+            hostname: crate::config::hostname(),
+            audit_id: self.scope.id().as_str().to_owned(),
+            provider: result.provider.as_str().to_owned(),
+            archetype: self.archetype.clone(),
+            session_id: result.session_id.clone().unwrap_or_default(),
             kind,
-        );
+            profile_origin: self.profile_origin.clone(),
+            model: result.model.clone(),
+            effort: result.effort.clone(),
+            env_keys: self.env_keys.clone(),
+            sandbox: result
+                .permissions
+                .as_ref()
+                .and_then(provider::Permissions::recorded_level)
+                .map(str::to_owned),
+            provider_sandbox: result
+                .permissions
+                .as_ref()
+                .and_then(provider::Permissions::native_to_record)
+                .map(str::to_owned),
+            writable_roots: result.writable_roots.clone(),
+            served_model: result.served.model_label(),
+            cost_usd: result.served.cost_usd,
+            grok_trust: result.grok_trust.clone(),
+            operator_prompt: self.operator_prompt.clone(),
+            assembled_prompt: prompt.to_owned(),
+            response: result.output.as_ref().ok().map(|t| t.text.clone()),
+            error: result.output.as_ref().err().map(ToString::to_string),
+            review_version: env!("CARGO_PKG_VERSION").to_owned(),
+            digest: summary_of(result),
+            leftovers: (!result.leftovers.is_empty()).then(|| result.leftovers.clone()),
+            codex_home: result.codex_home.clone(),
+        };
+        let _audit_written = audit::log_result(&self.data, &self.scope, &row);
+        // A manual failed launch did not warm the cache. Automatic recovery is
+        // already an established invocation and retains its historical row policy.
+        sidecar && result.session_id.is_some() && sessions::append(&self.data, &self.scope, &row)
+    }
+
+    fn record_task(&self, outcome: &TaskOutcome) {
+        let mut recorded = false;
+        for invocation in &outcome.invocations {
+            recorded = self.record_as(
+                &invocation.result,
+                invocation.kind.clone(),
+                &invocation.prompt,
+            );
+        }
+        let final_run = &outcome
+            .invocations
+            .last()
+            .expect("at least one invocation")
+            .result;
+        for invocation in &outcome.invocations {
+            self.publish(&invocation.result, final_run, recorded);
+        }
+    }
+
+    pub(super) fn record_message(&self, result: &provider::ProviderResult, prompt: &str) -> bool {
+        // A launch failure never warmed the cache, so it must not become the
+        // latest row used by the age gate or inheritance.
+        self.record_as(result, sessions::SessionKind::Resume, prompt)
+    }
+    pub(super) fn publish(
+        &self,
+        requested: &provider::ProviderResult,
+        final_run: &provider::ProviderResult,
+        sidecar_written: bool,
+    ) {
+        if let Some(id) = &requested.run_id {
+            let handoff = sessions::handoff::Handoff {
+                schema: sessions::handoff::PROTOCOL,
+                requested: id.clone(),
+                interrupted: outcome_of(requested).is_some_and(provider::Outcome::interrupted),
+                final_session: final_run.session_id.clone(),
+                sidecar_written,
+            };
+            match sessions::handoff::publish(&self.data, &handoff) {
+                Ok(()) => {
+                    if let Some(reservation) = &requested._reservation {
+                        reservation.complete();
+                    }
+                }
+                Err(e) => eprintln!("warning: failed to publish run handoff: {e}"),
+            }
+        }
     }
 }
 
@@ -123,6 +153,7 @@ impl Launch {
         &self,
         start: provider::SessionStart,
         prompt: &str,
+        predecessor: Option<crate::sessions::handoff::RunId>,
     ) -> provider::ProviderResult {
         let spec = provider::LaunchSpec {
             start,
@@ -130,7 +161,7 @@ impl Launch {
             ..self.spec.clone()
         };
         // Fan-out stagger and internal retries do not need a launch handshake.
-        provider::invoke(spec, None, &self.runtime).await
+        provider::invoke(spec, None, &self.runtime, predecessor).await
     }
 }
 
@@ -280,6 +311,7 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
         .invoke(
             provider::SessionStart::Fresh { id: None },
             &launch.spec.prompt,
+            None,
         )
         .await;
     let outcome = match after_run(&first) {
@@ -312,6 +344,7 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
                             .expect("auto-resume identity validated before selection"),
                     ),
                     nudge,
+                    first.run_id.clone(),
                 )
                 .await;
             after_auto_resume(first, second, launch.spec.prompt.clone(), nudge.to_string())
@@ -319,22 +352,14 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
     };
     // Both runs are recorded only now, after any auto-resume. Keep paired rows
     // in launch order so the resume remains latest when their epoch seconds tie.
-    // Between the first run ending and the auto-resume spawning, the session
-    // has no in-flight marker; it has no sidecar row either, so a message
-    // arriving then is refused ("no record") instead of launching. Recording
-    // the first run before auto-resuming would give it a row with no marker,
-    // and the message would start a second turn on the session. A message
-    // arriving while the auto-resume runs finds its marker (written before its
-    // spawn) and interrupts it, as for any run.
-    for invocation in &outcome.invocations {
-        ctx.record_as(
-            &invocation.result,
-            invocation.kind.clone(),
-            &invocation.prompt,
-        );
-    }
-    // A signalled `review` exits once every codex run is recorded, before the
-    // results are printed, so say here how to continue this one.
+    // Pending markers stay discoverable across the recovery/recording gap.
+    // The second marker names its direct predecessor so new messages can
+    // target recovery, while existing waiters retain the original run ID.
+    ctx.record_task(&outcome);
+    // During graceful stop, the supervisor waits for interruptible turns'
+    // recording guards, then may exit before normal result printing. Emit this
+    // interrupted session's continuation hint here. This notification snapshot
+    // controls the hint only; it is not an admission check.
     if launch.runtime.lifecycle.stop_requested()
         && let (Some(sid), Some(true)) = (
             outcome.result().session_id.as_deref(),
@@ -360,6 +385,8 @@ mod tests {
             provider::Answer::None
         };
         provider::ProviderResult {
+            run_id: None,
+            _reservation: None,
             provider: provider::Provider::Codex,
             output: Ok(provider::Turn {
                 text: format!("text of {sid}"),
@@ -389,6 +416,137 @@ mod tests {
             session: sid.into(),
             nudge,
         }
+    }
+
+    #[test]
+    fn recording_keeps_completion_time_and_failed_recovery_out_of_cache_history() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        let data = crate::data::DataDir::at(root.clone());
+        let scope = crate::data::LogScope::new(
+            crate::data::AuditId::from_record("audit").expect("id"),
+            false,
+        );
+        let ctx = RecordCtx {
+            project_root: root.join("project"),
+            data: data.clone(),
+            scope: scope.clone(),
+            archetype: "bare".into(),
+            env_keys: Vec::new(),
+            profile_origin: None,
+            operator_prompt: "operator".into(),
+        };
+        let mut first = codex_run("session", false, false);
+        first.run_id = Some(crate::sessions::handoff::RunId::default());
+        first.completed_epoch = 42;
+        let mut second = codex_run("session", false, false);
+        second.run_id = Some(crate::sessions::handoff::RunId::default());
+        second.output = Err(anyhow::anyhow!("failed launch"));
+        second.completed_epoch = 43;
+        let outcome = after_auto_resume(first, second, "original".into(), "nudge".into());
+        let requested = outcome.invocations[0].result.run_id.as_ref().expect("run");
+        assert!(
+            sessions::handoff::read(&data, requested)
+                .expect("receipt")
+                .is_none()
+        );
+        ctx.record_task(&outcome);
+        let rows = sessions::read_all_in(&data);
+        assert_eq!(rows.len(), 1, "failed recovery must not refresh the cache");
+        assert_eq!(rows[0].epoch_secs, Some(42));
+        let audit_path = data
+            .audit(&ctx.project_root, &scope)
+            .expect("audit path")
+            .join("audit.jsonl");
+        let audit = std::fs::read_to_string(audit_path).expect("audit");
+        let audit_rows: Vec<serde_json::Value> = audit
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("audit row"))
+            .collect();
+        assert_eq!(audit_rows.len(), 2);
+        assert_eq!(audit_rows[0]["timestamp"], rows[0].timestamp);
+        assert_eq!(audit_rows[1]["session"], "session");
+        let handoff = sessions::handoff::read(&data, requested)
+            .expect("read")
+            .expect("published");
+        assert!(
+            !handoff.interrupted && !handoff.sidecar_written,
+            "a prior successful append cannot substitute for final handoff"
+        );
+        assert_eq!(handoff.final_session.as_deref(), Some("session"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recording_routes_both_families_through_one_injected_domain() {
+        use crate::data::{AuditId, DataDir, LogFamily, LogScope};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        let data = DataDir::at(root.clone());
+        let project = root.join("project");
+        for (private, sid) in [(false, "public"), (true, "private")] {
+            let scope = LogScope::new(AuditId::from_record("beef").expect("test fixture"), private);
+            let ctx = RecordCtx {
+                project_root: project.clone(),
+                data: data.clone(),
+                scope: scope.clone(),
+                archetype: "bare".into(),
+                env_keys: Vec::new(),
+                profile_origin: None,
+                operator_prompt: "operator".into(),
+            };
+            let result = codex_run(sid, true, false);
+            ctx.record(&result, "assembled");
+            ctx.record_as(&result, sessions::SessionKind::Resume, "followup");
+            let rows =
+                std::fs::read_to_string(data.sessions(scope.family()).expect("test fixture"))
+                    .expect("test fixture");
+            let rows: Vec<sessions::SessionRecord> = rows
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("test fixture"))
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].session_id, sid);
+            assert_eq!(rows[0].audit_id, "beef");
+            assert_eq!(rows[0].kind, sessions::SessionKind::Run);
+            assert_eq!(rows[1].kind, sessions::SessionKind::Resume);
+            assert_eq!(rows[1].assembled_prompt, "followup");
+            let audit = std::fs::read_to_string(
+                data.audit(&project, &scope)
+                    .expect("test fixture")
+                    .join("audit.jsonl"),
+            )
+            .expect("test fixture");
+            assert_eq!(audit.lines().count(), 2);
+            let runtime = provider::ProviderRuntime::from_config(
+                crate::supervisor::Lifecycle::default(),
+                None,
+                data.clone(),
+                &scope,
+            );
+            assert_eq!(
+                runtime.data.orphan_log(runtime.log_family),
+                Some(root.join(if private {
+                    "review/teardowns-private.jsonl"
+                } else {
+                    "review/teardowns.jsonl"
+                }))
+            );
+        }
+        assert_eq!(sessions::read_all_in(&data).len(), 4);
+        assert!(
+            data.sessions(LogFamily::Public)
+                .expect("test fixture")
+                .exists()
+        );
+        assert!(
+            data.sessions(LogFamily::Private)
+                .expect("test fixture")
+                .exists()
+        );
+        std::fs::remove_dir_all(root).expect("test fixture");
     }
 
     #[test]

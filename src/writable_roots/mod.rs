@@ -56,7 +56,6 @@ mod dependencies;
 mod derivation;
 mod filter;
 mod host;
-mod output;
 mod profile;
 
 #[cfg(test)]
@@ -64,7 +63,6 @@ mod test_host;
 
 pub use derivation::derive;
 pub use host::{Host, RealHost};
-pub use output::{config_override, config_override_paths};
 pub use profile::derive_with;
 
 /// One derived grant: the path, and why a build needs it.

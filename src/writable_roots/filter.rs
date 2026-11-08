@@ -60,10 +60,10 @@ pub(super) fn push_root(
     let Some(text) = path.to_str() else {
         return;
     };
-    // A control character cannot be carried by a TOML basic string, so such a
-    // path would render a `-c` value codex refuses to parse - an opaque launch
-    // failure. A path really containing a newline is far more likely a mangled
-    // environment variable than a directory anyone meant to grant.
+    // A discovered path containing a newline or another control character is
+    // more likely a mangled environment variable than an intended grant.
+    // Refuse it here; explicit raw Codex config remains adapter-owned and its
+    // renderer can carry escaped controls without changing this grant policy.
     if text.contains(|c: char| c.is_control()) {
         eprintln!("warning: ignoring writable root containing a control character");
         return;
@@ -230,9 +230,8 @@ mod tests {
         assert_eq!(grants[0].path, "/home/dev/project-other");
     }
 
-    /// A control character cannot live in a TOML basic string, so emitting one
-    /// would render a `-c` value codex refuses to parse - an opaque launch
-    /// failure rather than a grant.
+    /// Refuse surprising control-bearing derived paths even though a provider
+    /// renderer can represent escaped controls in explicitly supplied config.
     #[test]
     fn a_control_character_in_a_path_is_refused() {
         let host = FakeHost::new().var("CARGO_HOME", "/home/dev/.cargo\nx");

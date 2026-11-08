@@ -160,7 +160,10 @@ fn grok_no_answer_reason_carries_the_cause_and_the_trust_hint() {
     );
     let full = super::explain_grok_no_answer(
         base,
-        Some("permission_cancelled: permission for `search_replace` was refused"),
+        Some(&super::state::CancelCause {
+            category: "permission_cancelled".into(),
+            refused_tool: Some("search_replace".into()),
+        }),
         Some("/p is not in grok's trusted folders"),
     );
     assert!(full.contains("stopReason: cancelled"), "{full}");
@@ -418,7 +421,7 @@ async fn grok_preparation_retains_request_and_rechecks_distrust_before_spawn() {
     )
     .expect("decline after setup");
     let runtime = ProviderRuntime {
-        data_root: Some(home.join("data")),
+        data: crate::data::DataDir::at(home.join("data")),
         ..Default::default()
     };
     let error = match prepared
@@ -513,4 +516,115 @@ async fn grok_trust_key_drift_is_not_a_verified_grant() {
         .expect_err("changed grant target");
     assert!(error.to_string().contains("trust key changed"), "{error:#}");
     std::fs::remove_dir_all(base).expect("cleanup");
+}
+
+/// A recorded generated profile is recreated from its historical set, never
+/// from the current host's derived grants. No provider is needed for setup.
+#[tokio::test]
+async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatch() {
+    use super::*;
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-scratch")
+        .join(crate::ids::generate_uuid());
+    std::fs::create_dir_all(base.join("project/.git")).expect("project");
+    std::fs::create_dir_all(base.join("grok-home")).expect("grok home");
+    let base = std::fs::canonicalize(base).expect("canonical scratch");
+    let project = base.join("project");
+    let home = base.join("grok-home");
+    std::fs::write(
+        home.join("trusted_folders.toml"),
+        format!("[folders.\"{}\"]\ntrusted = true\n", project.display()),
+    )
+    .expect("trusted");
+    let launch = |name: &str, roots: &[String]| {
+        // Exercise the same historical row decoder and inheritance path as message.
+        let row: crate::sessions::SessionRow = serde_json::from_value(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z", "project": project,
+            "hostname": "host", "audit_id": "audit", "provider": "grok",
+            "archetype": "bare", "session_id": "historical-grok",
+            "sandbox": "workspace-write", "provider_sandbox": name,
+            "writable_roots": roots, "operator_prompt": "p",
+            "assembled_prompt": "p", "review_version": "0.0.0"
+        }))
+        .expect("historical row");
+        let mut settings = RunSettings::from_inherited(
+            Provider::Grok,
+            InheritedSettings::from_record(Some(&row), Provider::Grok),
+        );
+        // Inject child locations; this does not change production inheritance.
+        settings.env = Some(std::collections::BTreeMap::from([
+            ("GROK_HOME".into(), home.to_string_lossy().into_owned()),
+            ("HOME".into(), "/home/nobody-here".into()),
+        ]));
+        LaunchSpec {
+            provider: Provider::Grok,
+            start: SessionStart::Resume(SessionId::parse("historical-grok").expect("id")),
+            settings,
+            prompt: "continue".into(),
+            root: project.clone(),
+        }
+    };
+    for (name, recorded) in [
+        ("review-ws-cbf29ce484222325", vec![]),
+        (
+            "review-ws-a4924c479efe6e4c",
+            vec![
+                "/home/u/.cargo".into(),
+                "/home/u/.brokkr".into(),
+                "/home/u/.cargo".into(),
+            ],
+        ),
+    ] {
+        let expected = RootSet::new(&recorded);
+        for _ in 0..2 {
+            let launch = launch(name, &recorded);
+            let mut plan = super::super::permissions::PermissionPlan::new(
+                launch.settings.permissions.clone(),
+                &project,
+                &launch.settings.writable_roots,
+            );
+            prepare(&launch, &mut plan).await.expect("resume prepared");
+            assert_eq!(plan.permissions.native_to_record(), Some(name));
+            assert_eq!(
+                plan.paths,
+                expected.paths(),
+                "only the recorded set, no host grants"
+            );
+            assert!(plan.uses_recorded_roots());
+            assert!(!plan.derives());
+            let config: toml::Table = std::fs::read_to_string(home.join("sandbox.toml"))
+                .expect("recreated profile")
+                .parse()
+                .expect("toml");
+            let stored: Vec<_> = config["profiles"][name]["read_write"]
+                .as_array()
+                .expect("roots")
+                .iter()
+                .map(|v| v.as_str().expect("root"))
+                .collect();
+            assert_eq!(stored, expected.paths());
+            std::fs::remove_file(home.join("sandbox.toml")).expect("delete generated file");
+        }
+    }
+    std::fs::remove_file(home.join("trusted_folders.toml")).expect("undecided project");
+    let launch = launch("review-ws-cbf29ce484222325", &["/different".into()]);
+    let mut plan = super::super::permissions::PermissionPlan::new(
+        launch.settings.permissions.clone(),
+        &project,
+        &launch.settings.writable_roots,
+    );
+    let err = match prepare(&launch, &mut plan).await {
+        Err(e) => e,
+        Ok(_) => panic!("mismatch must refuse"),
+    };
+    assert!(err.to_string().contains("do not match"), "{err}");
+    assert!(
+        !home.join("sandbox.toml").exists(),
+        "no mismatched profile written"
+    );
+    assert!(
+        !home.join("trusted_folders.toml").exists(),
+        "no trust write"
+    );
+    let _ = std::fs::remove_dir_all(base);
 }

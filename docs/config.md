@@ -62,6 +62,7 @@ bz = "~/Programs/bz"
   `stall_timeout_secs`.
 - `[_audit]`: `id` names the project's audit trail. `review init` creates a
   32-character hex id; a missing or empty id gets one before the first launch.
+  Existing nonempty ids remain opaque strings, unchanged.
   The id is saved before launch, and the run fails if it cannot be saved.
   `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
@@ -88,7 +89,9 @@ bz = "~/Programs/bz"
 
 ## Reserved words
 
-An archetype or group may not be named any of these:
+An archetype or group may not use the names below. Reserved command names come
+from the CLI itself, including hidden migration commands and aliases; this table
+is checked against that vocabulary.
 
 | Reserved word | Why |
 |---|---|

@@ -47,17 +47,34 @@ The prompt is piped via stdin.
   stream decoding shares this owner but is a separate format: unphased
   `item.completed` text is diagnostic fallback and cannot become `PhaseAnswer`.
 - `src/transcript.rs` - Resolves Codex home and locates
-  `$CODEX_HOME/sessions/**/rollout-*-<session_id>.jsonl`, then folds its bytes.
-  `slice_from_offset` restricts reads to this invocation's baseline; `None` is
-  the whole-file session-show view. Past-EOF offsets yield no evidence. The
-  runner resolves home once before launch and reuses it for baseline, watchdog
-  and recovery; saved homes let session show find the same storage later.
+  `$CODEX_HOME/sessions/**/*-<session_id>.jsonl` candidates, then requires the
+  first physical record to be `session_meta` with an exact `payload.id` or
+  legacy `payload.session_id`. Both keys, when present, must be strings and
+  agree. A well-formed different identity is skipped; malformed, oversized or
+  unreadable headers are reported if no verified candidate is found. The first
+  record is capped at 1 MiB including an optional LF; complete JSON at EOF and
+  CRLF are accepted. Nonblocking open and opened-handle regular-file inspection
+  keep special files from blocking header reads. Suffixes and paths use native
+  bytes, including opaque IDs and non-UTF-8 path components. This verifies
+  identity at discovery time, not content authenticity, uniqueness, symlink
+  confinement or immunity to later file replacement.
+  `Scope::WholeFile` is the session-show view; `Scope::From(RolloutOffset)`
+  restricts reads to the invocation's measured baseline; `Scope::Untrusted`
+  attributes no bytes. Past-EOF offsets also yield no evidence. Only From
+  authorizes watchdog monitoring. The runner resolves home once before launch
+  and reuses it for baseline, watchdog and recovery; saved homes let session
+  show find the same storage later.
 - `src/provider/codex/forensics.rs` - `CodexForensics` holds log lines,
   transcript, quiet duration and last rollout event. It renders the provider
   block and the transcript block also used by `provider::session_artifacts`.
   `CodexIncident` writes the last 80 scoped rollout lines and obtains rate
-  limits from the same fold. Its required u64 offset cannot accidentally
-  request a whole-file view; unknown scope uses the past-EOF sentinel.
+  limits from the same fold. It receives the exact Scope used for recovery and
+  the watchdog, including explicit Untrusted authority. Live transcript and
+  incident paths stay native through filesystem reads; only display and the
+  historical string wire fields project them lossily. Open EventKind values
+  retain both physical event names until their historical type/payload display
+  projection. InFlightTool retains raw optional call IDs; missing IDs match
+  nothing, while present empty IDs match equal present empty IDs.
 - `src/incident.rs` - Common bundle storage takes `ProcessSpec`, settled
   `Outcome`, process evidence and optional provider artifacts. Only Codex's
   adapter currently elects to bundle (`!captured || exit!=0 || signal`, excluding
@@ -70,7 +87,9 @@ The prompt is piped via stdin.
   for both write and read, defaulting historical omissions and checking the
   schema, provider and UTC time before listing. Flat key names, including
   `codex_version`, remain compatible. `Meta::verdict` preserves the historical
-  tri-state transcript evidence and gives a stated reason priority. Write/read
+  tri-state transcript evidence and gives a stated reason priority. An answer
+  preserved by the watchdog remains affirmative evidence even if the recovery
+  read later loses the transcript. Write/read
   errors retain their failed paths; incomplete bundles are never advertised as
   complete and listing warns while showing other readable bundles.
 - `src/watchdog.rs` - The generic patience loop consumes source revisions and
@@ -89,7 +108,7 @@ The prompt is piped via stdin.
   Codex constructs its verdict. Recovery prefers that exact licensed answer
   over a later current-turn summary. Quiet duration and last event reach the
   digest and bundle.
-- `tests/provider_runs.rs` - End-to-end tests of the codex runner against a **stub `codex`** shell script, an integration test because the runner's keeper is the built `review` binary (see [teardown.md](teardown.md)). The behaviours under test are *process* behaviours - finishing work then refusing to exit, wedging mid-turn, leaving a descendant that holds stdout open or ignores `SIGTERM` - none of which can be faked with a mocked return value; they need a real child, pipe and kill. `ProviderRuntime` (`commands`, the per-provider executable and leading arguments, watchdog `Timings`, `drain_grace`, `data_root`, and `teardown`, the keeper's binary and graces) is the injection point that makes a 3-minute detection and 10-second escalation resolve in under a second. `data_root` is load-bearing, not tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s own paths otherwise resolve from the real `HOME`/`XDG_DATA_HOME` - an earlier version of this suite wrote stub incident bundles into the operator's real `~/.local/share/review/incidents`. Coverage: stranded completion is killed and recovered; a mid-turn wedge trips the stall timeout (killed, bundled, *no* answer recovered, `quiet_secs`/`last_rollout_event` recorded); a disabled stall timeout never fires; an advancing rollout is never killed (answer present *and* still writing - the advancement gate, not the answer gate); a pipe-retaining child blocks neither reaping nor output capture, and is ended as a leftover; the keeper's escalation actually reaps a `SIGTERM`-ignoring descendant; a refused turn (`error` + `turn.failed`, exit 1, no `final_answer` on disk) carries its stated reason into the digest, the summary and `meta.json` while keeping the rest of its failure signature; resumed incident bundles exclude previous rollout turns and use the shared phase-aware answer summary, including no-append, commentary-only and trailing-phantom cases. Scratch lives in `target/test-scratch/<uuid>/`; stubs record any deliberately-left-running pid to `$LINGER_PID` so tests clean up after themselves.
+- `tests/provider_runs.rs` - End-to-end tests through `invoke` and the complete Codex adapter against a **stub `codex`** shell script, an integration test because the runner's keeper is the built `review` binary (see [teardown.md](teardown.md)). The behaviours under test are *process* behaviours - finishing work then refusing to exit, wedging mid-turn, leaving a descendant that holds stdout open or ignores `SIGTERM` - none of which can be faked with a mocked return value; they need a real child, pipe and kill. `ProviderRuntime` (`commands`, the per-provider executable and leading arguments, watchdog `Timings`, `drain_grace`, `data`, and `teardown`, the keeper's binary and graces) is the injection point that makes a 3-minute detection and 10-second escalation resolve in under a second. `data: DataDir` is load-bearing, not tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s own paths otherwise resolve from the real `HOME`/`XDG_DATA_HOME` - an earlier version of this suite wrote stub incident bundles into the operator's real `~/.local/share/review/incidents`. Coverage: stranded completion is killed and recovered; a mid-turn wedge trips the stall timeout (killed, bundled, *no* answer recovered, `quiet_secs`/`last_rollout_event` recorded); a disabled stall timeout never fires; an advancing rollout is never killed (answer present *and* still writing - the advancement gate, not the answer gate); a pipe-retaining child blocks neither reaping nor output capture, and is ended as a leftover; the keeper's escalation actually reaps a `SIGTERM`-ignoring descendant; a refused turn (`error` + `turn.failed`, exit 1, no `final_answer` on disk) carries its stated reason into the digest, the summary and `meta.json` while keeping the rest of its failure signature; resumed incident bundles exclude previous rollout turns and use the shared phase-aware answer summary, including no-append, commentary-only and trailing-phantom cases. Scratch lives in `target/test-scratch/<uuid>/`; stubs record any deliberately-left-running pid to `$LINGER_PID` so tests clean up after themselves.
 
 ## Failures, recovery and hangs
 
@@ -131,9 +150,19 @@ Codex runs under a keeper (see [teardown.md](teardown.md)), which puts it in a p
 
 `review interrupt <id>` exists because a running `codex exec` turn cannot be spoken to. Established from the codex source (checkout at 50fc133d05, installed 0.156.1): exec reads stdin once (`read_prompt_from_stdin`), runs its app-server in-process with no socket or remote-control endpoint, and handles exactly one signal - SIGINT, which it turns into `turn/interrupt`, ending the turn `Interrupted` and exiting 1. In-turn steering (`turn/steer`, landing at the next sampling boundary) exists but only for a client of the process that owns the thread, and exec is its own only client. No other process can take the thread over either: each live thread holds an flock at `$CODEX_HOME/thread-writer-locks/<thread_id>.lock`, and `thread/resume` from anywhere else fails "already has an active writer" until it is released. `codex queue` does reach another process's thread, but only as a *new* turn once the current one ends, and an exec run is a single turn - so for us it can only deliver after the work is done, which `review resume` already does. The one lever is therefore end the turn, then resume.
 
-Mechanics: the in-flight marker records the run's keeper pid (`child_pid`), `review interrupt` writes `<id>.interrupt` beside it and then sends SIGINT to the keeper, which forwards one SIGINT to codex's own pid through a pidfd. On an npm install that pid is the node wrapper, which forwards SIGINT to the native binary once (`codex-cli/bin/codex.js`); signalling the whole group would hand the native binary a second copy. The wrapper installs that forwarding only *after* spawning the native binary, and a SIGINT in between would kill the wrapper and orphan codex still holding the writer lock - so the marker offers the pid only once codex has written to stdout. Before signalling, the verb checks that the keeper still leads its own group *and* is the owning `review`'s child, since it may have exited and its pid been reused.
+Mechanics: the in-flight marker records one keeper identity and a separate readiness fact, `review interrupt` writes `<id>.<run_id>.interrupt` beside it and then sends SIGINT to the keeper, which forwards one SIGINT to codex's own pid through a pidfd. On an npm install that pid is the node wrapper, which forwards SIGINT to the native binary once (`codex-cli/bin/codex.js`); signalling the whole group would hand the native binary a second copy. The wrapper installs that forwarding only *after* spawning the native binary, and a SIGINT in between would kill the wrapper and orphan codex still holding the writer lock - so the marker becomes signal-ready only once codex has written to stdout. Before signalling, the verb checks that the keeper still leads its own group *and* is the owning `review`'s child, since it may have exited and its pid been reused.
 
-The request file exists because an interrupted turn is otherwise indistinguishable from a mid-turn death - `exit 1`, no answer - and [auto-resume](#auto-resume) would resume straight past the operator's decision. The owning run consumes it once codex is reaped (before dropping its marker, since `read_live` sweeps requests with no marker beside them), and it counts only if the run has no answer: codex can finish between the request and the signal. An interrupted run gets `Outcome::interrupted` (persisted as `DigestSummary.interrupted`; `jq 'select(.digest.interrupted)'`) and `terminated_by_review`, no incident bundle, no auto-resume, and the resume command in its output. If the interrupt lands on an auto-resume's second invocation, that invocation is what gets reported. `review interrupt` waits for the request to be consumed, then for the owner's sidecar row - which is what `review resume` needs - and prints the same command; it counts rows rather than comparing timestamps, which are whole seconds and can tie with the session's previous row. The flock is released by the kernel on exit, so the resume is not blocked by the dead process. Runs launched by a `review` older than `child_pid` are refused: they could not be signalled safely, and would auto-resume past the interrupt anyway.
+The request file exists because an interrupted turn is otherwise indistinguishable from a mid-turn death - `exit 1`, no answer - and [auto-resume](#auto-resume) would resume straight past the operator's decision. The owning run consumes it once codex is reaped (before dropping its marker, since `read_live` sweeps requests with no marker beside them), and it counts only if the run has no answer: codex can finish between the request and the signal. An interrupted run gets `Outcome::interrupted` (persisted as `DigestSummary.interrupted`; `jq 'select(.digest.interrupted)'`) and `terminated_by_review`, no incident bundle, no auto-resume, and the resume command in its output. If the interrupt lands on an auto-resume's second invocation, that invocation is what gets reported. `review interrupt` waits for the captured invocation's bounded result receipt,
+published only after recovery and all recording attempts. It does not scan or
+count sidecar rows. The receipt reports that invocation's interruption separately
+from the final session's successful sidecar append. Marker visibility continues
+as handoff pending through that interval. Automatic recovery projects its explicit
+predecessor into its marker, allowing the resolver to select that successor while
+an already captured waiter stays on its original invocation. Unrelated overlaps
+are refused as ambiguous. Active markers lacking the supported handoff protocol
+are refused before signalling; historical recorded sessions remain readable.
+The flock is released by the kernel on exit, so resume is not blocked by the
+ended provider.
 
 `review message <id>` is the verb orchestrators are pointed at: with a codex turn in flight it runs the interrupt above, then resumes the session with stdin; on an idle session it is a plain resume (`review resume` survives as a hidden, warning alias). It exists for its name. Told to "interrupt the agent", an orchestrating Claude reached for its own task-stop tool, which signals `review`, not the turn, and the old supervisor then killed codex and exited before any sidecar row was written - a fresh session left with no record, so it could never be resumed. "Message the agent" has no rival tool, and `--help` and `review config` both say not to stop the process.
 
@@ -256,3 +285,17 @@ original writer's omitted later fields. Invalid present values in writer-only
 metadata fields now report a decode error rather than being silently ignored by
 the old subset reader. This is corruption handling, not a historical format
 migration. Unknown schemas are rejected.
+
+Runner helpers, their intermediate result and output-file creation are private.
+Fixtures inject only the executable prefix and runtime, then observe the actual
+adapter argv, including fresh/resume output placement, isolation flags, network
+policy and late raw overrides. Tables cover omitted and named sandbox levels;
+a separate derived-root case compares process arguments with effective recorded
+grants. The fixture owns the invocation result until handoff assertions finish,
+so pending markers retain the same lifetime as app recording.
+
+Pure rollout folds and outcome policy have independent tests. A final-byte-only
+classifier cannot replace the live composition: the watchdog may have retained
+an authoritative scoped answer that later rollout bytes no longer contain.
+The process regressions exercise that detection-time evidence through recovery;
+app tests separately pin retry vetoes and result selection.

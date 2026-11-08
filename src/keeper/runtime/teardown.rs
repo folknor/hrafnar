@@ -1,6 +1,6 @@
 //! Tree membership, reaping rounds, and bounded teardown.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::super::process::{children_of, read_cmdline};
 use super::super::protocol::{Event, KILLED_MAX, Outcome, Proc};
@@ -47,6 +47,8 @@ impl Keeper {
         complete
     }
 
+    // Membership requires live kernel identity checks. Synthetic snapshots can
+    // test targeting after admission, but cannot establish this pidfd proof.
     fn admit(&mut self, child: u32, parent: u32) -> bool {
         let Ok(pidfd) = pidfd_open(child) else {
             return false;
@@ -125,7 +127,7 @@ impl Keeper {
     /// waking early only means finding the newcomers sooner.
     fn beat(&mut self, until: Instant) {
         let left = until.saturating_duration_since(Instant::now());
-        let beat = Duration::from_millis(self.spec.beat_ms).min(left);
+        let beat = self.spec.schedule.beat.min(left);
         if !beat.is_zero() {
             self.service(Some(beat));
         }
@@ -136,7 +138,7 @@ impl Keeper {
     /// short the moment its parent gets to reap it and clean up. Returns true
     /// once the tree is empty.
     fn full_beat(&mut self, until: Instant) -> bool {
-        let end = (Instant::now() + Duration::from_millis(self.spec.beat_ms)).min(until);
+        let end = (Instant::now() + self.spec.schedule.beat).min(until);
         loop {
             if self.reap() {
                 return true;
@@ -149,19 +151,19 @@ impl Keeper {
         }
     }
 
-    pub(super) fn teardown(&mut self, term_grace: Duration) -> Outcome {
-        let term_until = Instant::now() + term_grace;
-        let final_at = term_until + Duration::from_millis(self.spec.kill_phase_ms);
-        let mut complete;
+    pub(super) fn teardown(&mut self, start: crate::keeper::Start) -> Outcome {
+        let deadlines = self.spec.schedule.deadlines(Instant::now(), start);
+        let term_until = deadlines.term;
+        let final_at = deadlines.kill;
         // SIGTERM (and SIGCONT, so a stopped process can act on it) to every
         // member as it is found, until the grace runs out.
         loop {
             if self.reap() {
                 self.account_dead();
-                return self.outcome(true, true);
+                return self.outcome(true);
             }
-            // Whether this walk was complete matters only for the final
-            // verdict, which the kill rounds below decide.
+            // Discovery finds targets; its apparent completeness is never
+            // treated as proof that no unknown member remains.
             let _ = self.discover(term_until);
             for m in self.members.values_mut().filter(|m| !m.termed) {
                 let _ = pidfd_signal(&m.pidfd, libc::SIGTERM);
@@ -181,38 +183,27 @@ impl Keeper {
         // forks a new child each time its last one dies is never a leaf, and
         // leaves-first alone would kill its children forever. From then on,
         // every known member each round.
-        let beat = Duration::from_millis(self.spec.beat_ms);
-        let leaves_until = term_until + Duration::from_millis(self.spec.kill_phase_ms) / 2;
+        let beat = self.spec.schedule.beat;
+        let leaves_until = deadlines.leaves;
         loop {
             if self.reap() {
                 self.account_dead();
-                return self.outcome(true, true);
+                return self.outcome(true);
             }
             // Discovery stops short of the deadline, so what it found can
             // still be killed in the time left.
-            complete = self.discover(final_at.checked_sub(beat * 2).unwrap_or(final_at));
+            let _ = self.discover(final_at.checked_sub(beat * 2).unwrap_or(final_at));
             self.account_dead();
             let now = Instant::now();
             if now >= final_at {
                 break;
             }
-            let mut targets: Vec<u32> = if now >= leaves_until {
-                Vec::new()
-            } else {
-                let parents: std::collections::BTreeSet<u32> = self
-                    .members
-                    .keys()
-                    .filter_map(|pid| stat_ppid_start(*pid).map(|(ppid, _)| ppid))
-                    .collect();
-                self.members
-                    .keys()
-                    .copied()
-                    .filter(|pid| !parents.contains(pid))
-                    .collect()
-            };
-            if targets.is_empty() {
-                targets = self.members.keys().copied().collect();
-            }
+            let edges: Vec<_> = self
+                .members
+                .keys()
+                .map(|pid| (*pid, stat_ppid_start(*pid).map_or(0, |(ppid, _)| ppid)))
+                .collect();
+            let targets = crate::keeper::policy::kill_targets(&edges, now < leaves_until);
             for pid in targets {
                 if let Some(m) = self.members.get(&pid) {
                     let _ = pidfd_signal(&m.pidfd, libc::SIGKILL);
@@ -220,33 +211,33 @@ impl Keeper {
             }
             if self.full_beat(final_at) {
                 self.account_dead();
-                return self.outcome(true, true);
+                return self.outcome(true);
             }
         }
         // At the deadline: SIGKILL everything known, then keep finding and
         // killing what appears (a child forked just before its parent died
         // is now the keeper's) for two more beats, so nothing killed in the
         // last round, or orphaned by it, is reported as surviving.
-        let settle_end = final_at + beat * 2;
+        let settle_end = deadlines.settle;
         loop {
             for m in self.members.values() {
                 let _ = pidfd_signal(&m.pidfd, libc::SIGKILL);
             }
             if self.full_beat(settle_end) {
                 self.account_dead();
-                return self.outcome(true, true);
+                return self.outcome(true);
             }
             if Instant::now() >= settle_end {
                 break;
             }
-            complete = self.discover(settle_end);
+            let _ = self.discover(settle_end);
         }
         let empty = self.reap();
         self.account_dead();
-        self.outcome(empty, complete)
+        self.outcome(empty)
     }
 
-    fn outcome(&mut self, empty: bool, complete: bool) -> Outcome {
+    fn outcome(&mut self, empty: bool) -> Outcome {
         let survivors: Vec<Proc> = if empty {
             Vec::new()
         } else {
@@ -257,11 +248,13 @@ impl Keeper {
         }
         Outcome {
             status: self.leader_status,
-            clean: empty,
-            killed: std::mem::take(&mut self.killed),
-            killed_dropped: self.killed_dropped,
-            survivors: survivors.len(),
-            incomplete: !empty && (!complete || survivors.is_empty()),
+            teardown: crate::keeper::Teardown::observed(
+                empty,
+                std::mem::take(&mut self.killed),
+                self.killed_dropped,
+                survivors,
+            ),
+            interrupt_delivered: self.interrupted,
         }
     }
 }

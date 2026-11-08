@@ -24,7 +24,7 @@ fn save_doc(config_path: &Path, doc: &DocumentMut) -> Result<()> {
 
 /// Return the configured audit id, creating and persisting one when absent.
 /// The config file lock also serializes callers whose global locks differ.
-pub fn ensure_audit_id(config_path: &Path) -> Result<String> {
+pub fn ensure_audit_id(config_path: &Path) -> Result<crate::data::AuditId> {
     let doc = load_doc(config_path)?;
     if let Some(id) = configured_audit_id(&doc)? {
         return Ok(id);
@@ -47,13 +47,13 @@ pub fn ensure_audit_id(config_path: &Path) -> Result<String> {
         return Ok(id);
     }
 
-    let id = crate::config::try_generate_short_id()?;
+    let id = crate::data::AuditId::generate()?;
     set_audit_id(&mut doc, &id)?;
     save_doc(config_path, &doc)?;
     Ok(id)
 }
 
-fn configured_audit_id(doc: &DocumentMut) -> Result<Option<String>> {
+fn configured_audit_id(doc: &DocumentMut) -> Result<Option<crate::data::AuditId>> {
     let Some(audit) = doc.get("_audit") else {
         return Ok(None);
     };
@@ -66,10 +66,7 @@ fn configured_audit_id(doc: &DocumentMut) -> Result<Option<String>> {
     let id = id
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("[_audit].id is not a string in .review.toml"))?;
-    if id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(id.to_string()))
+    Ok(crate::data::AuditId::from_record(id))
 }
 
 fn set_audit_id(doc: &mut DocumentMut, id: &str) -> Result<()> {
@@ -128,7 +125,7 @@ pub fn init(sel: &Selection) -> Result<()> {
         );
     }
 
-    let audit_id = crate::ids::try_generate_short_id()?;
+    let audit_id = crate::data::AuditId::generate()?;
     let mut content = INIT_TEMPLATE_PREFIX.to_string();
     content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
     std::fs::write(&path, content)
@@ -176,7 +173,7 @@ mod tests {
     #[test]
     fn ensure_audit_id_keeps_an_existing_id() {
         let path = scratch_file("[_audit]\nid = \"beef\"\n");
-        assert_eq!(ensure_audit_id(&path).unwrap(), "beef");
+        assert_eq!(ensure_audit_id(&path).unwrap().as_str(), "beef");
         let raw = std::fs::read_to_string(&path).unwrap();
         assert_eq!(raw, "[_audit]\nid = \"beef\"\n");
         let _ = std::fs::remove_file(&path);
@@ -206,7 +203,34 @@ bugs = \"find edge cases\"
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("# top comment"));
         assert!(raw.contains("bugs = \"find edge cases\""));
-        assert!(raw.contains(&id));
+        assert!(raw.contains(id.as_str()));
         let _ = std::fs::remove_file(&path);
+    }
+    #[test]
+    fn audit_id_read_failures_preserve_existing_entries() {
+        // Invalid UTF-8 fails read_to_string even under root; chmod-based
+        // unreadability tests can silently succeed for privileged runners.
+        let path = scratch_file("placeholder");
+        let bytes = b"[archetypes]\n# \xff existing bytes\n";
+        std::fs::write(&path, bytes).expect("write unreadable text");
+        let error = ensure_audit_id(&path).expect_err("read must fail");
+        assert!(error.to_string().contains("failed to read"), "{error:#}");
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(std::fs::read(&path).expect("bytes remain"), bytes);
+        std::fs::remove_file(&path).expect("remove fixture file");
+        std::fs::create_dir(&path).expect("directory at config path");
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, "untouched").expect("sentinel");
+        assert!(
+            ensure_audit_id(&path)
+                .expect_err("directory is not config")
+                .to_string()
+                .contains("failed to read")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("preserved"),
+            "untouched"
+        );
+        std::fs::remove_dir_all(path).expect("cleanup");
     }
 }

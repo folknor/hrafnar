@@ -209,14 +209,12 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writable_roots::config_override;
     use crate::writable_roots::test_host::{FakeHost, cwd};
 
     #[test]
     fn a_workspace_that_needs_nothing_grants_nothing() {
         let host = FakeHost::new();
         assert!(derive(&cwd(), &host).is_empty());
-        assert_eq!(config_override(&[]), None);
     }
 
     #[test]

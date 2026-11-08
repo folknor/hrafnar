@@ -35,7 +35,7 @@ impl Observer for ClaudeObserver {
 /// matters.
 const CLAUDE_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
-pub async fn run_claude(
+pub(super) async fn run_claude(
     launch: &super::LaunchSpec,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
@@ -143,12 +143,14 @@ pub async fn run_claude(
     // reader). A SIGINT before claude installs its handler takes the default
     // action and kills it with nothing printed; after, it ends the turn with a
     // result object.
-    let marker_sid = fresh_id.clone().unwrap_or_else(|| session_id.to_string());
     let owner = Lease::known(
-        &marker_sid,
+        session.id().expect("validated claude identity"),
         Provider::Claude,
         project_root,
-        runtime.data_root.as_deref(),
+        &runtime.data,
+        &runtime.run_id,
+        runtime.reservation.clone(),
+        runtime.predecessor.as_ref(),
     );
     let lease = Lease::clone(&owner);
     let (mut run, pipes) = Run::spawn(

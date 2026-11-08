@@ -1,15 +1,25 @@
 //! Event pipe delivery and best-effort orphan outcome logging.
 
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use super::super::protocol::{Event, Outcome, Proc};
+use super::super::protocol::{Event, Outcome};
 use super::{Keeper, last_error};
 
 impl Keeper {
     pub(super) fn finish(&mut self, outcome: &Outcome) {
-        self.queue(&Event::Done(outcome.clone()));
-        let until = Instant::now() + Duration::from_millis(self.spec.flush_ms);
+        for proc_ in outcome.teardown.accounting().0 {
+            self.queue(&Event::Killed(proc_.clone()));
+        }
+        self.queue(&Event::Done(Outcome {
+            status: outcome.status,
+            teardown: outcome
+                .teardown
+                .clone()
+                .map_processes(|p| p.len(), |p| p.len()),
+            interrupt_delivered: outcome.interrupt_delivered,
+        }));
+        let until = Instant::now() + self.spec.schedule.flush;
         while !self.pending.is_empty() && self.events.is_some() && Instant::now() < until {
             self.flush();
             if !self.pending.is_empty() {
@@ -69,11 +79,7 @@ impl Keeper {
         let Some(path) = &self.spec.orphan_log else {
             return;
         };
-        let survivors: Vec<Proc> = if outcome.clean {
-            Vec::new()
-        } else {
-            self.members.values().map(|m| m.proc_.clone()).collect()
-        };
+        let survivors = outcome.teardown.named();
         let line = serde_json::json!({
             "epoch_secs": crate::provider::now_epoch_secs(),
             "label": self.spec.label,

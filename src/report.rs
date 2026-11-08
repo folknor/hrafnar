@@ -45,7 +45,7 @@ pub fn report_lines(entries: &[Unresolved]) -> Vec<String> {
             ));
         }
         if l.incomplete {
-            out.push("  (more remain that could not be identified)".to_string());
+            out.push("  (more may remain that could not be identified)".to_string());
         }
     }
     out
@@ -108,7 +108,7 @@ mod tests {
             lines[0].starts_with("left running: at least 1 process "),
             "{lines:?}"
         );
-        assert!(lines[1].contains("could not be identified"), "{lines:?}");
+        assert_eq!(lines[1], "  (more may remain that could not be identified)");
     }
 
     #[test]

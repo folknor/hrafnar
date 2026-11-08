@@ -64,87 +64,70 @@ impl ProviderCommands {
 #[derive(Clone)]
 pub struct ProviderRuntime {
     pub commands: ProviderCommands,
+    pub run_id: crate::sessions::handoff::RunId,
+    pub predecessor: Option<crate::sessions::handoff::RunId>,
+    pub reservation: Option<std::sync::Arc<crate::inflight::Reservation>>,
     /// Codex watchdog polling/patience; other adapters do not inherit this policy.
     pub timings: crate::watchdog::Timings,
     /// How long a pipe reader gets to finish after the child is reaped before
     /// it is aborted and we take whatever it buffered.
     pub drain_grace: std::time::Duration,
-    /// Overrides the XDG data root used for in-flight markers and incident
-    /// bundles. `None` in production. Tests set it because redirecting
-    /// `CODEX_HOME` only redirects the *child* - `review`'s own paths are
-    /// resolved from the test process's real `HOME`/`XDG_DATA_HOME`, so without
-    /// this the suite wrote stub incident bundles into the operator's real
-    /// `~/.local/share/review/incidents`.
-    /// Audit logs are written by the app layer after provider calls return;
-    /// direct provider-runner tests do not reach that logging path.
-    pub data_root: Option<std::path::PathBuf>,
+    /// Review-owned storage, shared by markers, incidents and orphan outcomes.
+    pub data: crate::data::DataDir,
+    pub log_family: crate::data::LogFamily,
     /// Shared command domain; default constructs an isolated one for tests.
     pub lifecycle: crate::supervisor::Lifecycle,
     /// The keeper binary and teardown pacing (see `contained`). Tests point the
     /// keeper at the built `review` and shorten the graces.
     pub teardown: crate::contained::Settings,
-    /// Where a keeper writes its outcome if `review` is gone before reading it:
-    /// `teardowns.jsonl`, or `teardowns-private.jsonl` for a private project.
-    pub orphan_log: Option<std::path::PathBuf>,
 }
 
 impl ProviderRuntime {
     /// Build from project config. `stall_timeout` comes from
     /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
-    /// otherwise it replaces it (off included). `private` routes the orphan
-    /// log the way the sidecar is routed.
+    /// otherwise it replaces it (off included). Scope routes the orphan log
+    /// to the same family as the sidecar.
     pub fn from_config(
         lifecycle: crate::supervisor::Lifecycle,
         stall_timeout: Option<crate::config::StallTimeout>,
-        private: bool,
+        data: crate::data::DataDir,
+        scope: &crate::data::LogScope,
     ) -> Self {
-        let mut rt = Self::with_lifecycle(lifecycle);
+        let mut rt = Self::with_data(lifecycle, data, scope.family());
         if let Some(timeout) = stall_timeout {
             rt.timings.stall_grace = timeout.grace();
         }
-        rt.orphan_log = orphan_log_path(None, private);
         rt
     }
 }
 
-/// The orphan log beside the sidecar logs. See `ProviderRuntime::orphan_log`.
-pub fn orphan_log_path(
-    data_root: Option<&std::path::Path>,
-    private: bool,
-) -> Option<std::path::PathBuf> {
-    let base = match data_root {
-        Some(root) => root.to_path_buf(),
-        None => std::env::var("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|_| {
-                std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-            })
-            .ok()?,
-    };
-    let name = if private {
-        "teardowns-private.jsonl"
-    } else {
-        "teardowns.jsonl"
-    };
-    Some(base.join("review").join(name))
-}
-
 impl ProviderRuntime {
-    fn with_lifecycle(lifecycle: crate::supervisor::Lifecycle) -> Self {
+    fn with_data(
+        lifecycle: crate::supervisor::Lifecycle,
+        data: crate::data::DataDir,
+        log_family: crate::data::LogFamily,
+    ) -> Self {
         Self {
             commands: ProviderCommands::default(),
+            run_id: crate::sessions::handoff::RunId::default(),
+            predecessor: None,
+            reservation: None,
             timings: super::codex::watchdog_timings(),
             drain_grace: crate::timings::DRAIN_GRACE,
-            data_root: None,
+            data,
+            log_family,
             lifecycle,
             teardown: crate::contained::Settings::default(),
-            orphan_log: orphan_log_path(None, false),
         }
     }
 }
 
 impl Default for ProviderRuntime {
     fn default() -> Self {
-        Self::with_lifecycle(crate::supervisor::Lifecycle::default())
+        Self::with_data(
+            crate::supervisor::Lifecycle::default(),
+            crate::data::DataDir::process().clone(),
+            crate::data::LogFamily::Public,
+        )
     }
 }

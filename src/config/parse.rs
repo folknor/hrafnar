@@ -1,6 +1,6 @@
 use super::{
     AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, ProfileTables,
-    Provider, RESERVED_NAMES, toml_key,
+    Provider, reserved_names, toml_key,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -14,7 +14,14 @@ fn unknown_provider_hint() -> String {
 /// group/archetype name clashes) happen in `resolve`, because a project's group
 /// may name a global archetype. Host-scoped `[_projects]` names are checked
 /// later, once the current host is known, by `resolve` or `global_projects`.
-pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
+pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> super::Result<ConfigFile> {
+    parse_file_inner(raw, origin, layer).map_err(|source| super::ConfigError::InvalidFile {
+        origin: origin.to_string(),
+        source,
+    })
+}
+
+fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
     // Parse to a table first, then peel off the reserved sections by name.
     // Everything left over is a provider table or a legacy host table. This
     // avoids serde `flatten`, which does not coexist with a sibling named field
@@ -91,7 +98,7 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
     }
 
     for (name, prime) in &archetypes {
-        if RESERVED_NAMES.contains(&name.as_str()) {
+        if reserved_names().contains(name) {
             bail!("'{name}' is a reserved name and cannot be used as an archetype in {origin}");
         }
         if name == BARE && !prime.trim().is_empty() {
@@ -103,7 +110,7 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         }
     }
     for (name, members) in &groups {
-        if RESERVED_NAMES.contains(&name.as_str()) || name == BARE {
+        if reserved_names().contains(name) || name == BARE {
             bail!("'{name}' is a reserved name and cannot be used as a group in {origin}");
         }
         if members.is_empty() {
@@ -191,12 +198,12 @@ mod tests {
     /// Parse a single local file and resolve it alone, as a project with no
     /// global config would be.
     fn local_only(raw: &str, host: &str) -> Result<ReviewConfig> {
-        resolve(
+        Ok(resolve(
             parse_file(raw, "local", Layer::Local)?,
             None,
             host,
             crate::config::ConfigFiles::default(),
-        )
+        )?)
     }
 
     #[test]

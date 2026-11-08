@@ -340,7 +340,7 @@ pub struct StatusFacts<'a> {
     /// A signal was observed (live) or recorded (a row, whatever its text).
     pub signaled: bool,
     pub quiet_secs: Option<u64>,
-    pub last_event: Option<&'a str>,
+    pub last_event: Option<&'a dyn std::fmt::Display>,
     pub task_complete: Option<bool>,
 }
 

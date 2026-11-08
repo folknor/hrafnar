@@ -20,7 +20,10 @@ enum GrokPermissions {
     ReadOnly,
     FullAccess,
     FreshWorkspace,
-    RecordedProfile { name: String, roots: Vec<String> },
+    RecordedProfile {
+        name: grok::ProfileName,
+        roots: grok::RootSet,
+    },
     BuiltinWorkspace,
     Custom(String),
     InheritSaved,
@@ -75,13 +78,13 @@ impl Permissions {
                 Some("read-only") => GrokPermissions::ReadOnly,
                 Some("none") => GrokPermissions::FullAccess,
                 Some("workspace") => GrokPermissions::BuiltinWorkspace,
-                Some(name) if grok::is_generated_profile_name(name) => {
-                    GrokPermissions::RecordedProfile {
-                        name: name.to_string(),
-                        roots: grok::canonical_roots(roots),
-                    }
-                }
-                Some(name) => GrokPermissions::Custom(name.to_string()),
+                Some(name) => match grok::ProfileName::from_record(name) {
+                    Some(name) => GrokPermissions::RecordedProfile {
+                        name,
+                        roots: grok::RootSet::new(roots),
+                    },
+                    None => GrokPermissions::Custom(name.to_string()),
+                },
             }),
         })
     }
@@ -104,9 +107,8 @@ impl Permissions {
                 GrokPermissions::FreshWorkspace | GrokPermissions::BuiltinWorkspace => {
                     Some("workspace")
                 }
-                GrokPermissions::RecordedProfile { name, .. } | GrokPermissions::Custom(name) => {
-                    Some(name)
-                }
+                GrokPermissions::RecordedProfile { name, .. } => Some(name.as_str()),
+                GrokPermissions::Custom(name) => Some(name),
                 GrokPermissions::InheritSaved => None,
             },
         }
@@ -201,7 +203,7 @@ impl PermissionPlan {
         };
         let mut paths = match &permissions.0 {
             NativePermissions::Grok(GrokPermissions::RecordedProfile { roots, .. }) => {
-                roots.clone()
+                roots.paths().to_vec()
             }
             _ => granted.iter().map(|g| g.path.clone()).collect(),
         };
@@ -209,7 +211,7 @@ impl PermissionPlan {
             NativePermissions::Codex(_) => {}
             NativePermissions::Grok(_) => {
                 if policy == RootPolicy::Derive {
-                    paths = grok::canonical_roots(&paths);
+                    paths = grok::RootSet::new(&paths).paths().to_vec();
                 }
             }
             NativePermissions::Claude => {}
@@ -237,10 +239,11 @@ impl PermissionPlan {
     }
 
     /// Commit a successfully created native profile without changing provenance.
-    pub fn grok_profile(&mut self, name: String) {
+    pub fn grok_profile(&mut self, roots: grok::RootSet) {
+        self.paths = roots.paths().to_vec();
         self.permissions = Permissions(NativePermissions::Grok(GrokPermissions::RecordedProfile {
-            name,
-            roots: self.paths.clone(),
+            name: roots.profile_name(),
+            roots,
         }));
     }
 }
@@ -281,7 +284,7 @@ mod tests {
     #[test]
     fn generated_looking_custom_names_only_gain_restore_behavior_at_the_record_boundary() {
         let roots = vec!["/b".into(), "/a".into(), "/b".into()];
-        let canonical = grok::canonical_roots(&roots);
+        let canonical = grok::RootSet::new(&roots);
         let name = "review-ws-0123456789abcdef".to_string();
         let fresh = Permissions::profile(Provider::Grok, Some(&SandboxLevel::Custom(name.clone())));
         assert_eq!(fresh.selector(), Some(name.as_str()));
@@ -290,7 +293,12 @@ mod tests {
         assert_eq!(fresh.roots(), RootPolicy::Ignore);
         let restored =
             Permissions::restore(Provider::Grok, Some("workspace-write"), Some(&name), &roots);
-        assert_eq!(restored.write_setup(), Some(grok::GrokWrite::Resume(name)));
+        assert_eq!(
+            restored.write_setup(),
+            Some(grok::GrokWrite::Resume(
+                grok::ProfileName::from_record(&name).expect("generated name")
+            ))
+        );
         assert_eq!(restored.roots(), RootPolicy::Recorded);
         match restored.0 {
             NativePermissions::Grok(GrokPermissions::RecordedProfile { roots, .. }) => {

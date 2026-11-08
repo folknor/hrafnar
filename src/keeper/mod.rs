@@ -38,19 +38,24 @@
 //!
 //! # Protocol
 //!
-//! `review` spawns `review __keep <spec-json>` with SIGINT, SIGTERM, SIGCHLD
+//! `review` spawns `review __keep <spec-fd>` with SIGINT, SIGTERM, SIGCHLD
 //! and SIGPIPE blocked, so no signal can take its default action before the
-//! keeper reads them from a signalfd. Two pipes beyond stdio, whose numbers are
+//! keeper reads them from a signalfd. The spec is a sealed memfd, read and closed
+//! before any provider fork; argv carries only its descriptor number. Two pipes beyond stdio, whose numbers are
 //! in the spec: control (review to keeper: `g` go, `i` interrupt, `t`
 //! terminate; EOF means `review` is gone) and events (keeper to review, one
 //! JSON `Event` per line). The keeper launches nothing before `g`, so `review`
 //! can record the keeper's identity first. Its own stdio is the provider's and
 //! it never writes to it.
 
+mod launch;
+mod policy;
 mod process;
 mod protocol;
 mod runtime;
 
+pub use launch::{Environment, Launch, Launcher};
+pub use policy::{Start, Teardown, TeardownSchedule};
 pub use protocol::{ARG, Control, Event, KILLED_MAX, Outcome, Proc, Spec};
 pub use runtime::{block_handled_signals, main};
 

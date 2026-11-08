@@ -29,10 +29,42 @@ pub fn main() -> i32 {
 }
 
 fn run_from_args() -> std::io::Result<()> {
-    let spec = std::env::args()
+    let fd = std::env::args()
         .nth(2)
-        .and_then(|s| serde_json::from_str::<Spec>(&s).ok())
-        .ok_or_else(|| std::io::Error::other("bad keeper spec"))?;
+        .and_then(|s| s.parse::<RawFd>().ok())
+        .filter(|fd| *fd >= 3)
+        .ok_or_else(|| std::io::Error::other("bad keeper spec fd"))?;
+    // SAFETY: validate the inherited descriptor before taking ownership.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: the private launcher transferred this descriptor to the keeper.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    use std::io::Read;
+    let mut payload = Vec::new();
+    file.take(super::protocol::SPEC_MAX as u64 + 1)
+        .read_to_end(&mut payload)?;
+    // take owns and closes the file before any provider can be created.
+    if payload.len() > super::protocol::SPEC_MAX {
+        return Err(std::io::Error::other("keeper spec too large"));
+    }
+    let spec: Spec = serde_json::from_slice(&payload).map_err(std::io::Error::other)?;
+    if spec.control_fd < 3
+        || spec.events_fd < 3
+        || spec.control_fd == spec.events_fd
+        || spec.control_fd == fd
+        || spec.events_fd == fd
+    {
+        return Err(std::io::Error::other("bad keeper pipe descriptors"));
+    }
+    for pipe in [spec.control_fd, spec.events_fd] {
+        // SAFETY: inspect transferred descriptors before creating any new fd.
+        if unsafe { libc::fcntl(pipe, libc::F_GETFD) } < 0 {
+            return Err(last_error());
+        }
+    }
+    spec.launch.validate()?;
+    spec.schedule.validate()?;
     Keeper::new(spec)?.run()
 }
 
@@ -173,7 +205,7 @@ impl Keeper {
                     reason: "terminated before the provider started".to_string(),
                 });
                 self.finish(&Outcome {
-                    clean: true,
+                    teardown: super::Teardown::observed(true, Vec::new(), 0, Vec::new()),
                     ..Outcome::default()
                 });
                 return Ok(());
@@ -181,7 +213,7 @@ impl Keeper {
             self.service(None);
         }
         let started = Instant::now();
-        let startup = Duration::from_millis(self.spec.startup_ms);
+        let startup = self.spec.startup;
         while self.phase == Phase::Starting {
             if self.terminate || started.elapsed() >= startup {
                 let reason = if self.terminate {
@@ -207,12 +239,12 @@ impl Keeper {
             self.service(None);
         }
         let grace = if self.leader_status.is_some() || self.leader.is_none() {
-            self.spec.leftover_grace_ms
+            super::Start::Leftover
         } else {
-            self.spec.terminate_grace_ms
+            super::Start::Terminate
         };
         self.phase = Phase::TearingDown;
-        let outcome = self.teardown(Duration::from_millis(grace));
+        let outcome = self.teardown(grace);
         self.finish(&outcome);
         Ok(())
     }
@@ -353,16 +385,15 @@ impl Keeper {
 
     /// Forward the first interrupt to the provider, once, while it runs.
     fn interrupt(&mut self) {
-        // `interrupted` only suppresses duplicate forwarding; review records
-        // intent at the caller. Supported callers wait for provider output
+        // `interrupted` records successful delivery and suppresses repeats.
+        // Caller intent remains independent. Supported callers wait for provider output
         // before sending `i` or SIGINT, and terminate before readiness so a
         // pre-exec child is not signalled with its default handler.
         if self.phase != Phase::Running || self.interrupted || self.leader_status.is_some() {
             return;
         }
         if let Some((_, fd)) = &self.leader {
-            self.interrupted = true;
-            let _ = pidfd_signal(fd, libc::SIGINT);
+            self.interrupted = pidfd_signal(fd, libc::SIGINT).is_ok();
         }
     }
 

@@ -1,8 +1,10 @@
 pub(crate) mod forensics;
 pub(crate) mod rollout;
+mod roots;
 pub(crate) mod watch;
 
 use super::*;
+use crate::transcript::{RolloutOffset, Scope};
 
 /// Nudge sent when auto-resuming a codex run that died without a final answer.
 const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
@@ -238,7 +240,7 @@ pub(super) async fn run_codex(
     // `invoke`, and `src/writable_roots/` for why they are derived at all).
     // Placed before profile `config` so a profile can restate
     // `sandbox_workspace_write.writable_roots` and win.
-    if let Some(override_arg) = crate::writable_roots::config_override_paths(root_paths) {
+    if let Some(override_arg) = roots::config_override_paths(root_paths) {
         args.push("-c".to_string());
         args.push(override_arg);
     }
@@ -296,7 +298,7 @@ pub(super) async fn run_codex(
         args.push("--json".to_string());
         args.push("-o".to_string());
         args.push(last_msg_path.clone());
-        Some(session_id.to_string())
+        session.id().cloned()
     };
 
     run_codex_json(
@@ -316,11 +318,11 @@ pub(super) async fn run_codex(
 /// backstop. `known_session_id` is `Some` on resume (we already know it) and
 /// `None` on a fresh run (parsed from `thread.started`). Never bails on a
 /// non-zero exit: a halted/errored run still reports what it produced.
-pub async fn run_codex_json(
+async fn run_codex_json(
     launch: &super::LaunchSpec,
     args: Vec<String>,
     last_msg_path: &str,
-    known_session_id: Option<String>,
+    known_session_id: Option<SessionId>,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
@@ -357,9 +359,9 @@ pub async fn run_codex_json(
     // completed in the same second as this run's launch would slip through a
     // time-based filter. The offset has no such race - it is exact. Zero for a
     // fresh run, whose rollout does not exist yet.
-    // `None` means "no trustworthy baseline", which disables both the watchdog
+    // An unknown baseline becomes Scope::Untrusted, which disables both the watchdog
     // and transcript recovery for this run. It is emphatically not the same as
-    // `Some(0)`: falling back to zero for a *resume* whose rollout could not be
+    // Scope::From(0): falling back to zero for a *resume* whose rollout could not be
     // read would scope the scan to the entire session history, and an old
     // `final_answer` from a previous turn could then authorise killing a genuine
     // mid-turn wedge, or be recovered as this run's answer.
@@ -370,7 +372,7 @@ pub async fn run_codex_json(
         project_root,
     );
     let mut baseline_problem = None;
-    let rollout_baseline: Option<u64> = match (codex_home.as_deref(), known_session_id.as_deref()) {
+    let rollout_baseline: Option<u64> = match (codex_home.as_deref(), known_session_id.as_ref()) {
         (None, _) => {
             baseline_problem = Some("Codex home is unknown".to_string());
             None
@@ -381,7 +383,7 @@ pub async fn run_codex_json(
         // Resume: the rollout already holds earlier turns, so we must know
         // exactly where they end. If we cannot stat it, we do not guess.
         (Some(home), Some(sid)) => {
-            match crate::transcript::find_transcript_path_in_home_lookup(sid, home) {
+            match crate::transcript::find_transcript_path_checked_in_home(sid, home) {
                 crate::transcript::Lookup::Found(path) => match std::fs::metadata(path) {
                     Ok(metadata) => Some(metadata.len()),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -409,11 +411,17 @@ pub async fn run_codex_json(
             }
         }
     };
+    let rollout_scope = rollout_baseline.map_or(Scope::Untrusted, |offset| {
+        Scope::From(RolloutOffset(offset))
+    });
     if let Some(problem) = baseline_problem {
         eprintln!(
             "warning: {problem} for session {}; completion watchdog and transcript recovery \
              are disabled for this run",
-            known_session_id.as_deref().unwrap_or("?")
+            known_session_id
+                .as_ref()
+                .map(SessionId::as_str)
+                .unwrap_or("?")
         );
     }
 
@@ -441,18 +449,28 @@ pub async fn run_codex_json(
     // could kill the wrapper and orphan codex - still holding the session's
     // writer lock, which would make the resume `review interrupt` hands back
     // fail.
-    let session = match known_session_id.as_deref() {
-        Some(sid) => SessionStart::Resume(SessionId::parse(sid)?),
+    let session = match known_session_id.as_ref() {
+        Some(sid) => SessionStart::Resume(sid.clone()),
         None => SessionStart::Fresh { id: None },
     };
-    let owner = match known_session_id.as_deref() {
+    let owner = match session.id() {
         Some(sid) => Lease::known(
             sid,
             Provider::Codex,
             project_root,
-            runtime.data_root.as_deref(),
+            &runtime.data,
+            &runtime.run_id,
+            runtime.reservation.clone(),
+            runtime.predecessor.as_ref(),
         ),
-        None => Lease::learned(Provider::Codex, project_root, runtime.data_root.as_deref()),
+        None => Lease::learned(
+            Provider::Codex,
+            project_root,
+            &runtime.data,
+            &runtime.run_id,
+            runtime.reservation.clone(),
+            runtime.predecessor.as_ref(),
+        ),
     };
     let lease = Lease::clone(&owner);
     let scanning_for_session_id = known_session_id.is_none();
@@ -497,7 +515,7 @@ pub async fn run_codex_json(
     // incident bundle.
     let mut watchdog_answer: Option<String> = None;
     let mut quiet_secs: Option<u64> = None;
-    let mut last_rollout_event: Option<String> = None;
+    let mut last_rollout_event: Option<crate::transcript::EventKind> = None;
 
     // Wait for codex, but stay interruptible.
     //
@@ -522,7 +540,7 @@ pub async fn run_codex_json(
         let watchdog = crate::watchdog::wait_for_stranded_completion(
             lease.session_watch(),
             codex_home.clone(),
-            rollout_baseline,
+            rollout_scope,
             runtime.timings,
         );
         async move {
@@ -619,6 +637,7 @@ pub async fn run_codex_json(
     // truncated capture can leave without the `thread.started` line. Losing the
     // id would cost us the transcript, the recovery path and the sidecar row.
     let session_id = known_session_id
+        .map(|id| id.as_str().to_owned())
         .or(parsed_session_id)
         .or(watched_session_id);
 
@@ -629,12 +648,6 @@ pub async fn run_codex_json(
     // on disk (task_complete) yet exits non-zero and truncates both the `--json`
     // stream and the `-o` file, so the rollout is the authoritative record.
     let suspicious = !captured || !status.success();
-    // An untrustworthy baseline must not degrade to "scan everything": scope to
-    // a point past the end of the file so nothing is attributed to this run.
-    // `u64::MAX` is exact for that purpose - `slice_from_offset` yields an empty
-    // slice for any offset beyond the file.
-    let rollout_offset = rollout_baseline.unwrap_or(u64::MAX);
-    let recovery_scope = Some(rollout_offset);
     let transcript = if suspicious {
         // Scoped to the bytes this run appended (see `rollout_baseline`), so a
         // previous turn's `final_answer` can never be recovered as ours. When
@@ -643,7 +656,7 @@ pub async fn run_codex_json(
         // answer that also suppresses auto-resume.
         match (session_id.as_deref(), codex_home.as_deref()) {
             (Some(sid), Some(home)) => {
-                match crate::transcript::summarize_session_in_home_lookup(sid, home, recovery_scope)
+                match crate::transcript::summarize_session_in_home_lookup(sid, home, rollout_scope)
                 {
                     crate::transcript::Lookup::Found(summary) => Some(summary),
                     crate::transcript::Lookup::Absent => {
@@ -683,6 +696,9 @@ pub async fn run_codex_json(
     //   3. the last streamed message - interim commentary, a last resort.
     // A trailing turn can reset the summary's answer. Preserve the exact
     // scoped evidence that licensed our kill even if the rollout later changes.
+    // Final rollout bytes alone cannot reconstruct this decision: detection's
+    // saved answer is a separate temporal input. Pure fold/outcome tests cover
+    // their own rules; invoke fixtures exercise this live composition.
     let recovered =
         watchdog_answer.or_else(|| transcript.as_ref().and_then(|t| t.final_answer.clone()));
     // The bundle's answer flag must agree with recovery: a trailing phantom
@@ -738,22 +754,23 @@ pub async fn run_codex_json(
             stdout: &stdout_buf,
             stderr: &stderr_buf,
             duration_ms,
-            data_root: runtime.data_root.as_deref(),
+            data: &runtime.data,
             outcome: &outcome,
             turns,
             forensics: Some(crate::incident::IncidentForensics::Codex(
                 crate::incident::CodexIncident {
-                    transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
-                    transcript_offset: rollout_offset,
-                    final_answer_present: transcript.as_ref().map(|_| answer_in_scope),
+                    transcript_path: transcript.as_ref().map(|t| t.path.as_path()),
+                    scope: rollout_scope,
+                    final_answer_present: forensics::answer_presence(
+                        answer_in_scope,
+                        transcript.as_ref(),
+                    ),
                     quiet_secs,
-                    last_rollout_event: last_rollout_event.as_deref(),
+                    last_rollout_event: last_rollout_event.as_ref(),
                 },
             )),
         }) {
-            crate::incident::BundleWriteOutcome::Written(path) => {
-                Some(path.to_string_lossy().into_owned())
-            }
+            crate::incident::BundleWriteOutcome::Written(path) => Some(path),
             crate::incident::BundleWriteOutcome::Unavailable(reason) => {
                 eprintln!("warning: incident bundle was not written: {reason}");
                 None

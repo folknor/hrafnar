@@ -73,11 +73,15 @@ async fn stopping_refuses_spawn_in_the_same_domain_only() {
     // The nonexistent executable distinguishes admission refusal from exec
     // failure without starting any uncontained test process.
     let mut command = Command::new("/review-nonexistent-test-command");
-    let error = lifecycle.spawn(&mut command, &ctl).expect_err("refused");
+    let error = lifecycle
+        .spawn(&mut command, &ctl, std::time::Duration::from_secs(7))
+        .expect_err("refused");
     assert!(error.to_string().contains("not launched"), "{error:#}");
     assert!(lifecycle.live_keepers().is_empty());
     let other = Lifecycle::default();
-    let error = other.spawn(&mut command, &ctl).expect_err("exec fails");
+    let error = other
+        .spawn(&mut command, &ctl, std::time::Duration::from_secs(7))
+        .expect_err("exec fails");
     assert!(error.to_string().contains("failed to spawn"), "{error:#}");
 }
 
@@ -93,11 +97,37 @@ fn completion_cannot_remove_another_registration_that_reused_the_pid() {
         .expect("registry")
         .live
         .insert(7, Arc::clone(&new));
+    lifecycle
+        .0
+        .registry
+        .lock()
+        .expect("registry")
+        .bounds
+        .insert(7, std::time::Duration::from_secs(17));
     lifecycle.complete("old run", 7, &old, &unknown());
+    assert_eq!(
+        lifecycle
+            .0
+            .registry
+            .lock()
+            .expect("registry")
+            .bounds
+            .get(&7),
+        Some(&std::time::Duration::from_secs(17))
+    );
     assert_eq!(lifecycle.live_keepers(), vec![7]);
     assert_eq!(lifecycle.unresolved().len(), 1);
     lifecycle.complete("new run", 7, &new, &Leftovers::default());
     assert!(lifecycle.live_keepers().is_empty());
+    assert!(
+        lifecycle
+            .0
+            .registry
+            .lock()
+            .expect("registry")
+            .bounds
+            .is_empty()
+    );
     assert_eq!(
         lifecycle.unresolved().len(),
         1,
@@ -115,7 +145,11 @@ async fn poisoned_registry_refuses_admission_and_preserves_accounting() {
         panic!("poison test");
     }));
     let error = lifecycle
-        .spawn(&mut Command::new("/review-nonexistent-test-command"), &ctl)
+        .spawn(
+            &mut Command::new("/review-nonexistent-test-command"),
+            &ctl,
+            std::time::Duration::from_secs(7),
+        )
         .expect_err("poison refuses admission");
     assert!(error.to_string().contains("registry unavailable"));
     lifecycle.request_stop();

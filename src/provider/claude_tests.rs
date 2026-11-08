@@ -18,7 +18,14 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
     let head = new_shared_buf();
     let metrics = std::sync::Arc::new(std::sync::Mutex::new(super::ClaudeMetrics::default()));
     // A lease with no marker: `ready` only records the fact.
-    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let owner = Lease::learned(
+        Provider::Claude,
+        Path::new("/nonexistent"),
+        &crate::data::DataDir::unavailable(),
+        &crate::sessions::handoff::RunId::default(),
+        None,
+        None,
+    );
     let lease = Lease::clone(&owner);
     // The keep must exceed the result line, as production's 8 MiB does; the
     // stream is several times larger, so the tail really is trimmed.
@@ -257,7 +264,14 @@ fn claude_usage_counts_every_result_and_ignores_other_events() {
 #[tokio::test]
 async fn claude_eof_metrics_and_abort_facts_are_independent_of_capture() {
     use tokio::io::AsyncWriteExt;
-    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let owner = Lease::learned(
+        Provider::Claude,
+        Path::new("/nonexistent"),
+        &crate::data::DataDir::unavailable(),
+        &crate::sessions::handoff::RunId::default(),
+        None,
+        None,
+    );
     let lease = Lease::clone(&owner);
     let metrics: SharedClaudeMetrics = Default::default();
     read_stream(
@@ -302,7 +316,14 @@ async fn claude_eof_metrics_and_abort_facts_are_independent_of_capture() {
 
 #[tokio::test]
 async fn claude_init_does_not_accept_an_oversized_line_suffix() {
-    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let owner = Lease::learned(
+        Provider::Claude,
+        Path::new("/nonexistent"),
+        &crate::data::DataDir::unavailable(),
+        &crate::sessions::handoff::RunId::default(),
+        None,
+        None,
+    );
     let lease = Lease::clone(&owner);
     let mut bytes = vec![b' '; CLAUDE_INIT_SCAN_MAX + 1];
     bytes.extend_from_slice(CLAUDE_INIT.as_bytes());

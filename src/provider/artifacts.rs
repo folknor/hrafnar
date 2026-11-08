@@ -13,9 +13,11 @@ pub(crate) fn session_artifacts(record: &SessionRecord) -> SessionArtifacts {
                 std::path::Path::new(&record.project),
             );
             Some(match home.as_deref() {
-                Some(home) => {
-                    transcript::summarize_session_in_home_lookup(&record.session_id, home, None)
-                }
+                Some(home) => transcript::summarize_session_in_home_lookup(
+                    &record.session_id,
+                    home,
+                    transcript::Scope::WholeFile,
+                ),
                 None => transcript::Lookup::UnknownHome,
             })
         }
@@ -71,12 +73,14 @@ mod tests {
         let home = root.join("custom-codex");
         std::fs::create_dir_all(home.join("sessions")).expect("fixture home");
         let path = home.join("sessions/rollout-test-session.jsonl");
-        let initial = concat!(
-            "{\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"payload\":{\"type\":\"agent_message\",\"phase\":\"final_answer\",\"message\":\"answer\"}}\n",
-            "{\"payload\":{\"type\":\"task_complete\"}}\n"
+        let initial = format!(
+            "{}\n{}\n{}\n{}\n",
+            crate::codex_fixtures::metadata("session"),
+            crate::codex_fixtures::event(None, "task_started"),
+            crate::codex_fixtures::legacy_message("answer", "final_answer"),
+            crate::codex_fixtures::event(None, "task_complete")
         );
-        std::fs::write(&path, initial).expect("rollout");
+        std::fs::write(&path, &initial).expect("rollout");
         let mut record: SessionRecord = serde_json::from_value(serde_json::json!({
             "timestamp":"2026-01-01T00:00:00Z","hostname":"old-host","audit_id":"old",
             "provider":"codex","archetype":"bare","session_id":"session",

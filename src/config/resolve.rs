@@ -16,6 +16,22 @@ pub fn resolve(
     global: Option<ConfigFile>,
     hostname: &str,
     files: ConfigFiles,
+) -> super::Result<ReviewConfig> {
+    let project_root = files
+        .local
+        .as_deref()
+        .map(crate::project::ProjectRoot::from_config_path)
+        .transpose()?;
+    resolve_inner(local, global, hostname, files, project_root)
+        .map_err(|source| super::ConfigError::Resolve { source })
+}
+
+fn resolve_inner(
+    local: ConfigFile,
+    global: Option<ConfigFile>,
+    hostname: &str,
+    files: ConfigFiles,
+    project_root: Option<crate::project::ProjectRoot>,
 ) -> Result<ReviewConfig> {
     let audit = local.audit.clone();
     let mut layers: Vec<(Layer, ConfigFile)> = vec![(Layer::Local, local)];
@@ -183,6 +199,7 @@ pub fn resolve(
         profiles,
         hostname: hostname.to_string(),
         files,
+        project_root,
         projects,
     })
 }

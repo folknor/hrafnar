@@ -5,6 +5,8 @@ use std::os::fd::RawFd;
 use std::path::PathBuf;
 
 /// The hidden first argument that turns a `review` process into a keeper.
+pub(super) const SPEC_MAX: usize = 16 << 20;
+
 pub const ARG: &str = "__keep";
 
 /// How many cleanly killed processes an outcome names. Survivors are never
@@ -41,23 +43,11 @@ impl Control {
 /// What `review` asks the keeper to run, and how patiently to tear it down.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Spec {
-    pub program: String,
-    pub args: Vec<String>,
+    pub launch: super::Launch,
     pub control_fd: RawFd,
     pub events_fd: RawFd,
-    /// SIGTERM grace for what a provider left behind after exiting on its own.
-    pub leftover_grace_ms: u64,
-    /// SIGTERM grace when told to terminate a provider that is still running.
-    pub terminate_grace_ms: u64,
-    /// After the SIGTERM grace: how long SIGKILL rounds may take, leaves first.
-    pub kill_phase_ms: u64,
-    /// Pause between teardown rounds, which lets a supervising ancestor reap a
-    /// killed child and run its own cleanup.
-    pub beat_ms: u64,
-    /// How long the provider may take to exec before the launch is failed.
-    pub startup_ms: u64,
-    /// How long the final events may take to drain before the keeper exits.
-    pub flush_ms: u64,
+    pub schedule: super::TeardownSchedule,
+    pub startup: std::time::Duration,
     /// Appended to (one JSON line) when `review` is gone and the outcome has
     /// nobody to go to.
     pub orphan_log: Option<PathBuf>,
@@ -77,23 +67,13 @@ pub struct Proc {
 
 /// What the teardown established.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct Outcome {
+pub struct Outcome<Processes = Vec<Proc>> {
     /// The provider's raw wait status; `None` when it never ran or could not
     /// be reaped.
     pub status: Option<i32>,
-    /// `ECHILD`: nothing the provider started is alive.
-    pub clean: bool,
-    /// Processes left behind that the teardown ended, up to `KILLED_MAX`.
-    pub killed: Vec<Proc>,
-    /// Further killed processes not named in `killed`.
-    #[serde(default)]
-    pub killed_dropped: usize,
-    /// Processes still alive that the keeper could name; each was sent as a
-    /// `Survivor` event before this outcome.
-    pub survivors: usize,
-    /// Processes remain that discovery could not name, so `survivors` is a
-    /// lower bound.
-    pub incomplete: bool,
+    pub teardown: super::Teardown<Processes>,
+    /// A successful pidfd_send_signal(SIGINT), not proof it was handled.
+    pub interrupt_delivered: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -112,5 +92,7 @@ pub enum Event {
         status: i32,
     },
     Survivor(Proc),
-    Done(Outcome),
+    Killed(Proc),
+    /// Compact counts complete the bounded process-event streams.
+    Done(Outcome<usize>),
 }

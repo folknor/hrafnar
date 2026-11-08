@@ -42,6 +42,15 @@ what this host has registered, so registering a project, or a checkout going
 missing, can never silently change what an existing command acts on.
 `review config` lists the registered projects for this host.
 
+## Project identity
+
+Roots use their canonical path when it can be resolved, and otherwise retain
+their recorded spelling. Old session paths still compare by raw equality too,
+so deleted projects remain visible. Capturing a path does not prove the checkout
+still exists or is the same project. Before interrupting a session for a message,
+review checks its exact config and audit id; after interruption it loads and
+checks them again before sending anything.
+
 ## Per command
 
 - A run, `review config`, `review init` and `review sessions` act on the

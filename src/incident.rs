@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Everything known about a finished provider run, handed to the bundle writer.
+/// ProcessSpec, Outcome, Exit and the provider extension own independent rules.
+/// The remaining byte buffers and measurements are observations, not interchangeable
+/// policy selectors; wrapping each scalar would not add an invariant.
 pub struct Incident<'a> {
     pub provider: crate::provider::Provider,
     /// The process as it was spawned: argv[0] and the args, the working
@@ -47,10 +50,8 @@ pub struct Incident<'a> {
     pub stdout: &'a [u8],
     pub stderr: &'a [u8],
     pub duration_ms: u128,
-    /// Overrides the XDG data root the bundle is written under. `None` in
-    /// production; set by tests so a stub run cannot write into the operator's
-    /// real incident directory.
-    pub data_root: Option<&'a Path>,
+    /// The invocation's immutable storage domain, also injected by tests.
+    pub data: &'a crate::data::DataDir,
     pub outcome: &'a crate::provider::Outcome,
     pub turns: u32,
     pub forensics: Option<IncidentForensics<'a>>,
@@ -122,21 +123,6 @@ pub struct EnvVar {
     value: Option<String>,
 }
 
-/// Where bundles are written. `data_root` overrides the real XDG location and
-/// exists so the test harness cannot deposit stub bundles in the operator's
-/// actual `~/.local/share/review/incidents` - it did exactly that before this
-/// was injectable, because redirecting `CODEX_HOME` only redirects the *child*.
-fn incidents_dir(data_root: Option<&Path>) -> Option<PathBuf> {
-    let data_dir = match data_root {
-        Some(root) => root.to_path_buf(),
-        None => std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .ok()?,
-    };
-    Some(data_dir.join("review").join("incidents"))
-}
-
 /// A name that shouldn't have its value recorded (heuristic, errs toward hiding).
 /// Bundles keep nonsecret values for replay and redact likely secrets. Sidecars
 /// record env names only, so omitting values there is compatible with this rule.
@@ -175,7 +161,7 @@ pub enum BundleWriteOutcome {
 /// Write a forensic bundle for a suspicious run. A directory is reported as
 /// written only when every artifact, including its index, was written.
 pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
-    let Some(base) = incidents_dir(inc.data_root) else {
+    let Some(base) = inc.data.incidents() else {
         return BundleWriteOutcome::Unavailable(
             "could not determine the incident data directory".to_string(),
         );
@@ -277,12 +263,16 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         turns: inc.turns,
         terminated_by_review: inc.outcome.termination().map(ToString::to_string),
         quiet_secs: codex.and_then(|c| c.quiet_secs),
-        last_rollout_event: codex.and_then(|c| c.last_rollout_event).map(str::to_string),
+        last_rollout_event: codex
+            .and_then(|c| c.last_rollout_event)
+            .map(ToString::to_string),
         turn_error: inc.outcome.stated.clone(),
         stdout_bytes: inc.stdout.len(),
         stderr_bytes: inc.stderr.len(),
         stdout_truncated,
-        transcript_path: codex.and_then(|c| c.transcript_path).map(str::to_string),
+        transcript_path: codex
+            .and_then(|c| c.transcript_path)
+            .map(|path| path.to_string_lossy().into_owned()),
         final_answer_present,
         rate_limits,
         env,
@@ -418,8 +408,11 @@ pub struct IncidentListing {
 /// Recent incident bundles, newest first, ordered by their recorded UTC time.
 /// Read failures are returned alongside the bundles that could be read.
 pub fn list_recent(limit: usize) -> IncidentListing {
-    // Always the real location: `review incidents` is an operator-facing view.
-    let base = match incidents_dir(None) {
+    list_recent_in(crate::data::DataDir::process(), limit)
+}
+
+pub fn list_recent_in(data: &crate::data::DataDir, limit: usize) -> IncidentListing {
+    let base = match data.incidents() {
         Some(b) => b,
         None => {
             return IncidentListing {
@@ -736,13 +729,14 @@ mod tests {
             stdin: Stdin::Pipe(Vec::new()),
         };
         let outcome = Outcome::no_answer().stated("refused".into());
-        let rollout = base.join("rollout.jsonl");
+        use std::os::unix::ffi::OsStrExt;
+        let rollout = base.join(std::ffi::OsStr::from_bytes(b"rollout-\xff.jsonl"));
         std::fs::write(&rollout, concat!(
             "{\"payload\":{\"type\":\"agent_message\",\"phase\":\"final_answer\",\"message\":\"old\"}}\n",
             "{\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit\":5}}}\n"
         )).unwrap();
         let baseline = std::fs::metadata(&rollout).unwrap().len();
-        let path = rollout.to_str().expect("test path");
+        let path = rollout.as_path();
         let mut incident = Incident {
             provider: Provider::Codex,
             process: &process,
@@ -754,7 +748,7 @@ mod tests {
             stdout: b"stream",
             stderr: b"error",
             duration_ms: 12,
-            data_root: Some(&base),
+            data: &crate::data::DataDir::at(base.clone()),
             outcome: &outcome,
             turns: 0,
             forensics: None,
@@ -771,7 +765,11 @@ mod tests {
             incident.forensics = offset.map(|offset| {
                 IncidentForensics::Codex(CodexIncident {
                     transcript_path: Some(path),
-                    transcript_offset: offset,
+                    scope: if offset == u64::MAX {
+                        crate::transcript::Scope::Untrusted
+                    } else {
+                        crate::transcript::Scope::From(crate::transcript::RolloutOffset(offset))
+                    },
                     final_answer_present: Some(false),
                     quiet_secs: Some(3),
                     last_rollout_event: None,
@@ -805,6 +803,26 @@ mod tests {
                 assert_eq!(tail.is_empty(), offset == u64::MAX);
             }
         }
+        // The watchdog already licensed an answer, but recovery can no longer
+        // read its file. Affirmative evidence still reaches the schema-1 bundle.
+        incident.forensics = Some(IncidentForensics::Codex(CodexIncident {
+            transcript_path: None,
+            scope: crate::transcript::Scope::From(crate::transcript::RolloutOffset(baseline)),
+            final_answer_present: crate::provider::codex::forensics::answer_presence(true, None),
+            quiet_secs: Some(3),
+            last_rollout_event: None,
+        }));
+        let directory = match write_bundle(&incident) {
+            BundleWriteOutcome::Written(path) => path,
+            other => panic!("preserved answer bundle failed: {other:?}"),
+        };
+        assert_eq!(
+            read_incident_summary(&directory)
+                .expect("preserved evidence reads")
+                .final_answer_present,
+            Some(true)
+        );
+        assert!(!directory.join("transcript.tail.jsonl").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 

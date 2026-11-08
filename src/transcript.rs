@@ -11,13 +11,16 @@
 use std::{
     ffi::CStr,
     fmt, io,
+    io::{BufRead, Read},
     os::unix::ffi::OsStrExt,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 /// A tool call with no matching output in the Codex rollout.
 #[derive(Clone)]
 pub struct InFlightTool {
+    pub call_id: Option<String>,
     pub name: String,
     pub arguments: String,
 }
@@ -39,6 +42,51 @@ impl fmt::Display for InFlightTool {
     }
 }
 
+/// Physical event kind, open to future Codex event names. Display is only the
+/// historical diagnostic projection; it is not a parser or a closed vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventKind {
+    pub top: Option<String>,
+    pub payload: Option<String>,
+}
+
+impl fmt::Display for EventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            self.top.as_deref().unwrap_or("?"),
+            self.payload.as_deref().unwrap_or("?")
+        )
+    }
+}
+
+/// Byte boundary measured before a launch, not a timestamp or a turn number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RolloutOffset(pub u64);
+
+/// Authority to attribute rollout bytes. WholeFile is for session inspection;
+/// an unknown launch baseline must never become permission to read old turns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    WholeFile,
+    From(RolloutOffset),
+    Untrusted,
+}
+
+impl Scope {
+    pub fn bytes(self, bytes: &[u8]) -> &[u8] {
+        match self {
+            Self::WholeFile => bytes,
+            Self::Untrusted => &[],
+            Self::From(RolloutOffset(offset)) => match usize::try_from(offset) {
+                Ok(offset) if offset <= bytes.len() => &bytes[offset..],
+                _ => &[],
+            },
+        }
+    }
+}
+
 /// Result of looking for or reading a rollout artifact.
 ///
 /// Callers can distinguish an absent artifact, an unreadable artifact, and an
@@ -52,13 +100,13 @@ pub enum Lookup<T> {
 }
 
 pub struct TranscriptSummary {
-    pub path: String,
+    pub path: PathBuf,
     /// A `task_complete` event was seen (codex reported the turn done).
     pub task_complete: bool,
     /// A `stream_error` event was seen (internal-tool error froze the stream).
     pub stream_error: bool,
     /// `type/payload.type` of the final transcript event.
-    pub last_event: Option<String>,
+    pub last_event: Option<EventKind>,
     /// The last tool call with no matching output.
     pub last_in_flight_tool: Option<InFlightTool>,
     /// The last `final_answer`-phase agent message this turn, if any. codex
@@ -160,8 +208,8 @@ fn home_directory_from_passwd() -> Option<PathBuf> {
     }
 }
 
-/// Locate the transcript file for a session id by matching the `-<id>.jsonl`
-/// filename suffix (the id is a UUID, so this is unambiguous). Bounded
+/// Locate candidates by filename suffix, then require exact session identity
+/// from their first session_meta record. This also supports opaque IDs. Bounded
 /// recursive walk of the date-nested `sessions/` tree. A missing override uses
 /// the current process environment and the account home from the system user
 /// database when `HOME` is unset.
@@ -182,10 +230,10 @@ pub fn find_transcript_path_lookup(
 pub(crate) fn summarize_session_in_home_lookup(
     session_id: &str,
     home: &Path,
-    from_offset: Option<u64>,
+    scope: Scope,
 ) -> Lookup<TranscriptSummary> {
     match find_transcript_path_in_home_lookup(session_id, home) {
-        Lookup::Found(path) => summarize_lookup(&path, from_offset),
+        Lookup::Found(path) => summarize_lookup(&path, scope),
         Lookup::Absent => Lookup::Absent,
         Lookup::Unreadable(error) => Lookup::Unreadable(error),
         Lookup::UnknownHome => Lookup::UnknownHome,
@@ -199,11 +247,18 @@ pub(crate) fn find_transcript_path_in_home_lookup(
     let Ok(id) = crate::provider::SessionId::parse(session_id) else {
         return Lookup::Absent;
     };
-    find_session_path(&id, home)
+    find_transcript_path_checked_in_home(&id, home)
 }
 
-// Identity admission is distinct from the historical suffix discovery policy;
-// this does not prove a unique filename match or symlink confinement.
+pub(crate) fn find_transcript_path_checked_in_home(
+    session_id: &crate::provider::SessionId,
+    home: &Path,
+) -> Lookup<PathBuf> {
+    find_session_path(session_id, home)
+}
+
+// Suffixes only select candidates. Metadata supplies identity at discovery time;
+// a later path read is not pinned against replacement, nor confined by symlinks.
 fn find_session_path(session_id: &crate::provider::SessionId, home: &Path) -> Lookup<PathBuf> {
     let session_id = session_id.as_str();
     let sessions = home.join("sessions");
@@ -238,12 +293,6 @@ fn find_session_path(session_id: &crate::provider::SessionId, home: &Path) -> Lo
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => {
-                    // A matching filename is still locatable even when its
-                    // metadata cannot be read. The later file read reports
-                    // whether its contents are unavailable.
-                    if has_transcript_name(&path, &needle) {
-                        return Lookup::Found(path);
-                    }
                     if unreadable.is_none() {
                         unreadable = Some(error);
                     }
@@ -256,7 +305,14 @@ fn find_session_path(session_id: &crate::provider::SessionId, home: &Path) -> Lo
                     stack.push((path, depth + 1));
                 }
             } else if has_transcript_name(&path, &needle) {
-                return Lookup::Found(path);
+                match identifies_session(&path, session_id) {
+                    Ok(true) => return Lookup::Found(path),
+                    Ok(false) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        unreadable.get_or_insert(error);
+                    }
+                }
             }
         }
     }
@@ -266,13 +322,68 @@ fn find_session_path(session_id: &crate::provider::SessionId, home: &Path) -> Lo
     }
 }
 
-fn has_transcript_name(path: &Path, needle: &str) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(needle))
+// Bound the first physical record, including its optional LF, before decoding.
+// A complete JSON record at EOF is valid. Never scan ahead or decode lossily.
+const HEADER_LIMIT: u64 = 1 << 20;
+
+fn identifies_session(path: &Path, requested: &str) -> io::Result<bool> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rollout is not a regular file",
+        ));
+    }
+    let mut header = Vec::new();
+    io::BufReader::new(file.take(HEADER_LIMIT + 1)).read_until(b'\n', &mut header)?;
+    if header.len() as u64 > HEADER_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rollout metadata header is oversized",
+        ));
+    }
+    metadata_identifies(&header, requested)
 }
 
-pub(crate) fn summarize_lookup(path: &Path, from_offset: Option<u64>) -> Lookup<TranscriptSummary> {
+fn metadata_identifies(header: &[u8], requested: &str) -> io::Result<bool> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid rollout session metadata",
+        )
+    };
+    let event: serde_json::Value = serde_json::from_slice(header).map_err(|_| invalid())?;
+    if event.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
+        return Err(invalid());
+    }
+    let payload = event
+        .get("payload")
+        .and_then(|v| v.as_object())
+        .ok_or_else(invalid)?;
+    let id = payload
+        .get("id")
+        .map(|v| v.as_str().ok_or_else(invalid))
+        .transpose()?;
+    let legacy = payload
+        .get("session_id")
+        .map(|v| v.as_str().ok_or_else(invalid))
+        .transpose()?;
+    match (id, legacy) {
+        (Some(id), Some(legacy)) if id != legacy => Err(invalid()),
+        (Some(id), _) | (_, Some(id)) => Ok(id == requested),
+        (None, None) => Err(invalid()),
+    }
+}
+
+fn has_transcript_name(path: &Path, needle: &str) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_bytes().ends_with(needle.as_bytes()))
+}
+
+pub(crate) fn summarize_lookup(path: &Path, scope: Scope) -> Lookup<TranscriptSummary> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Lookup::Absent,
@@ -280,34 +391,10 @@ pub(crate) fn summarize_lookup(path: &Path, from_offset: Option<u64>) -> Lookup<
     };
     // Lossy is safe: an offset landing mid-line leaves one unparseable fragment,
     // which is skipped like any other malformed line.
-    let content = String::from_utf8_lossy(slice_from_offset(&bytes, from_offset));
+    let content = String::from_utf8_lossy(scope.bytes(&bytes));
     let mut summary = parse(&content);
-    summary.path = path.to_string_lossy().into_owned();
+    summary.path = path.to_path_buf();
     Lookup::Found(summary)
-}
-
-/// Slice a rollout's raw bytes to the region a run appended, given the file's
-/// size at that run's launch. `None` means "the whole file".
-///
-/// This is how a run's own events are delimited, in preference to comparing
-/// timestamps. Rollout events carry millisecond stamps while `review`'s clock
-/// string is second-resolution, so a previous turn that finished in the same
-/// second as a resume's launch would slip past a time filter - and its stale
-/// `final_answer` would then be recovered as the new run's result, suppressing
-/// auto-resume and writing a wrong answer into the sidecar. A byte offset has no
-/// such race.
-///
-/// A rollout *shorter* than the offset was rotated or replaced under us;
-/// scanning it whole could attribute another run's turn to this one, so it
-/// yields nothing.
-pub fn slice_from_offset(bytes: &[u8], from_offset: Option<u64>) -> &[u8] {
-    let Some(offset) = from_offset else {
-        return bytes;
-    };
-    match usize::try_from(offset) {
-        Ok(offset) if offset <= bytes.len() => &bytes[offset..],
-        _ => &[],
-    }
 }
 
 /// Current real turn, using the same evidence fold as the watchdog and bundles.
@@ -318,17 +405,18 @@ fn parse(content: &str) -> TranscriptSummary {
 /// Find and summarize the transcript for a codex session id, if one exists.
 /// `override_home` is the run's effective `CODEX_HOME` (a profile `env`
 /// override), if any.
-/// `from_offset` is the rollout's size at the run's launch, restricting the
+/// Scope restricts the summary to the run's own events. A From offset is the
+/// rollout's size at launch, restricting the
 /// summary to that run's own events - used by recovery so a prior turn's
-/// `final_answer` can never be reported as this run's result. Pass `None` to
+/// `final_answer` can never be reported as this run's result. Use WholeFile to
 /// summarize the whole rollout (e.g. `review sessions <id>`).
 pub fn summarize_session_lookup(
     session_id: &str,
     override_home: Option<&str>,
-    from_offset: Option<u64>,
+    scope: Scope,
 ) -> Lookup<TranscriptSummary> {
     match find_transcript_path_lookup(session_id, override_home) {
-        Lookup::Found(path) => summarize_lookup(&path, from_offset),
+        Lookup::Found(path) => summarize_lookup(&path, scope),
         Lookup::Absent => Lookup::Absent,
         Lookup::Unreadable(error) => Lookup::Unreadable(error),
         Lookup::UnknownHome => Lookup::UnknownHome,
@@ -338,6 +426,7 @@ pub fn summarize_session_lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_fixtures as fixtures;
 
     // A run that ran one tool to completion, started a second, then hit a
     // stream_error and never reached task_complete - the frozen-stream case.
@@ -355,7 +444,10 @@ mod tests {
         let s = parse(FROZEN);
         assert!(!s.task_complete);
         assert!(s.stream_error);
-        assert_eq!(s.last_event.as_deref(), Some("event_msg/stream_error"));
+        assert_eq!(
+            s.last_event.as_ref().map(ToString::to_string).as_deref(),
+            Some("event_msg/stream_error")
+        );
         let tool = s.last_in_flight_tool.expect("in-flight tool");
         assert_eq!(tool.name, "exec_command");
         assert!(
@@ -368,6 +460,7 @@ mod tests {
     #[test]
     fn in_flight_tool_display_truncates_long_arguments_with_ellipsis() {
         let tool = InFlightTool {
+            call_id: None,
             name: "exec_command".to_string(),
             arguments: "a".repeat(201),
         };
@@ -379,16 +472,17 @@ mod tests {
 
     #[test]
     fn clean_run_has_no_in_flight_tool() {
-        let clean = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let clean = format!(
+            "{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete")
         );
-        let s = parse(clean);
+        let s = parse(&clean);
         assert!(s.task_complete);
         assert!(!s.stream_error);
         assert!(s.last_in_flight_tool.is_none());
@@ -399,20 +493,21 @@ mod tests {
     // exec stream/-o were cut off. The final_answer must be recoverable.
     #[test]
     fn recovers_final_answer_from_transcript() {
-        let run = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let run = format!(
+            "{}{}{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I am now running the checks.","phase":"commentary"}}"#,
+            fixtures::legacy_message("I am now running the checks.", "commentary"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"All checks passed. No files changed.","phase":"final_answer"}}"#,
+            fixtures::legacy_message("All checks passed. No files changed.", "final_answer"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete")
         );
-        let s = parse(run);
+        let s = parse(&run);
         assert!(s.task_complete);
         assert_eq!(
             s.final_answer.as_deref(),
@@ -427,20 +522,21 @@ mod tests {
     // message earlier in the turn must not count.
     #[test]
     fn recovers_final_answer_from_an_assistant_message() {
-        let run = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let run = format!(
+            "{}{}{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review this."}]}}"#,
             "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading the fixtures now."}],"phase":"commentary"}}"#,
+            fixtures::assistant_message("Reading the fixtures now.", "commentary"),
             "\n",
             r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"NOT READ"}],"phase":"final_answer"}}}"#,
             "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No problems."}],"phase":"final_answer"}}"#,
+            fixtures::assistant_message("No problems.", "final_answer"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"No problems."}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"No problems."}}"#
         );
-        let s = parse(run);
+        let s = parse(&run);
         assert!(s.task_complete);
         assert_eq!(s.final_answer.as_deref(), Some("No problems."));
     }
@@ -463,31 +559,33 @@ mod tests {
 
     #[test]
     fn commentary_assistant_message_is_not_a_final_answer() {
-        let run = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let run = format!(
+            "{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading the fixtures now."}],"phase":"commentary"}}"#,
+            fixtures::assistant_message("Reading the fixtures now.", "commentary"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}"#
         );
-        assert!(parse(run).final_answer.is_none());
+        assert!(parse(&run).final_answer.is_none());
     }
 
     // A run that ended on a tool with only commentary - no final answer exists.
     #[test]
     fn no_final_answer_when_only_commentary() {
-        let run = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let run = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I am moving through the checks now.","phase":"commentary"}}"#,
+            fixtures::legacy_message("I am moving through the checks now.", "commentary"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete")
         );
-        let s = parse(run);
+        let s = parse(&run);
         assert!(s.task_complete);
         assert!(s.final_answer.is_none());
     }
@@ -497,18 +595,19 @@ mod tests {
     // summary must reflect the current turn, not the completed earlier one.
     #[test]
     fn resumed_turn_does_not_inherit_prior_completion() {
-        let resumed = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let resumed = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 999\"}","call_id":"c9"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"stream_error"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"stream_error"}}"#
         );
-        let s = parse(resumed);
+        let s = parse(&resumed);
         assert!(!s.task_complete, "second turn must not report complete");
         assert!(s.stream_error);
         let tool = s.last_in_flight_tool.expect("in-flight tool from turn 2");
@@ -526,24 +625,25 @@ mod tests {
     // The summary must still describe the real (completed) turn underneath.
     #[test]
     fn phantom_shutdown_turn_does_not_mask_real_completion() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let rollout = format!(
+            "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"The real report.","phase":"final_answer"}}"#,
+            fixtures::legacy_message("The real report.", "final_answer"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"turn_context","payload":{"cwd":"/home/folk/Programs/mogwai"}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<turn_aborted>"}]}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
         );
-        let s = parse(rollout);
+        let s = parse(&rollout);
         assert!(s.task_complete, "phantom turn must not clear task_complete");
         assert_eq!(s.final_answer.as_deref(), Some("The real report."));
     }
@@ -554,20 +654,21 @@ mod tests {
     // with a stale answer attached.
     #[test]
     fn early_cancelled_turn_with_a_user_message_is_not_a_phantom() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let rollout = format!(
+            "{}{}{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Old answer.","phase":"final_answer"}}"#,
+            fixtures::legacy_message("Old answer.", "final_answer"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"now do the next thing"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
         );
-        let s = parse(rollout);
+        let s = parse(&rollout);
         assert!(
             !s.task_complete,
             "a cancelled real turn must not inherit the prior turn's completion"
@@ -582,18 +683,19 @@ mod tests {
     // in this rollout at all, so the reasoning is what proves it was real.
     #[test]
     fn turn_cancelled_after_only_reasoning_is_not_a_phantom() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let rollout = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
         );
-        let s = parse(rollout);
+        let s = parse(&rollout);
         assert!(
             !s.task_complete,
             "reasoning proves the turn was real, not a teardown phantom"
@@ -604,18 +706,19 @@ mod tests {
     // tools and was then aborted really did fail, and must report as such.
     #[test]
     fn aborted_turn_with_content_is_not_rolled_back() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        let rollout = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            fixtures::event(Some("event_msg"), "task_complete"),
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            fixtures::event(Some("event_msg"), "task_started"),
             "\n",
             r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#
         );
-        let s = parse(rollout);
+        let s = parse(&rollout);
         assert!(
             !s.task_complete,
             "a real aborted turn must not inherit the prior turn's completion"
@@ -631,25 +734,35 @@ mod tests {
     // wrong response into the sidecar.
     fn parse_from(rollout: &str, from_offset: Option<u64>) -> TranscriptSummary {
         let bytes = rollout.as_bytes();
-        parse(&String::from_utf8_lossy(slice_from_offset(
-            bytes,
-            from_offset,
-        )))
+        let scope = from_offset.map_or(Scope::WholeFile, |offset| {
+            Scope::From(RolloutOffset(offset))
+        });
+        parse(&String::from_utf8_lossy(scope.bytes(bytes)))
     }
 
     #[test]
     fn offset_excludes_a_prior_turns_final_answer() {
-        let prior = concat!(
-            r#"{"timestamp":"2026-07-17T10:00:00.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+        let prior = format!(
+            "{}{}{}{}{}{}",
+            fixtures::timestamp(
+                &fixtures::event(Some("event_msg"), "task_started"),
+                "2026-07-17T10:00:00.000Z"
+            ),
             "\n",
-            r#"{"timestamp":"2026-07-17T10:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer from turn one.","phase":"final_answer"}}"#,
+            fixtures::timestamp(
+                &fixtures::legacy_message("Old answer from turn one.", "final_answer"),
+                "2026-07-17T10:00:05.000Z"
+            ),
             "\n",
-            r#"{"timestamp":"2026-07-17T10:00:06.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
-            "\n",
+            fixtures::timestamp(
+                &fixtures::event(Some("event_msg"), "task_complete"),
+                "2026-07-17T10:00:06.000Z"
+            ),
+            "\n"
         );
         let offset = u64::try_from(prior.len()).expect("test fixture fits in u64");
         // The resume died before writing anything of its own.
-        let rollout = prior.to_string();
+        let rollout = prior.clone();
 
         // Whole-file view (e.g. `review sessions <id>`): the old answer shows.
         assert_eq!(
@@ -670,14 +783,21 @@ mod tests {
     // is still excluded.
     #[test]
     fn offset_excludes_a_prior_answer_from_the_same_second() {
-        let prior = concat!(
-            r#"{"timestamp":"2026-07-17T10:00:05.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer.","phase":"final_answer"}}"#,
-            "\n",
+        let prior = format!(
+            "{}{}",
+            fixtures::timestamp(
+                &fixtures::legacy_message("Old answer.", "final_answer"),
+                "2026-07-17T10:00:05.100Z"
+            ),
+            "\n"
         );
         let offset = u64::try_from(prior.len()).expect("test fixture fits in u64");
         let rollout = format!(
             "{prior}{}\n",
-            r#"{"timestamp":"2026-07-17T10:00:05.900Z","type":"event_msg","payload":{"type":"task_started"}}"#
+            fixtures::timestamp(
+                &fixtures::event(Some("event_msg"), "task_started"),
+                "2026-07-17T10:00:05.900Z"
+            )
         );
         let s = parse_from(&rollout, Some(offset));
         assert!(s.final_answer.is_none());
@@ -687,12 +807,13 @@ mod tests {
     // attributing its contents to this run would be a lie.
     #[test]
     fn offset_past_the_end_yields_nothing() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Answer.","phase":"final_answer"}}"#,
-            "\n",
+        let rollout = format!(
+            "{}{}",
+            fixtures::legacy_message("Answer.", "final_answer"),
+            "\n"
         );
         let offset = u64::try_from(rollout.len() + 1000).expect("fits");
-        assert!(parse_from(rollout, Some(offset)).final_answer.is_none());
+        assert!(parse_from(&rollout, Some(offset)).final_answer.is_none());
     }
 }
 
@@ -711,5 +832,195 @@ mod identity_tests {
                 Lookup::Absent
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_and_metadata_tests {
+    use super::*;
+    use crate::codex_fixtures as fixtures;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/test-scratch")
+                .join(crate::config::generate_uuid());
+            std::fs::create_dir_all(path.join("sessions")).expect("scratch");
+            Self(path)
+        }
+        fn put(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.0.join("sessions").join(name);
+            std::fs::write(&path, bytes).expect("fixture");
+            path
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn scopes_distinguish_inspection_attribution_and_unknown() {
+        let bytes = b"old\nnew\n";
+        assert_eq!(Scope::WholeFile.bytes(bytes), bytes);
+        assert_eq!(Scope::Untrusted.bytes(bytes), b"");
+        for (offset, expected) in [
+            (0, &bytes[..]),
+            (4, &bytes[4..]),
+            (8, &b""[..]),
+            (9, &b""[..]),
+            (u64::MAX, &b""[..]),
+        ] {
+            assert_eq!(Scope::From(RolloutOffset(offset)).bytes(bytes), expected);
+        }
+    }
+
+    #[test]
+    fn metadata_checks_presence_types_and_raw_identity_without_normalizing() {
+        assert!(
+            metadata_identifies(fixtures::metadata("a-b-c").as_bytes(), "a-b-c").expect("header")
+        );
+        assert!(
+            !metadata_identifies(fixtures::metadata("bar-foo").as_bytes(), "foo")
+                .expect("different")
+        );
+        assert!(!metadata_identifies(fixtures::metadata("Foo").as_bytes(), "foo").expect("case"));
+        assert!(!metadata_identifies(fixtures::metadata(" foo").as_bytes(), "foo").expect("space"));
+        for payload in [
+            r#"{"session_id":"foo"}"#,
+            r#"{"id":"foo","session_id":"foo"}"#,
+        ] {
+            assert!(
+                metadata_identifies(
+                    format!(r#"{{"type":"session_meta","payload":{payload}}}"#).as_bytes(),
+                    "foo"
+                )
+                .expect("legacy or agreeing IDs")
+            );
+        }
+        for header in [
+            "",
+            "\n",
+            "{",
+            "[]",
+            "{}",
+            r#"{"type":"event_msg","payload":{"id":"foo"}}"#,
+            r#"{"type":"session_meta","payload":[]}"#,
+            r#"{"type":"session_meta","payload":{}}"#,
+            r#"{"type":"session_meta","payload":{"id":null,"session_id":"foo"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"foo","session_id":1}}"#,
+            r#"{"type":"session_meta","payload":{"id":"foo","session_id":"bar"}}"#,
+        ] {
+            assert_eq!(
+                metadata_identifies(header.as_bytes(), "foo")
+                    .expect_err(header)
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(
+            metadata_identifies(
+                b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"\xff\"}}",
+                "foo"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn discovery_verifies_metadata_and_continues_past_wrong_or_bad_candidates() {
+        let scratch = Scratch::new();
+        let wrong = scratch.put(
+            "rollout-date-bar-foo.jsonl",
+            fixtures::metadata("bar-foo").as_bytes(),
+        );
+        assert!(matches!(
+            find_transcript_path_in_home_lookup("foo", &scratch.0),
+            Lookup::Absent
+        ));
+        assert!(
+            matches!(find_transcript_path_in_home_lookup("bar-foo", &scratch.0), Lookup::Found(p) if p == wrong)
+        );
+        scratch.put("broken-foo.jsonl", b"not json\n");
+        assert!(matches!(
+            find_transcript_path_in_home_lookup("foo", &scratch.0),
+            Lookup::Unreadable(_)
+        ));
+        // The metadata is authoritative even when the candidate's prefix was renamed.
+        let exact = scratch.put(
+            "renamed-prefix-foo.jsonl",
+            b"{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"foo\"}}\r\n",
+        );
+        assert!(
+            matches!(find_transcript_path_in_home_lookup("foo", &scratch.0), Lookup::Found(p) if p == exact)
+        );
+        std::fs::remove_file(exact).expect("remove exact");
+        scratch.put(
+            "rollout-date-bar-foo.jsonl",
+            fixtures::metadata("foo").as_bytes(),
+        );
+        assert!(
+            matches!(find_transcript_path_in_home_lookup("foo", &scratch.0), Lookup::Found(p) if p == wrong)
+        );
+    }
+
+    #[test]
+    fn discovery_and_summary_preserve_non_utf8_home_and_filename() {
+        let scratch = Scratch::new();
+        let home = scratch.0.join(std::ffi::OsStr::from_bytes(b"home-\xff"));
+        std::fs::create_dir_all(home.join("sessions")).expect("native home");
+        let path = home
+            .join("sessions")
+            .join(std::ffi::OsStr::from_bytes(b"rollout-\xfe-foo.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                fixtures::metadata("foo"),
+                fixtures::legacy_message("native answer", "final_answer")
+            ),
+        )
+        .expect("native rollout");
+        assert!(
+            matches!(find_transcript_path_in_home_lookup("foo", &home), Lookup::Found(p) if p == path)
+        );
+        match summarize_session_in_home_lookup("foo", &home, Scope::WholeFile) {
+            Lookup::Found(summary) => {
+                assert_eq!(summary.path, path);
+                assert_eq!(summary.final_answer.as_deref(), Some("native answer"));
+            }
+            _ => panic!("native path summary"),
+        }
+    }
+
+    #[test]
+    fn physical_header_is_bounded_and_nonregular_candidates_do_not_block() {
+        let scratch = Scratch::new();
+        let header = fixtures::metadata("foo");
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.resize(usize::try_from(HEADER_LIMIT).expect("fits"), b' ');
+        let path = scratch.put("limit-foo.jsonl", &bytes);
+        assert!(identifies_session(&path, "foo").expect("limit includes optional LF"));
+        bytes.push(b'\n');
+        std::fs::write(&path, &bytes).expect("oversize");
+        assert_eq!(
+            identifies_session(&path, "foo")
+                .expect_err("over limit")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        std::fs::write(&path, format!("\n{header}\n")).expect("empty first line");
+        assert!(identifies_session(&path, "foo").is_err());
+        let fifo = scratch.0.join("sessions/fifo-foo.jsonl");
+        let cpath = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path");
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            identifies_session(&fifo, "foo")
+                .expect_err("FIFO refused without reading")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

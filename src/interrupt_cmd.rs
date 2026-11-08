@@ -29,17 +29,17 @@
 //!    `turn/interrupt`, so the turn ends cleanly and the session lock is freed;
 //!    claude ends the turn, kills its running command and prints its result.
 //! 4. We wait for the owner to consume the request (the provider has been reaped),
-//!    then for its sidecar row, because that row is what `review resume` needs.
+//!    then for its exact run handoff, published after recovery and recording.
 //!    Printing the resume command any earlier would hand the operator a command
 //!    that fails.
 
 use anyhow::{Result, bail};
 use std::path::Path;
 
-use crate::sessions::SessionRecord;
+use crate::sessions::{handoff, query};
 
 pub async fn run(session_id: &str) -> Result<()> {
-    let outcome = interrupt(session_id, None, crate::sessions::read_all).await?;
+    let outcome = interrupt(session_id, None).await?;
     println!("session: {session_id}");
     println!("project: {}", outcome.project);
     if outcome.interrupted {
@@ -58,7 +58,7 @@ pub async fn run(session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// What became of an interrupt, read from the rows the owner recorded.
+/// What became of the captured invocation, after its durable handoff.
 #[derive(Debug)]
 pub struct Outcome {
     pub interrupted: bool,
@@ -66,174 +66,159 @@ pub struct Outcome {
     pub provider: crate::provider::Provider,
 }
 
-/// The verb, minus printing. `data_root` and `rows` (every sidecar row, oldest
-/// first) are injectable so the whole sequence can run against a stub codex.
-pub async fn interrupt(
-    session_id: &str,
-    data_root: Option<&Path>,
-    rows: impl Fn() -> Vec<SessionRecord>,
-) -> Result<Outcome> {
-    let Some(marker) = crate::inflight::live_marker(session_id, data_root) else {
-        // Nothing to signal yet, but not nothing happening: a message is
-        // queued behind the global lock and will start a turn shortly.
-        if crate::inflight::launch_pending(session_id, data_root) {
-            bail!(
-                "a message to session {session_id} is waiting to launch, so there is no \
-                 turn to interrupt yet\n  retry once it has launched, or send your own \
-                 `review message`, which waits for it and then interrupts it"
-            );
+/// Target one observed invocation, never a row position or a replacement run.
+pub async fn interrupt(session_id: &str, data_root: Option<&Path>) -> Result<Outcome> {
+    let observation = query::Observation::capture(data_root);
+    let empty = query::Snapshot::empty();
+    let marker = match observation.state(session_id, &empty) {
+        query::State::InFlight(m) => m,
+        query::State::HandoffPending(m) => m,
+        query::State::CleanupPending(m) => bail!("{}", cleanup_pending_message(session_id, m)),
+        query::State::Ambiguous => {
+            bail!("session {session_id}: ambiguous live-run observation; retry shortly")
         }
-        bail!(
-            "no run of session {session_id} is in flight on this host\n  \
-             `review sessions --all` lists the ones that are"
-        );
+        query::State::Queued(_) => bail!(
+            "a message to session {session_id} is waiting to launch, so there is no turn to interrupt yet\n  retry once it has launched, or send your own `review message`, which waits for it and then interrupts it"
+        ),
+        query::State::Idle(_) | query::State::Unknown => bail!(
+            "no run of session {session_id} is in flight on this host\n  `review sessions --all` lists the ones that are"
+        ),
     };
-    if marker.cleanup_pending {
-        bail!("{}", cleanup_pending_message(session_id, &marker));
+    interrupt_observed(session_id, marker, data_root).await
+}
+
+/// Message has already selected and project-validated this exact observation.
+/// Reacquiring a different target here could interrupt an unvalidated project.
+pub(crate) async fn interrupt_observed(
+    session_id: &str,
+    marker: &crate::inflight::Live,
+    data_root: Option<&Path>,
+) -> Result<Outcome> {
+    let data = crate::data::DataDir::from_override(data_root);
+    let empty = query::Snapshot::empty();
+    let pending = marker.phase == crate::inflight::Phase::HandoffPending;
+    if marker.cleanup_pending() {
+        bail!("{}", cleanup_pending_message(session_id, marker));
     }
     let provider = match marker.provider.parse::<crate::provider::Provider>() {
-        Ok(p) if p.interruptible() => p,
+        Ok(p) if pending || p.interruptible() => p,
         _ => bail!(
             "session {session_id} is a {} run; only {} runs can be interrupted",
             marker.provider,
             crate::provider::Provider::interruptible_names()
         ),
     };
-    // The pid is offered once the provider has printed its first output, a
-    // second or two after launch. A run caught inside that window - which
-    // `review message` does routinely, its launch lock handing over the moment
-    // the previous message's run spawns - is waited for rather than refused.
-    let marker = if marker.child_pid.is_some() {
-        marker
-    } else {
-        eprintln!("waiting for {provider} to start before interrupting it...");
-        let deadline = std::time::Instant::now() + crate::timings::INTERRUPT_PID_WAIT;
-        loop {
-            tokio::time::sleep(crate::timings::INTERRUPT_PID_POLL).await;
-            match crate::inflight::live_marker(session_id, data_root) {
-                // It ended before it could be interrupted; there is nothing
-                // left to stop.
-                None => {
-                    return Ok(Outcome {
-                        interrupted: false,
-                        project: marker.project.clone(),
-                        provider,
-                    });
-                }
-                Some(m) if m.child_pid.is_some() => break m,
-                Some(_) if std::time::Instant::now() >= deadline => bail!(
-                    "session {session_id} cannot be interrupted: {provider} has produced no \
-                     output in {}s, or the run was launched by an older `review` (pid {}) \
-                     that does not record {provider}'s pid",
-                    crate::timings::INTERRUPT_PID_WAIT.as_secs(),
-                    marker.pid
-                ),
-                Some(_) => {}
-            }
-        }
-    };
-    // Always offered by now; refused rather than defaulted, since pid 0 would
-    // signal our own process group.
-    let Some(child_pid) = marker.child_pid else {
-        bail!("session {session_id}: {provider}'s pid is not recorded");
-    };
-    let Ok(pid) = i32::try_from(child_pid) else {
-        bail!("{provider} pid {child_pid} is out of range");
-    };
-    // The keeper may have exited since the marker was read, and its pid been
-    // reused. A pidfd pins whatever holds the pid now; what `review` spawned
-    // leads its own process group, is the owner's child, and has the start
-    // time the marker recorded. Checked after the pidfd is open and confirmed
-    // still unexited afterwards, so the checks were of the process the signal
-    // will reach.
-    let gone = || {
-        anyhow::anyhow!(
-            "the {provider} run's keeper (pid {child_pid}) has already exited; the run is \
-             finishing on its own"
-        )
-    };
-    let pidfd = crate::process::pidfd_open(child_pid).map_err(|_| gone())?;
-    // SAFETY: `getpgid` only reads the process table.
-    let leads_group = unsafe { libc::getpgid(pid) } == pid;
-    let identity = crate::process::stat_ppid_start(child_pid);
-    let ours = leads_group
-        && identity.is_some_and(|(ppid, start)| {
-            ppid == marker.pid && marker.keeper_start.is_none_or(|s| s == start)
-        })
-        && !crate::process::pidfd_exited(&pidfd);
-    if !ours {
-        return Err(gone());
+    // Older markers have run_id too; only the explicit protocol promises a
+    // completion receipt. Refuse before changing a turn we cannot hand back.
+    anyhow::ensure!(
+        marker.protocol == handoff::PROTOCOL,
+        "session {session_id}: this run was launched by an older review without result handoff support; wait for it to finish"
+    );
+    let run_id: handoff::RunId = marker.run_id.clone().try_into()?;
+    if pending {
+        return wait_handoff(session_id, marker, provider, &data, &run_id).await;
     }
-
-    let count = |rows: &[SessionRecord]| rows.iter().filter(|r| r.session_id == session_id).count();
-    let rows_before = count(&rows());
-    crate::inflight::request_interrupt(session_id, data_root)?;
-    if let Err(err) = crate::process::pidfd_signal(&pidfd, libc::SIGINT) {
-        // Gone already, and the owner may have consumed the request on its way
-        // out; then there is a run to report on after all.
-        if crate::inflight::interrupt_pending(session_id, data_root) {
-            let _ = crate::inflight::take_interrupt_request(session_id, data_root);
-            bail!("failed to signal the {provider} run's keeper (pid {child_pid}): {err}");
+    let owner = marker.owner;
+    let mut current = marker.clone();
+    let deadline = std::time::Instant::now() + crate::timings::INTERRUPT_PID_WAIT;
+    while !current.signal_ready {
+        if let Some(done) = handoff::read(&data, &run_id)? {
+            return handoff_outcome(session_id, marker, provider, &done);
         }
+        let observed = query::Observation::capture(data_root);
+        match observed.state(session_id, &empty) {
+            query::State::Ambiguous => {
+                bail!("session {session_id}: ambiguous live-run observation; retry shortly")
+            }
+            query::State::CleanupPending(m) => bail!("{}", cleanup_pending_message(session_id, m)),
+            query::State::InFlight(m) if m.run_id == marker.run_id => current = m.clone(),
+            _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+        }
+        if current.signal_ready {
+            break;
+        }
+        if owner.is_gone() {
+            return wait_handoff(session_id, marker, provider, &data, &run_id).await;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "session {session_id} cannot be interrupted: {provider} has produced no output in {}s (review pid {})",
+            crate::timings::INTERRUPT_PID_WAIT.as_secs(),
+            owner.pid()
+        );
+        tokio::time::sleep(crate::timings::INTERRUPT_PID_POLL).await;
+    }
+    // Reclassify immediately before signalling, even if the first snapshot was
+    // already ready. A newer recovery may supersede the captured target, but
+    // that never redirects an existing interrupter to a different invocation.
+    let observed = query::Observation::capture(data_root);
+    let current = match observed.state(session_id, &empty) {
+        query::State::Ambiguous => {
+            bail!("session {session_id}: ambiguous live-run observation; retry shortly")
+        }
+        query::State::CleanupPending(m) => bail!("{}", cleanup_pending_message(session_id, m)),
+        query::State::InFlight(m)
+            if m.run_id == marker.run_id && m.owner == owner && m.signal_ready =>
+        {
+            m
+        }
+        _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+    };
+    let keeper = current
+        .keeper
+        .ok_or_else(|| anyhow::anyhow!("session {session_id}: keeper is not recorded"))?;
+    let pinned = match keeper.pin() {
+        Ok(p) if p.is_keeper_of(owner) => p,
+        _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+    };
+    // Exact request paths make even a late request harmless to later runs.
+    marker.request(&data)?;
+    if let Err(e) = pinned.signal(libc::SIGINT) {
+        eprintln!("keeper signal failed ({e}); waiting for this run's handoff");
     } else {
         eprintln!(
-            "interrupt sent to {provider} through its keeper (pid {child_pid}); waiting for the \
-             run to wind down"
+            "interrupt sent to {provider} through its keeper (pid {}); waiting for the run to wind down",
+            keeper.pid()
         );
     }
-
-    // The owner consumes the request once the provider is reaped, so its absence says
-    // the turn is over - without guessing from sidecar timestamps, which are
-    // whole seconds and can tie with the session's previous row.
-    while crate::inflight::interrupt_pending(session_id, data_root) {
-        if !crate::process::identity_alive(marker.pid, marker.pid_start) {
-            // Nobody is left to consume it; withdraw it so it cannot mark a
-            // later resume of this session as interrupted.
-            let _ = crate::inflight::take_interrupt_request(session_id, data_root);
-            bail!(
-                "the owning review (pid {}) exited before {provider} did; session \
-                 {session_id} was not recorded, so it cannot be resumed through review",
-                marker.pid
-            );
-        }
-        tokio::time::sleep(crate::timings::INTERRUPT_POLL).await;
-    }
-
-    // Now the owner's rows. An interrupted auto-resume records the dead first
-    // run and then the resume, back to back, so a lone uninterrupted new row
-    // gets one more look before it is taken as the answer.
-    let mut looked_again = false;
+    wait_handoff(session_id, marker, provider, &data, &run_id).await
+}
+fn handoff_outcome(
+    session_id: &str,
+    marker: &crate::inflight::Live,
+    provider: crate::provider::Provider,
+    done: &handoff::Handoff,
+) -> Result<Outcome> {
+    anyhow::ensure!(
+        done.sidecar_written && done.final_session.as_deref() == Some(session_id),
+        "session {session_id}: the run finished without a recorded handoff for this session; inspect its owner's output"
+    );
+    Ok(Outcome {
+        interrupted: done.interrupted,
+        project: marker.project.clone(),
+        provider,
+    })
+}
+async fn wait_handoff(
+    session_id: &str,
+    marker: &crate::inflight::Live,
+    provider: crate::provider::Provider,
+    data: &crate::data::DataDir,
+    run_id: &handoff::RunId,
+) -> Result<Outcome> {
     loop {
-        let all = rows();
-        let new: Vec<&SessionRecord> = all
-            .iter()
-            .filter(|r| r.session_id == session_id)
-            .skip(rows_before)
-            .collect();
-        if let Some(row) = new
-            .iter()
-            .find(|r| r.digest.as_ref().is_some_and(|d| d.interrupted))
-        {
-            return Ok(Outcome {
-                interrupted: true,
-                project: row.project.clone(),
-                provider,
-            });
+        if let Some(done) = handoff::read(data, run_id)? {
+            return handoff_outcome(session_id, marker, provider, &done);
         }
-        if let Some(row) = new.last() {
-            if looked_again {
-                return Ok(Outcome {
-                    interrupted: false,
-                    project: row.project.clone(),
-                    provider,
-                });
+        if marker.owner.is_gone() {
+            // Publication may race the liveness observation. A final read is
+            // mandatory before declaring the handoff incomplete.
+            if let Some(done) = handoff::read(data, run_id)? {
+                return handoff_outcome(session_id, marker, provider, &done);
             }
-            looked_again = true;
-        } else if !crate::process::identity_alive(marker.pid, marker.pid_start) {
             bail!(
-                "the owning review (pid {}) exited without recording session {session_id}, \
-                 so it cannot be resumed through review",
-                marker.pid
+                "the owning review (pid {}) exited without recording a handoff for session {session_id}",
+                marker.owner.pid()
             );
         }
         tokio::time::sleep(crate::timings::INTERRUPT_POLL).await;
@@ -245,14 +230,14 @@ pub async fn interrupt(
 /// message`.
 // This wording is CLI policy: the store reports liveness, while message
 // imports the interrupt verb's explanation rather than teaching storage prose.
-pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Marker) -> String {
+pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Live) -> String {
     format!(
         "session {session_id}: the review that ran it (pid {}) is gone and its processes are \
          still being torn down (keeper pid {}); retry shortly",
-        marker.pid,
+        marker.owner.pid(),
         marker
             .keeper
-            .map_or_else(|| "?".to_string(), |k| k.to_string())
+            .map_or_else(|| "?".to_string(), |k| k.pid().to_string())
     )
 }
 
@@ -263,4 +248,71 @@ pub(crate) fn interruptible(provider: &str) -> bool {
     provider
         .parse::<crate::provider::Provider>()
         .is_ok_and(crate::provider::Provider::interruptible)
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    #[tokio::test]
+    async fn pending_handoff_waits_without_signalling_or_guessing_from_old_rows() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        let data = crate::data::DataDir::at(root.clone());
+        let id = handoff::RunId::default();
+        let reserved = crate::inflight::reserve(&data, &id)
+            .expect("reserve")
+            .expect("storage");
+        let sid = crate::provider::SessionId::parse("pending-session").expect("session");
+        let mut guard = crate::inflight::mark_for(
+            &sid,
+            crate::provider::Provider::Grok,
+            "/p",
+            &data,
+            &id,
+            None,
+        );
+        reserved.register(&guard);
+        guard.handoff();
+        drop(guard);
+        let marker = crate::inflight::live_marker(sid.as_str(), Some(&root))
+            .expect("continuous pending marker");
+        assert_eq!(marker.phase, crate::inflight::Phase::HandoffPending);
+        let scope = crate::data::LogScope::new(
+            crate::data::AuditId::from_record("a").expect("audit"),
+            false,
+        );
+        let mut row: crate::sessions::SessionRow = serde_json::from_value(serde_json::json!({
+            "timestamp": "old", "epoch_secs": 1, "project": "/p", "hostname": "h", "audit_id": "a",
+            "provider": "grok", "archetype": "bare", "session_id": sid.as_str(),
+            "operator_prompt": "old", "assembled_prompt": "old", "review_version": "0",
+        }))
+        .expect("row");
+        assert!(crate::sessions::append(&data, &scope, &row));
+        let waiter = interrupt(sid.as_str(), Some(&root));
+        let recorder = async {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            assert!(handoff::read(&data, &id).expect("receipt").is_none());
+            row.epoch_secs = Some(2);
+            assert!(crate::sessions::append(&data, &scope, &row));
+            handoff::publish(
+                &data,
+                &handoff::Handoff {
+                    schema: handoff::PROTOCOL,
+                    requested: id.clone(),
+                    interrupted: false,
+                    final_session: Some(sid.as_str().to_owned()),
+                    sidecar_written: true,
+                },
+            )
+            .expect("publish");
+            reserved.complete();
+        };
+        let (outcome, ()) = tokio::join!(waiter, recorder);
+        assert!(!outcome.expect("recorded handoff").interrupted);
+        assert_eq!(crate::sessions::read_all_in(&data).len(), 2);
+        assert!(crate::inflight::live_marker(sid.as_str(), Some(&root)).is_none());
+        drop(reserved);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

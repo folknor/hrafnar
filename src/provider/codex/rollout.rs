@@ -1,7 +1,7 @@
 //! Codex evidence decoding. Callers scope bytes to the invocation before folding.
 //! Current-turn state and any answer in that scope are deliberately distinct:
 //! a later real turn clears the former, while the watchdog may use the latter.
-use crate::transcript::{InFlightTool, TranscriptSummary};
+use crate::transcript::{EventKind, InFlightTool, TranscriptSummary};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PhaseAnswer(pub(crate) String);
@@ -57,7 +57,7 @@ fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
 
 /// Parse transcript NDJSON content into a summary. Split from file IO so the
 /// event handling can be unit-tested directly. Scoping to a single run's events
-/// is the caller's job, via `slice_from_offset`.
+/// is the caller's job, via `Scope::bytes`.
 pub(crate) fn fold(content: &str) -> Rollout {
     // Per-turn state. A resumed session appends to the same rollout, so this is
     // snapshotted and reset at each turn boundary (see the `task_started` arm).
@@ -66,15 +66,15 @@ pub(crate) fn fold(content: &str) -> Rollout {
         task_complete: bool,
         stream_error: bool,
         final_answer: Option<String>,
-        /// Optional call_id -> (name, arguments), preserving insertion order
+        /// Raw optional call IDs (including empty strings), preserving insertion order
         /// and distinct id-less calls via a Vec.
-        in_flight: Vec<(Option<String>, InFlightTool)>,
+        in_flight: Vec<InFlightTool>,
     }
 
     let mut latest_phase_answer = None;
     let mut rate_limits = None;
     let mut cur = TurnState::default();
-    let mut last_event: Option<String> = None;
+    let mut last_event = None;
     // The turn we were in before the most recent `task_started`. Kept so an
     // empty turn that immediately aborts can be rolled back (see below).
     let mut prev: Option<TurnState> = None;
@@ -104,7 +104,10 @@ pub(crate) fn fold(content: &str) -> Rollout {
             rate_limits = Some(limits.clone());
         }
 
-        last_event = Some(format!("{}/{}", top.unwrap_or("?"), ptype.unwrap_or("?")));
+        last_event = Some(EventKind {
+            top: top.map(str::to_string),
+            payload: ptype.map(str::to_string),
+        });
 
         match ptype {
             // A resumed session appends new turns to the same rollout file. Reset
@@ -198,13 +201,11 @@ pub(crate) fn fold(content: &str) -> Rollout {
                         .or_else(|| p.get("input"))
                         .map(ToString::to_string)
                         .unwrap_or_default();
-                    cur.in_flight.push((
+                    cur.in_flight.push(InFlightTool {
                         call_id,
-                        InFlightTool {
-                            name,
-                            arguments: args,
-                        },
-                    ));
+                        name,
+                        arguments: args,
+                    });
                 }
             }
             Some(pt) if pt.ends_with("_call_output") => {
@@ -216,17 +217,17 @@ pub(crate) fn fold(content: &str) -> Rollout {
                 // of several pending calls, so leave them unchanged.
                 if let Some(call_id) = output_call_id {
                     cur.in_flight
-                        .retain(|(id, _)| id.as_deref() != Some(call_id));
+                        .retain(|tool| tool.call_id.as_deref() != Some(call_id));
                 }
             }
             _ => {}
         }
     }
 
-    let last_in_flight_tool = cur.in_flight.pop().map(|(_, tool)| tool);
+    let last_in_flight_tool = cur.in_flight.pop();
 
     let current_turn = TranscriptSummary {
-        path: String::new(),
+        path: std::path::PathBuf::new(),
         task_complete: cur.task_complete,
         stream_error: cur.stream_error,
         last_event,
@@ -342,18 +343,21 @@ pub(crate) fn stream(content: &str) -> Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_fixtures as fixtures;
 
     #[test]
     fn answer_projections_distinguish_real_turns_and_shutdown_phantoms() {
-        let answer = concat!(
-            "{\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"payload\":{\"type\":\"agent_message\",\"phase\":\"final_answer\",\"message\":\"A\"}}\n",
-            "{\"payload\":{\"type\":\"task_complete\"}}\n",
+        let answer = format!(
+            "{}\n{}\n{}\n",
+            fixtures::event(None, "task_started"),
+            r#"{"payload":{"type":"agent_message","phase":"final_answer","message":"A"}}"#,
+            fixtures::event(None, "task_complete")
         );
-        let phantom = concat!(
-            "{\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"payload\":{\"type\":\"message\",\"role\":\"developer\"}}\n",
-            "{\"payload\":{\"type\":\"turn_aborted\"}}\n",
+        let phantom = format!(
+            "{}\n{}\n{}\n",
+            fixtures::event(None, "task_started"),
+            r#"{"payload":{"type":"message","role":"developer"}}"#,
+            r#"{"payload":{"type":"turn_aborted"}}"#
         );
         let rolled_back = fold(&format!("{answer}{phantom}"));
         assert_eq!(rolled_back.current_turn.final_answer.as_deref(), Some("A"));
@@ -362,33 +366,83 @@ mod tests {
             Some(PhaseAnswer("A".into()))
         );
         assert_eq!(
-            rolled_back.current_turn.last_event.as_deref(),
+            rolled_back
+                .current_turn
+                .last_event
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
             Some("?/turn_aborted")
         );
-        let real = concat!(
-            "{\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"payload\":{\"type\":\"user_message\",\"message\":\"next\"}}\n",
-            "{\"payload\":{\"type\":\"reasoning\"}}\n",
-            "{\"payload\":{\"type\":\"turn_aborted\"}}\n",
+        let real = format!(
+            "{}\n{}\n{}\n{}\n",
+            fixtures::event(None, "task_started"),
+            r#"{"payload":{"type":"user_message","message":"next"}}"#,
+            r#"{"payload":{"type":"reasoning"}}"#,
+            r#"{"payload":{"type":"turn_aborted"}}"#
         );
         let later = fold(&format!("{answer}{real}"));
         assert!(later.current_turn.final_answer.is_none());
         assert!(!later.current_turn.task_complete);
         assert_eq!(later.latest_phase_answer, Some(PhaseAnswer("A".into())));
-        let scoped = fold(real);
+        let scoped = fold(&real);
         assert!(scoped.latest_phase_answer.is_none());
     }
 
     #[test]
     fn stream_interim_and_task_completion_never_become_phase_answers() {
-        let raw = concat!(
+        let raw = format!(
+            "{}{}",
             "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Working\"}}\n",
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"Working\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"Working\"}}\n"
         );
-        assert_eq!(stream(raw).interim_message.as_deref(), Some("Working"));
-        let rollout = fold(raw);
+        assert_eq!(stream(&raw).interim_message.as_deref(), Some("Working"));
+        let rollout = fold(&raw);
         assert!(rollout.current_turn.task_complete);
         assert!(rollout.current_turn.final_answer.is_none());
         assert!(rollout.latest_phase_answer.is_none());
+    }
+}
+
+#[cfg(test)]
+mod forensic_value_tests {
+    use super::*;
+    #[test]
+    fn unknown_event_kinds_and_raw_tool_ids_remain_evidence() {
+        let event = fold(r#"{"type":"future/top","payload":{"type":"future/payload"}}"#)
+            .current_turn
+            .last_event
+            .expect("event");
+        assert_eq!(event.top.as_deref(), Some("future/top"));
+        assert_eq!(event.payload.as_deref(), Some("future/payload"));
+        assert_eq!(event.to_string(), "future/top/future/payload");
+        assert_eq!(
+            fold("{}")
+                .current_turn
+                .last_event
+                .expect("unknown")
+                .to_string(),
+            "?/?"
+        );
+        let tools = concat!(
+            "{\"payload\":{\"type\":\"function_call\",\"call_id\":\"\",\"name\":\"empty\"}}\n",
+            "{\"payload\":{\"type\":\"function_call\",\"name\":\"unidentified\"}}\n",
+            "{\"payload\":{\"type\":\"function_call_output\"}}\n"
+        );
+        let tool = fold(tools)
+            .current_turn
+            .last_in_flight_tool
+            .expect("missing output ID matches nothing");
+        assert_eq!(tool.name, "unidentified");
+        assert!(tool.call_id.is_none());
+        let tool = fold(&format!("{tools}{{\"payload\":{{\"type\":\"function_call\",\"call_id\":\"x\",\"name\":\"named\"}}}}\n{{\"payload\":{{\"type\":\"function_call_output\",\"call_id\":\"x\"}}}}\n")).current_turn.last_in_flight_tool.expect("unidentified stays pending");
+        assert!(tool.call_id.is_none());
+        let empty = fold(
+            "{\"payload\":{\"type\":\"function_call\",\"call_id\":\"\",\"name\":\"empty\"}}\n",
+        )
+        .current_turn
+        .last_in_flight_tool
+        .expect("empty ID is raw evidence");
+        assert_eq!(empty.call_id.as_deref(), Some(""));
     }
 }

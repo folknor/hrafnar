@@ -19,12 +19,12 @@ mod layering {
     }
 
     fn layered(local_raw: &str, global_raw: &str, host: &str) -> Result<ReviewConfig> {
-        resolve(
+        Ok(resolve(
             local(local_raw),
             Some(global(global_raw)),
             host,
             ConfigFiles::default(),
-        )
+        )?)
     }
 
     fn entry<'a>(cfg: &'a ReviewConfig, provider: &str, profile: &str) -> &'a ProfileEntry {
@@ -389,7 +389,7 @@ model = \"global-host\"
 
     #[test]
     fn reserved_names_error_as_archetype_or_group_in_the_global_layer_too() {
-        for name in RESERVED_NAMES {
+        for name in reserved_names() {
             let raw = format!("[archetypes]\n{name} = \"x\"\n");
             let err = parse_file(&raw, "global.toml", Layer::Global)
                 .unwrap_err()
@@ -407,7 +407,7 @@ model = \"global-host\"
 
     #[test]
     fn every_reserved_name_errors_as_a_local_group() {
-        for name in RESERVED_NAMES {
+        for name in reserved_names() {
             let raw = format!("[archetypes]\nbugs = \"x\"\n[_groups]\n{name} = [\"bugs\"]\n");
             let err = parse_file(&raw, "local.toml", Layer::Local)
                 .unwrap_err()
@@ -623,19 +623,23 @@ model = \"m\"
             global: Some("/home/u/.config/review/config.toml".into()),
             global_loaded: false,
         };
-        let mut cfg = resolve(local(""), None, "h", files).unwrap();
+        let mut files = files;
+        let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
         assert_eq!(
             cfg.searched(),
             "/p/.review.toml, /home/u/.config/review/config.toml (absent)"
         );
-        cfg.files.global_loaded = true;
+        files.global_loaded = true;
+        let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
         assert_eq!(
             cfg.searched(),
             "/p/.review.toml, /home/u/.config/review/config.toml"
         );
-        cfg.files.global = None;
+        files.global = None;
+        let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
         assert_eq!(cfg.searched(), "/p/.review.toml");
-        cfg.files.local = None;
+        files.local = None;
+        let cfg = resolve(local(""), None, "h", files).unwrap();
         assert_eq!(cfg.searched(), "(no .review.toml)");
     }
 

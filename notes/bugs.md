@@ -29,16 +29,26 @@ so this is unverified rather than known wrong; a probe of a multi-result run
 (a background subagent wake) would settle it. Not a wave item: it needs a real
 provider run.
 
-## BUG-052 - Codex rollout suffix lookup does not prove exact session identity
+## BUG-053 - Exec-status EOF can also mean pre-exec death
 
-Reported by: app/config/path spar (lateral), verified in transcript::find_session_path.
+Verified while reviewing the keeper launch handshake. In
+src/keeper/runtime/launch.rs, a successful exec closes the CLOEXEC status pipe;
+read_exec_status treats EOF as Spawned. A child killed externally between fork
+and exec also closes that pipe without writing errno. This predates the keeper
+protocol rewrite. Retrying interrupted errno writes does not distinguish these
+two cases. Establish the intended startup-report contract and add a controlled
+pre-exec-death regression before claiming EOF proves exec success. Provider wait
+status and teardown still follow; this is the launch acknowledgement, not a
+claim that containment loses the child.
 
-The search accepts the first filename ending in `-<session_id>.jsonl`.
-Both `foo` and `bar-foo` are valid SessionId values, so looking up `foo`
-can select `rollout-date-bar-foo.jsonl`. The type prevents malformed identity
-paths but does not make this suffix match unique. Real Codex IDs are currently
-UUIDs, which is the assumption the existing search comment makes; executable
-identity validation intentionally accepts historical opaque IDs too. Establish
-an exact identity check from the rollout metadata or documented filename format
-without rejecting old opaque IDs. This link preserves discovery semantics and
-does not claim exact matching or symlink confinement.
+## BUG-054 - Opaque audit ids are interpolated into directory paths
+
+Verified in src/data.rs (previously audit::audit_dir) and config_write's
+configured_audit_id. Existing config accepts any nonempty string unchanged.
+An id such as `x/../../elsewhere` adds traversal components to the historical
+`<hostname>-<project>-<id>` audit directory. AuditId deliberately guarantees
+nonemptiness only, preserving accepted operator config and identity comparisons.
+Choose a safe path encoding or containment policy with an explicit plan for
+existing audit locations; a generated-hex-only validator would reject existing
+valid operator ids and does not handle migration. This predates the data owner
+move and remains unfixed; sessions and identity text must remain readable.

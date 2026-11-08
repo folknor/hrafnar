@@ -42,7 +42,10 @@ fn provider_extension_projects_the_unchanged_flat_digest_schema() {
                     .current_turn,
             ),
             quiet_secs: Some(30),
-            last_rollout_event: Some("event_msg/task_complete".into()),
+            last_rollout_event: Some(crate::transcript::EventKind {
+                top: Some("event_msg".into()),
+                payload: Some("task_complete".into()),
+            }),
             ..CodexForensics::default()
         })),
         ..Digest::default()

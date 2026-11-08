@@ -21,7 +21,6 @@ use crate::config::{self, Profile, ProfileDef, ProfileEntry, Provider, ReviewCon
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::Path;
 
 /// Whether a provider's binary is on `PATH` on this host. A function rather
 /// than a map, so no provider can be missing from it and read as absent.
@@ -34,15 +33,8 @@ const PRIME_PREVIEW_CHARS: usize = 72;
 /// layer and provider availability, which is what an orchestrator needs before
 /// it has picked a project.
 pub fn run(sel: &config::Selection) -> Result<()> {
-    let (cfg, project_root) = config::load_optional(sel)?;
-    print!(
-        "{}",
-        render_text(
-            &cfg,
-            project_root.as_deref(),
-            &crate::provider::is_available
-        )
-    );
+    let cfg = config::load_optional(sel)?;
+    print!("{}", render_text(&cfg, &crate::provider::is_available));
     Ok(())
 }
 
@@ -55,27 +47,22 @@ fn env_keys(p: &Profile) -> Vec<&str> {
 }
 
 /// The terminal view: compact, no colours, one block per section.
-pub fn render_text(cfg: &ReviewConfig, project_root: Option<&Path>, avail: Availability) -> String {
+pub fn render_text(cfg: &ReviewConfig, avail: Availability) -> String {
     let mut out = String::new();
     // Writing into a `String` cannot fail; the `fmt::Result` plumbing exists
     // only so the body can use `?` instead of discarding each `writeln!`.
-    let _ = write_text(&mut out, cfg, project_root, avail);
+    let _ = write_text(&mut out, cfg, avail);
     out
 }
 
-fn write_text(
-    out: &mut String,
-    cfg: &ReviewConfig,
-    project_root: Option<&Path>,
-    avail: Availability,
-) -> std::fmt::Result {
+fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std::fmt::Result {
     writeln!(out, "files:")?;
-    match cfg.files.local {
+    match cfg.files().local {
         Some(ref l) => writeln!(out, "  local:   {}", l.display())?,
         None => writeln!(out, "  local:   none (not in a project; global layer only)")?,
     }
-    match cfg.files.global {
-        Some(ref g) if cfg.files.global_loaded => writeln!(out, "  global:  {}", g.display())?,
+    match cfg.files().global {
+        Some(ref g) if cfg.files().global_loaded => writeln!(out, "  global:  {}", g.display())?,
         Some(ref g) => writeln!(out, "  global:  {} (absent)", g.display())?,
         None => writeln!(
             out,
@@ -83,8 +70,8 @@ fn write_text(
         )?,
     }
     writeln!(out, "host:      {}", cfg.hostname)?;
-    match project_root {
-        Some(root) => writeln!(out, "project:   {}", root.display())?,
+    match cfg.project_root() {
+        Some(root) => writeln!(out, "project:   {}", root.as_path().display())?,
         None => writeln!(out, "project:   none")?,
     }
 
@@ -371,7 +358,16 @@ model = \"opus\"
     fn cfg() -> ReviewConfig {
         let local = parse_file(LOCAL, "local", Layer::Local).unwrap();
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
-        resolve(local, Some(global), "host", config::ConfigFiles::default()).unwrap()
+        resolve(
+            local,
+            Some(global),
+            "host",
+            config::ConfigFiles {
+                local: Some("/proj/.review.toml".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
     }
 
     fn avail(codex: bool) -> impl Fn(Provider) -> bool {
@@ -383,7 +379,7 @@ model = \"opus\"
     }
 
     fn text(avail_codex: bool) -> String {
-        render_text(&cfg(), Some(Path::new("/proj")), &avail(avail_codex))
+        render_text(&cfg(), &avail(avail_codex))
     }
 
     #[test]
@@ -449,7 +445,7 @@ model = \"opus\"
     #[test]
     fn availability_is_reported_and_a_missing_default_stands_out() {
         let c = cfg();
-        let text = render_text(&c, Some(Path::new("/proj")), &avail(false));
+        let text = render_text(&c, &avail(false));
         assert!(text.contains("claude  installed"), "{text}");
         assert!(text.contains("grok    NOT INSTALLED"), "{text}");
         assert!(text.contains("NOT INSTALLED  default"), "{text}");
@@ -460,13 +456,13 @@ model = \"opus\"
 
         // Installed default: no warning. grok is not installed but is not a
         // default, so it is listed without alarm.
-        let text = render_text(&c, Some(Path::new("/proj")), &avail(true));
+        let text = render_text(&c, &avail(true));
         assert!(!text.contains("warning"), "{text}");
     }
 
     #[test]
     fn text_view_previews_primes_and_explains_unset_sandbox() {
-        let text = render_text(&cfg(), Some(Path::new("/proj")), &avail(true));
+        let text = render_text(&cfg(), &avail(true));
         // Multi-line prime: first line, marked as cut.
         assert!(text.contains("You are a security expert...."), "{text}");
         assert!(!text.contains("Read the codebase"), "{text}");
@@ -502,7 +498,7 @@ model = \"opus\"
             config::ConfigFiles::default(),
         )
         .unwrap();
-        let text = render_text(&c, None, &avail(true));
+        let text = render_text(&c, &avail(true));
         assert!(text.contains("not in a project"), "{text}");
         assert!(text.contains("project:   none"), "{text}");
         assert!(text.contains("deep  (global [codex.deep])"), "{text}");

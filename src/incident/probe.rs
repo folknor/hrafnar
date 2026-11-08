@@ -1,7 +1,6 @@
 //! Bounded, contained provider version capture for incident bundles.
 
 use crate::contained::{Leftovers, Settings, spawn};
-use tokio::process::Command;
 
 /// `binary <leading_args> --version` under a keeper, for incident bundles: a wrapper or a
 /// stub can fork too. Its leftovers join the run's.
@@ -11,14 +10,28 @@ pub async fn version_probe(
     leading_args: &[String],
     settings: &Settings,
 ) -> (Option<String>, Leftovers) {
-    let mut cmd = Command::new(binary);
-    cmd.args(leading_args).arg("--version");
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return (None, Leftovers::default()),
+    };
+    let launch = match crate::keeper::Launch::new(
+        std::ffi::OsStr::new(binary),
+        leading_args
+            .iter()
+            .map(std::ffi::OsString::from)
+            .chain(["--version".into()]),
+        &cwd,
+        crate::keeper::Environment::Inherit(Vec::new()),
+    ) {
+        Ok(launch) => launch,
+        Err(_) => return (None, Leftovers::default()),
+    };
     let label = format!("{binary} --version probe");
     // Never inherit our stdin: a binary that reads stdin before parsing its
     // arguments would block forever, taking the incident write with it.
     let mut contained = match spawn(
         lifecycle,
-        &cmd,
+        launch,
         std::process::Stdio::null(),
         settings,
         &label,
@@ -54,10 +67,10 @@ pub async fn version_probe(
         (launched, buf, status)
     };
     // Bounded end to end, launch included: a probe that has not finished
-    // within the startup bound is terminated, and given the keeper's own
+    // within its operation budget is terminated, and given the keeper's own
     // teardown bound. Past that it is abandoned, which `Drop` records as an
     // unknown outcome; an incident bundle is not worth a hung run.
-    let outcome = tokio::time::timeout(settings.startup, run).await;
+    let outcome = tokio::time::timeout(settings.probe_timeout, run).await;
     let (launched, buf, status) = match outcome {
         Ok(done) => done,
         Err(_) => {

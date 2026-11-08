@@ -17,9 +17,9 @@
 //! 4. `Run::wait`: provider exit, an optional adapter kill arm (codex's
 //!    watchdog) and the graceful-stop arm, then the keeper's teardown with the
 //!    stop arm still live.
-//! 5. `Run::finish`: the interrupt request is taken before the marker goes
-//!    (`read_live` discards a request with no marker beside it), the marker is
-//!    removed, the keeper's report is collected, the prompt writer is joined.
+//! 5. `Run::finish`: the exact interrupt request is taken before markers become
+//!    handoff pending and transfer to the invocation reservation; the keeper's
+//!    report is collected and the prompt writer is joined.
 //!
 //! What the readers observe (readiness to take a SIGINT, a session id learned
 //! mid-stream) are facts on the `Lease`, kept apart from the marker they also
@@ -91,19 +91,29 @@ impl ProcessSpec {
         }
     }
 
-    fn command(&self) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(&self.program);
-        cmd.args(&self.args).current_dir(&self.cwd).envs(&self.env);
-        cmd
+    fn launch_spec(&self) -> std::io::Result<crate::keeper::Launch> {
+        crate::keeper::Launch::new(
+            std::ffi::OsStr::new(&self.program),
+            self.args.iter().map(std::ffi::OsString::from),
+            &self.cwd,
+            crate::keeper::Environment::Inherit(
+                self.env
+                    .iter()
+                    .map(|(k, v)| (k.into(), Some(v.into())))
+                    .collect(),
+            ),
+        )
     }
 }
 
 /// The in-flight marker state behind a `Lease`.
 struct LeaseState {
     /// Every marker this lease holds: the session's, and for grok an echoed
-    /// alias. One `Guard` per id for the whole lease, never recreated, so its
-    /// `run_id` ownership check keeps holding.
-    guards: Vec<(String, crate::inflight::Guard)>,
+    /// alias. One Guard per checked id exclusively owns its path until the
+    /// same reservation takes cleanup authority for the pending handoff.
+    guards: Vec<(crate::provider::SessionId, crate::inflight::Guard)>,
+    reservation: Option<std::sync::Arc<crate::inflight::Reservation>>,
+    admission_error: Option<String>,
     closed: bool,
     keeper: Option<u32>,
 }
@@ -111,9 +121,13 @@ struct LeaseState {
 struct LeaseInner {
     provider: Provider,
     project: String,
-    data_root: Option<PathBuf>,
+    data: crate::data::DataDir,
+    run_id: crate::sessions::handoff::RunId,
+    predecessor: Option<crate::sessions::handoff::RunId>,
     state: Mutex<LeaseState>,
     ready: tokio::sync::watch::Sender<bool>,
+    // Raw protocol evidence is deliberately not SessionId: a malformed first
+    // event must survive classification while gaining no path authority.
     session: tokio::sync::watch::Sender<Option<String>>,
 }
 
@@ -141,13 +155,32 @@ impl std::ops::Deref for LeaseOwner {
 }
 
 impl Lease {
-    fn open(provider: Provider, project: &Path, data_root: Option<&Path>) -> Lease {
+    fn open(
+        provider: Provider,
+        project: &Path,
+        data: &crate::data::DataDir,
+        run_id: &crate::sessions::handoff::RunId,
+        reserved: Option<std::sync::Arc<crate::inflight::Reservation>>,
+        predecessor: Option<&crate::sessions::handoff::RunId>,
+    ) -> Lease {
+        let (reservation, admission_error) = if let Some(reserved) = reserved {
+            (Some(reserved), None)
+        } else {
+            match crate::inflight::reserve(data, run_id) {
+                Ok(reservation) => (reservation.map(std::sync::Arc::new), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        };
         Lease(Arc::new(LeaseInner {
             provider,
             project: project.to_string_lossy().into_owned(),
-            data_root: data_root.map(Path::to_path_buf),
+            data: data.clone(),
+            run_id: run_id.clone(),
+            predecessor: predecessor.cloned(),
             state: Mutex::new(LeaseState {
                 guards: Vec::new(),
+                reservation,
+                admission_error,
                 closed: false,
                 keeper: None,
             }),
@@ -159,29 +192,71 @@ impl Lease {
     /// A run whose session id is known before launch - every claude and grok
     /// run, every resume. The marker goes up now, before the spawn.
     pub fn known(
-        session_id: &str,
+        session_id: &crate::provider::SessionId,
         provider: Provider,
         project: &Path,
-        data_root: Option<&Path>,
+        data: &crate::data::DataDir,
+        run_id: &crate::sessions::handoff::RunId,
+        reserved: Option<std::sync::Arc<crate::inflight::Reservation>>,
+        predecessor: Option<&crate::sessions::handoff::RunId>,
     ) -> LeaseOwner {
-        let lease = Self::open(provider, project, data_root);
+        let lease = Self::open(provider, project, data, run_id, reserved, predecessor);
         if let Ok(mut state) = lease.0.state.lock() {
-            lease.0.session.send_replace(Some(session_id.to_string()));
-            let guard = crate::inflight::mark(
-                session_id,
-                provider,
-                &lease.0.project,
-                lease.0.data_root.as_deref(),
-            );
-            state.guards.push((session_id.to_string(), guard));
+            lease
+                .0
+                .session
+                .send_replace(Some(session_id.as_str().to_owned()));
+            if state.admission_error.is_some() {
+                return LeaseOwner(lease.clone());
+            }
+            let guard = lease.marker(session_id, state.keeper, state.reservation.as_deref());
+            state.guards.push((session_id.clone(), guard));
         }
         LeaseOwner(lease)
     }
 
     /// A run that learns its session id from its stream (a fresh codex run).
     /// The marker goes up when `set_session` is first called.
-    pub fn learned(provider: Provider, project: &Path, data_root: Option<&Path>) -> LeaseOwner {
-        LeaseOwner(Self::open(provider, project, data_root))
+    pub fn learned(
+        provider: Provider,
+        project: &Path,
+        data: &crate::data::DataDir,
+        run_id: &crate::sessions::handoff::RunId,
+        reserved: Option<std::sync::Arc<crate::inflight::Reservation>>,
+        predecessor: Option<&crate::sessions::handoff::RunId>,
+    ) -> LeaseOwner {
+        LeaseOwner(Self::open(
+            provider,
+            project,
+            data,
+            run_id,
+            reserved,
+            predecessor,
+        ))
+    }
+
+    fn marker(
+        &self,
+        id: &crate::provider::SessionId,
+        keeper: Option<u32>,
+        reservation: Option<&crate::inflight::Reservation>,
+    ) -> crate::inflight::Guard {
+        let mut guard = crate::inflight::mark_for(
+            id,
+            self.0.provider,
+            &self.0.project,
+            &self.0.data,
+            &self.0.run_id,
+            self.0.predecessor.as_ref(),
+        );
+        if let Some(keeper) = keeper {
+            guard.record_keeper(keeper);
+            guard.record_ready(*self.0.ready.borrow() && self.offers_pid());
+        }
+        if let Some(reservation) = reservation {
+            reservation.register(&guard);
+        }
+        guard
     }
 
     /// Whether this provider's pid is ever offered on the marker. Only an
@@ -198,6 +273,7 @@ impl Lease {
             }
             for (_, guard) in &mut state.guards {
                 guard.record_keeper(keeper);
+                guard.record_ready(*self.0.ready.borrow() && self.offers_pid());
             }
         }
     }
@@ -215,7 +291,7 @@ impl Lease {
         }
         let keeper = state.keeper;
         for (_, guard) in &mut state.guards {
-            guard.record_child_pid(keeper);
+            guard.record_ready(keeper.is_some());
         }
     }
 
@@ -230,22 +306,14 @@ impl Lease {
             return;
         }
         self.0.session.send_replace(Some(session_id.to_string()));
-        if state.closed || !state.guards.is_empty() {
+        if state.closed || state.admission_error.is_some() || !state.guards.is_empty() {
             return;
         }
-        let mut guard = crate::inflight::mark(
-            session_id,
-            self.0.provider,
-            &self.0.project,
-            self.0.data_root.as_deref(),
-        );
-        if let Some(keeper) = state.keeper {
-            guard.record_keeper(keeper);
-            if *self.0.ready.borrow() && self.offers_pid() {
-                guard.record_child_pid(Some(keeper));
-            }
-        }
-        state.guards.push((session_id.to_string(), guard));
+        let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+            return;
+        };
+        let guard = self.marker(&id, state.keeper, state.reservation.as_deref());
+        state.guards.push((id, guard));
     }
 
     /// Hold a marker for a second id the run also answers to (grok echoing a
@@ -255,53 +323,66 @@ impl Lease {
         let Ok(mut state) = self.0.state.lock() else {
             return;
         };
-        if state.closed || state.guards.iter().any(|(id, _)| id == session_id) {
+        if state.closed
+            || state.admission_error.is_some()
+            || state.guards.iter().any(|(id, _)| id.as_str() == session_id)
+        {
             return;
         }
-        let mut guard = crate::inflight::mark(
-            session_id,
-            self.0.provider,
-            &self.0.project,
-            self.0.data_root.as_deref(),
-        );
-        if let Some(keeper) = state.keeper {
-            guard.record_keeper(keeper);
-        }
-        state.guards.push((session_id.to_string(), guard));
+        let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+            return;
+        };
+        let guard = self.marker(&id, state.keeper, state.reservation.as_deref());
+        state.guards.push((id, guard));
     }
 
     /// Consume the interrupt request aimed at the session this lease holds
     /// and, when `close`, remove every marker - one transition under the
     /// lease lock, so a session discovered mid-settlement cannot put up a
     /// marker whose request this run then never consumes. The request goes
-    /// before the markers: `read_live` discards a request with no marker
-    /// beside it.
+    /// before the markers; exact requests arriving later are harmless residue.
     fn settle(&self, close: bool) -> bool {
         let Ok(mut state) = self.0.state.lock() else {
             return false;
         };
-        let requested = self.session().as_deref().is_some_and(|sid| {
-            crate::inflight::take_interrupt_request(sid, self.0.data_root.as_deref())
+        // Exact run requests cannot mark a later invocation. The legacy
+        // session request is a deliberately weaker compatibility facade.
+        let exact = state.guards.iter().fold(false, |any, (_, guard)| {
+            guard.take_request(&self.0.data) || any
         });
+        let requested = self
+            .session()
+            .as_deref()
+            .is_some_and(|sid| crate::inflight::take_interrupt_request_in(sid, &self.0.data));
+        let requested = exact || requested;
         if close {
             state.closed = true;
+            for (_, guard) in &mut state.guards {
+                guard.handoff();
+            }
             let guards = std::mem::take(&mut state.guards);
+            let reservation = state.reservation.take();
             drop(state);
             drop(guards);
+            drop(reservation);
         }
         requested
     }
 
     /// Remove every marker. Facts still update afterwards; markers never do.
     fn close(&self) {
-        let guards = match self.0.state.lock() {
+        let (guards, reservation) = match self.0.state.lock() {
             Ok(mut state) => {
                 state.closed = true;
-                std::mem::take(&mut state.guards)
+                for (_, guard) in &mut state.guards {
+                    guard.handoff();
+                }
+                (std::mem::take(&mut state.guards), state.reservation.take())
             }
             Err(_) => return,
         };
         drop(guards);
+        drop(reservation);
     }
 
     pub fn is_ready(&self) -> bool {
@@ -398,17 +479,31 @@ impl Run {
             LeaseUse::Owned(owner) => (owner.0.clone(), Some(owner)),
             LeaseUse::Shared(lease) => (lease, None),
         };
+        {
+            let state = lease
+                .0
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lease poisoned"))?;
+            if let Some(reason) = &state.admission_error {
+                anyhow::bail!("not launched: cannot reserve invocation markers: {reason}");
+            }
+            if state.guards.iter().any(|(_, g)| g.collision()) {
+                anyhow::bail!("not launched: invocation marker path already exists");
+            }
+        }
         // A request left over from an earlier run of this session (its
         // `review` killed before consuming it) is not aimed at this one, and
         // would mark this run as interrupted. A fresh session is new.
         if let SessionStart::Resume(id) = session {
-            let _ =
-                crate::inflight::take_interrupt_request(id.as_str(), runtime.data_root.as_deref());
+            let _ = crate::inflight::take_interrupt_request_in(id.as_str(), &runtime.data);
         }
-        // A run still waiting on the lock or its stagger when `review` was
-        // told to stop would otherwise start a turn nobody sees the end of.
-        // The keeper gate in `contained::spawn` checks again under its
-        // registry lock, closing the race between this check and the spawn.
+        // After lease checks and stale-request consumption, avoid remaining
+        // launch preparation on an observed graceful stop, preserving its
+        // diagnostic over subsequent preparation failures. This snapshot is
+        // not admission authority: contained delegates to Lifecycle::spawn's
+        // locked gate, which closes the race. An already admitted keeper may
+        // still reach provider `go` after stop; wait/escalation handle that run.
         if runtime.lifecycle.stop_requested() {
             anyhow::bail!("not launched: review was signalled to stop");
         }
@@ -418,11 +513,11 @@ impl Run {
         };
         let mut contained = crate::contained::spawn(
             &runtime.lifecycle,
-            &spec.command(),
+            spec.launch_spec()?,
             stdin_cfg,
             &runtime.teardown,
             &label(provider, lease.session().as_deref()),
-            runtime.orphan_log.clone(),
+            runtime.data.orphan_log(runtime.log_family),
         )?;
         // Before `go`, so a marker whose owner dies mid-run says who is
         // cleaning up.
@@ -568,7 +663,7 @@ impl Run {
             self.wait(std::future::pending::<()>()).await;
         }
         let keeper = self.keeper.take().expect("waited above");
-        // Consumed whatever became of the run, before the marker goes; one
+        // Consumed whatever became of the run, before handoff transfer; one
         // left behind would mark the session's next run as interrupted.
         let requested = self.lease.settle(self.owner.is_some());
         let session = self.lease.session();
@@ -589,7 +684,9 @@ impl Run {
         Ended {
             status: finished.status,
             leftovers: finished.leftovers,
-            interrupt_requested: requested || self.stopped_by_signal,
+            interrupt_requested: requested
+                || self.stopped_by_signal
+                || finished.interrupt_delivered == Some(true),
             stopped_by_signal: self.stopped_by_signal,
             stdin,
             readers: AbortOnDrop(std::mem::take(&mut self.readers)),
@@ -625,9 +722,10 @@ mod tests {
     }
 
     fn marker(root: &Path, sid: &str) -> Option<serde_json::Value> {
-        let path = root.join("review/inflight").join(format!("{sid}.json"));
-        let text = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&text).ok()
+        crate::inflight::read_live(Some(root))
+            .into_iter()
+            .find(|m| m.session_id == sid)
+            .and_then(|m| serde_json::to_value(&m.marker).ok())
     }
 
     #[test]
@@ -635,6 +733,9 @@ mod tests {
         let lease = Lease::learned(
             crate::provider::Provider::Codex,
             Path::new("/project"),
+            &crate::data::DataDir::unavailable(),
+            &crate::sessions::handoff::RunId::default(),
+            None,
             None,
         );
         lease.set_session("../malformed");
@@ -649,42 +750,102 @@ mod tests {
     #[test]
     fn a_session_learned_after_readiness_offers_the_keeper_at_once() {
         let root = scratch("ready-first");
-        let owner = Lease::learned(Provider::Codex, Path::new("/p"), Some(&root));
+        let owner = Lease::learned(
+            Provider::Codex,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         owner.record_keeper(4242);
         owner.ready();
         assert!(marker(&root, "s1").is_none(), "no id, no marker");
         owner.set_session("s1");
         let m = marker(&root, "s1").expect("marker up");
-        assert_eq!(m["keeper"], 4242);
-        assert_eq!(m["child_pid"], 4242);
+        assert_eq!(m["keeper"]["pid"], 4242);
+        assert_eq!(m["signal_ready"], true);
     }
 
     #[test]
     fn readiness_after_the_session_offers_the_keeper_then() {
         let root = scratch("session-first");
-        let owner = Lease::learned(Provider::Codex, Path::new("/p"), Some(&root));
+        let owner = Lease::learned(
+            Provider::Codex,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         owner.record_keeper(7);
         owner.set_session("s2");
-        assert!(marker(&root, "s2").expect("marker")["child_pid"].is_null());
+        assert_eq!(marker(&root, "s2").expect("marker")["signal_ready"], false);
         owner.ready();
-        assert_eq!(marker(&root, "s2").expect("marker")["child_pid"], 7);
+        assert_eq!(marker(&root, "s2").expect("marker")["signal_ready"], true);
     }
 
     #[test]
     fn a_non_interruptible_provider_never_offers_a_pid() {
         let root = scratch("grok");
-        let owner = Lease::known("g1", Provider::Grok, Path::new("/p"), Some(&root));
+        let owner = Lease::known(
+            &crate::provider::SessionId::parse("g1").expect("id"),
+            Provider::Grok,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         owner.record_keeper(9);
         owner.ready();
         let m = marker(&root, "g1").expect("marker");
-        assert_eq!(m["keeper"], 9);
-        assert!(m["child_pid"].is_null());
+        assert_eq!(m["keeper"]["pid"], 9);
+        assert_eq!(m["signal_ready"], false);
+    }
+
+    #[test]
+    fn aliases_project_existing_readiness_and_reservation_outlives_lease() {
+        let root = scratch("alias-ready");
+        let data = crate::data::DataDir::at(root.clone());
+        let id = crate::sessions::handoff::RunId::default();
+        let reserved = crate::inflight::reserve(&data, &id)
+            .expect("reserve")
+            .map(std::sync::Arc::new);
+        let owner = Lease::known(
+            &crate::provider::SessionId::parse("primary").expect("id"),
+            Provider::Claude,
+            Path::new("/p"),
+            &data,
+            &id,
+            reserved.clone(),
+            None,
+        );
+        owner.record_keeper(std::process::id());
+        owner.ready();
+        owner.alias("alias");
+        assert_eq!(marker(&root, "alias").expect("alias")["signal_ready"], true);
+        drop(owner);
+        assert!(
+            crate::inflight::reserve(&data, &id).is_err(),
+            "invocation owner still holds namespace"
+        );
+        drop(reserved);
+        assert!(crate::inflight::reserve(&data, &id).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn the_first_learned_session_wins() {
         let root = scratch("accept-once");
-        let owner = Lease::learned(Provider::Codex, Path::new("/p"), Some(&root));
+        let owner = Lease::learned(
+            Provider::Codex,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         owner.set_session("first");
         owner.set_session("second");
         assert_eq!(owner.session().as_deref(), Some("first"));
@@ -694,13 +855,31 @@ mod tests {
     #[test]
     fn settling_consumes_the_request_and_closes_for_good() {
         let root = scratch("settle");
-        let owner = Lease::known("k1", Provider::Claude, Path::new("/p"), Some(&root));
+        let owner = Lease::known(
+            &crate::provider::SessionId::parse("k1").expect("id"),
+            Provider::Claude,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         crate::inflight::request_interrupt("k1", Some(&root)).expect("request");
         assert!(owner.settle(true), "the request is this run's");
         assert!(marker(&root, "k1").is_none(), "marker removed");
-        assert!(!crate::inflight::take_interrupt_request("k1", Some(&root)));
+        assert!(!crate::inflight::take_interrupt_request_in(
+            "k1",
+            &crate::data::DataDir::at(root.clone())
+        ));
         // Facts still update after closing; markers never come back.
-        let late = Lease::learned(Provider::Codex, Path::new("/p"), Some(&root));
+        let late = Lease::learned(
+            Provider::Codex,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         late.settle(true);
         late.set_session("late");
         assert_eq!(late.session().as_deref(), Some("late"));
@@ -710,10 +889,18 @@ mod tests {
     #[test]
     fn dropping_the_owner_removes_every_marker_and_alias() {
         let root = scratch("owner-drop");
-        let owner = Lease::known("a", Provider::Grok, Path::new("/p"), Some(&root));
+        let owner = Lease::known(
+            &crate::provider::SessionId::parse("a").expect("id"),
+            Provider::Grok,
+            Path::new("/p"),
+            &crate::data::DataDir::at(root.clone()),
+            &crate::sessions::handoff::RunId::default(),
+            None,
+            None,
+        );
         owner.record_keeper(3);
         owner.alias("b");
-        assert_eq!(marker(&root, "b").expect("alias")["keeper"], 3);
+        assert_eq!(marker(&root, "b").expect("alias")["keeper"]["pid"], 3);
         let reader_clone = Lease::clone(&owner);
         drop(owner);
         assert!(marker(&root, "a").is_none());

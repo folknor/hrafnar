@@ -46,7 +46,7 @@ pub enum Kind {
 }
 
 /// Verdict handed back to the runner when the watchdog fires.
-pub struct Verdict {
+pub struct Verdict<E = String> {
     pub kind: Kind,
     /// Exact answer that licensed a stranded kill, scoped to this run.
     pub final_answer: Option<String>,
@@ -58,10 +58,10 @@ pub struct Verdict {
     pub quiet_secs: u64,
     /// `type/payload.type` of the last event in the rollout - what codex was
     /// doing when it went quiet.
-    pub last_event: Option<String>,
+    pub last_event: Option<E>,
 }
 
-impl Verdict {
+impl<E> Verdict<E> {
     /// The cause recorded for the kill. `reason` is the longer operator-facing
     /// explanation of the same verdict; this is its fixed, persisted name.
     pub fn termination(&self) -> crate::provider::Termination {
@@ -77,26 +77,30 @@ impl Verdict {
 
 /// Answer and diagnostic evidence from one successful source read. None from
 /// Source::evidence means unreadable, not a successful read with no answer.
-pub(crate) struct Evidence<A> {
+pub(crate) struct Evidence<A, E = String> {
     pub answer: Option<A>,
-    pub last_event: Option<String>,
+    pub last_event: Option<E>,
 }
 
 /// A revision changes only when observed progress changes. Sources own that
 /// definition; the monitor owns elapsed patience, never provider decoding.
 pub(crate) trait Source {
     type Answer;
+    type Event: std::fmt::Display;
     async fn revision(&mut self) -> Option<u64>;
-    async fn evidence(&mut self) -> Option<Evidence<Self::Answer>>;
+    async fn evidence(&mut self) -> Option<Evidence<Self::Answer, Self::Event>>;
 }
 
-pub(crate) struct Detection<A> {
+pub(crate) struct Detection<A, E> {
     pub kind: Kind,
-    pub evidence: Evidence<A>,
+    pub evidence: Evidence<A, E>,
     pub quiet_secs: u64,
 }
 
-pub(crate) async fn monitor<S: Source>(source: &mut S, timings: Timings) -> Detection<S::Answer> {
+pub(crate) async fn monitor<S: Source>(
+    source: &mut S,
+    timings: Timings,
+) -> Detection<S::Answer, S::Event> {
     let mut last_revision = 0;
     let mut last_change = Instant::now();
     loop {
@@ -146,10 +150,11 @@ mod tests {
     }
     impl Source for Probe {
         type Answer = String;
+        type Event = String;
         async fn revision(&mut self) -> Option<u64> {
             self.revisions.pop_front().unwrap_or(Some(4))
         }
-        async fn evidence(&mut self) -> Option<Evidence<Self::Answer>> {
+        async fn evidence(&mut self) -> Option<Evidence<Self::Answer, Self::Event>> {
             self.evidence_reads += 1;
             self.answers
                 .pop_front()

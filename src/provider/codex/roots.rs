@@ -1,15 +1,5 @@
-use super::GrantedRoot;
-
-/// The codex `-c` override expressing a set of grants, or `None` when empty.
-///
-/// TOML strings are emitted with escaping so a path containing a quote or a
-/// backslash cannot break out of the array and inject an unrelated key.
-pub fn config_override(grants: &[GrantedRoot]) -> Option<String> {
-    config_override_paths(&grants.iter().map(|g| g.path.clone()).collect::<Vec<_>>())
-}
-
 /// Render the resolved effective set, which may come from a raw profile override.
-pub fn config_override_paths(paths: &[String]) -> Option<String> {
+pub(super) fn config_override_paths(paths: &[String]) -> Option<String> {
     if paths.is_empty() {
         return None;
     }
@@ -22,26 +12,66 @@ pub fn config_override_paths(paths: &[String]) -> Option<String> {
 }
 
 fn escape_toml(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    use std::fmt::Write;
+    let mut out = String::new();
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{8}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                write!(&mut out, "\\u{:04x}", u32::from(c)).expect("writing to String");
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writable_roots::derive;
-    use crate::writable_roots::test_host::{FakeHost, cwd};
-
     #[test]
     fn the_override_is_a_toml_array_of_the_granted_paths() {
-        let host = FakeHost::new()
-            .var("HOME", "/home/dev")
-            .var("CARGO_TARGET_DIR", "/media/disk/cargo");
-        let grants = derive(&cwd(), &host);
+        let paths = [
+            "/home/dev/.brokkr",
+            "/home/dev/.cargo",
+            "/home/dev/.local/share/brokkr",
+            "/media/disk/cargo",
+        ]
+        .map(str::to_string);
+        assert_eq!(config_override_paths(&[]), None);
         assert_eq!(
-            config_override(&grants).as_deref(),
+            config_override_paths(&paths).as_deref(),
             Some(
                 r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/home/dev/.cargo","/home/dev/.local/share/brokkr","/media/disk/cargo"]"#
             )
+        );
+    }
+
+    #[test]
+    fn raw_config_roots_with_controls_roundtrip_through_the_generated_override() {
+        // Raw Codex config is intentionally not subject to derivation filters.
+        // Each -c is parsed, even though a later raw entry wins its value.
+        let mut path = String::from("/cache/\\\"");
+        path.extend((0u8..=31).map(char::from));
+        path.extend((127u8..=159).map(char::from));
+        path.push('雪');
+        let raw = format!(
+            "sandbox_workspace_write.writable_roots={}",
+            toml::Value::Array(vec![toml::Value::String(path.clone())])
+        );
+        let paths = super::super::config_writable_roots_override(&[raw]).expect("raw override");
+        assert_eq!(paths, [path.clone()]);
+        let generated = config_override_paths(&paths).expect("generated override");
+        let doc: toml::Table = generated.parse().expect("all controls escaped for TOML");
+        assert_eq!(
+            doc["sandbox_workspace_write"]["writable_roots"][0].as_str(),
+            Some(path.as_str())
         );
     }
 
@@ -51,9 +81,8 @@ mod tests {
     #[test]
     fn a_quote_in_a_path_cannot_inject_another_config_key() {
         let hostile = "/run/\"],approval_policy=\"on-request";
-        let host = FakeHost::new().var("HOME", hostile);
-        let grants = derive(&cwd(), &host);
-        let Some(rendered) = config_override(&grants) else {
+        let paths = [format!("{hostile}/.brokkr"), format!("{hostile}/.cargo")];
+        let Some(rendered) = config_override_paths(&paths) else {
             panic!("a granted root must render an override");
         };
 

@@ -32,7 +32,7 @@
 //! error. A registered path is the project root exactly (`Selection::Exact`); a
 //! path selector is discovered from, as the cwd always has been.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,85 @@ pub use registry::check_name;
 #[path = "path_expansion.rs"]
 pub(crate) mod path_expansion;
 pub(crate) use self::path_expansion::expand as expand_path;
+
+/// A canonical-or-raw identity captured at one observation. This is neither
+/// existence proof nor audit identity; message revalidation must observe again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectRoot(PathBuf);
+
+impl ProjectRoot {
+    pub fn observe(path: &Path) -> Self {
+        Self(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+    }
+
+    pub(crate) fn from_config_path(path: &Path) -> crate::config::Result<Self> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| crate::config::ConfigError::InvalidPath {
+                path: path.to_path_buf(),
+            })?;
+        Ok(Self::observe(parent))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+    pub fn to_path_buf(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum LookupError {
+    Unknown {
+        registered: Vec<String>,
+    },
+    Ambiguous {
+        matches: Vec<String>,
+    },
+    Expand {
+        raw: String,
+        source: path_expansion::ExpandError,
+    },
+    NotAbsolute {
+        raw: String,
+    },
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown { registered } => write!(
+                f,
+                "no project registered under that name on this host (registered: {})",
+                if registered.is_empty() {
+                    "none".to_string()
+                } else {
+                    registered.join(", ")
+                }
+            ),
+            Self::Ambiguous { matches } => write!(
+                f,
+                "ambiguous: matches {}; use the full name",
+                matches.join(", ")
+            ),
+            Self::Expand { raw, source } => write!(f, "registered path {raw}: {source}"),
+            Self::NotAbsolute { raw } => write!(
+                f,
+                "registered path {raw} is not absolute; a registry entry cannot depend on the directory review was started from"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LookupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Expand { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Whether `selector` is spelled as a path rather than a registered name.
 fn is_path(selector: &str) -> bool {
@@ -73,16 +152,18 @@ pub fn select(selector: Option<&str>) -> Result<Selection> {
         if !path.is_dir() {
             bail!("-C {selector}: {} is not a directory", path.display());
         }
-        return Ok(Selection::Discover(canonical(&path)));
+        return Ok(Selection::Discover(
+            ProjectRoot::observe(&path).to_path_buf(),
+        ));
     }
     let (registry, global) = crate::config::global_projects()?;
-    let path = lookup(selector, &registry, &env_var).map_err(|why| {
+    let path = lookup(selector, &registry, &env_var).with_context(|| {
         let file = global
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "the global config".to_string());
-        anyhow::anyhow!(
-            "-C {selector}: {why}\n  \
+        format!(
+            "-C {selector}\n  \
              Projects are registered in {file} under [_projects.{}]; a path needs a \
              path spelling (./{selector}).",
             crate::config::toml_key(&crate::config::hostname())
@@ -94,7 +175,7 @@ pub fn select(selector: Option<&str>) -> Result<Selection> {
             path.display()
         );
     }
-    Ok(Selection::Exact(canonical(&path)))
+    Ok(Selection::Exact(ProjectRoot::observe(&path).to_path_buf()))
 }
 
 /// The registered path for `name`, expanded and checked to be absolute. Pure
@@ -103,52 +184,43 @@ fn lookup(
     name: &str,
     registry: &BTreeMap<String, String>,
     var: &dyn Fn(&str) -> Option<String>,
-) -> std::result::Result<PathBuf, String> {
+) -> std::result::Result<PathBuf, LookupError> {
     let exact: Vec<&String> = registry
         .keys()
         .filter(|k| k.eq_ignore_ascii_case(name))
         .collect();
-    let key = match exact.as_slice() {
+    let candidates = if exact.is_empty() {
+        registry
+            .keys()
+            .filter(|k| {
+                k.rsplit_once('/')
+                    .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case(name))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        exact
+    };
+    let key = match candidates.as_slice() {
         [one] => *one,
-        _ => {
-            let short: Vec<&String> = registry
-                .keys()
-                .filter(|k| {
-                    k.rsplit_once('/')
-                        .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case(name))
-                })
-                .collect();
-            match short.as_slice() {
-                [one] => *one,
-                [] => {
-                    let known: Vec<&str> = registry.keys().map(String::as_str).collect();
-                    return Err(format!(
-                        "no project registered under that name on this host (registered: {})",
-                        if known.is_empty() {
-                            "none".to_string()
-                        } else {
-                            known.join(", ")
-                        }
-                    ));
-                }
-                many => {
-                    let names: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
-                    return Err(format!(
-                        "ambiguous: matches {}; use the full name",
-                        names.join(", ")
-                    ));
-                }
-            }
+        [] => {
+            return Err(LookupError::Unknown {
+                registered: registry.keys().cloned().collect(),
+            });
+        }
+        many => {
+            return Err(LookupError::Ambiguous {
+                matches: many.iter().map(|s| (*s).clone()).collect(),
+            });
         }
     };
     let raw = &registry[key];
-    let expanded = expand_path(raw, var).map_err(|e| format!("registered path {raw}: {e}"))?;
+    let expanded = expand_path(raw, var).map_err(|source| LookupError::Expand {
+        raw: raw.clone(),
+        source,
+    })?;
     let path = PathBuf::from(&expanded);
     if !path.is_absolute() {
-        return Err(format!(
-            "registered path {raw} is not absolute; a registry entry cannot depend on \
-             the directory review was started from"
-        ));
+        return Err(LookupError::NotAbsolute { raw: raw.clone() });
     }
     Ok(path)
 }
@@ -157,17 +229,15 @@ fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
 /// Whether a recorded project string names `root`. New rows record canonical
 /// roots; older ones may carry a symlinked spelling, so a recorded path that
 /// still exists is compared canonicalized, and one that is gone by its raw
 /// string - its rows stay listed under the identity they were filed with.
 pub fn same_project(recorded: &str, root: &Path) -> bool {
     let rec = Path::new(recorded);
-    rec == root || canonical(rec) == canonical(root)
+    // Historical raw equality is intentional; captured ProjectRoot equality
+    // instead compares stable observations without doing filesystem IO.
+    rec == root || ProjectRoot::observe(rec) == ProjectRoot::observe(root)
 }
 
 /// Where to look for the project's `.review.toml`.
@@ -247,7 +317,7 @@ mod tests {
     fn an_ambiguous_short_name_is_an_error() {
         let r = reg(&[("a/tool", "/a"), ("b/tool", "/b")]);
         let e = lookup("tool", &r, &env).unwrap_err();
-        assert!(e.contains("ambiguous"), "{e}");
+        assert!(e.to_string().contains("ambiguous"), "{e}");
         assert_eq!(lookup("a/tool", &r, &env).unwrap(), PathBuf::from("/a"));
     }
 
@@ -255,7 +325,7 @@ mod tests {
     fn an_unknown_name_lists_what_is_registered() {
         let r = reg(&[("bz", "/b")]);
         let e = lookup("nope", &r, &env).unwrap_err();
-        assert!(e.contains("registered: bz"), "{e}");
+        assert!(e.to_string().contains("registered: bz"), "{e}");
     }
 
     #[test]
@@ -272,9 +342,77 @@ mod tests {
             PathBuf::from("/home/u/Programs/a")
         );
         assert_eq!(lookup("b", &r, &env).unwrap(), PathBuf::from("/srv/src/b"));
-        assert!(lookup("c", &r, &env).unwrap_err().contains("$UNSET"));
-        assert!(lookup("d", &r, &env).unwrap_err().contains("not absolute"));
-        assert!(lookup("e", &r, &env).unwrap_err().contains("only `~`"));
+        assert!(
+            lookup("c", &r, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("$UNSET")
+        );
+        assert!(
+            lookup("d", &r, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("not absolute")
+        );
+        assert!(
+            lookup("e", &r, &env)
+                .unwrap_err()
+                .to_string()
+                .contains("only `~`")
+        );
+    }
+
+    #[test]
+    fn lookup_errors_keep_categories_and_sources_through_context() {
+        use std::error::Error;
+        let duplicate = reg(&[("A", "/a"), ("a", "/b")]);
+        assert!(
+            matches!(lookup("a", &duplicate, &env), Err(LookupError::Ambiguous { matches }) if matches == ["A", "a"])
+        );
+        assert!(
+            matches!(lookup("missing", &duplicate, &env), Err(LookupError::Unknown { registered }) if registered.len() == 2)
+        );
+        let invalid = reg(&[("x", "$MISSING/x"), ("y", "relative")]);
+        let error = lookup("x", &invalid, &env).expect_err("unset variable");
+        assert!(error.source().is_some());
+        let wrapped = anyhow::Error::new(error).context("selector guidance");
+        assert!(matches!(
+            wrapped.downcast_ref::<LookupError>(),
+            Some(LookupError::Expand { .. })
+        ));
+        assert!(matches!(
+            lookup("y", &invalid, &env),
+            Err(LookupError::NotAbsolute { .. })
+        ));
+    }
+
+    #[test]
+    fn captured_roots_are_stable_but_new_observations_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("project-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("one")).expect("one");
+        std::fs::create_dir_all(base.join("two")).expect("two");
+        symlink(base.join("one"), base.join("alias")).expect("alias");
+        let before = ProjectRoot::observe(&base.join("alias"));
+        assert_eq!(before, ProjectRoot::observe(&base.join("one")));
+        assert!(same_project(
+            base.join("alias").to_str().expect("utf8 fixture"),
+            before.as_path()
+        ));
+        std::fs::remove_file(base.join("alias")).expect("unlink");
+        symlink(base.join("two"), base.join("alias")).expect("retarget");
+        assert_ne!(before, ProjectRoot::observe(&base.join("alias")));
+        assert_eq!(before, ProjectRoot::observe(&base.join("one")));
+        std::fs::remove_dir_all(&base).expect("cleanup");
+        assert_eq!(ProjectRoot::observe(&base), ProjectRoot::observe(&base));
+        assert_eq!(ProjectRoot::observe(&base).as_path(), base);
+        assert!(matches!(
+            ProjectRoot::from_config_path(Path::new("/")),
+            Err(crate::config::ConfigError::InvalidPath { .. })
+        ));
     }
 
     #[test]

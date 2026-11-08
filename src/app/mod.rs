@@ -77,6 +77,10 @@ pub async fn run() -> Result<CommandExit> {
     // waited, not just what the providers spent.
     let started = std::time::Instant::now();
     let cli = Cli::parse_checked();
+    if !matches!(cli.command, Some(cli::Command::Man { .. })) {
+        // Resolve once before any command work; no filesystem effects.
+        let _ = crate::data::DataDir::process();
+    }
 
     // Forward SIGINT/SIGTERM to any running codex process groups before exiting.
     // codex runs in its own process group (so we can kill it and its children as
@@ -91,22 +95,14 @@ pub async fn run() -> Result<CommandExit> {
     // the misuse rather than a lookup failure. These commands are host-wide or
     // session-addressed with no project to assert, so accepting -C would
     // suggest a scope restriction that does not exist.
-    if let Some(ref sel) = cli.project {
-        let refused = match &cli.command {
-            Some(cli::Command::Interrupt { .. }) => Some("review interrupt"),
-            Some(cli::Command::Incidents { .. }) => Some("review incidents"),
-            Some(cli::Command::Man { .. }) => Some("review man"),
-            Some(cli::Command::Sessions {
-                id: None,
-                all: true,
-                ..
-            }) => Some("review sessions --all"),
-            _ => None,
-        };
-        if let Some(what) = refused {
-            bail!("-C {sel} does not apply to `{what}`, which is not scoped to a project");
-        }
+    if let Some(ref sel) = cli.project
+        && let cli::ProjectScope::Unscoped(what) = cli.project_scope()
+    {
+        bail!("-C {sel} does not apply to `{what}`, which is not scoped to a project");
     }
+    // Scope is classified before dispatch: selected verbs resolve config below;
+    // asserted verbs pass the selector to their recorded-target checks. Never
+    // turn a wrong-scope selector into None (which would select the cwd).
     let selector = cli.project.as_deref();
 
     match &cli.command {
@@ -181,7 +177,8 @@ pub async fn run() -> Result<CommandExit> {
         None
     };
 
-    let (mut cfg, project_root) = config::load(&project::select(selector)?)?;
+    let mut cfg = config::load(&project::select(selector)?)?;
+    let project_root = cfg.require_project_root()?.to_path_buf();
     let stdin_instructions = match early_stdin {
         Some(s) => s,
         None => input::read_stdin()?,
@@ -270,12 +267,14 @@ pub async fn run() -> Result<CommandExit> {
     // Refresh the cached audit id from the project file. ensure_audit_id locks
     // and rereads that file, so concurrent first runs share the persisted id.
     let local_config_path = cfg
-        .files
+        .files()
         .local
         .as_deref()
         .expect("config::load always resolves a local config path");
     let audit_id = config_write::ensure_audit_id(local_config_path)?;
     cfg.audit.id = Some(audit_id.clone());
+    let scope = crate::data::LogScope::new(audit_id, cfg.audit.private);
+    let data = crate::data::DataDir::process().clone();
 
     // Codex run settings from project config: today just the stall timeout,
     // which is tunable (and disableable) because it rests on an empirical codex
@@ -283,7 +282,8 @@ pub async fn run() -> Result<CommandExit> {
     let provider_runtime = provider::ProviderRuntime::from_config(
         lifecycle.clone(),
         cfg.stall_timeout(),
-        cfg.audit.private,
+        data.clone(),
+        &scope,
     );
 
     // Spawn all providers with staggered launches to avoid rate limits
@@ -331,8 +331,8 @@ pub async fn run() -> Result<CommandExit> {
             };
             let ctx = std::sync::Arc::new(RecordCtx {
                 project_root: project_root.clone(),
-                private: cfg.audit.private,
-                audit_id: audit_id.clone(),
+                data: data.clone(),
+                scope: scope.clone(),
                 archetype: arch_name.clone(),
                 env_keys,
                 profile_origin,
@@ -373,6 +373,8 @@ pub async fn run() -> Result<CommandExit> {
                 Ok(outcome) => outcome.into_result(),
                 Err(err) => {
                     let result = provider::ProviderResult {
+                        run_id: None,
+                        _reservation: None,
                         provider: p.provider,
                         output: Err(anyhow::anyhow!("task panicked: {err}")),
                         session_id: None,
@@ -448,9 +450,9 @@ fn print_left_running(lifecycle: &crate::supervisor::Lifecycle) -> bool {
 
 /// The project root `-C <sel>` names: a registered root as it stands, a path
 /// walked up to its `.review.toml`.
-fn selected_root(sel: &str) -> Result<std::path::PathBuf> {
+fn selected_root(sel: &str) -> Result<project::ProjectRoot> {
     match project::select(Some(sel))? {
-        config::Selection::Exact(dir) => Ok(dir),
+        config::Selection::Exact(dir) => Ok(project::ProjectRoot::observe(&dir)),
         // No ReviewConfig exists on this path, so there is no `files.local`
         // value from which to take the filename for this diagnostic.
         discover => config::project_root(&discover)?.ok_or_else(|| {

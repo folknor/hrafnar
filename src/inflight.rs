@@ -11,8 +11,8 @@
 //! touch count only ever increments on detected completion, so it cannot be used
 //! to tell working from wedged.
 //!
-//! A marker file is written as soon as the session id is known and removed when
-//! the run returns, which gives `review sessions` a third state to report:
+//! A marker file is written as soon as the session id is known and retained
+//! through recording and handoff publication, which gives `review sessions` a third state to report:
 //! "turn in flight since <time>".
 //!
 //! # Why a file rather than a sidecar row
@@ -32,61 +32,137 @@
 //! and readers treat a marker whose owner is gone as stale rather than as a
 //! live turn - unless the run's keeper is still alive, tearing down what the
 //! run started, in which case the marker reads as cleanup pending until it is
-//! not. Every failure in here warns and continues - a liveness hint must never
-//! be able to derail an actual run.
+//! not. Invocation namespace reservation failures refuse before launching;
+//! marker updates after admission are best-effort visibility hints.
 
 // Markers, requests and launch locks deliberately share this store. The lock
 // protocol is operator-owned; splitting just markers/requests would divide the
 // directory and identity rules without introducing an independent store rule.
+// The frozen LaunchLock API intentionally remains a validated string facade.
+// Known Lease identities stay typed; raw stream/history evidence is preserved.
 // Executable SessionId conversion belongs at action boundaries, not in serde
 // for historical markers, whose original strings must remain readable.
 pub use crate::process::identity_alive;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    #[default]
+    Running,
+    HandoffPending,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "MarkerWire")]
 pub struct Marker {
     pub session_id: String,
     pub provider: String,
     pub project: String,
-    /// UNIX seconds when the run was launched.
     pub started_epoch: u64,
-    /// pid of the owning `review` process, used to detect stale markers left by
-    /// a `review` that was killed outright.
-    pub pid: u32,
-    /// pid of the provider process `review` spawned - the leader of its process
-    /// group - which `review interrupt` signals. Absent in markers written before
-    /// the field existed; such a run cannot be interrupted.
-    #[serde(default)]
-    pub child_pid: Option<u32>,
-    /// Unique per run, so a run can tell its own marker from another run's of
-    /// the same session (see `Guard`). Owner pid and start second together
-    /// are not unique: one `review` could run a session twice within a second.
-    /// Empty in markers written before the field existed.
-    #[serde(default)]
+    pub owner: crate::process::ProcessIdentity,
+    pub keeper: Option<crate::process::ProcessIdentity>,
+    pub signal_ready: bool,
     pub run_id: String,
-    /// Start time (`/proc/<pid>/stat` field 22) of the owning `review`, so a
-    /// reused pid is not taken for it. Absent in older markers, which fall back
-    /// to a bare existence check.
-    #[serde(default)]
-    pub pid_start: Option<u64>,
-    /// The run's keeper (see `keeper`) and its start time, recorded before the
-    /// provider launches. While the owner is gone but the keeper lives, the
-    /// run's processes are still being torn down.
-    #[serde(default)]
-    pub keeper: Option<u32>,
-    #[serde(default)]
-    pub keeper_start: Option<u64>,
-    /// Set by `read_live`, never stored: the owning `review` is gone and its
-    /// keeper is still tearing the run down. Nothing may launch on the session
-    /// or interrupt it until that ends.
-    #[serde(skip)]
-    pub cleanup_pending: bool,
+    pub protocol: u32,
+    pub phase: Phase,
+    pub predecessor: Option<crate::sessions::handoff::RunId>,
 }
-
-/// This process's start time, for its markers.
-fn own_start() -> Option<u64> {
-    crate::process::stat_ppid_start(std::process::id()).map(|(_, s)| s)
+// Old active markers remain visible. Their duplicate child_pid is readiness
+// evidence only when it names the keeper, never a second signal identity.
+#[derive(Deserialize)]
+struct MarkerWire {
+    session_id: String,
+    provider: String,
+    project: String,
+    started_epoch: u64,
+    #[serde(default)]
+    owner: Option<crate::process::ProcessIdentity>,
+    #[serde(default)]
+    keeper: Option<serde_json::Value>,
+    #[serde(default)]
+    signal_ready: bool,
+    #[serde(default)]
+    run_id: String,
+    #[serde(default)]
+    protocol: u32,
+    #[serde(default)]
+    phase: Phase,
+    #[serde(default)]
+    predecessor: Option<crate::sessions::handoff::RunId>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    pid_start: Option<u64>,
+    #[serde(default)]
+    keeper_start: Option<u64>,
+    #[serde(default)]
+    child_pid: Option<u32>,
+}
+impl TryFrom<MarkerWire> for Marker {
+    type Error = String;
+    fn try_from(w: MarkerWire) -> Result<Self, Self::Error> {
+        let owner = w
+            .owner
+            .or_else(|| {
+                w.pid
+                    .and_then(|p| crate::process::ProcessIdentity::recorded(p, w.pid_start))
+            })
+            .ok_or("invalid marker owner")?;
+        let keeper = match w.keeper {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(n)) => Some(
+                crate::process::ProcessIdentity::recorded(
+                    n.as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .ok_or("invalid keeper pid")?,
+                    w.keeper_start,
+                )
+                .ok_or("invalid keeper pid")?,
+            ),
+            Some(v) => Some(serde_json::from_value(v).map_err(|e| e.to_string())?),
+        };
+        let signal_ready = if w.protocol == 0 {
+            keeper.is_some_and(|k| Some(k.pid()) == w.child_pid)
+        } else {
+            w.signal_ready
+        };
+        Ok(Self {
+            session_id: w.session_id,
+            provider: w.provider,
+            project: w.project,
+            started_epoch: w.started_epoch,
+            owner,
+            keeper,
+            signal_ready,
+            run_id: w.run_id,
+            protocol: w.protocol,
+            phase: w.phase,
+            predecessor: w.predecessor,
+        })
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunState {
+    Running,
+    CleanupPending,
+}
+#[derive(Clone)]
+pub struct Live {
+    pub marker: Marker,
+    pub state: RunState,
+}
+impl std::ops::Deref for Live {
+    type Target = Marker;
+    fn deref(&self) -> &Marker {
+        &self.marker
+    }
+}
+impl Live {
+    pub fn cleanup_pending(&self) -> bool {
+        self.state == RunState::CleanupPending
+    }
 }
 
 /// Where markers live. `data_root` overrides the real XDG location and exists so
@@ -94,14 +170,7 @@ fn own_start() -> Option<u64> {
 /// `~/.local/share/review/inflight` - redirecting `CODEX_HOME` only redirects
 /// the *child*, not the paths `review` itself resolves.
 fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
-    let data_dir = match data_root {
-        Some(root) => root.to_path_buf(),
-        None => std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .ok()?,
-    };
-    Some(data_dir.join("review").join("inflight"))
+    crate::data::DataDir::from_override(data_root).inflight()
 }
 
 /// Is `id` safe to use as a path component for a session?
@@ -121,69 +190,160 @@ pub(crate) fn is_safe_session_id(id: &str) -> bool {
     crate::provider::SessionId::is_safe(id)
 }
 
-/// Removes its marker file on drop, so the marker's lifetime is exactly the
-/// run's - including on early returns and panics.
-///
-/// Only while the file is still this run's. Two `review` processes can run the
-/// same session at once - two `review message` calls to an idle claude session
-/// both launch, claude having no session lock of its own - and they share one
-/// marker path. The second overwrites the first's marker; the first to finish
-/// used to delete it regardless, leaving the still-running second invisible to
-/// `review sessions` and `review interrupt`.
-pub struct Guard(Option<(PathBuf, Marker)>);
+/// Reserve the invocation namespace before a provider can launch, including a
+/// fresh Codex run whose session is not known until output arrives. Reservation
+/// collisions fail launch; there is never a fallback to a shared marker path.
+pub struct Reservation {
+    path: PathBuf,
+    markers: std::sync::Mutex<Vec<PathBuf>>,
+}
+impl Reservation {
+    pub(crate) fn register(&self, guard: &Guard) {
+        if let Some((path, _)) = &guard.0 {
+            self.markers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(path.clone());
+        }
+    }
+    /// Only paths exclusively created by this invocation are ours to remove.
+    /// Called after receipt publication, or by the last reservation owner.
+    pub(crate) fn complete(&self) {
+        let mut paths = self
+            .markers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        paths.retain(|path| match std::fs::remove_file(path) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to remove owned marker {}: {e}",
+                    path.display()
+                );
+                true
+            }
+        });
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.complete();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+pub(crate) fn reserve(
+    data: &crate::data::DataDir,
+    id: &crate::sessions::handoff::RunId,
+) -> std::io::Result<Option<Reservation>> {
+    let Some(dir) = data.inflight() else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.lease", id.as_str()));
+    let _file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let reservation = Reservation {
+        path,
+        markers: std::sync::Mutex::new(Vec::new()),
+    };
+    for extension in ["result", "result.tmp"] {
+        match std::fs::symlink_metadata(dir.join(format!("{}.{extension}", id.as_str()))) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "invocation result namespace already exists",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // A crashed owner's reservation persists. Also refuse historical/stale
+    // marker residue rather than adopt its namespace if a file was removed.
+    let suffix = format!(".{}.json", id.as_str());
+    for entry in std::fs::read_dir(&dir)? {
+        if entry?.file_name().to_str().is_some_and(|s| {
+            s.ends_with(&suffix)
+                || s.ends_with(&format!("{suffix}.tmp"))
+                || s.ends_with(&format!(".{}.interrupt", id.as_str()))
+        }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "invocation markers already exist",
+            ));
+        }
+    }
+    Ok(Some(reservation))
+}
 
+/// Exclusively owns a per-invocation path. No other run can rewrite or remove
+/// it, so cleanup needs no check-then-act comparison with a shared session file.
+pub struct Guard(Option<(PathBuf, Marker)>, bool);
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some((path, marker)) = self.0.take()
-            && still_ours(&path, &marker)
-        {
+        if let Some((path, _)) = self.0.take() {
             let _ = std::fs::remove_file(path);
         }
     }
 }
-
 impl Guard {
-    /// Record the run's keeper. Called before the keeper is told to launch,
-    /// so a marker whose owner dies mid-run always says who is cleaning up.
+    /// The reservation already registered this exact owned path. Even a failed
+    /// phase rewrite transfers deletion authority without an unlink window.
+    pub(crate) fn handoff(&mut self) {
+        if let Some((path, mut marker)) = self.0.take() {
+            marker.phase = Phase::HandoffPending;
+            marker.signal_ready = false;
+            if let Err(e) = write_marker(&path, &marker) {
+                eprintln!("warning: failed to mark pending handoff: {e}");
+            }
+        }
+    }
+    pub(crate) fn collision(&self) -> bool {
+        self.1
+    }
     pub fn record_keeper(&mut self, keeper: u32) {
-        if let Some((path, marker)) = self.0.as_mut()
-            && still_ours(path, marker)
-        {
-            marker.keeper = Some(keeper);
-            marker.keeper_start = crate::process::stat_ppid_start(keeper).map(|(_, s)| s);
+        if let Some((path, marker)) = self.0.as_mut() {
+            marker.keeper = crate::process::ProcessIdentity::observe(keeper);
             if let Err(e) = write_marker(path, marker) {
                 eprintln!("warning: failed to update inflight marker: {e}");
             }
         }
     }
-
-    /// Offer the provider's pid to `review interrupt`, once it is safe to
-    /// signal (see `run_codex_json`). Best-effort like the rest of the marker,
-    /// and skipped if another run has since taken the marker over (see `Guard`).
-    pub fn record_child_pid(&mut self, child_pid: Option<u32>) {
-        if let Some((path, marker)) = self.0.as_mut()
-            && still_ours(path, marker)
-        {
-            marker.child_pid = child_pid;
+    pub fn record_ready(&mut self, ready: bool) {
+        if let Some((path, marker)) = self.0.as_mut() {
+            marker.signal_ready = ready;
             if let Err(e) = write_marker(path, marker) {
                 eprintln!("warning: failed to update inflight marker: {e}");
             }
         }
+    }
+    pub(crate) fn take_request(&self, data: &crate::data::DataDir) -> bool {
+        self.0.as_ref().is_some_and(|(_, marker)| {
+            marker
+                .request_path(data)
+                .is_some_and(|p| std::fs::remove_file(p).is_ok())
+        })
     }
 }
-
-/// Whether the marker at `path` is the one `ours` describes: the same run. A
-/// missing or unreadable file is not ours to touch.
-///
-/// A check then an action, so a second run could replace the marker between
-/// the two. Closing that needs a lock around every marker write; the window is
-/// microseconds wide and opens only for two runs of one session at once, which
-/// `review message`'s launch lock already keeps apart.
-fn still_ours(path: &Path, ours: &Marker) -> bool {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<Marker>(&content).ok())
-        .is_some_and(|on_disk| on_disk.run_id == ours.run_id)
+impl Marker {
+    pub(crate) fn request_path(&self, data: &crate::data::DataDir) -> Option<PathBuf> {
+        let sid = crate::provider::SessionId::parse(&self.session_id).ok()?;
+        let run: crate::sessions::handoff::RunId = self.run_id.clone().try_into().ok()?;
+        Some(
+            data.inflight()?
+                .join(format!("{}.{}.interrupt", sid.as_str(), run.as_str())),
+        )
+    }
+    pub(crate) fn request(&self, data: &crate::data::DataDir) -> std::io::Result<()> {
+        std::fs::write(
+            self.request_path(data)
+                .ok_or_else(|| std::io::Error::other("unsafe run identity"))?,
+            "",
+        )
+    }
 }
 
 /// Write a marker via a rename, so a concurrent reader never sees it
@@ -198,67 +358,118 @@ fn write_marker(path: &Path, marker: &Marker) -> std::io::Result<()> {
 }
 
 /// Record that `session_id` is running now. Returns a guard that removes the
-/// marker when dropped; a `Guard(None)` on any failure, so a broken data dir
-/// silently degrades to the old no-visibility behaviour instead of failing the
-/// run.
+/// marker when dropped. Late marker IO failures degrade visibility; invocation
+/// namespace reservation is checked independently before provider launch.
 pub fn mark(
     session_id: &str,
     provider: crate::provider::Provider,
     project: &str,
     data_root: Option<&Path>,
 ) -> Guard {
+    mark_in(
+        session_id,
+        provider,
+        project,
+        &crate::data::DataDir::from_override(data_root),
+    )
+}
+
+pub(crate) fn mark_in(
+    session_id: &str,
+    provider: crate::provider::Provider,
+    project: &str,
+    data: &crate::data::DataDir,
+) -> Guard {
     let Ok(id) = crate::provider::SessionId::parse(session_id) else {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
-        return Guard(None);
+        return Guard(None, false);
     };
-    mark_checked(&id, provider, project, data_root)
+    mark_checked(
+        &id,
+        provider,
+        project,
+        data,
+        &crate::sessions::handoff::RunId::default(),
+        None,
+    )
+}
+
+pub(crate) fn mark_for(
+    session_id: &crate::provider::SessionId,
+    provider: crate::provider::Provider,
+    project: &str,
+    data: &crate::data::DataDir,
+    run_id: &crate::sessions::handoff::RunId,
+    predecessor: Option<&crate::sessions::handoff::RunId>,
+) -> Guard {
+    mark_checked(session_id, provider, project, data, run_id, predecessor)
 }
 
 fn mark_checked(
     session_id: &crate::provider::SessionId,
     provider: crate::provider::Provider,
     project: &str,
-    data_root: Option<&Path>,
+    data: &crate::data::DataDir,
+    run_id: &crate::sessions::handoff::RunId,
+    predecessor: Option<&crate::sessions::handoff::RunId>,
 ) -> Guard {
     let session_id = session_id.as_str();
-    let Some(dir) = dir(data_root) else {
-        return Guard(None);
+    let Some(dir) = data.inflight() else {
+        return Guard(None, false);
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("warning: failed to create inflight dir: {e}");
-        return Guard(None);
+        return Guard(None, false);
     }
     // Validated above as a bare filename component, so this cannot escape `dir`.
-    let path = dir.join(format!("{session_id}.json"));
+    let path = dir.join(format!("{session_id}.{}.json", run_id.as_str()));
     let marker = Marker {
-        session_id: session_id.to_string(),
-        provider: provider.as_str().to_string(),
-        project: project.to_string(),
+        session_id: session_id.to_owned(),
+        provider: provider.as_str().to_owned(),
+        project: project.to_owned(),
         started_epoch: crate::provider::now_epoch_secs(),
-        pid: std::process::id(),
-        // Offered later, once it is safe to signal - see `Guard::record_child_pid`.
-        child_pid: None,
-        run_id: crate::ids::generate_uuid(),
-        pid_start: own_start(),
+        owner: crate::process::ProcessIdentity::observe(std::process::id())
+            .expect("own positive pid"),
         keeper: None,
-        keeper_start: None,
-        cleanup_pending: false,
+        signal_ready: false,
+        phase: Phase::Running,
+        predecessor: predecessor.cloned(),
+        run_id: run_id.as_str().to_owned(),
+        protocol: crate::sessions::handoff::PROTOCOL,
     };
-    if let Err(e) = write_marker(&path, &marker) {
-        eprintln!("warning: failed to write inflight marker: {e}");
-        return Guard(None);
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("warning: failed to create inflight marker: {e}");
+            return Guard(None, e.kind() == std::io::ErrorKind::AlreadyExists);
+        }
+    };
+    let bytes = serde_json::to_vec(&marker).expect("marker serializes");
+    let published = file
+        .write_all(&bytes)
+        .and_then(|()| std::fs::hard_link(&tmp, &path));
+    let _ = std::fs::remove_file(tmp);
+    if let Err(e) = published {
+        eprintln!("warning: failed to publish inflight marker: {e}");
+        return Guard(None, e.kind() == std::io::ErrorKind::AlreadyExists);
     }
-    Guard(Some((path, marker)))
+    Guard(Some((path, marker)), false)
 }
 
 /// Every currently-live in-flight marker. Markers whose owning `review` process
-/// is gone are stale (killed mid-run) and are both skipped and cleaned up here,
-/// so the directory cannot accumulate lies over time - and so is an interrupt
-/// request with no live marker beside it, which no run is left to consume.
+/// and keeper are established gone are stale and cleaned up here. Unknown
+/// process observations preserve the marker. Requests are never swept from an
+/// observation snapshot: a concurrent marker may have been missed.
 ///
 /// `data_root` is `None` everywhere but tests: `review sessions` and `review
 /// interrupt` are operator-facing and read the real location.
-pub fn read_live(data_root: Option<&Path>) -> Vec<Marker> {
+pub fn read_live(data_root: Option<&Path>) -> Vec<Live> {
     let Some(dir) = dir(data_root) else {
         return Vec::new();
     };
@@ -266,58 +477,61 @@ pub fn read_live(data_root: Option<&Path>) -> Vec<Marker> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut requests = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         match path.extension().and_then(|e| e.to_str()) {
             Some("json") => {}
-            Some("interrupt") => {
-                requests.push(path);
-                continue;
-            }
             _ => continue,
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(mut marker) = serde_json::from_str::<Marker>(&content) else {
+        let Ok(marker) = serde_json::from_str::<Marker>(&content) else {
             continue;
         };
-        if identity_alive(marker.pid, marker.pid_start) {
-            out.push(marker);
-        } else if marker
-            .keeper
-            .is_some_and(|k| identity_alive(k, marker.keeper_start))
-        {
-            // The owner is gone but its keeper is still tearing the run down;
-            // the marker stays until the keeper is gone too.
-            marker.cleanup_pending = true;
-            out.push(marker);
+        if !marker.owner.is_gone() {
+            out.push(Live {
+                marker,
+                state: RunState::Running,
+            });
+            continue;
+        }
+        // The keeper may have been published after our first read but before
+        // owner death. Reread only now, when that owner can no longer update.
+        let latest = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Marker>(&s).ok());
+        let Some(latest) = latest.filter(|m| m.owner == marker.owner && m.run_id == marker.run_id)
+        else {
+            out.push(Live {
+                marker,
+                state: RunState::CleanupPending,
+            });
+            continue;
+        };
+        if latest.keeper.is_some_and(|keeper| !keeper.is_gone()) {
+            out.push(Live {
+                marker: latest,
+                state: RunState::CleanupPending,
+            });
         } else {
             let _ = std::fs::remove_file(&path);
         }
     }
-    // A run consumes its request before removing its marker, so a request whose
-    // marker is gone is one nobody will ever read.
-    for request in requests {
-        let owned = request
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .is_some_and(|sid| out.iter().any(|m| m.session_id == sid));
-        if !owned {
-            let _ = std::fs::remove_file(&request);
-        }
-    }
+    // Absence from a directory scan is not proof of absence: never delete a
+    // request here. Exact orphan requests cannot affect another invocation.
     out
 }
 
 /// The live marker for `session_id`, if a run of it is in flight on this host.
-pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Marker> {
+pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Live> {
     let id = crate::provider::SessionId::parse(session_id).ok()?;
     let session_id = id.as_str();
-    read_live(data_root)
+    let mut matching = read_live(data_root)
         .into_iter()
-        .find(|m| m.session_id == session_id)
+        .filter(|m| m.session_id == session_id);
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
 }
 
 /// Held by `review message` from before it checks whether the session has a turn
@@ -464,7 +678,17 @@ fn interrupt_path_checked(
     session_id: &crate::provider::SessionId,
     data_root: Option<&Path>,
 ) -> Option<PathBuf> {
-    Some(dir(data_root)?.join(format!("{}.interrupt", session_id.as_str())))
+    interrupt_path_in(session_id, &crate::data::DataDir::from_override(data_root))
+}
+
+fn interrupt_path_in(
+    session_id: &crate::provider::SessionId,
+    data: &crate::data::DataDir,
+) -> Option<PathBuf> {
+    Some(
+        data.inflight()?
+            .join(format!("{}.interrupt", session_id.as_str())),
+    )
 }
 
 /// Record that the operator asked for `session_id`'s run to be interrupted.
@@ -490,6 +714,13 @@ pub fn request_interrupt(session_id: &str, data_root: Option<&Path>) -> std::io:
 /// Also how a request is withdrawn, with the result ignored.
 pub fn take_interrupt_request(session_id: &str, data_root: Option<&Path>) -> bool {
     interrupt_path(session_id, data_root).is_some_and(|p| std::fs::remove_file(p).is_ok())
+}
+
+pub(crate) fn take_interrupt_request_in(session_id: &str, data: &crate::data::DataDir) -> bool {
+    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+        return false;
+    };
+    interrupt_path_in(&id, data).is_some_and(|path| std::fs::remove_file(path).is_ok())
 }
 
 #[cfg(test)]
@@ -525,42 +756,37 @@ mod tests {
     }
 
     #[test]
-    fn a_run_does_not_delete_a_marker_another_run_has_taken_over() {
+    fn per_run_markers_are_exclusive_and_independent() {
         let root = scratch_root();
-        let sid = "019fefb0-227c-7c83-a398-380011b8e66b";
-        let first = mark(sid, crate::provider::Provider::Claude, "/p", Some(&root));
-        // A second run of the same session writes the same path - here from
-        // the same `review` in the same second, so only the run id differs.
-        let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
-        let second = Marker {
-            session_id: sid.to_string(),
-            provider: "claude".to_string(),
-            project: "/p".to_string(),
-            started_epoch: crate::provider::now_epoch_secs(),
-            pid: std::process::id(),
-            child_pid: None,
-            run_id: "another-run".to_string(),
-            pid_start: None,
-            keeper: None,
-            keeper_start: None,
-            cleanup_pending: false,
-        };
-        write_marker(&path, &second).expect("second marker");
-        drop(first);
-        assert!(
-            path.exists(),
-            "the first run to finish must leave the second's marker in place"
-        );
-        // A marker that is still ours is removed as before.
-        std::fs::remove_file(&path).expect("clear");
-        drop(mark(
-            sid,
+        let data = crate::data::DataDir::at(root.clone());
+        let sid = "same-session";
+        let checked = crate::provider::SessionId::parse(sid).expect("id");
+        let id = crate::sessions::handoff::RunId::default();
+        let first = mark_for(
+            &checked,
             crate::provider::Provider::Claude,
             "/p",
-            Some(&root),
-        ));
-        assert!(!path.exists(), "our own marker goes when the run does");
-        let _ = std::fs::remove_dir_all(&root);
+            &data,
+            &id,
+            None,
+        );
+        let collision = mark_for(
+            &checked,
+            crate::provider::Provider::Claude,
+            "/p",
+            &data,
+            &id,
+            None,
+        );
+        assert!(collision.collision());
+        drop(collision);
+        let second = mark(sid, crate::provider::Provider::Claude, "/p", Some(&root));
+        assert_eq!(read_live(Some(&root)).len(), 2);
+        drop(first);
+        assert_eq!(read_live(Some(&root)).len(), 1);
+        drop(second);
+        assert!(read_live(Some(&root)).is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -648,7 +874,7 @@ mod tests {
     fn a_marker_whose_owner_is_gone_but_keeper_lives_is_cleanup_pending() {
         let root = scratch_root();
         let me = std::process::id();
-        let start = own_start();
+        let start = crate::process::stat_ppid_start(me).map(|(_, s)| s);
         let write = |sid: &str, keeper: Option<u32>| {
             let marker = Marker {
                 session_id: sid.to_string(),
@@ -657,13 +883,14 @@ mod tests {
                 started_epoch: 0,
                 // Our own pid with a start time that is not ours: an owner
                 // whose pid has been reused, so gone.
-                pid: me,
-                child_pid: None,
+                owner: crate::process::ProcessIdentity::recorded(me, start.map(|s| s + 1))
+                    .expect("owner"),
+                signal_ready: false,
+                protocol: crate::sessions::handoff::PROTOCOL,
+                phase: Phase::Running,
+                predecessor: None,
                 run_id: sid.to_string(),
-                pid_start: start.map(|s| s + 1),
-                keeper,
-                keeper_start: start,
-                cleanup_pending: false,
+                keeper: keeper.and_then(|p| crate::process::ProcessIdentity::recorded(p, start)),
             };
             let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
             std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -677,7 +904,7 @@ mod tests {
         let live = read_live(Some(&root));
         assert!(
             live.iter()
-                .any(|m| m.session_id == pending && m.cleanup_pending),
+                .any(|m| m.session_id == pending && m.cleanup_pending()),
             "a live keeper keeps the marker, as cleanup pending"
         );
         assert!(pending_path.exists());
@@ -699,7 +926,8 @@ mod tests {
         let old =
             r#"{"session_id":"s","provider":"codex","project":"/p","started_epoch":1,"pid":2}"#;
         let marker: Marker = serde_json::from_str(old).expect("old marker parses");
-        assert_eq!(marker.child_pid, None);
+        assert!(!marker.signal_ready);
+        assert_eq!(marker.protocol, 0);
     }
 
     #[test]
@@ -724,5 +952,82 @@ mod tests {
     #[test]
     fn rejects_absurdly_long_ids() {
         assert!(!is_safe_session_id(&"a".repeat(129)));
+    }
+}
+
+#[cfg(test)]
+mod exact_run_tests {
+    use super::*;
+    #[test]
+    fn requests_cannot_be_taken_by_another_run_or_swept_by_observation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        let data = crate::data::DataDir::at(root.clone());
+        let sid = crate::provider::SessionId::parse("session").expect("id");
+        let first = mark_for(
+            &sid,
+            crate::provider::Provider::Claude,
+            "/p",
+            &data,
+            &crate::sessions::handoff::RunId::default(),
+            None,
+        );
+        let second = mark_for(
+            &sid,
+            crate::provider::Provider::Claude,
+            "/p",
+            &data,
+            &crate::sessions::handoff::RunId::default(),
+            None,
+        );
+        let marker = &first.0.as_ref().expect("first marker").1;
+        marker.request(&data).expect("request");
+        assert!(!second.take_request(&data));
+        assert!(first.take_request(&data));
+        marker.request(&data).expect("late request");
+        let orphan = marker.request_path(&data).expect("request path");
+        let id: crate::sessions::handoff::RunId = marker.run_id.clone().try_into().expect("run id");
+        drop(first);
+        assert_eq!(read_live(Some(&root)).len(), 1);
+        assert!(
+            orphan.exists(),
+            "scanning cannot prove an absent marker was not concurrently published"
+        );
+        assert!(
+            reserve(&data, &id).is_err(),
+            "orphan requests prevent namespace reuse"
+        );
+        assert!(!second.take_request(&data));
+        drop(second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn reservation_rejects_temporary_result_residue_and_legacy_readiness_is_not_a_second_pid() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        let data = crate::data::DataDir::at(root.clone());
+        let id = crate::sessions::handoff::RunId::default();
+        let reservation = reserve(&data, &id).expect("reserve");
+        assert!(reserve(&data, &id).is_err());
+        drop(reservation);
+        let tmp = data
+            .inflight()
+            .expect("inflight")
+            .join(format!("{}.result.tmp", id.as_str()));
+        std::fs::write(tmp, "partial").expect("partial publication");
+        assert!(reserve(&data, &id).is_err());
+        for (child, ready) in [(7, true), (8, false)] {
+            let marker: Marker = serde_json::from_value(serde_json::json!({
+                "session_id": "s", "provider": "claude", "project": "/p", "started_epoch": 1,
+                "pid": 2, "keeper": 7, "keeper_start": 10, "child_pid": child,
+            }))
+            .expect("old marker");
+            assert_eq!(marker.signal_ready, ready);
+            assert_eq!(marker.keeper.expect("keeper").pid(), 7);
+            assert_eq!(marker.protocol, 0);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

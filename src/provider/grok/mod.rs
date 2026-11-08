@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 mod state;
 
-pub(super) use state::canonical_roots;
+pub(super) use state::{ProfileName, RootSet};
 
 /// Grok's headless result object (`--output-format json`). One JSON object on
 /// stdout per run, whatever the outcome; the fields we don't use (usage,
@@ -115,7 +115,7 @@ pub(super) async fn run_grok(
     selection.validate(Provider::Grok)?;
     session.validate(Provider::Grok)?;
     let session_id = session.id().expect("validated grok identity").as_str();
-    let data_root = runtime.data_root.as_deref();
+    let data = &runtime.data;
     // In flight for the whole run, wake turns included. Never offered a pid:
     // grok has no clean way to end a turn, so `review interrupt` refuses it.
     // What the marker buys is `review message` seeing the turn in flight and
@@ -125,7 +125,15 @@ pub(super) async fn run_grok(
     // provider echoes a different identity, the lease holds a marker for both
     // through the wakes, each kept current with the turn's keeper. One lease
     // for the whole run, closed when this function returns however it does.
-    let lease = Lease::known(session_id, Provider::Grok, project_root, data_root);
+    let lease = Lease::known(
+        session.id().expect("validated grok identity"),
+        Provider::Grok,
+        project_root,
+        data,
+        &runtime.run_id,
+        runtime.reservation.clone(),
+        runtime.predecessor.as_ref(),
+    );
     let first = run_grok_turn(
         launch,
         sandbox,
@@ -152,22 +160,16 @@ pub(super) async fn run_grok(
     loop {
         // Fail closed: a run whose results cannot be checked is not a run
         // whose results were seen.
-        let pending = match state::session_updates(&grok.home, &sid) {
-            None => Err(format!("no update log for grok session {sid}")),
-            Some(log) => state::unread_background_results(&log),
-        };
-        let pending = match pending {
-            Ok(p) => p,
-            Err(e) => {
-                let reason = format!("could not verify grok's background results: {e}");
+        let pending = match grok.wake_check(&sid) {
+            state::WakeCheck::Clean => break,
+            state::WakeCheck::Unread(pending) => pending,
+            state::WakeCheck::Unverifiable(reason) => {
+                let reason = format!("could not verify grok's background results: {reason}");
                 eprintln!("grok: {reason}");
                 run.out.digest = Some(wake_failure(&mut run.out, reason));
                 break;
             }
         };
-        if pending.is_empty() {
-            break;
-        }
         // A failed turn is not fixed by waking, whether grok stated a reason or
         // review found its stop reason missing. The outcome already fails it.
         if run.out.outcome.explained_failure() {
@@ -176,7 +178,9 @@ pub(super) async fn run_grok(
         // A signal can arrive after this turn but before we wake it. Do not
         // start another turn just to have the keeper shut it down. Preserve
         // the answer, but fail the run because its background results stayed
-        // unread.
+        // unread. This notification snapshot selects the wake result policy;
+        // it does not authorize a launch. Run::spawn still uses the lifecycle's
+        // admission gate if stop arrives after this check.
         if runtime.lifecycle.stop_requested() {
             let reason = "grok wake-up not launched: review was signalled to stop".to_string();
             eprintln!("grok: {reason}");
@@ -536,7 +540,7 @@ async fn run_grok_turn(
                     .and_then(state::cancel_cause)
             };
             let untrusted = grok.untrusted_hint(project_root);
-            let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
+            let reason = explain_grok_no_answer(reason, cause.as_ref(), untrusted.as_deref());
             let outcome = if review_error {
                 Outcome::no_answer().unverified(reason)
             } else {
@@ -564,7 +568,11 @@ async fn run_grok_turn(
 
 /// Extend grok's bare stop reason with what its event log and folder trust
 /// say. Pure so the wording is tested without a grok home.
-fn explain_grok_no_answer(reason: String, cause: Option<&str>, untrusted: Option<&str>) -> String {
+fn explain_grok_no_answer(
+    reason: String,
+    cause: Option<&state::CancelCause>,
+    untrusted: Option<&str>,
+) -> String {
     let mut out = reason;
     if let Some(cause) = cause {
         out.push_str(&format!(" - {cause}"));
@@ -708,31 +716,18 @@ pub(super) enum GrokWrite {
     /// profile, with the roots recorded with the session. Grok fixes a
     /// session's sandbox profile for its lifetime and refuses a different
     /// `--sandbox` on resume (`resolve_startup_sandbox` → `Conflict`).
-    Resume(String),
+    Resume(ProfileName),
     /// A resume of a session created under grok's built-in `workspace`, before
     /// `review` made profiles. It can only continue as it began: trusted, but
     /// without the extra roots.
     BuiltinWorkspace,
 }
 
-/// Generated profiles use exactly the stable suffix emitted by
-/// `state::profile_name`. Other names sharing the prefix belong to the
-/// operator and are passed to Grok as native profiles.
-pub(super) fn is_generated_profile_name(name: &str) -> bool {
-    name.strip_prefix(state::PROFILE_PREFIX)
-        .is_some_and(|suffix| {
-            suffix.len() == 16
-                && suffix
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-}
-
 /// What `prepare_grok_write` decided.
 #[derive(Debug, Default)]
 pub(super) struct GrokPrepared {
     /// The `review-ws-*` profile to launch under, when the run uses one.
-    pub(super) profile: Option<String>,
+    pub(super) profile: Option<RootSet>,
     /// The trust key `--trust` will grant, when the project had no decision
     /// yet. `None` when it was already trusted: no flag, no grant, nothing to
     /// announce.
@@ -756,9 +751,26 @@ pub(super) struct GrokPrepared {
 fn prepare_grok_write(
     kind: &GrokWrite,
     project_root: &Path,
-    roots: &[String],
+    roots: &RootSet,
     grok: &state::Grok,
 ) -> Result<GrokPrepared> {
+    // Validate recorded binding before announcing trust or writing a profile.
+    let name = match kind {
+        GrokWrite::BuiltinWorkspace => None,
+        GrokWrite::Fresh => Some(roots.profile_name()),
+        GrokWrite::Resume(name) => {
+            // The recorded roots must be the set the session's profile is named
+            // for; anything else is a row edited by hand or a record from a
+            // different run, and launching would grant a set nobody recorded.
+            if roots.profile_name() != *name {
+                anyhow::bail!(
+                    "the roots recorded with this session do not match its grok \
+                     sandbox profile `{name}` - start a fresh run"
+                );
+            }
+            Some(name.clone())
+        }
+    };
     let mut prepared = GrokPrepared::default();
     let (key, trust) = grok.check_trust(project_root)?;
     if trust == state::Trust::Undecided {
@@ -771,36 +783,23 @@ fn prepare_grok_write(
         );
         prepared.trust_grant = Some(key);
     }
-    let name = match kind {
-        GrokWrite::BuiltinWorkspace => return Ok(prepared),
-        GrokWrite::Fresh => state::profile_name(roots),
-        GrokWrite::Resume(name) => {
-            // The recorded roots must be the set the session's profile is named
-            // for; anything else is a row edited by hand or a record from a
-            // different run, and launching would grant a set nobody recorded.
-            if state::profile_name(roots) != *name {
-                anyhow::bail!(
-                    "the roots recorded with this session do not match its grok \
-                     sandbox profile `{name}` - start a fresh run"
-                );
-            }
-            name.clone()
-        }
+    let Some(name) = name else {
+        return Ok(prepared);
     };
     // Recreated on resume if someone deleted it: the name pins the exact set,
     // so recreating it grants nothing the session did not already have.
-    if grok.ensure_profile(&name, roots)? {
+    if grok.ensure_profile(roots)? {
         eprintln!(
             "grok: created sandbox profile `{name}` in {} (writable roots: {})",
             grok.home.join("sandbox.toml").display(),
-            if roots.is_empty() {
+            if roots.paths().is_empty() {
                 "none beyond grok's workspace".to_string()
             } else {
-                roots.join(", ")
+                roots.paths().join(", ")
             }
         );
     }
-    prepared.profile = Some(name);
+    prepared.profile = Some(roots.clone());
     Ok(prepared)
 }
 
@@ -824,7 +823,7 @@ pub(super) async fn prepare(
     };
     if let Some(kind) = plan.permissions.write_setup() {
         let root = launch.root.clone();
-        let roots = plan.paths.clone();
+        let roots = RootSet::new(&plan.paths);
         let state = prepared.grok.clone();
         let write =
             tokio::task::spawn_blocking(move || prepare_grok_write(&kind, &root, &roots, &state))
@@ -867,10 +866,7 @@ impl Prepared {
     fn verify_trust(&mut self, root: &Path) {
         self.verified_grant = None;
         if let Some(key) = &self.trust_grant {
-            match self.grok.check_trust(root) {
-                Ok((current, state::Trust::Trusted)) if current == *key => {
-                    self.verified_grant = Some(key.to_string_lossy().into_owned());
-                }
+            match self.grok.observe_trust(root) {
                 Ok((current, _)) if current != *key => {
                     eprintln!(
                         "warning: grok trust key changed from {} to {} - no durable grant recorded",
@@ -878,9 +874,26 @@ impl Prepared {
                         current.display()
                     );
                 }
-                _ => {
+                Ok((_, decision)) => match decision {
+                    state::Trust::Trusted => {
+                        self.verified_grant = Some(key.to_string_lossy().into_owned());
+                    }
+                    state::Trust::Declined => {
+                        eprintln!(
+                            "warning: grok folder {} is explicitly untrusted - no durable grant recorded",
+                            key.display()
+                        );
+                    }
+                    state::Trust::Undecided => {
+                        eprintln!(
+                            "warning: grok --trust did not durably trust {} - the next write run there will try again",
+                            key.display()
+                        );
+                    }
+                },
+                Err(e) => {
                     eprintln!(
-                        "warning: grok --trust did not durably trust {} - the next write run there will try again",
+                        "warning: could not verify grok trust for {}: {e:#} - no durable grant recorded",
                         key.display()
                     );
                 }

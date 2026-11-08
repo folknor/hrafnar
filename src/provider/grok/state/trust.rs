@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{Grok, has_symlink_component};
+use super::Grok;
 
 impl Grok {
     /// Grok's `is_unsafe_trust_root`: relative, the filesystem root, or the
@@ -87,6 +87,56 @@ fn parse_trust(text: &str) -> anyhow::Result<TrustDocument> {
     toml::from_str(text).map_err(|e| anyhow::anyhow!("grok cannot parse trusted_folders.toml: {e}"))
 }
 
+/// One fresh observation of whether Grok can load its whole trust store.
+/// This rejects observed symlinks, including ancestors. Inspection and read
+/// are separate operations, not an atomic confinement guarantee.
+enum StoreState {
+    Missing,
+    Unloadable(anyhow::Error),
+    Loaded(TrustDocument),
+}
+
+impl Grok {
+    fn load_store(&self) -> StoreState {
+        let path = self.home.join("trusted_folders.toml");
+        for part in path.ancestors() {
+            match std::fs::symlink_metadata(part) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return StoreState::Unloadable(anyhow::anyhow!(
+                        "{} is reached through a symlink - grok refuses to load it",
+                        path.display()
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return StoreState::Unloadable(anyhow::anyhow!(
+                        "cannot inspect {}: {e}",
+                        part.display()
+                    ));
+                }
+            }
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StoreState::Missing,
+            Err(e) => {
+                return StoreState::Unloadable(anyhow::anyhow!(
+                    "cannot read {}: {e}",
+                    path.display()
+                ));
+            }
+        };
+        match parse_trust(&text) {
+            Ok(doc) => StoreState::Loaded(doc),
+            Err(e) => StoreState::Unloadable(anyhow::anyhow!(
+                "{e} ({}) - grok would trust nothing; fix the file",
+                path.display()
+            )),
+        }
+    }
+}
+
 impl Grok {
     /// The decision grok would reach for a run in `dir`. Grok's gate queries
     /// the store with the *workspace key*, not the directory
@@ -108,13 +158,10 @@ impl Grok {
         }
     }
 
-    /// Pre-launch trust check for a write run, returning its resolved key and
-    /// the decision grok would reach. `Err` where grok's `--trust` would do the
-    /// wrong thing or could not work:
+    /// Observe a modelled trust key and its decision, including Declined.
+    /// `Err` where the key cannot be modelled or the store cannot load:
     /// - an unsafe key (filesystem root, user home, relative path), which grok
     ///   never trusts even with `--trust`;
-    /// - an explicit `trusted = false` covering the project (grok's grant would
-    ///   overwrite it - automating the yes must not overturn a recorded no);
     /// - a store grok cannot parse (it would trust nothing and cancel at the
     ///   first edit), or a symlinked one (grok refuses to load it);
     /// - a grok-managed `-w` worktree, whose key grok resolves through its own
@@ -122,7 +169,7 @@ impl Grok {
     ///   grant land on a declined source repo.
     ///
     /// A missing store is `Undecided`: `--trust` creates it.
-    pub(in crate::provider::grok) fn check_trust(
+    pub(in crate::provider::grok) fn observe_trust(
         &self,
         dir: &Path,
     ) -> anyhow::Result<(PathBuf, Trust)> {
@@ -135,7 +182,6 @@ impl Grok {
                 key.display()
             );
         }
-        let path = self.home.join("trusted_folders.toml");
         let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         // `dir` is canonical, but GROK_HOME may contain `..`. Compare against
         // the same canonical spelling so a managed worktree cannot evade this
@@ -156,26 +202,22 @@ impl Grok {
                 dir.display()
             );
         }
-        if has_symlink_component(&path) {
-            anyhow::bail!(
-                "{} is reached through a symlink - grok refuses to load it",
-                path.display()
-            );
-        }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((key, Trust::Undecided));
-            }
-            Err(e) => anyhow::bail!("cannot read {}: {e}", path.display()),
+        let decision = match self.load_store() {
+            StoreState::Missing => Trust::Undecided,
+            StoreState::Unloadable(e) => return Err(e),
+            StoreState::Loaded(doc) => self.decision(&doc, &key),
         };
-        let doc = parse_trust(&text).map_err(|e| {
-            anyhow::anyhow!(
-                "{e} ({}) - grok would trust nothing; fix the file",
-                path.display()
-            )
-        })?;
-        let decision = self.decision(&doc, &key);
+        Ok((key, decision))
+    }
+
+    /// Launch policy refuses an explicit no. Observation itself retains that
+    /// decision so postchecks and hints can name it without parsing errors.
+    pub(in crate::provider::grok) fn check_trust(
+        &self,
+        dir: &Path,
+    ) -> anyhow::Result<(PathBuf, Trust)> {
+        let (key, decision) = self.observe_trust(dir)?;
+        let path = self.home.join("trusted_folders.toml");
         if decision == Trust::Declined {
             anyhow::bail!(
                 "{} is explicitly untrusted in {} - review will not override that; \
@@ -187,14 +229,24 @@ impl Grok {
         Ok((key, decision))
     }
 
-    /// A hint for a cancelled turn when the project was not trusted, or `None`
-    /// when it was or the store cannot be read (no false blame).
+    /// Observation errors explain loadability, never pretend to prove an
+    /// untrusted decision. Missing stores are genuinely undecided.
     pub(in crate::provider::grok) fn untrusted_hint(&self, dir: &Path) -> Option<String> {
-        let key = self.workspace_key(dir);
         let path = self.home.join("trusted_folders.toml");
-        let doc = parse_trust(&std::fs::read_to_string(&path).ok()?).ok()?;
-        (self.decision(&doc, &key) != Trust::Trusted)
-            .then(|| format!("{} is not trusted in {}", key.display(), path.display()))
+        match self.observe_trust(dir) {
+            Ok((_, Trust::Trusted)) => None,
+            Ok((key, Trust::Declined)) => Some(format!(
+                "{} is explicitly untrusted in {}",
+                key.display(),
+                path.display()
+            )),
+            Ok((key, Trust::Undecided)) => Some(format!(
+                "{} is not trusted in {}",
+                key.display(),
+                path.display()
+            )),
+            Err(e) => Some(format!("could not check grok folder trust: {e:#}")),
+        }
     }
 }
 
@@ -404,6 +456,64 @@ mod tests {
                 .to_string()
                 .contains("never trusts")
         );
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn all_trust_consumers_share_store_loadability_and_keep_declines_observable() {
+        let home = scratch();
+        let project = scratch();
+        let grok = grok_at(&home);
+        let key = grok.workspace_key(&project);
+        let path = home.join("trusted_folders.toml");
+        assert!(matches!(grok.load_store(), StoreState::Missing));
+        assert!(
+            grok.untrusted_hint(&project)
+                .expect("missing is undecided")
+                .contains("not trusted")
+        );
+        std::fs::write(
+            &path,
+            format!("[folders.\"{}\"]\ntrusted = false\n", key.display()),
+        )
+        .expect("declined");
+        assert_eq!(
+            grok.observe_trust(&project).expect("observable decline").1,
+            Trust::Declined
+        );
+        assert!(grok.check_trust(&project).is_err());
+        assert!(
+            grok.untrusted_hint(&project)
+                .expect("declined hint")
+                .contains("explicitly untrusted")
+        );
+        std::fs::write(&path, "[broken").expect("malformed");
+        assert!(matches!(grok.load_store(), StoreState::Unloadable(_)));
+        assert!(
+            grok.untrusted_hint(&project)
+                .expect("load hint")
+                .contains("could not check")
+        );
+        assert!(grok.observe_trust(&project).is_err());
+        std::fs::remove_file(&path).expect("remove malformed");
+        let target = home.join("actual.toml");
+        std::fs::write(
+            &target,
+            format!("[folders.\"{}\"]\ntrusted = true\n", key.display()),
+        )
+        .expect("trusted target");
+        std::os::unix::fs::symlink(&target, &path).expect("symlink store");
+        assert!(matches!(grok.load_store(), StoreState::Unloadable(_)));
+        assert!(grok.observe_trust(&project).is_err());
+        assert!(
+            grok.untrusted_hint(&project)
+                .expect("symlink hint")
+                .contains("symlink")
+        );
+        std::fs::remove_file(&path).expect("remove link");
+        std::fs::create_dir(&path).expect("directory instead of store");
+        assert!(matches!(grok.load_store(), StoreState::Unloadable(_)));
         let _ = std::fs::remove_dir_all(home);
         let _ = std::fs::remove_dir_all(project);
     }

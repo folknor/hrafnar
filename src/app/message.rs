@@ -6,7 +6,7 @@ use super::{format_runtime, print_left_running, run_failed, selected_root};
 // Interrupt remains a separate verb owner; message composes its signalling
 // and wording without duplicating it or moving storage policy into the app.
 use crate::{
-    audit, config, config_write, inflight, input, interrupt_cmd, lock, project, provider, sessions,
+    config, config_write, inflight, input, interrupt_cmd, lock, project, provider, sessions,
 };
 
 /// The provider a `review resume` talks to: the one the sidecar recorded for the
@@ -36,12 +36,7 @@ fn resume_record(
     session_id: &str,
     record: Option<sessions::SessionRecord>,
 ) -> Result<(sessions::SessionRecord, provider::Provider)> {
-    let Some(record) = record else {
-        bail!(
-            "no record of session {session_id} on this host\n  \
-             `review sessions` lists the sessions this host's review runs created."
-        );
-    };
+    let record = record.ok_or_else(|| sessions::query::not_found(session_id))?;
     let Ok(provider) = record.provider.parse::<provider::Provider>() else {
         bail!(
             "session {session_id} was recorded for provider '{}', which review no \
@@ -68,22 +63,40 @@ fn resume_record(
 /// ancestor's audit id and privacy - and that config must parse. The audit id
 /// must match the record too: a path alone cannot tell the original checkout
 /// from another project initialized in its place.
+struct MessageTarget {
+    config: config::ReviewConfig,
+}
+
+/// A snapshot to compare with a newly loaded target after interruption. Keeping
+/// this distinct from launch policy prevents reusing the first filesystem check.
+#[derive(PartialEq, Eq)]
+struct TargetIdentity {
+    root: project::ProjectRoot,
+    audit: Option<crate::data::AuditId>,
+}
+
+impl MessageTarget {
+    fn identity(&self) -> Result<TargetIdentity> {
+        Ok(TargetIdentity {
+            root: self.config.require_project_root()?.clone(),
+            audit: self.config.audit.id.clone(),
+        })
+    }
+}
+
 fn message_target(
     session_id: &str,
     record: Option<&sessions::SessionRecord>,
     marker_project: Option<&str>,
     selector: Option<&str>,
-) -> Result<(config::ReviewConfig, std::path::PathBuf)> {
+) -> Result<MessageTarget> {
     let recorded = match (record.map(|r| r.project.as_str()), marker_project) {
         (Some(r), Some(m)) if !project::same_project(r, std::path::Path::new(m)) => bail!(
             "session {session_id} is recorded in {r} but its turn in flight runs in {m}\n  \
              Refusing to guess which project the message belongs to."
         ),
         (Some(p), _) | (None, Some(p)) => p,
-        (None, None) => bail!(
-            "no record of session {session_id} on this host\n  \
-             `review sessions` lists the sessions this host's review runs created."
-        ),
+        (None, None) => return Err(sessions::query::not_found(session_id)),
     };
     let root = std::path::PathBuf::from(recorded);
     if !root.is_dir() {
@@ -94,25 +107,16 @@ fn message_target(
     }
     if let Some(sel) = selector {
         let selected = selected_root(sel)?;
-        if !project::same_project(recorded, &selected) {
-            bail!(
-                "session {session_id} belongs to {recorded}, not {} (-C {sel})",
-                selected.display()
-            );
-        }
+        sessions::query::assert_project(session_id, recorded, selected.as_path(), sel)?;
     }
-    let (cfg, root) = config::load(&config::Selection::Exact(root))?;
+    let cfg = config::load(&config::Selection::Exact(root))?;
+    let root = cfg.require_project_root()?.as_path();
     if let Some(rec) = record
-        && !rec.audit_id.is_empty()
-        && cfg.audit.id.as_deref() != Some(rec.audit_id.as_str())
+        && let Some(recorded_id) = crate::data::AuditId::from_record(&rec.audit_id)
+        && cfg.audit.id.as_ref() != Some(&recorded_id)
     {
-        // An empty configured id is absent, as it is to `ensure_audit_id`.
-        let current_audit_id = cfg
-            .audit
-            .id
-            .as_deref()
-            .filter(|id| !id.is_empty())
-            .unwrap_or("none");
+        // Empty historical ids carry no identity assertion.
+        let current_audit_id = cfg.audit.id.as_deref().unwrap_or("none");
         bail!(
             "session {session_id} was recorded under audit id {} but {} now has {}\n  \
              The checkout at that path is not the project the session was started in.",
@@ -121,7 +125,7 @@ fn message_target(
             current_audit_id
         );
     }
-    Ok((cfg, root))
+    Ok(MessageTarget { config: cfg })
 }
 
 /// `review message <id>`: deliver stdin to a session whatever it is doing. A
@@ -162,11 +166,31 @@ pub(super) async fn run_message(
     // Read on a dry run too: the marker can name the project (a fresh run
     // still in flight has no row yet) or contradict the row, and a preview
     // that skipped it would pass what the real message refuses.
-    let marker = inflight::live_marker(session_id, None);
-    let record = sessions::latest_for_session(session_id);
+    // Observe first: pending-marker removal follows durable recording. If we
+    // see no marker after that removal, history must be acquired afterwards.
+    let observation = sessions::query::Observation::capture(None);
+    let mut snapshot = sessions::query::Snapshot::read();
+    let marker = match observation.state(session_id, &snapshot) {
+        sessions::query::State::InFlight(m)
+        | sessions::query::State::CleanupPending(m)
+        | sessions::query::State::HandoffPending(m) => Some(m.clone()),
+        sessions::query::State::Ambiguous => {
+            bail!("session {session_id}: ambiguous live-run observation; retry shortly")
+        }
+        sessions::query::State::Queued(row) => {
+            let _ = row;
+            None
+        }
+        sessions::query::State::Idle(row) => {
+            let _ = row;
+            None
+        }
+        sessions::query::State::Unknown => None,
+    };
+    let record = snapshot.latest(session_id).cloned();
     // Under the launch lock, before any signal: a message bound for the wrong
     // project, or one whose project config is broken, must not cost the turn.
-    let (target_cfg, target_root) = message_target(
+    let target = message_target(
         session_id,
         record.as_ref(),
         marker.as_ref().map(|m| m.project.as_str()),
@@ -176,29 +200,39 @@ pub(super) async fn run_message(
         // Only a marker so far: nothing to inherit or age-check yet, so the
         // preview is the message itself.
         eprintln!("session: {session_id} (turn in flight, not yet recorded)");
-        eprintln!("project: {}", target_root.display());
+        eprintln!(
+            "project: {}",
+            target.config.require_project_root()?.as_path().display()
+        );
         println!("{instructions}");
         return Ok(crate::exit::CommandExit::Success);
     }
-    let expected = (target_root, target_cfg.audit.id);
+    let expected = target.identity()?;
     if let Some(marker) = marker.filter(|_| !dry_run) {
         // Its owner is gone and its processes are still being torn down: a
         // turn launched now would run beside them.
-        if marker.cleanup_pending {
+        if marker.cleanup_pending() {
             bail!(
                 "{}",
                 interrupt_cmd::cleanup_pending_message(session_id, &marker)
             );
         }
-        if !interrupt_cmd::interruptible(&marker.provider) {
+        if marker.phase == inflight::Phase::Running
+            && !interrupt_cmd::interruptible(&marker.provider)
+        {
             bail!(
                 "session {session_id} has a {} turn in flight, which cannot be interrupted\n  \
                  send the message once it has finished",
                 marker.provider
             );
         }
-        eprintln!("session {session_id} has a turn in flight; interrupting it first");
-        let outcome = interrupt_cmd::interrupt(session_id, None, sessions::read_all).await?;
+        if marker.phase == inflight::Phase::HandoffPending {
+            eprintln!("session {session_id} is being recorded; waiting for its handoff");
+        } else {
+            eprintln!("session {session_id} has a turn in flight; interrupting it first");
+        }
+        let outcome = interrupt_cmd::interrupt_observed(session_id, &marker, None).await?;
+        snapshot = sessions::query::Snapshot::read();
         if !outcome.interrupted {
             eprintln!(
                 "the turn finished before the interrupt took effect - its answer is in \
@@ -207,8 +241,7 @@ pub(super) async fn run_message(
         }
     }
     // Looked up once and reused by the cache-age gate and inheritance below.
-    let (record, provider_name) =
-        resume_record(session_id, sessions::latest_for_session(session_id))?;
+    let (record, provider_name) = resume_record(session_id, snapshot.latest(session_id).cloned())?;
     eprintln!("provider: {provider_name} (from the session record)");
     let archetype = record.archetype.as_str();
 
@@ -217,18 +250,20 @@ pub(super) async fn run_message(
     // only just written its first row, which `run_message` could not see. The
     // config decides whether this resume's rows go to the private log, so one
     // that does not parse is an error, never treated as absent.
-    let (cfg, project_root) = message_target(session_id, Some(&record), None, selector)?;
+    let target = message_target(session_id, Some(&record), None, selector)?;
+    let actual = target.identity()?;
+    let cfg = target.config;
+    let project_root = actual.root.to_path_buf();
     // And it must still be the project validated before the interrupt: the
     // row the interrupted run wrote is checked against its own config above,
     // which on its own would accept a row naming some other valid project.
-    let (root, audit) = expected;
-    if root != project_root || audit != cfg.audit.id {
+    if expected != actual {
         bail!(
             "session {session_id} now records {} (audit id {}), not {} as it did before \
              the interrupt\n  Nothing was sent.",
             project_root.display(),
             cfg.audit.id.as_deref().unwrap_or("none"),
-            root.display()
+            expected.root.as_path().display()
         );
     }
 
@@ -242,15 +277,6 @@ pub(super) async fn run_message(
     if !provider::is_available(provider_name) {
         bail!("'{provider_name}' not found on PATH");
     }
-
-    // A resume bypasses the config for prompt/profile purposes, but the
-    // stall timeout is a safety setting rather than a prompt input, so it is
-    // still honoured.
-    let provider_runtime = provider::ProviderRuntime::from_config(
-        lifecycle.clone(),
-        cfg.stall_timeout(),
-        cfg.audit.private,
-    );
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
     // last ended; past the provider's cutoff (`Provider::stale_cutoff`: 27 min
@@ -296,7 +322,15 @@ pub(super) async fn run_message(
     // same project identity, and a write failure cannot leave an unidentifiable
     // session behind.
     let audit_id = config_write::ensure_audit_id(&project_root.join(".review.toml"))?;
-    let private = cfg.audit.private;
+    let scope = crate::data::LogScope::new(audit_id, cfg.audit.private);
+    let data = crate::data::DataDir::process().clone();
+    // Prompt/profile settings are inherited; the current stall safety setting is honoured.
+    let provider_runtime = provider::ProviderRuntime::from_config(
+        lifecycle.clone(),
+        cfg.stall_timeout(),
+        data.clone(),
+        &scope,
+    );
 
     // Permissions, model and effort are inherited from the session's own last
     // recorded run rather than defaulted (see `InheritedSettings::from_record`). Each is
@@ -328,7 +362,7 @@ pub(super) async fn run_message(
         root: project_root.clone(),
     };
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
-    let invoke = provider::invoke(spec, Some(launched_tx), &provider_runtime);
+    let invoke = provider::invoke(spec, Some(launched_tx), &provider_runtime, None);
     tokio::pin!(invoke);
 
     // Release the lock as soon as the process is spawned. `launched_rx` also
@@ -351,65 +385,19 @@ pub(super) async fn run_message(
         }
     };
 
-    let digest_summary = super::launch::summary_of(&result);
-    audit::log_result(
-        &project_root,
-        private,
-        &audit_id,
-        archetype,
-        result.provider.as_str(),
-        session_id,
-        &stdin_instructions,
-        &result.output,
-        digest_summary.as_ref(),
-        &result.leftovers,
-    );
-    // Any resume that actually *ran* refreshes the cold-cache clock, because the
-    // clock tracks prompt-cache warmth, not answer quality. Reprocessing the
-    // session prefix warms the cache regardless of whether the turn produced a
-    // real final answer - a codex mid-turn death (which comes back as
-    // `Ok`-with-a-death-outcome) warmed it just as much as a clean run. Gating on
-    // "did we get a good answer" (the old `!died_without_answer` clause) meant a
-    // dead intermediate resume left the clock pinned to the last *successful*
-    // touch, so the next resume of a genuinely-warm session was wrongly refused
-    // as stale. `output.is_ok()` is the honest proxy for "reached the provider
-    // and got output back"; a hard launch failure (`Err`, cache never warmed)
-    // still doesn't refresh.
-    let resume_ran = result.output.is_ok();
-    if resume_ran {
-        sessions::record_with_kind(
-            &project_root,
-            private,
-            &audit_id,
-            archetype,
-            result.provider,
-            session_id,
-            sessions::SessionKind::Resume,
-            result.completed_epoch,
-            // Recorded, not `None`: a resume now launches with an inherited
-            // model and effort, and leaving them out of its own row would break
-            // the chain at the first resume - the next one would find a row
-            // naming neither and fall back to the provider default, which is
-            // the bug this fixes, one link along.
-            result.model.as_deref(),
-            result.effort.as_deref(),
-            Vec::new(),
-            // The permissions this resume actually launched with - inherited
-            // from the session's last recorded run, so the next resume in the
-            // chain inherits from this row in turn.
-            result.permissions.as_ref(),
-            result.writable_roots.clone(),
-            &result.served,
-            result.grok_trust.as_deref(),
-            &stdin_instructions,
-            &stdin_instructions,
-            &result.output,
-            digest_summary.as_ref(),
-            &result.leftovers,
-            result.codex_home.as_deref(),
-            None,
-        );
-    }
+    let ctx = super::launch::RecordCtx {
+        project_root,
+        data,
+        scope,
+        archetype: archetype.to_owned(),
+        // Manual messages do not restore profile env; record what this launch
+        // actually used, never copy names for values it did not inherit.
+        env_keys: Vec::new(),
+        profile_origin: None,
+        operator_prompt: stdin_instructions.clone(),
+    };
+    let recorded = ctx.record_message(&result, &stdin_instructions);
+    ctx.publish(&result, &result, recorded);
 
     provider::print_result(&result);
     let left_running = print_left_running(lifecycle);

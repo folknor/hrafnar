@@ -1,7 +1,7 @@
-use anyhow::Result;
+pub mod handoff;
+pub mod query;
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
-use std::path::Path;
 
 /// How this session-log row was produced. Known legacy spellings remain
 /// readable, and unrecognized strings round-trip without losing their value.
@@ -102,91 +102,14 @@ impl fmt::Display for Age {
     }
 }
 
-#[derive(Serialize)]
-struct SessionEntry<'a> {
-    timestamp: String,
-    /// Seconds since UNIX epoch - duplicates `timestamp` but lets readers do
-    /// age math without parsing the ISO string back.
-    epoch_secs: u64,
-    project: &'a str,
-    hostname: String,
-    audit_id: &'a str,
-    provider: &'a str,
-    archetype: &'a str,
-    session_id: &'a str,
-    /// "run" for a fresh run, "session" for a resume.
-    kind: SessionKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile_origin: Option<&'a crate::provider::ProfileOrigin>,
-    model: Option<&'a str>,
-    /// Reasoning effort the run launched with. Recorded alongside `model`
-    /// because a `review resume` inherits both from this row, and a resume
-    /// that restored the model but not the effort would run the right model at
-    /// the provider's default depth.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    effort: Option<&'a str>,
-    /// Environment variable *names* configured for this provider entry; values
-    /// are deliberately not recorded to avoid leaking secrets in the sidecar.
-    env_keys: Vec<String>,
-    /// The sandbox level in review's vocabulary for known levels. Custom names
-    /// pass through; claude has no filesystem sandbox and records `None`. Makes
-    /// "which runs could write?" a `jq` query rather than an inference from the
-    /// profile name, which is only a claim about what was requested.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sandbox: Option<&'a str>,
-    /// Native selector retained separately because Grok pins it for the session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider_sandbox: Option<&'a str>,
-    /// Writable roots granted beyond the provider's defaults. Empty for every
-    /// run that widened nothing, which is every read-only run.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    writable_roots: Vec<String>,
-    /// The model the provider reports actually served the run, which is not
-    /// the name `model` holds (grok serves `-m grok-4.7` as `grok-4.7-build`).
-    /// Record-only: deliberately absent from `SessionRecord`, so no resume can
-    /// inherit it into `-m`, which refuses it. See `provider::Served`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    served_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cost_usd: Option<f64>,
-    /// The folder a grok run was launched with `--trust` for - a permanent,
-    /// host-wide grant that also lets the repo's `.grok` MCP/LSP config run.
-    /// See `provider::ProviderResult::grok_trust`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grok_trust: Option<&'a str>,
-    operator_prompt: &'a str,
-    assembled_prompt: &'a str,
-    response: Option<String>,
-    error: Option<String>,
-    review_version: &'static str,
-    /// Flat run digest when available: exit/signal/captured/turns/task_complete/
-    /// usage, so a truncated or errored run is searchable instead of
-    /// masquerading as a clean short `response`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    digest: Option<crate::provider::DigestSummary>,
-    /// What the run's processes left behind: the ones its keeper killed, and
-    /// any it could not (see `contained::Leftovers`). Absent when nothing was
-    /// left, so `jq 'select(.leftovers)'` finds the runs that left something.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    leftovers: Option<crate::contained::Leftovers>,
-    /// Resolved Codex home used for this session's rollout. Stored separately
-    /// from `env_keys` because the profile value is needed for later forensics
-    /// and resumes, while environment values are otherwise not persisted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    codex_home: Option<&'a str>,
-}
-
-#[derive(Deserialize, Clone)]
-pub struct SessionRecord {
-    #[allow(dead_code)]
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SessionRow {
     pub timestamp: String,
     /// Missing and legacy zero epochs mean the time is unknown.
     #[serde(default, deserialize_with = "deserialize_epoch_secs")]
     pub epoch_secs: Option<u64>,
     pub project: String,
-    #[allow(dead_code)]
     pub hostname: String,
-    #[allow(dead_code)]
     pub audit_id: String,
     pub provider: String,
     pub archetype: String,
@@ -203,28 +126,32 @@ pub struct SessionRecord {
     /// passed no effort at all.
     #[serde(default)]
     pub effort: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub env_keys: Vec<String>,
     /// Sandbox level the run launched with; absent on rows written before this
     /// was recorded, and on providers without a filesystem sandbox.
-    #[allow(dead_code)]
     #[serde(default)]
     pub sandbox: Option<String>,
     #[serde(default)]
     pub provider_sandbox: Option<String>,
     /// Writable roots granted beyond the provider's defaults.
-    #[allow(dead_code)]
     #[serde(default)]
     pub writable_roots: Vec<String>,
     pub operator_prompt: String,
-    #[allow(dead_code)]
     pub assembled_prompt: String,
-    #[allow(dead_code)]
     pub response: Option<String>,
     pub error: Option<String>,
-    #[allow(dead_code)]
     pub review_version: String,
+    /// Served facts are evidence only. InheritedSettings selects request fields
+    /// explicitly; these must never become model selectors or permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grok_trust: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leftovers: Option<crate::contained::Leftovers>,
     /// Present on codex rows written after digest persistence landed; `None` for
     /// claude rows and for older rows.
     #[serde(default)]
@@ -234,6 +161,9 @@ pub struct SessionRecord {
     pub codex_home: Option<String>,
 }
 
+/// Historical call sites use this name; there is only one wire representation.
+pub type SessionRecord = SessionRow;
+
 fn deserialize_epoch_secs<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -241,46 +171,35 @@ where
     Ok(Option::<u64>::deserialize(deserializer)?.filter(|epoch| *epoch != 0))
 }
 
-fn sessions_path(private: bool) -> Option<std::path::PathBuf> {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
-        })
-        .ok()?;
-    let base = data_dir.join("review");
-    let name = if private {
-        "sessions-private.jsonl"
-    } else {
-        "sessions.jsonl"
-    };
-    Some(base.join(name))
-}
-
 /// Read every well-formed entry from both the public and private sidecar logs.
 /// Malformed lines are skipped with a warning; missing files are treated as empty.
 pub fn read_all() -> Vec<SessionRecord> {
+    read_all_in(crate::data::DataDir::process())
+}
+
+pub fn read_all_in(data: &crate::data::DataDir) -> Vec<SessionRecord> {
     let mut out = Vec::new();
-    for private in [false, true] {
-        let path = match sessions_path(private) {
+    for family in [
+        crate::data::LogFamily::Public,
+        crate::data::LogFamily::Private,
+    ] {
+        let path = match data.sessions(family) {
             Some(p) => p,
             None => continue,
         };
-        if !path.exists() {
-            continue;
-        }
-        let content = match std::fs::read_to_string(&path) {
+        let content = match crate::fsutil::read_jsonl(&path) {
             Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 eprintln!("warning: failed to read {}: {e}", path.display());
                 continue;
             }
         };
-        for line in content.lines() {
-            if line.trim().is_empty() {
+        for line in content.split(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            match serde_json::from_str::<SessionRecord>(line) {
+            match serde_json::from_slice::<SessionRow>(line) {
                 Ok(r) => out.push(r),
                 Err(e) => eprintln!("warning: skipping malformed sessions log line: {e}"),
             }
@@ -291,10 +210,7 @@ pub fn read_all() -> Vec<SessionRecord> {
 
 /// Most recent record matching the given session ID, if any.
 pub fn latest_for_session(session_id: &str) -> Option<SessionRecord> {
-    read_all()
-        .into_iter()
-        .filter(|r| r.session_id == session_id)
-        .max_by(|a, b| a.epoch_secs.cmp(&b.epoch_secs))
+    query::Snapshot::read().latest(session_id).cloned()
 }
 
 /// Compact elapsed time for session listings, with second precision below a minute.
@@ -318,107 +234,41 @@ pub fn format_age(secs: u64) -> String {
     format!("{days}d")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn record_with_kind(
-    project_root: &Path,
-    private: bool,
-    audit_id: &str,
-    archetype: &str,
-    provider: crate::provider::Provider,
-    session_id: &str,
-    kind: SessionKind,
-    // UNIX seconds when the run finished (from ProviderResult.completed_epoch),
-    // so the recorded time reflects completion rather than collection order.
-    epoch_secs: u64,
-    model: Option<&str>,
-    effort: Option<&str>,
-    env_keys: Vec<String>,
-    // The filesystem permissions the run launched with. Recorded because a
-    // profile's advertised guarantee is worth nothing if what a run actually
-    // received is only visible in the terminal that launched it.
-    sandbox: Option<&crate::provider::Permissions>,
-    writable_roots: Vec<String>,
-    served: &crate::provider::Served,
-    grok_trust: Option<&str>,
-    operator_prompt: &str,
-    assembled_prompt: &str,
-    result: &Result<crate::provider::Turn>,
-    digest: Option<&crate::provider::DigestSummary>,
-    leftovers: &crate::contained::Leftovers,
-    codex_home: Option<&str>,
-    profile_origin: Option<&crate::provider::ProfileOrigin>,
-) {
-    let path = match sessions_path(private) {
+/// Append a complete row. Success means the sidecar append completed; an audit
+/// append is an independent obligation and cannot stand in for this result.
+pub(crate) fn append(
+    data: &crate::data::DataDir,
+    scope: &crate::data::LogScope,
+    entry: &SessionRow,
+) -> bool {
+    let path = match data.sessions(scope.family()) {
         Some(p) => p,
         None => {
             eprintln!("warning: could not determine sessions log path (HOME not set)");
-            return;
+            return false;
         }
     };
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         eprintln!("warning: failed to create sessions log dir: {e}");
-        return;
+        return false;
     }
-
-    let project_str = project_root.to_string_lossy();
-    let entry = SessionEntry {
-        timestamp: crate::audit::chrono_utc(epoch_secs),
-        epoch_secs,
-        project: project_str.as_ref(),
-        hostname: crate::config::hostname(),
-        audit_id,
-        provider: provider.as_str(),
-        archetype,
-        session_id,
-        kind,
-        profile_origin,
-        model,
-        effort,
-        env_keys,
-        sandbox: sandbox.and_then(crate::provider::Permissions::recorded_level),
-        provider_sandbox: sandbox.and_then(crate::provider::Permissions::native_to_record),
-        writable_roots,
-        served_model: served.model_label(),
-        cost_usd: served.cost_usd,
-        grok_trust,
-        operator_prompt,
-        assembled_prompt,
-        response: result.as_ref().ok().map(|turn| turn.text.clone()),
-        error: result.as_ref().err().map(ToString::to_string),
-        review_version: env!("CARGO_PKG_VERSION"),
-        digest: digest.cloned(),
-        leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),
-        codex_home,
-    };
 
     let line = match serde_json::to_string(&entry) {
         Ok(json) => json,
         Err(e) => {
             eprintln!("warning: failed to serialize session entry: {e}");
-            return;
+            return false;
         }
     };
 
-    let mut file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        Ok(f) => f,
+    match crate::fsutil::append_jsonl(&path, line.as_bytes()) {
+        Ok(()) => true,
         Err(e) => {
-            eprintln!("warning: failed to open sessions log: {e}");
-            return;
+            eprintln!("warning: failed to append session entry: {e}");
+            false
         }
-    };
-
-    // One `write_all` of the whole line: `writeln!` on an unbuffered `File`
-    // issues the text and the newline as separate writes, and runs that finish
-    // together record from concurrent tasks, so their rows could interleave.
-    use std::io::Write;
-    if let Err(e) = file.write_all(format!("{line}\n").as_bytes()) {
-        eprintln!("warning: failed to write session entry: {e}");
     }
 }
 
@@ -435,55 +285,40 @@ mod tests {
 }
 
 #[cfg(test)]
-mod origin_tests {
+mod compatibility_tests {
     use super::*;
-
     #[test]
-    fn profile_origin_round_trips_and_legacy_rows_remain_readable() {
-        let origin = crate::provider::ProfileOrigin {
-            layer: "local".into(),
-            table: "[codex.deep]".into(),
-        };
-        let mut entry = SessionEntry {
-            timestamp: "2026-01-01T00:00:00Z".into(),
-            epoch_secs: 1,
-            project: "/project",
-            hostname: "host".into(),
-            audit_id: "audit",
-            provider: "codex",
-            archetype: "bare",
-            session_id: "session",
-            kind: SessionKind::Run,
-            profile_origin: Some(&origin),
-            model: None,
-            effort: None,
-            env_keys: vec![],
-            sandbox: None,
-            provider_sandbox: None,
-            writable_roots: vec![],
-            served_model: None,
-            cost_usd: None,
-            grok_trust: None,
-            operator_prompt: "p",
-            assembled_prompt: "p",
-            response: None,
-            error: Some("launch failed".into()),
-            review_version: env!("CARGO_PKG_VERSION"),
-            digest: None,
-            leftovers: None,
-            codex_home: None,
-        };
-        let json = serde_json::to_value(&entry).expect("serialize row");
-        let restored: SessionRecord = serde_json::from_value(json).expect("read row");
-        assert_eq!(restored.profile_origin, Some(origin.clone()));
-        entry.profile_origin = None;
-        let legacy = serde_json::to_value(&entry).expect("serialize absent origin");
-        assert!(legacy.get("profile_origin").is_none());
-        assert!(
-            serde_json::from_value::<SessionRecord>(legacy)
-                .expect("read legacy row")
-                .profile_origin
-                .is_none()
+    fn historical_rows_round_trip_without_gaining_execution_authority() {
+        let legacy = serde_json::json!({
+            "timestamp": "t", "project": "/p", "hostname": "h", "audit_id": "opaque / id",
+            "provider": "codex", "archetype": "bare", "session_id": "../historical",
+            "model": "requested", "operator_prompt": "operator", "assembled_prompt": "assembled",
+            "review_version": "0.1", "served_model": "served-build", "cost_usd": 1.25,
+            "grok_trust": "/trusted", "kind": "future-kind",
+        });
+        let mut row: SessionRow = serde_json::from_value(legacy).expect("historical row");
+        assert_eq!(row.epoch_secs, None);
+        assert!(crate::provider::SessionId::parse(&row.session_id).is_err());
+        let inherited = crate::provider::InheritedSettings::from_record(
+            Some(&row),
+            crate::provider::Provider::Codex,
         );
+        assert_eq!(inherited.model.as_deref(), Some("requested"));
+        assert_eq!(row.served_model.as_deref(), Some("served-build"));
+        row.profile_origin = Some(crate::provider::ProfileOrigin {
+            layer: "local".into(),
+            table: "[codex.read]".into(),
+        });
+        let value = serde_json::to_value(&row).expect("serialize same representation");
+        let restored: SessionRow = serde_json::from_value(value).expect("reread row");
+        assert_eq!(restored.kind, SessionKind::Other("future-kind".into()));
+        assert_eq!(restored.profile_origin, row.profile_origin);
+        assert_eq!(restored.cost_usd, Some(1.25));
+        assert_eq!(restored.grok_trust.as_deref(), Some("/trusted"));
+        assert_eq!(restored.audit_id, "opaque / id");
+        row.epoch_secs = Some(0);
+        let zero: SessionRow = serde_json::from_value(serde_json::to_value(row).expect("zero row"))
+            .expect("read zero");
+        assert_eq!(zero.epoch_secs, None);
     }
 }

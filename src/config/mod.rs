@@ -2,7 +2,9 @@
 //! this boundary; parsing, resolution, discovery and writing each have one owner.
 //! Native permissions belong to providers, registry rules to project::registry,
 //! and random identifiers to the dependency-free ids module.
+mod error;
 pub(crate) mod load;
+pub use error::{ConfigError, Result, SearchBoundary};
 mod parse;
 mod profile;
 mod resolve;
@@ -22,24 +24,25 @@ pub use crate::provider::Provider;
 
 pub(crate) const CONFIG_FILENAME: &str = ".review.toml";
 
-/// Names that can't be archetypes or groups: `all`, the `-a` keyword for every
-/// configured archetype except `bare`, and the subcommand names. `-a` itself
-/// cannot collide with a subcommand, but the legacy positional form can: `review
-/// sessions` runs the subcommand, silently, rather than the archetype. So they
-/// stay reserved while that alias exists. Keep in step with `cli::Command` and the
-/// "Reserved words" table in `docs/config.md`.
-pub const RESERVED_NAMES: &[&str] = &[
-    "all",
-    "message",
-    "resume",
-    "interrupt",
-    "config",
-    "sessions",
-    "incidents",
-    "init",
-    "man",
-    "help",
-];
+/// Reserved CLI vocabulary is derived from Clap (including hidden commands
+/// and aliases). Keep the dependency one way: CLI construction must not consult
+/// this list, because constructing it renders the CLI help.
+pub fn reserved_names() -> &'static std::collections::BTreeSet<String> {
+    static NAMES: std::sync::LazyLock<std::collections::BTreeSet<String>> =
+        std::sync::LazyLock::new(|| {
+            use clap::CommandFactory;
+            let mut command = crate::cli::Cli::command();
+            command.build();
+            let mut names =
+                std::collections::BTreeSet::from(["all".to_string(), "help".to_string()]);
+            for sub in command.get_subcommands() {
+                names.insert(sub.get_name().to_string());
+                names.extend(sub.get_all_aliases().map(str::to_string));
+            }
+            names
+        });
+    &NAMES
+}
 
 /// `bare` is the explicit no-prime selector, and the legacy positional
 /// `review bare` means the same. Existing `bare = ""` definitions stay valid;
@@ -73,7 +76,11 @@ impl Layer {
 pub struct AuditConfig {
     #[serde(default)]
     pub private: bool,
-    pub id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::data::AuditId::deserialize_optional"
+    )]
+    pub id: Option<crate::data::AuditId>,
 }
 
 /// Defaults under `[_defaults]`. Each field is `Option` so an absent key falls
@@ -252,13 +259,28 @@ pub struct ReviewConfig {
     /// provider -> profile name -> entry.
     pub profiles: BTreeMap<Provider, BTreeMap<String, ProfileEntry>>,
     pub hostname: String,
-    pub files: ConfigFiles,
+    // Both are constructed together by resolve; callers cannot replace one
+    // independently and create a config paired with a different root.
+    files: ConfigFiles,
+    project_root: Option<crate::project::ProjectRoot>,
     /// This host's `[_projects.<host>]` registry, name -> path as written.
     pub projects: BTreeMap<String, String>,
 }
 
 impl ReviewConfig {
+    pub fn files(&self) -> &ConfigFiles {
+        &self.files
+    }
+    pub fn project_root(&self) -> Option<&crate::project::ProjectRoot> {
+        self.project_root.as_ref()
+    }
+    pub fn require_project_root(&self) -> Result<&crate::project::ProjectRoot> {
+        self.project_root().ok_or(ConfigError::ProjectRequired)
+    }
+
     /// Expand names, groups and the synthetic bare selector in selection order.
+    /// `bare` is a selector, not a configured prime: all excludes its legacy
+    /// empty definition, and explicit bare works without any such definition.
     pub(crate) fn select_archetypes(
         &self,
         selector: Option<&str>,
@@ -337,11 +359,7 @@ impl ReviewConfig {
     /// The effective profile, or an error describing the tables searched in
     /// precedence order. Keep the lookup and its explanation together so the
     /// app does not need to restate the config resolver's search rules.
-    pub(crate) fn require_profile(
-        &self,
-        provider: Provider,
-        profile: &str,
-    ) -> anyhow::Result<&Profile> {
+    pub(crate) fn require_profile(&self, provider: Provider, profile: &str) -> Result<&Profile> {
         self.resolve_profile(provider, profile).ok_or_else(|| {
             let host_table = format!("[{}.{provider}.{profile}]", toml_key(&self.hostname));
             let common_table = format!("[{provider}.{profile}]");
@@ -366,9 +384,11 @@ impl ReviewConfig {
             } else {
                 searched.join(", ")
             };
-            anyhow::anyhow!(
-                "profile '{profile}' not defined for provider '{provider}'\n  looked for {searched}"
-            )
+            ConfigError::ProfileUndefined {
+                provider,
+                profile: profile.to_string(),
+                searched,
+            }
         })
     }
 
@@ -415,6 +435,81 @@ pub use crate::project::Selection;
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+    #[test]
+    fn root_and_provenance_are_derived_together_and_profile_errors_stay_typed() {
+        let cfg = resolve(
+            ConfigFile::default(),
+            None,
+            "host",
+            ConfigFiles {
+                local: Some("/missing/project/.review.toml".into()),
+                ..Default::default()
+            },
+        )
+        .expect("resolve");
+        assert_eq!(
+            cfg.require_project_root().expect("root").as_path(),
+            std::path::Path::new("/missing/project")
+        );
+        let error = cfg
+            .require_profile(Provider::Codex, "missing")
+            .expect_err("profile");
+        assert!(
+            matches!(&error, ConfigError::ProfileUndefined { provider: Provider::Codex, profile, .. } if profile == "missing")
+        );
+        let error = anyhow::Error::new(error).context("launch settings");
+        assert!(matches!(
+            error.downcast_ref::<ConfigError>(),
+            Some(ConfigError::ProfileUndefined { .. })
+        ));
+        let global =
+            resolve(ConfigFile::default(), None, "host", ConfigFiles::default()).expect("global");
+        assert!(global.project_root().is_none());
+        assert!(matches!(
+            global.require_project_root(),
+            Err(ConfigError::ProjectRequired)
+        ));
+        let local =
+            parse_file("[_groups]\ng=['missing']", "fixture", Layer::Local).expect("parse local");
+        assert!(matches!(
+            resolve(local, None, "host", ConfigFiles::default()),
+            Err(ConfigError::Resolve { .. })
+        ));
+    }
+
+    #[test]
+    fn bare_is_synthetic_and_all_excludes_it_with_or_without_a_definition() {
+        for definition in ["", "bare = ''\n", "bare = '  '\n"] {
+            let cfg = resolve(
+                parse_file(
+                    &format!("[archetypes]\n{definition}a='prime'"),
+                    "fixture",
+                    Layer::Local,
+                )
+                .expect("parse"),
+                None,
+                "host",
+                ConfigFiles::default(),
+            )
+            .expect("resolve");
+            assert_eq!(
+                cfg.select_archetypes(Some("bare")).expect("bare"),
+                cfg.select_archetypes(None).expect("implicit bare")
+            );
+            assert_eq!(
+                cfg.select_archetypes(Some("all")).expect("all"),
+                vec![("a".into(), "prime".into())]
+            );
+            assert_eq!(
+                crate::prompt::assemble(
+                    &cfg.select_archetypes(Some("bare")).expect("bare")[0].1,
+                    "  raw\n"
+                ),
+                "  raw\n"
+            );
+        }
+    }
+
     #[test]
     fn selection_expands_groups_deduplicates_and_keeps_bare_unprimed() {
         let raw = "[archetypes]\na = 'prime'\nb = 'second'\nbare = ''\n[_groups]\ng = ['b', 'a']\n";

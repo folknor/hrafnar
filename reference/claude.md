@@ -161,8 +161,8 @@ from it; that is why the graceful path sends `SIGINT`.
 The mechanics are codex's ([codex.md](codex.md#interrupting-a-run)), minus the
 node wrapper: claude runs under a keeper ([teardown.md](teardown.md)), which
 gives it a process group of its own and tears down every shell it started when
-the run ends; its in-flight marker names the keeper's pid once claude has
-printed its first event (a `SIGINT` before its handler is installed would kill
+the run ends; its in-flight marker stores one keeper identity and becomes
+signal-ready once claude has printed its first event (a `SIGINT` before its handler is installed would kill
 it with nothing printed); `review interrupt` leaves a request beside the marker
 and signals the keeper, which forwards one `SIGINT` to claude alone; and a
 signalled `review` has the keeper send it `SIGINT` too, waiting for the run to
@@ -183,11 +183,12 @@ session used to both launch, running two turns on one session at once. `review
 message` now holds a per-session launch lock from before it checks for a turn in
 flight until its run has launched, and a run's marker is written before its
 spawn, so the second message waits, then finds the first in flight and
-interrupts it. As a second line of defence, a run removes or updates the shared
-marker only while it is still the one it wrote, so two runs of one session could
-not hide each other even if they met.
+interrupts it. As a second line of defence, a run removes or updates its own
+marker at an exclusively owned per-invocation path. Pending handoff remains
+visible through app recording and receipt publication; two unrelated runs of one
+session cannot overwrite or delete each other. Ambiguous observations are refused.
 
-`tests/provider_runs.rs` drives the real `run_claude` against a stub claude
+`tests/provider_runs.rs` drives `invoke` and the complete Claude adapter against a stub claude
 (`ProviderRuntime.commands` with the Claude prefix) for each of these: the interrupt, an answer
 beating it, a stop after and before the first event, a refused launch after a
 stop, a death after starting, and a stale request before a resume.
@@ -197,3 +198,9 @@ the turn in 0.2s, recorded it, printed the `review message` command and left
 nothing running; `review interrupt <ID>` from a second process did the same;
 and `review message <ID>` interrupted the turn and resumed it with the new
 message, which the model answered.
+
+The argv table covers fresh/resume, omitted and named review sandbox levels,
+stream-json, dontAsk and model/effort selection. Claude still receives no sandbox
+flag or effective root grants. Direct runner helpers and their intermediate
+result are private; fixtures retain the invocation result through pending-marker
+and receipt assertions. Runtime timings and keeper settings remain injectable.

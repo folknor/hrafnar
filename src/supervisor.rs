@@ -40,8 +40,12 @@ impl Control {
 
 #[derive(Default)]
 struct Registry {
+    // Monotonic keeper-admission latch, not evidence that teardown finished.
+    // No caller needs an escalation phase: termination is a request, while
+    // completion is established separately for each registered keeper.
     closed: bool,
     live: std::collections::HashMap<u32, Arc<Control>>,
+    bounds: std::collections::HashMap<u32, std::time::Duration>,
 }
 
 /// Shared by every attempt, wake and probe belonging to one command. Default
@@ -52,6 +56,8 @@ pub struct Lifecycle(Arc<State>);
 struct State {
     registry: Mutex<Registry>,
     ledger: Mutex<Vec<Unresolved>>,
+    // Latched graceful-stop notification, not a second admission authority.
+    // Escalation can close admission without publishing this notification.
     stop: tokio::sync::watch::Sender<bool>,
     unrecorded: AtomicUsize,
 }
@@ -68,10 +74,14 @@ impl Default for Lifecycle {
 }
 
 impl Lifecycle {
+    /// Observe graceful-stop requests, including one made before subscribing.
+    /// This notification does not describe keeper admission or completed teardown.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
         self.0.stop.subscribe()
     }
 
+    /// A graceful-stop snapshot for caller policy, never permission to spawn.
+    /// `terminate_all` can close admission without changing this notification.
     pub fn stop_requested(&self) -> bool {
         *self.0.stop.borrow()
     }
@@ -89,7 +99,15 @@ impl Lifecycle {
         self.0.stop.send_replace(true);
     }
 
-    pub(crate) fn spawn(&self, cmd: &mut Command, control: &Arc<Control>) -> Result<Child> {
+    // The only keeper admission authority: closure, spawn and registration
+    // serialize under this mutex. A false stop snapshot cannot authorize a
+    // launch. This admits the keeper, not the later provider `go` operation.
+    pub(crate) fn spawn(
+        &self,
+        cmd: &mut Command,
+        control: &Arc<Control>,
+        bound: std::time::Duration,
+    ) -> Result<Child> {
         let mut registry = self
             .0
             .registry
@@ -101,6 +119,7 @@ impl Lifecycle {
         let child = cmd.spawn().context("failed to spawn the keeper")?;
         if let Some(pid) = child.id() {
             registry.live.insert(pid, Arc::clone(control));
+            registry.bounds.insert(pid, bound);
         }
         Ok(child)
     }
@@ -137,6 +156,7 @@ impl Lifecycle {
             .is_some_and(|owner| Arc::ptr_eq(owner, control))
         {
             registry.live.remove(&pid);
+            registry.bounds.remove(&pid);
         }
     }
 
@@ -159,7 +179,10 @@ impl Lifecycle {
             .collect()
     }
 
-    /// Escalation, separate from graceful stop. Admission stays closed.
+    /// Request forced termination and close keeper admission, without publishing
+    /// graceful stop or claiming teardown completed. Safe without a prior stop;
+    /// the signal supervisor requests graceful stop first to allow recording.
+    /// Keepers leave the registry only when their exact owner completes.
     pub fn terminate_all(&self) -> usize {
         let mut registry = self
             .0
@@ -243,8 +266,8 @@ pub fn install_signal_supervisor(lifecycle: Lifecycle) {
                 }
             }
             // SIGTERM handler unavailable: still forward Ctrl-C, and leave
-            // SIGTERM on its OS default (which kills us, orphaning codex - the
-            // old behaviour, and better than not handling anything).
+            // SIGTERM on its OS default (losing graceful recording; keepers
+            // still observe control-pipe closure and attempt teardown).
             None => {
                 let _ = tokio::signal::ctrl_c().await;
                 "SIGINT"
@@ -277,12 +300,23 @@ pub fn install_signal_supervisor(lifecycle: Lifecycle) {
                 _ = next_signal() => {}
             }
         }
-        // No keeper spawns from here, and every live one tears down its run.
+        // Admission is closed; request teardown of every registered keeper.
+        // Termination delivery is best effort; the observations below establish
+        // completion or report unresolved teardown.
         let told = lifecycle.terminate_all();
         if told > 0 {
             eprintln!("\n{name}: tearing down {told} running provider(s)");
         }
-        let bound = crate::contained::Settings::default().terminate_bound();
+        let bound = lifecycle
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bounds
+            .values()
+            .copied()
+            .max()
+            .unwrap_or_default();
         let drained = async {
             while !lifecycle.live_keepers().is_empty() {
                 tokio::time::sleep(crate::timings::GRACEFUL_STOP_POLL).await;

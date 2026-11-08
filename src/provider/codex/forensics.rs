@@ -17,21 +17,33 @@ pub struct CodexForensics {
     pub quiet_secs: Option<u64>,
     /// `type/payload.type` of the last rollout event - what codex was doing when
     /// it went silent.
-    pub last_rollout_event: Option<String>,
+    pub last_rollout_event: Option<crate::transcript::EventKind>,
 }
 
 pub struct CodexIncident<'a> {
-    pub transcript_path: Option<&'a str>,
-    /// The same scope passed to transcript recovery. An offset beyond EOF
-    /// means no bytes can safely be attributed to this run.
-    pub transcript_offset: u64,
+    pub transcript_path: Option<&'a Path>,
+    /// The same attribution authority passed to recovery and the watchdog.
+    pub scope: crate::transcript::Scope,
     /// Whether recovery (including a preserved watchdog answer) found an answer.
     pub final_answer_present: Option<bool>,
     /// How long the rollout had been unchanged when the watchdog acted, and the
     /// last event it saw. The pair that makes a stall-timeout misfire on a
     /// healthy run diagnosable after the fact.
     pub quiet_secs: Option<u64>,
-    pub last_rollout_event: Option<&'a str>,
+    pub last_rollout_event: Option<&'a crate::transcript::EventKind>,
+}
+
+/// Affirmative scoped evidence survives loss of the file on the later read.
+/// Without it, only a successful recovery read can establish a negative result.
+pub(crate) fn answer_presence(
+    recovered: bool,
+    transcript: Option<&crate::transcript::TranscriptSummary>,
+) -> Option<bool> {
+    if recovered {
+        Some(true)
+    } else {
+        transcript.map(|_| false)
+    }
 }
 
 impl CodexForensics {
@@ -51,7 +63,7 @@ impl CodexForensics {
 }
 
 pub(crate) fn print_transcript(t: &crate::transcript::TranscriptSummary) {
-    println!("transcript: {}", t.path);
+    println!("transcript: {}", t.path.display());
     println!(
         "  task_complete={} stream_error={}",
         t.task_complete, t.stream_error
@@ -75,8 +87,7 @@ impl CodexIncident<'_> {
         if let Some(path) = self.transcript_path {
             match std::fs::read(path) {
                 Ok(bytes) => {
-                    let scoped =
-                        crate::transcript::slice_from_offset(&bytes, Some(self.transcript_offset));
+                    let scoped = self.scope.bytes(&bytes);
                     let content = String::from_utf8_lossy(scoped);
                     let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
                     if let Err(error) = write_file(dir, "transcript.tail.jsonl", tail.as_bytes()) {

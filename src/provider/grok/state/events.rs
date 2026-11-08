@@ -5,7 +5,25 @@ use std::path::Path;
 /// Takes the *last* `turn_ended` (a resumed session holds several turns), and
 /// the last permission refusal before it unless a later allowed permission
 /// superseded it.
-pub(in crate::provider::grok) fn cancel_cause(events: &str) -> Option<String> {
+/// Open protocol category and independent refusal evidence. Keep both facts
+/// typed until explanation; the historical flat digest remains a text projection.
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::provider::grok) struct CancelCause {
+    pub category: String,
+    pub refused_tool: Option<String>,
+}
+
+impl std::fmt::Display for CancelCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.category)?;
+        if let Some(tool) = &self.refused_tool {
+            write!(f, ": permission for `{tool}` was refused")?;
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::provider::grok) fn cancel_cause(events: &str) -> Option<CancelCause> {
     let mut refused_tool: Option<String> = None;
     let mut cause: Option<String> = None;
     for line in events.lines() {
@@ -37,10 +55,9 @@ pub(in crate::provider::grok) fn cancel_cause(events: &str) -> Option<String> {
             _ => {}
         }
     }
-    let cause = cause?;
-    Some(match refused_tool {
-        Some(tool) => format!("{cause}: permission for `{tool}` was refused"),
-        None => cause,
+    Some(CancelCause {
+        category: cause?,
+        refused_tool,
     })
 }
 
@@ -100,7 +117,7 @@ mod tests {
     #[test]
     fn cancel_cause_names_the_category_and_the_refused_tool() {
         assert_eq!(
-            cancel_cause(CANCELLED).as_deref(),
+            cancel_cause(CANCELLED).map(|c| c.to_string()).as_deref(),
             Some("permission_cancelled: permission for `search_replace` was refused")
         );
     }
@@ -109,13 +126,18 @@ mod tests {
     fn allowed_permissions_are_not_blamed() {
         let events = r#"{"type":"permission_resolved","tool_name":"read_file","decision":"allow"}
 {"type":"turn_ended","outcome":"cancelled","cancellation_category":"max_turns"}"#;
-        assert_eq!(cancel_cause(events).as_deref(), Some("max_turns"));
+        assert_eq!(
+            cancel_cause(events).map(|c| c.to_string()).as_deref(),
+            Some("max_turns")
+        );
 
         let refusal_then_allow = r#"{"type":"permission_resolved","tool_name":"search_replace","decision":"cancelled"}
 {"type":"permission_resolved","tool_name":"read_file","decision":"allow"}
 {"type":"turn_ended","outcome":"cancelled","cancellation_category":"max_turns"}"#;
         assert_eq!(
-            cancel_cause(refusal_then_allow).as_deref(),
+            cancel_cause(refusal_then_allow)
+                .map(|c| c.to_string())
+                .as_deref(),
             Some("max_turns")
         );
         assert_eq!(

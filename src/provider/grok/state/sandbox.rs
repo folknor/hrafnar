@@ -4,15 +4,14 @@ use super::{Grok, has_symlink_component};
 use crate::fsutil::locked_update;
 
 impl Grok {
-    /// Make sure profile `name` exists in `<home>/sandbox.toml` granting exactly
+    /// Make sure the profile named by `roots` exists in `<home>/sandbox.toml` granting exactly
     /// `roots`, returning whether this call created it. Locked because a
     /// fan-out launches several grok runs at once and two creating the same
     /// profile unlocked would race; renamed into place so a grok starting
     /// concurrently never reads a half-written file.
     pub(in crate::provider::grok) fn ensure_profile(
         &self,
-        name: &str,
-        roots: &[String],
+        roots: &RootSet,
     ) -> anyhow::Result<bool> {
         let path = self.home.join("sandbox.toml");
         if has_symlink_component(&path) {
@@ -23,7 +22,7 @@ impl Grok {
         }
         let mut created = false;
         locked_update(&self.home, "sandbox.toml", |text| {
-            let (new_text, c) = merge_profile(text, name, roots)?;
+            let (new_text, c) = merge_profile(text, roots)?;
             created = c;
             Ok(new_text)
         })?;
@@ -60,31 +59,62 @@ const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose 
 # plus any profile extras). The name is a hash of the list: never edit it;\n\
 # delete the profile and review recreates it. Other profiles are left alone.\n";
 
-/// The root set in canonical form: sorted, deduplicated. The profile name and
-/// the recorded roots both use it, so a resume can check one against the other.
-pub(in crate::provider) fn canonical_roots(roots: &[String]) -> Vec<String> {
-    let mut v = roots.to_vec();
-    v.sort();
-    v.dedup();
-    v
+/// A lexical set of already selected paths, not filesystem canonicalization
+/// or proof of a grant. The historical byte ordering and hash stay stable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::provider) struct RootSet(Vec<String>);
+
+impl RootSet {
+    pub(in crate::provider) fn new(roots: &[String]) -> Self {
+        let mut paths = roots.to_vec();
+        paths.sort();
+        paths.dedup();
+        Self(paths)
+    }
+
+    pub(in crate::provider) fn paths(&self) -> &[String] {
+        &self.0
+    }
+
+    /// FNV-1a, with a NUL after each path. Never DefaultHasher: historical
+    /// generated profiles must survive compiler changes. A collision is
+    /// refused by the create-only writer's content check.
+    pub(in crate::provider) fn profile_name(&self) -> ProfileName {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for root in &self.0 {
+            for b in root.bytes().chain(std::iter::once(0)) {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        ProfileName(format!("{PROFILE_PREFIX}{h:016x}"))
+    }
 }
 
-/// The profile name for a root set: `PROFILE_PREFIX` + 16 hex digits of
-/// FNV-1a over the canonical set. FNV rather than `DefaultHasher`, whose output
-/// is not stable across Rust releases - a name that changed under a toolchain
-/// bump would orphan every recorded session's profile. Not a security hash and
-/// not meant as one: the name only has to be stable and collision-unlikely
-/// across one host's handful of sets, and `merge_profile` refuses a same-named
-/// profile whose contents differ, so a collision fails loudly.
-pub(in crate::provider::grok) fn profile_name(roots: &[String]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for root in canonical_roots(roots) {
-        for b in root.bytes().chain(std::iter::once(0)) {
-            h ^= u64::from(b);
-            h = h.wrapping_mul(0x0100_0000_01b3);
-        }
+/// Only review-generated profile syntax. Parsing historical evidence does
+/// not prove matching roots; preparation checks that before the writer runs.
+/// Fresh custom selectors remain opaque native names, even with this syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::provider) struct ProfileName(String);
+
+impl ProfileName {
+    pub(in crate::provider) fn from_record(name: &str) -> Option<Self> {
+        let suffix = name.strip_prefix(PROFILE_PREFIX)?;
+        (suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+        .then(|| Self(name.to_string()))
     }
-    format!("{PROFILE_PREFIX}{h:016x}")
+    pub(in crate::provider) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProfileName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Mirror of grok's `ProfileConfig` (`xai-grok-sandbox/src/profiles.rs`).
@@ -110,7 +140,7 @@ struct SandboxConfig {
     profiles: HashMap<String, ProfileConfig>,
 }
 
-/// Ensure profile `name` (`extends = "workspace"`, `read_write` = `roots`)
+/// Ensure the profile named by `roots` (`extends = "workspace"`, `read_write` = `roots`)
 /// exists in a `sandbox.toml` body. Returns the new body when it had to be
 /// created, and whether it was.
 ///
@@ -123,10 +153,10 @@ struct SandboxConfig {
 /// itself could not deserialize the whole file - see the module docs.
 pub(in crate::provider::grok) fn merge_profile(
     text: &str,
-    name: &str,
-    roots: &[String],
+    roots: &RootSet,
 ) -> anyhow::Result<(Option<String>, bool)> {
-    let roots = canonical_roots(roots);
+    let name = roots.profile_name();
+    let name = name.as_str();
     let existing: SandboxConfig = if text.trim().is_empty() {
         SandboxConfig {
             profiles: HashMap::new(),
@@ -139,8 +169,10 @@ pub(in crate::provider::grok) fn merge_profile(
         })?
     };
     if let Some(p) = existing.profiles.get(name) {
+        // The historical name binds the read_write set and workspace base,
+        // not the entire effective policy. Other valid fields remain accepted.
         let base_ok = matches!(p.extends.as_deref(), None | Some("workspace"));
-        if !base_ok || canonical_roots(&p.read_write) != roots {
+        if !base_ok || RootSet::new(&p.read_write) != *roots {
             anyhow::bail!(
                 "grok sandbox profile `{name}` does not match the roots it is named for - \
                  it was edited; delete it and review will recreate it"
@@ -163,7 +195,7 @@ pub(in crate::provider::grok) fn merge_profile(
         .ok_or_else(|| anyhow::anyhow!("grok sandbox.toml: `profiles` is not a table"))?;
     let mut table = toml_edit::Table::new();
     table.insert("extends", toml_edit::value("workspace"));
-    let list: toml_edit::Array = roots.iter().map(String::as_str).collect();
+    let list: toml_edit::Array = roots.paths().iter().map(String::as_str).collect();
     table.insert("read_write", toml_edit::value(list));
     // A standard table gets the banner; `profiles = { ... }` written inline can
     // only take an inline entry.
@@ -188,8 +220,12 @@ mod tests {
     use super::super::test_support::{grok_at, scratch};
     use super::*;
 
-    fn roots(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_string()).collect()
+    fn roots(v: &[&str]) -> RootSet {
+        RootSet::new(&v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    }
+
+    fn profile_name(roots: &RootSet) -> String {
+        roots.profile_name().to_string()
     }
 
     #[test]
@@ -198,20 +234,38 @@ mod tests {
         // Order and duplicates do not change the set, so not the name.
         let a_shuffled = roots(&["/home/u/.cargo", "/home/u/.brokkr", "/home/u/.cargo"]);
         assert_eq!(profile_name(&a), profile_name(&a_shuffled));
-        assert!(profile_name(&a).starts_with(PROFILE_PREFIX));
+        assert_eq!(profile_name(&a), "review-ws-a4924c479efe6e4c");
         // A different set is a different profile - no widening across sets.
         let b = roots(&["/home/u/.brokkr", "/home/u/.cargo", "/srv/fixtures"]);
         assert_ne!(profile_name(&a), profile_name(&b));
         // Pinned: the name must survive toolchain upgrades, or every recorded
         // session's profile would be orphaned. FNV-1a, not `DefaultHasher`.
-        assert_eq!(profile_name(&[]), "review-ws-cbf29ce484222325");
+        assert_eq!(profile_name(&roots(&[])), "review-ws-cbf29ce484222325");
+    }
+
+    #[test]
+    fn generated_name_parsing_preserves_only_the_historical_exact_shape() {
+        let name = "review-ws-cbf29ce484222325";
+        assert_eq!(
+            ProfileName::from_record(name).expect("historical").as_str(),
+            name
+        );
+        for native in [
+            "review-ws-",
+            "review-ws-mine",
+            "review-ws-CBF29CE484222325",
+            "review-ws-cbf29ce4842223250",
+            "workspace",
+        ] {
+            assert!(ProfileName::from_record(native).is_none(), "{native}");
+        }
     }
 
     #[test]
     fn profile_is_created_once_with_exact_roots_and_never_modified() {
         let set = roots(&["/home/u/.cargo", "/home/u/.brokkr"]);
         let name = profile_name(&set);
-        let (text, created) = merge_profile("", &name, &set).expect("empty file");
+        let (text, created) = merge_profile("", &set).expect("empty file");
         let text = text.expect("created");
         assert!(created);
         assert!(text.contains("Created by `review`"), "{text}");
@@ -225,14 +279,11 @@ mod tests {
         );
 
         // Already there with the same set: no write.
-        assert_eq!(
-            merge_profile(&text, &name, &set).expect("again"),
-            (None, false)
-        );
+        assert_eq!(merge_profile(&text, &set).expect("again"), (None, false));
 
         // A second set gets its own profile; the first is untouched.
         let other = roots(&["/srv/fixtures"]);
-        let (grown, _) = merge_profile(&text, &profile_name(&other), &other).expect("second");
+        let (grown, _) = merge_profile(&text, &other).expect("second");
         let grown: toml::Table = grown.expect("changed").parse().expect("valid");
         assert_eq!(
             grown["profiles"][name.as_str()]["read_write"]
@@ -248,7 +299,7 @@ mod tests {
             "# my comment\n[profiles.devbox2]\nextends = \"devbox\"\nread_write = [\"/x\"]\n";
         let set = roots(&["/a"]);
         let name = profile_name(&set);
-        let (text, _) = merge_profile(theirs, &name, &set).expect("merge");
+        let (text, _) = merge_profile(theirs, &set).expect("merge");
         assert!(
             text.expect("changed")
                 .starts_with("# my comment\n[profiles.devbox2]"),
@@ -257,15 +308,15 @@ mod tests {
 
         // A content-addressed profile whose contents no longer match its name.
         let edited = format!("[profiles.{name}]\nextends = \"workspace\"\nread_write = [\"/b\"]\n");
-        let err = merge_profile(&edited, &name, &set).expect_err("refused");
+        let err = merge_profile(&edited, &set).expect_err("refused");
         assert!(err.to_string().contains("was edited"), "{err}");
         let rebased = format!("[profiles.{name}]\nextends = \"strict\"\nread_write = [\"/a\"]\n");
-        assert!(merge_profile(&rebased, &name, &set).is_err());
+        assert!(merge_profile(&rebased, &set).is_err());
 
         // Someone else's profile grok cannot deserialize: grok would drop the
         // whole file, ours included, so writing ours is pointless.
         let broken = "[profiles.theirs]\nread_write = \"/x\"\n";
-        let err = merge_profile(broken, &name, &set).expect_err("refused");
+        let err = merge_profile(broken, &set).expect_err("refused");
         assert!(err.to_string().contains("ignore the whole file"), "{err}");
     }
 
@@ -275,7 +326,7 @@ mod tests {
         let name = profile_name(&set);
         // `profiles = { ... }` inline: the new entry must be inline too.
         let inline = "profiles = { theirs = { extends = \"strict\" } }\n";
-        let (text, created) = merge_profile(inline, &name, &set).expect("inline");
+        let (text, created) = merge_profile(inline, &set).expect("inline");
         assert!(created);
         let parsed: toml::Table = text.expect("changed").parse().expect("valid");
         assert_eq!(
@@ -286,7 +337,7 @@ mod tests {
         // so one without it still matches.
         let bare = format!("[profiles.{name}]\nread_write = [\"/a\"]\n");
         assert_eq!(
-            merge_profile(&bare, &name, &set).expect("no extends"),
+            merge_profile(&bare, &set).expect("no extends"),
             (None, false)
         );
     }
@@ -297,14 +348,13 @@ mod tests {
         let home = scratch();
         let grok = grok_at(&home);
         let set = roots(&["/a"]);
-        let name = profile_name(&set);
-        assert!(grok.ensure_profile(&name, &set).expect("write"));
+        assert!(grok.ensure_profile(&set).expect("write"));
         let mode = std::fs::metadata(home.join("sandbox.toml"))
             .expect("written")
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(!grok.ensure_profile(&name, &set).expect("noop"));
+        assert!(!grok.ensure_profile(&set).expect("noop"));
 
         // Grok refuses to load a symlinked trust-boundary file, so a profile
         // written through one could never be used.
@@ -314,9 +364,7 @@ mod tests {
         std::os::unix::fs::symlink(real.join("sandbox.toml"), home.join("sandbox.toml"))
             .expect("link");
         let other = roots(&["/b"]);
-        let err = grok
-            .ensure_profile(&profile_name(&other), &other)
-            .expect_err("refused");
+        let err = grok.ensure_profile(&other).expect_err("refused");
         assert!(err.to_string().contains("symlink"), "{err}");
         let _ = std::fs::remove_dir_all(&home);
     }

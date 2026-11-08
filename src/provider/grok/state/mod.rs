@@ -44,10 +44,9 @@ mod events;
 mod sandbox;
 mod trust;
 
-pub(super) use background::{Unread, unread_background_results, wake_prompt};
-pub(super) use events::{cancel_cause, session_events, session_updates};
-pub(in crate::provider) use sandbox::canonical_roots;
-pub(super) use sandbox::{PROFILE_PREFIX, profile_name};
+pub(super) use background::{Unread, WakeCheck, wake_prompt};
+pub(super) use events::{CancelCause, cancel_cause, session_events};
+pub(in crate::provider) use sandbox::{ProfileName, RootSet};
 pub(super) use trust::{Trust, trust_failures};
 
 /// Grok's environment as the *child* will see it. A profile `env` redirects

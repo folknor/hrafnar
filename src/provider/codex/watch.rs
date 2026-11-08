@@ -1,4 +1,5 @@
 //! Codex rollout progress source and its measured silence/answer policy.
+use crate::transcript::{EventKind, RolloutOffset, Scope};
 use crate::watchdog::{Evidence, Kind, Source, Timings, Verdict, monitor};
 use std::path::PathBuf;
 
@@ -16,13 +17,13 @@ use std::path::PathBuf;
 pub async fn wait_for_stranded_completion(
     session_rx: tokio::sync::watch::Receiver<Option<String>>,
     codex_home: Option<PathBuf>,
-    baseline: Option<u64>,
+    scope: Scope,
     timings: Timings,
-) -> Verdict {
+) -> Verdict<EventKind> {
     // Unknown scope cannot license either answer-based stopping or a stall.
-    let baseline = match baseline {
-        Some(baseline) => baseline,
-        None => std::future::pending().await,
+    let baseline = match scope {
+        Scope::From(offset) => offset,
+        Scope::WholeFile | Scope::Untrusted => std::future::pending().await,
     };
     let mut source = CodexRollout {
         session_rx,
@@ -51,7 +52,11 @@ pub async fn wait_for_stranded_completion(
              codex wakes itself every few minutes even while waiting on a \
              long tool call, so silence this long means the run is wedged, not working.\n  \
              Terminating it and reporting failure.\n  last rollout event: {}\n  transcript: {path}",
-            last_event.as_deref().unwrap_or("(none)")
+            last_event
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("(none)")
         ),
     };
     Verdict {
@@ -69,13 +74,14 @@ pub async fn wait_for_stranded_completion(
 struct CodexRollout {
     session_rx: tokio::sync::watch::Receiver<Option<String>>,
     home: Option<PathBuf>,
-    baseline: u64,
+    baseline: RolloutOffset,
     cached_transcript: Option<(String, PathBuf)>,
     unreadable_session: Option<String>,
 }
 
 impl Source for CodexRollout {
     type Answer = super::rollout::PhaseAnswer;
+    type Event = EventKind;
     async fn revision(&mut self) -> Option<u64> {
         // Still waiting to learn which session this is (fresh run, pre-
         // `thread.started`). Nothing to watch yet.
@@ -124,20 +130,16 @@ impl Source for CodexRollout {
         Some(meta.len())
     }
 
-    async fn evidence(&mut self) -> Option<Evidence<Self::Answer>> {
+    async fn evidence(&mut self) -> Option<Evidence<Self::Answer, Self::Event>> {
         let (_, path) = self.cached_transcript.as_ref()?;
         let bytes = tokio::fs::read(path).await.ok()?;
-        let ours = scan_from_baseline(&bytes, self.baseline);
+        let ours = Scope::From(self.baseline).bytes(&bytes);
         let folded = crate::provider::codex::rollout::fold(&String::from_utf8_lossy(ours));
         Some(Evidence {
             answer: folded.latest_phase_answer,
             last_event: folded.current_turn.last_event,
         })
     }
-}
-
-fn scan_from_baseline(bytes: &[u8], baseline: u64) -> &[u8] {
-    crate::transcript::slice_from_offset(bytes, Some(baseline))
 }
 
 #[cfg(test)]
@@ -152,23 +154,42 @@ fn last_event(bytes: &[u8]) -> Option<String> {
     crate::provider::codex::rollout::fold(&String::from_utf8_lossy(bytes))
         .current_turn
         .last_event
+        .map(|event| event.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_fixtures as fixtures;
 
-    const TASK_STARTED: &str = r#"{"timestamp":"2026-08-11T07:25:08.000Z","type":"event_msg","payload":{"type":"task_started"}}"#;
-    const FINAL_ANSWER: &str = r#"{"timestamp":"2026-08-11T07:42:20.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#;
-    const COMMENTARY: &str = r#"{"timestamp":"2026-08-11T07:30:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}"#;
+    fn task_started() -> String {
+        fixtures::timestamp(
+            &fixtures::event(Some("event_msg"), "task_started"),
+            "2026-08-11T07:25:08.000Z",
+        )
+    }
+    fn answer_record() -> String {
+        fixtures::timestamp(
+            &fixtures::legacy_message("Done.", "final_answer"),
+            "2026-08-11T07:42:20.000Z",
+        )
+    }
+    fn commentary() -> String {
+        fixtures::timestamp(
+            &fixtures::legacy_message("I am now regenerating the pilot.", "commentary"),
+            "2026-08-11T07:30:00.000Z",
+        )
+    }
 
     fn scan(rollout: &str, baseline: u64) -> bool {
-        final_answer(scan_from_baseline(rollout.as_bytes(), baseline)).is_some()
+        final_answer(Scope::From(RolloutOffset(baseline)).bytes(rollout.as_bytes())).is_some()
     }
 
     #[test]
     fn detects_a_final_answer_from_this_run() {
-        let rollout = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let final_answer = answer_record();
+        let task_started = task_started();
+        let rollout = format!("{task_started}\n{final_answer}\n");
         assert!(scan(&rollout, 0));
     }
 
@@ -177,34 +198,49 @@ mod tests {
     // recognised as answered.
     #[test]
     fn detects_a_final_answer_as_an_assistant_message() {
-        let answer = r#"{"timestamp":"2026-09-29T06:28:09.406Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}],"phase":"final_answer"}}"#;
-        let rollout = format!("{TASK_STARTED}\n{answer}\n");
+        let task_started = task_started();
+        let answer = fixtures::timestamp(
+            &fixtures::assistant_message("Done.", "final_answer"),
+            "2026-09-29T06:28:09.406Z",
+        );
+        let rollout = format!("{task_started}\n{answer}\n");
         assert!(scan(&rollout, 0));
     }
 
     #[test]
     fn latest_answer_survives_trailing_turns() {
-        let later = FINAL_ANSWER.replace("Done.", "Latest.");
+        let commentary = commentary();
+        let final_answer = answer_record();
+        let task_started = task_started();
+        let later = final_answer.replace("Done.", "Latest.");
         let rollout =
-            format!("{FINAL_ANSWER}\n{TASK_STARTED}\n{later}\n{TASK_STARTED}\n{COMMENTARY}\n");
-        assert_eq!(final_answer(rollout.as_bytes()).as_deref(), Some("Latest."));
+            format!("{final_answer}\n{task_started}\n{later}\n{task_started}\n{commentary}\n");
+        assert_eq!(
+            super::final_answer(rollout.as_bytes()).as_deref(),
+            Some("Latest.")
+        );
     }
 
     #[test]
     fn commentary_alone_is_not_an_answer() {
+        let commentary = commentary();
+        let task_started = task_started();
         // The mid-turn wedge case: interim notes only. Killing here would throw
         // away a run that never reported.
-        let rollout = format!("{TASK_STARTED}\n{COMMENTARY}\n");
+        let rollout = format!("{task_started}\n{commentary}\n");
         assert!(!scan(&rollout, 0));
     }
 
     #[test]
     fn a_previous_turns_answer_does_not_count() {
+        let commentary = commentary();
+        let final_answer = answer_record();
+        let task_started = task_started();
         // A resume appends to the same rollout. The prior turn's answer must not
         // make us kill a resume that has produced nothing yet.
-        let prior = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let prior = format!("{task_started}\n{final_answer}\n");
         let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
-        let rollout = format!("{prior}{TASK_STARTED}\n{COMMENTARY}\n");
+        let rollout = format!("{prior}{task_started}\n{commentary}\n");
         assert!(!scan(&rollout, baseline));
         // Sanity: without the baseline the stale answer would have counted,
         // which is exactly the misfire the offset prevents.
@@ -217,10 +253,16 @@ mod tests {
     // licensed killing a resume that had produced nothing.
     #[test]
     fn a_prior_answer_in_the_same_second_does_not_count() {
-        let same_second_answer = r#"{"timestamp":"2026-08-11T07:25:08.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer.","phase":"final_answer"}}"#;
+        let same_second_answer = fixtures::timestamp(
+            &fixtures::legacy_message("Old answer.", "final_answer"),
+            "2026-08-11T07:25:08.100Z",
+        );
         let prior = format!("{same_second_answer}\n");
         let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
-        let launched_same_second = r#"{"timestamp":"2026-08-11T07:25:08.900Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let launched_same_second = fixtures::timestamp(
+            &fixtures::event(Some("event_msg"), "task_started"),
+            "2026-08-11T07:25:08.900Z",
+        );
         let rollout = format!("{prior}{launched_same_second}\n");
         assert!(!scan(&rollout, baseline));
     }
@@ -231,13 +273,15 @@ mod tests {
     // field's whole purpose is saying what *this* run was doing when it froze.
     #[test]
     fn last_event_is_scoped_to_this_run() {
-        let prior = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let final_answer = answer_record();
+        let task_started = task_started();
+        let prior = format!("{task_started}\n{final_answer}\n");
         let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
 
         // A resume that has written nothing of its own yet.
         let bytes = prior.clone().into_bytes();
         assert_eq!(
-            last_event(scan_from_baseline(&bytes, baseline)),
+            last_event(Scope::From(RolloutOffset(baseline)).bytes(&bytes)),
             None,
             "a run that wrote nothing must not inherit the prior turn's event"
         );
@@ -251,17 +295,18 @@ mod tests {
         // Once the run does write, its own last event is reported.
         let tool_call =
             r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec"}}"#;
-        let resumed = format!("{prior}{TASK_STARTED}\n{tool_call}\n");
+        let resumed = format!("{prior}{task_started}\n{tool_call}\n");
         let bytes = resumed.into_bytes();
         assert_eq!(
-            last_event(scan_from_baseline(&bytes, baseline)).as_deref(),
+            last_event(Scope::From(RolloutOffset(baseline)).bytes(&bytes)).as_deref(),
             Some("response_item/custom_tool_call")
         );
     }
 
     #[test]
     fn malformed_lines_are_skipped() {
-        let rollout = format!("not json at all\n{FINAL_ANSWER}\n");
+        let final_answer = answer_record();
+        let rollout = format!("not json at all\n{final_answer}\n");
         assert!(scan(&rollout, 0));
     }
 
@@ -269,8 +314,10 @@ mod tests {
     // skipped without hiding the answer that follows it.
     #[test]
     fn a_baseline_inside_a_line_skips_only_that_fragment() {
-        let rollout = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
-        let baseline = u64::try_from(TASK_STARTED.len() / 2).expect("fits");
+        let final_answer = answer_record();
+        let task_started = task_started();
+        let rollout = format!("{task_started}\n{final_answer}\n");
+        let baseline = u64::try_from(task_started.len() / 2).expect("fits");
         assert!(scan(&rollout, baseline));
     }
 
@@ -278,8 +325,33 @@ mod tests {
     // whole could read another run's turn, so it must yield nothing.
     #[test]
     fn a_truncated_rollout_yields_nothing() {
-        let rollout = format!("{FINAL_ANSWER}\n");
+        let final_answer = answer_record();
+        let rollout = format!("{final_answer}\n");
         let baseline = u64::try_from(rollout.len() + 1000).expect("fits");
         assert!(!scan(&rollout, baseline));
+    }
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    #[tokio::test]
+    async fn untrusted_and_whole_file_scopes_never_license_watchdog_judgment() {
+        for scope in [Scope::Untrusted, Scope::WholeFile] {
+            let (_tx, rx) = tokio::sync::watch::channel(Some("foo".to_string()));
+            let timings = Timings {
+                poll_interval: std::time::Duration::from_millis(1),
+                quiet_grace: std::time::Duration::ZERO,
+                stall_grace: Some(std::time::Duration::ZERO),
+            };
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(10),
+                    wait_for_stranded_completion(rx, None, scope, timings)
+                )
+                .await
+                .is_err()
+            );
+        }
     }
 }

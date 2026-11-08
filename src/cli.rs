@@ -30,7 +30,7 @@ is spelled as one (`-C ../bz`, `-C ~/src/bz`) and is searched upward like the
 current directory. There is no fallback between the two. The current directory
 never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
-`review interrupt`, `review incidents` and `review sessions --all` refuse -C.
+{PROJECT_REFUSALS} refuse -C.
 
 Providers: {PROVIDERS}, from --provider or [_defaults].providers. A
 provider that is not installed fails the run before anything launches.
@@ -98,6 +98,7 @@ fn render(template: &str) -> String {
         .replace("{UNINTERRUPTIBLE}", &Provider::uninterruptible_names())
         .replace("{PROVIDERS}", &Provider::supported())
         .replace("{CUTOFFS}", &Provider::stale_cutoff_prose())
+        .replace("{PROJECT_REFUSALS}", &project_refusals())
 }
 
 /// A rendered template, for clap attributes, which take a `&'static str`.
@@ -123,7 +124,9 @@ const MESSAGE_AFTER_HELP_TEMPLATE: &str = "\
 If a {INTERRUPTIBLE} turn is in flight, it is interrupted first (as `review
 interrupt` does) - the turn is cut off and whatever it had not finished is lost -
 and the message then continues the session. A {UNINTERRUPTIBLE} turn in flight cannot be
-interrupted; the message is refused until it ends.
+interrupted; the message is refused until it ends. A run already recording
+waits for its handoff. Active runs from older builds without handoff support
+must finish before continuation.
 
 The session must come from a run on this host: its provider is read from the
 record that run left (`review sessions` lists them), and an ID with no record
@@ -146,7 +149,9 @@ processes are still being torn down is refused until they are.";
 const INTERRUPT_AFTER_HELP_TEMPLATE: &str = "\
 Works on {INTERRUPTIBLE} runs, not {UNINTERRUPTIBLE}. This ends the turn, waits for the run
 to record its session, and prints the `review message` command that continues
-it. The interrupted run exits 1, like any run that produced no answer. To stop a
+it. A run already recording waits for its exact handoff without signalling.
+Active runs from older builds without handoff support must finish before
+continuation. The interrupted run exits 1, like any run that produced no answer. To stop a
 turn and send new information in one step, use `review message` instead.
 
 Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
@@ -370,6 +375,71 @@ pub enum Command {
     },
 }
 
+/// Selection chooses launch policy; assertion checks a recorded session's
+/// project. Neither is meaningful for a host-wide command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectScope {
+    Selected,
+    Asserted,
+    Unscoped(&'static str),
+}
+
+impl Command {
+    pub(crate) fn project_scope(&self) -> ProjectScope {
+        match self {
+            Self::Message { .. } | Self::Resume { .. } => ProjectScope::Asserted,
+            Self::Sessions { id: Some(_), .. } => ProjectScope::Asserted,
+            Self::Sessions {
+                id: None,
+                all: true,
+                ..
+            } => ProjectScope::Unscoped("review sessions --all"),
+            Self::Sessions {
+                id: None,
+                all: false,
+                ..
+            }
+            | Self::Init
+            | Self::Config => ProjectScope::Selected,
+            Self::Interrupt { .. } => ProjectScope::Unscoped("review interrupt"),
+            Self::Incidents { .. } => ProjectScope::Unscoped("review incidents"),
+            Self::Man { .. } => ProjectScope::Unscoped("review man"),
+        }
+    }
+}
+
+impl Cli {
+    pub(crate) fn project_scope(&self) -> ProjectScope {
+        match &self.command {
+            Some(command) => command.project_scope(),
+            None if self.session.is_some() => ProjectScope::Asserted,
+            None => ProjectScope::Selected,
+        }
+    }
+}
+
+// These are presentation representatives, not an independent refusal list.
+// Scope owns whether each representation refuses -C and the diagnostic name.
+fn project_refusals() -> String {
+    [
+        Command::Interrupt { id: String::new() },
+        Command::Incidents { limit: 20 },
+        Command::Man { topic: None },
+        Command::Sessions {
+            id: None,
+            all: true,
+            limit: 20,
+        },
+    ]
+    .iter()
+    .filter_map(|command| match command.project_scope() {
+        ProjectScope::Unscoped(name) => Some(format!("`{name}`")),
+        ProjectScope::Selected | ProjectScope::Asserted => None,
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,23 +585,52 @@ mod tests {
         assert!(parse(&["interrupt"]).is_err(), "the id is required");
     }
 
-    /// Every root subcommand, hidden ones, aliases and clap's generated `help`
-    /// included, is a reserved word: while the positional archetype alias
-    /// exists, an archetype by that name would be silently shadowed. Derived
-    /// from the built command so a new subcommand cannot be forgotten.
     #[test]
-    fn every_subcommand_name_is_reserved() {
-        let mut cmd = Cli::command();
-        cmd.build();
-        for sub in cmd.get_subcommands() {
-            for name in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
-                assert!(
-                    crate::config::RESERVED_NAMES.contains(&name),
-                    "subcommand `{name}` is missing from RESERVED_NAMES"
-                );
+    fn project_scope_follows_the_effective_invocation_and_help() {
+        let cases: &[(&[&str], ProjectScope)] = &[
+            (&[], ProjectScope::Selected),
+            (&["config"], ProjectScope::Selected),
+            (&["init"], ProjectScope::Selected),
+            (&["sessions"], ProjectScope::Selected),
+            (&["sessions", "s"], ProjectScope::Asserted),
+            (&["message", "s"], ProjectScope::Asserted),
+            (&["resume", "s"], ProjectScope::Asserted),
+            (&["--session", "s"], ProjectScope::Asserted),
+            (
+                &["sessions", "--all"],
+                ProjectScope::Unscoped("review sessions --all"),
+            ),
+            (
+                &["interrupt", "s"],
+                ProjectScope::Unscoped("review interrupt"),
+            ),
+            (&["incidents"], ProjectScope::Unscoped("review incidents")),
+            (&["man"], ProjectScope::Unscoped("review man")),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(parsed(args).project_scope(), *expected, "{args:?}");
+            if let ProjectScope::Unscoped(name) = expected {
+                assert!(AFTER_HELP.contains(&format!("`{name}`")), "{name}");
             }
         }
-        assert!(crate::config::RESERVED_NAMES.contains(&"all"));
+        // Exercise every actual command too, so a newly unscoped verb cannot
+        // be omitted from the help representatives unnoticed.
+        let mut command = Cli::command();
+        command.build();
+        for sub in command
+            .get_subcommands()
+            .filter(|sub| sub.get_name() != "help")
+        {
+            let mut args = vec![sub.get_name()];
+            args.extend(
+                sub.get_arguments()
+                    .filter(|arg| arg.is_positional() && arg.is_required_set())
+                    .map(|_| "s"),
+            );
+            if let ProjectScope::Unscoped(name) = parsed(&args).project_scope() {
+                assert!(AFTER_HELP.contains(&format!("`{name}`")), "{name}");
+            }
+        }
     }
 
     #[test]

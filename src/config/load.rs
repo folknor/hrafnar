@@ -2,8 +2,9 @@ use super::{
     CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, Selection, hostname, parse_file,
     resolve,
 };
+use super::{ConfigError, Result, SearchBoundary};
+use crate::project::ProjectRoot;
 use crate::project::registry::check_projects;
-use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -33,13 +34,12 @@ fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Opt
 
 /// Load the project's `.review.toml` (required: it carries the audit id) and
 /// the global config (optional), and resolve them for this host.
-pub fn load(sel: &Selection) -> Result<(ReviewConfig, PathBuf)> {
+pub fn load(sel: &Selection) -> Result<ReviewConfig> {
     let local_path = match locate_config(sel)? {
         Located::Found(path) => path,
-        Located::Missing(why) => bail!("{why}"),
+        Located::Missing(boundary) => return Err(ConfigError::NotFound { boundary }),
     };
-    let project_root = project_root_of(&local_path)?;
-    Ok((load_layers(Some(local_path))?, project_root))
+    load_layers(Some(local_path))
 }
 
 /// Like `load`, but a missing `.review.toml` is not an error: the config is the
@@ -47,43 +47,34 @@ pub fn load(sel: &Selection) -> Result<(ReviewConfig, PathBuf)> {
 /// does not parse still is - callers use this to decide things like whether a
 /// run's logs are private, and silently treating a broken config as an absent
 /// one would downgrade a private project to the public log.
-pub fn load_optional(sel: &Selection) -> Result<(ReviewConfig, Option<PathBuf>)> {
+pub fn load_optional(sel: &Selection) -> Result<ReviewConfig> {
     match locate_config(sel)? {
-        Located::Found(path) => {
-            let root = project_root_of(&path)?;
-            Ok((load_layers(Some(path))?, Some(root)))
-        }
+        Located::Found(path) => load_layers(Some(path)),
         // An exact root was chosen as the project; showing the global layer
         // alone would describe a project that is not there.
-        Located::Missing(why) if matches!(sel, Selection::Exact(_)) => bail!("{why}"),
-        Located::Missing(_) => Ok((load_layers(None)?, None)),
+        Located::Missing(boundary) if matches!(sel, Selection::Exact(_)) => {
+            Err(ConfigError::NotFound { boundary })
+        }
+        Located::Missing(_) => load_layers(None),
     }
 }
 
 /// The project root - the directory holding `.review.toml` - without parsing
 /// anything, for callers that only need to know which project they are in.
-pub fn project_root(sel: &Selection) -> Result<Option<PathBuf>> {
+pub fn project_root(sel: &Selection) -> Result<Option<ProjectRoot>> {
     match locate_config(sel)? {
-        Located::Found(path) => Ok(Some(project_root_of(&path)?)),
+        Located::Found(path) => Ok(Some(ProjectRoot::from_config_path(&path)?)),
         Located::Missing(_) => Ok(None),
     }
-}
-
-/// The root is canonicalized, so one checkout has one identity: it is what the
-/// sidecar and in-flight markers record and what `-C` and `review sessions`
-/// compare against, and a symlinked spelling must not split a project in two.
-fn project_root_of(local_path: &std::path::Path) -> Result<PathBuf> {
-    let parent = local_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", local_path.display()))?;
-    Ok(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
 }
 
 fn load_layers(local_path: Option<PathBuf>) -> Result<ReviewConfig> {
     let local = match local_path {
         Some(ref p) => {
-            let raw = std::fs::read_to_string(p)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", p.display()))?;
+            let raw = std::fs::read_to_string(p).map_err(|source| ConfigError::Read {
+                path: p.clone(),
+                source,
+            })?;
             parse_file(&raw, &p.display().to_string(), Layer::Local)?
         }
         None => ConfigFile::default(),
@@ -113,10 +104,10 @@ pub(crate) fn entry_exists(path: &std::path::Path) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(anyhow::anyhow!(
-            "failed to inspect {}: {error}",
-            path.display()
-        )),
+        Err(source) => Err(ConfigError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -128,13 +119,16 @@ fn read_optional_file(path: &std::path::Path) -> Result<Option<String>> {
     }
     std::fs::read_to_string(path)
         .map(Some)
-        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 pub(crate) enum Located {
     Found(PathBuf),
-    /// Not found; carries the message saying where the search stopped.
-    Missing(String),
+    /// Genuine absence, distinct from failed inspection or an invalid file.
+    Missing(SearchBoundary),
 }
 
 pub(crate) fn locate_config(sel: &Selection) -> Result<Located> {
@@ -144,11 +138,7 @@ pub(crate) fn locate_config(sel: &Selection) -> Result<Located> {
             return Ok(if entry_exists(&candidate)? {
                 Located::Found(candidate)
             } else {
-                Located::Missing(format!(
-                    "no {CONFIG_FILENAME} in {}\n\n\
-                     Run `review -C <project> init` to create one.",
-                    root.display()
-                ))
+                Located::Missing(SearchBoundary::Exact(root.clone()))
             });
         }
         Selection::Discover(start) => start.clone(),
@@ -160,16 +150,12 @@ pub(crate) fn locate_config(sel: &Selection) -> Result<Located> {
             return Ok(Located::Found(candidate));
         }
         if entry_exists(&dir.join(".git"))? {
-            return Ok(Located::Missing(format!(
-                "no {CONFIG_FILENAME} found (searched up to git root: {})\n\n\
-                 Run `review init` to create one.",
-                dir.display()
-            )));
+            return Ok(Located::Missing(SearchBoundary::GitRoot(dir)));
         }
+        let searched_to = dir.clone();
         if !dir.pop() {
-            return Ok(Located::Missing(format!(
-                "no {CONFIG_FILENAME} found in current or parent directories\n\n\
-                 Run `review init` to create one."
+            return Ok(Located::Missing(SearchBoundary::FilesystemRoot(
+                searched_to,
             )));
         }
     }
@@ -192,7 +178,7 @@ pub fn global_projects() -> Result<(BTreeMap<String, String>, Option<PathBuf>)> 
     // This lookup must work before a registered project's config can be loaded.
     // Resolving the whole global file here would validate unrelated settings,
     // then the selected project's full load would parse it again anyway.
-    check_projects(&mine, &host, "global")?;
+    check_projects(&mine, &host, "global").map_err(|source| ConfigError::Resolve { source })?;
     Ok((mine, Some(path)))
 }
 
@@ -241,6 +227,55 @@ mod tests {
             Located::Missing(_)
         ));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn typed_errors_distinguish_absence_storage_and_invalid_configuration() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("config-errors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("fixture");
+        std::fs::write(base.join(".git"), "").expect("boundary");
+        let exact = Selection::Exact(base.clone());
+        assert!(
+            matches!(load(&exact), Err(ConfigError::NotFound { boundary: SearchBoundary::Exact(root) }) if root == base)
+        );
+        assert!(matches!(
+            load_optional(&exact),
+            Err(ConfigError::NotFound { .. })
+        ));
+        assert!(
+            matches!(locate_config(&Selection::Discover(base.clone())).expect("locate"), Located::Missing(SearchBoundary::GitRoot(root)) if root == base)
+        );
+        assert!(
+            read_optional_file(&base.join(CONFIG_FILENAME))
+                .expect("missing")
+                .is_none()
+        );
+        std::fs::create_dir(base.join(CONFIG_FILENAME)).expect("unreadable directory");
+        assert!(matches!(
+            load_optional(&exact),
+            Err(ConfigError::Read { .. })
+        ));
+        std::fs::remove_dir(base.join(CONFIG_FILENAME)).expect("remove");
+        std::fs::write(base.join(CONFIG_FILENAME), "[broken").expect("malformed");
+        let error = load_optional(&exact).expect_err("invalid");
+        assert!(
+            matches!(&error, ConfigError::InvalidFile { origin, .. } if origin.ends_with(CONFIG_FILENAME))
+        );
+        let wrapped = anyhow::Error::new(error).context("message target");
+        assert!(matches!(
+            wrapped.downcast_ref::<ConfigError>(),
+            Some(ConfigError::InvalidFile { .. })
+        ));
+        use std::os::unix::fs::symlink;
+        symlink("loop", base.join("loop")).expect("loop");
+        assert!(matches!(
+            entry_exists(&base.join("loop/child")),
+            Err(ConfigError::Inspect { .. })
+        ));
+        std::fs::remove_dir_all(base).expect("cleanup");
     }
 
     #[test]

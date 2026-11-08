@@ -17,8 +17,7 @@ mod session;
 mod stream;
 
 pub(crate) use artifacts::session_artifacts;
-pub use claude::run_claude;
-pub use codex::run_codex_json;
+use claude::run_claude;
 pub use kind::{Provider, UnknownProvider};
 pub use launch::{InheritedSettings, LaunchSpec, ProfileOrigin, RunSettings};
 use lifecycle::{Lease, LeaseUse, Run};
@@ -28,14 +27,14 @@ pub use outcome::{Answer, EndedBy, Outcome, StatusFacts, Termination, Turn, Watc
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
 pub use result::{
-    CodexForensics, Digest, DigestSummary, ProviderForensics, ProviderResult, RunOutput, Served,
-    Usage, now_epoch_secs,
+    CodexForensics, Digest, DigestSummary, ProviderForensics, ProviderResult, Served, Usage,
+    now_epoch_secs,
 };
-pub use runtime::{ProviderCommand, ProviderCommands, ProviderRuntime, orphan_log_path};
+pub use runtime::{ProviderCommand, ProviderCommands, ProviderRuntime};
 pub use session::{SessionId, SessionStart};
 
 use codex::run_codex;
-use result::{answered_status_digest, result_served, status_digest};
+use result::{RunOutput, answered_status_digest, result_served, status_digest};
 
 #[cfg(test)]
 mod tests;
@@ -73,7 +72,7 @@ pub fn recovery(r: &ProviderResult) -> Option<&'static str> {
 /// (`create_new`) makes collisions between concurrent runs impossible and
 /// defeats symlink pre-planting on what used to be a predictable pid+archetype
 /// path. The file is created empty; codex overwrites it with the final message.
-pub fn new_output_file() -> Result<String> {
+fn new_output_file() -> Result<String> {
     new_temp_file("codex")
 }
 
@@ -214,22 +213,43 @@ pub async fn invoke(
     mut launch: LaunchSpec,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
+    predecessor: Option<crate::sessions::handoff::RunId>,
 ) -> ProviderResult {
+    let mut invocation_runtime = runtime.clone();
+    invocation_runtime.predecessor = predecessor;
+    invocation_runtime.run_id = crate::sessions::handoff::RunId::default();
+    let reservation_error =
+        match crate::inflight::reserve(&invocation_runtime.data, &invocation_runtime.run_id) {
+            Ok(reservation) => {
+                invocation_runtime.reservation = reservation.map(std::sync::Arc::new);
+                None
+            }
+            Err(e) => {
+                invocation_runtime.reservation = None;
+                Some(anyhow::anyhow!("cannot reserve invocation markers: {e}"))
+            }
+        };
+    let runtime = &invocation_runtime;
     let provider = launch.provider;
     let selection = &launch.settings.selection;
     let permissions = launch.settings.permissions.clone();
     let project_root = launch.root.as_path();
     let profile_roots = &launch.settings.writable_roots;
     let selection_check = selection.validate(provider);
-    if permissions.provider() != provider || selection_check.is_err() {
+    if permissions.provider() != provider || selection_check.is_err() || reservation_error.is_some()
+    {
         return ProviderResult {
+            run_id: reservation_error.is_none().then(|| runtime.run_id.clone()),
+            _reservation: runtime.reservation.clone(),
             provider,
-            output: Err(selection_check.err().unwrap_or_else(|| {
-                anyhow::anyhow!(
-                    "permission plan belongs to {}, not {provider}",
-                    permissions.provider()
-                )
-            })),
+            output: Err(reservation_error
+                .or_else(|| selection_check.err())
+                .unwrap_or_else(|| {
+                    anyhow::anyhow!(
+                        "permission plan belongs to {}, not {provider}",
+                        permissions.provider()
+                    )
+                })),
             session_id: None,
             codex_home: None,
             digest: None,
@@ -313,6 +333,8 @@ pub async fn invoke(
     let completed_epoch = now_epoch_secs();
     let mut result = match result {
         Ok(run) => ProviderResult {
+            run_id: Some(runtime.run_id.clone()),
+            _reservation: runtime.reservation.clone(),
             provider,
             output: Ok(Turn {
                 text: run.text,
@@ -331,9 +353,17 @@ pub async fn invoke(
             leftovers: run.leftovers,
         },
         Err(e) => ProviderResult {
+            run_id: Some(runtime.run_id.clone()),
+            _reservation: runtime.reservation.clone(),
             provider,
             output: Err(e),
-            session_id: None,
+            // A requested resume ID identifies the audit attempt, not proof
+            // that a turn ran. Recording keeps Err resumes out of the sidecar.
+            // Caller-minted fresh IDs likewise do not prove provider storage.
+            session_id: match &launch.start {
+                SessionStart::Resume(id) => Some(id.as_str().to_owned()),
+                SessionStart::Fresh { .. } => None,
+            },
             codex_home: None,
             digest: None,
             completed_epoch,

@@ -4,6 +4,9 @@
 `sessions.jsonl` under `$XDG_DATA_HOME/review`, else `~/.local/share/review`
 (`sessions-private.jsonl` for a project with `[_audit] private = true`). That record is what `review message` reads to
 find a session's provider, project and settings.
+The command snapshots this data location once; sessions, audit, incidents,
+inflight files and teardown logs use it. Provider homes and the host launch
+lock remain separate. Profile env cannot redirect review's own storage.
 
 ## Listing sessions
 
@@ -13,17 +16,24 @@ project's. Each entry shows its age, provider, archetype, how many times it was
 touched, and the first line of the prompt that opened it.
 Ages use `just now`, `<age> ago`, or `?` when the timestamp is unknown.
 
-Two kinds of entry come before the list:
+Live state entries come before the list:
 
 - `[in flight] <provider> / turn in flight since <age>`: a run is happening
   right now. Its record is only written when it returns, so without this a
   running turn would look like an idle session showing its previous answer.
+- `[recording] <provider> / waiting for the run handoff`: provider teardown has
+  ended and recovery or recording is finishing. A message waits for that
+  invocation instead of launching from an older row.
 - `[queued] message waiting to launch`: a `review message` that holds the
   session's launch lock but has not launched yet, usually because it is waiting
   behind the host-wide launch lock. A further message waiting behind that one
   adds no entry of its own (see `review man message`).
 
-A run whose `review` process has died is not shown in flight.
+A run whose owner died while its keeper is still alive shows as cleanup
+pending and blocks messages. Uncertain process observations preserve this
+block. Unrelated multiple live-run observations are reported as ambiguous;
+retry rather than choosing one. A documented automatic recovery identifies its
+predecessor, so its active turn remains interruptible.
 
 ## One session
 
@@ -35,7 +45,17 @@ Fresh runs are recorded as `run`; resumes, including automatic resumes, are
 recorded as `session`. Each row's assembled prompt is what that invocation
 received. An automatic recovery row records the recovery nudge and retains the
 original operator prompt separately. Recovery pairs are appended in invocation
-order after recovery ends, whichever answer is displayed.
+order after recovery ends, whichever answer is displayed. A failed resume
+launch is audit-only and does not refresh the cache clock. Both logs use the
+invocation's completion time. Historical rows retain their existing field names,
+optional defaults and opaque identities; served model/cost/trust/leftover facts
+are readable evidence and never become inherited request settings.
+
+Queries use one explicit log snapshot, refreshed after waiting for a handoff.
+The interrupt wait reads a bounded receipt for the exact invocation, not the
+append-only history. A receipt is published after all recovery recording attempts
+and distinguishes interruption from successful sidecar persistence. Missing or
+failed persistence never claims a resumable handoff.
 
 For codex it also reads the session's transcript under the resolved
 `CODEX_HOME` recorded with the session: its path, whether the turn completed,
@@ -72,7 +92,10 @@ readable, and unsupported versions or invalid metadata produce a warning.
 
 ## Querying further
 
-The session log is one JSON object per line. Fields include `session_id`,
+The session log is one JSON object per line. Cooperating writers serialize
+appends; an incomplete tail is separated before the next row without deleting
+old bytes. Readers skip malformed byte-delimited lines, including invalid UTF-8
+fragments from a failed write, while retaining valid earlier and later rows. Fields include `session_id`,
 `provider`, `project`, `archetype`, `model`, `effort`, `sandbox`,
 `writable_roots`, `profile_origin` (selected profile layer and table), `env_keys` (env var names only), `codex_home` (the resolved
 Codex rollout directory), the prompts, the response or error, and a flat

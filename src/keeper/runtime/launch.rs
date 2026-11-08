@@ -1,6 +1,7 @@
 //! Provider fork/exec and the exec-status handshake.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use super::super::protocol::Event;
@@ -19,19 +20,52 @@ impl Keeper {
     }
 
     fn fork_provider(&mut self) -> Result<(), String> {
-        let program = &self.spec.program;
-        let path = if program.contains('/') {
-            PathBuf::from(program)
+        self.spec.launch.validate().map_err(|e| e.to_string())?;
+        let launch = &self.spec.launch;
+        let program = std::ffi::OsStr::from_bytes(&launch.program);
+        let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(&launch.cwd));
+        let path = if launch.program.contains(&b'/') {
+            if PathBuf::from(program).is_absolute() {
+                PathBuf::from(program)
+            } else {
+                cwd.join(program)
+            }
         } else {
-            which::which(program).map_err(|e| format!("{program}: {e}"))?
+            let path = launch
+                .env
+                .iter()
+                .find(|(k, _)| k == b"PATH")
+                .map_or(std::ffi::OsStr::new("/bin:/usr/bin"), |(_, v)| {
+                    std::ffi::OsStr::from_bytes(v)
+                });
+            // which expands a leading ~ using the keeper's home. Exec PATH
+            // has no tilde expansion: make even empty and ~ components absolute
+            // under the child cwd before asking its executable checker.
+            let paths =
+                std::env::join_paths(std::env::split_paths(path).map(|part| cwd.join(part)))
+                    .map_err(|e| e.to_string())?;
+            which::which_in(program, Some(paths), &cwd)
+                .map_err(|e| format!("{}: {e}", program.to_string_lossy()))?
         };
-        let to_c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
-        let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|e| e.to_string())?;
-        let mut argv_c = vec![to_c(program)?];
-        for a in &self.spec.args {
+        let to_c = |s: &[u8]| std::ffi::CString::new(s).map_err(|e| e.to_string());
+        let path_c = to_c(path.as_os_str().as_bytes())?;
+        let cwd_c = to_c(&launch.cwd)?;
+        let mut argv_c = vec![to_c(&launch.program)?];
+        for a in &launch.args {
             argv_c.push(to_c(a)?);
         }
+        let env_c: Vec<_> = launch
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let mut entry = k.clone();
+                entry.push(b'=');
+                entry.extend(v);
+                to_c(&entry)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut env: Vec<*const libc::c_char> = env_c.iter().map(|c| c.as_ptr()).collect();
+        env.push(std::ptr::null());
         let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
         argv.push(std::ptr::null());
         let mut status_fds = [0 as RawFd; 2];
@@ -61,14 +95,21 @@ impl Keeper {
                 // The Rust runtime ignores SIGPIPE; a provider gets the
                 // default, as it would from `std::process::Command`.
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-                libc::execv(path_c.as_ptr(), argv.as_ptr());
+                if libc::chdir(cwd_c.as_ptr()) == 0 {
+                    libc::execve(path_c.as_ptr(), argv.as_ptr(), env.as_ptr());
+                }
                 let errno = *libc::__errno_location();
                 let bytes = errno.to_ne_bytes();
-                libc::write(
-                    status_w.as_raw_fd(),
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                );
+                loop {
+                    let n = libc::write(
+                        status_w.as_raw_fd(),
+                        bytes.as_ptr().cast::<libc::c_void>(),
+                        bytes.len(),
+                    );
+                    if n >= 0 || *libc::__errno_location() != libc::EINTR {
+                        break;
+                    }
+                }
                 libc::_exit(127);
             }
         }
@@ -112,7 +153,9 @@ impl Keeper {
         // SAFETY: reads into a buffer we own.
         let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast::<libc::c_void>(), 4) };
         if n == 0 {
-            // Closed by a successful exec.
+            // Conventionally closed by successful exec. An external pre-exec
+            // death can also close it; this handshake alone is not proof that
+            // the provider ever ran an instruction in its new image.
             if let Some((pid, _)) = &self.leader {
                 let pid = *pid;
                 self.queue(&Event::Spawned { pid });
@@ -121,7 +164,10 @@ impl Keeper {
         } else if n == 4 {
             let err = std::io::Error::from_raw_os_error(i32::from_ne_bytes(buf));
             self.queue(&Event::ExecFailed {
-                reason: format!("{}: {err}", self.spec.program),
+                reason: format!(
+                    "{}: {err}",
+                    String::from_utf8_lossy(&self.spec.launch.program)
+                ),
             });
             self.phase = Phase::TearingDown;
         } else {

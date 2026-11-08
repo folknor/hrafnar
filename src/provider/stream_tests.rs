@@ -132,7 +132,14 @@ fn head_tail_snapshots_reject_cut_fragments_and_preserve_true_boundaries() {
 
 #[tokio::test]
 async fn codex_first_byte_and_session_facts_survive_reader_abort() {
-    let owner = Lease::learned(Provider::Codex, Path::new("/nonexistent"), None);
+    let owner = Lease::learned(
+        Provider::Codex,
+        Path::new("/nonexistent"),
+        &crate::data::DataDir::unavailable(),
+        &crate::sessions::handoff::RunId::default(),
+        None,
+        None,
+    );
     let lease = Lease::clone(&owner);
     let (mut writer, reader) = tokio::io::duplex(256);
     let capture = Capture::head(new_shared_buf(), 0);

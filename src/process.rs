@@ -115,32 +115,124 @@ pub fn stat_ppid_start(pid: u32) -> Option<(u32, u64)> {
     Some((ppid, start))
 }
 
-/// Whether the process recorded as `pid` with start time `start` is alive.
-/// Through a pidfd: opened first, the start time read after, then the pidfd
-/// checked still unexited, so the start time read was this process's. A zombie
-/// leader whose other threads still run counts as alive, which its `/proc`
-/// state would not.
+/// Compatibility observation predicate: true includes unknown observation,
+/// because a permission/resource failure must not erase a live marker. Signals
+/// require ProcessIdentity::pin instead. A zombie leader with other live threads
+/// is not gone until its pidfd reports exit.
 pub fn identity_alive(pid: u32, start: Option<u64>) -> bool {
-    let Some(start) = start else {
-        return pid_alive(pid);
-    };
-    let Ok(pidfd) = pidfd_open(pid) else {
-        return false;
-    };
-    stat_ppid_start(pid).is_some_and(|(_, s)| s == start) && !pidfd_exited(&pidfd)
+    ProcessIdentity::recorded(pid, start).is_some_and(|identity| !identity.is_gone())
 }
 
-/// Is `pid` a live process? Signal 0 performs permission and existence checks
-/// without delivering anything. `ESRCH` means gone; `EPERM` means it exists but
-/// belongs to someone else, which still counts as alive.
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: `kill` with signal 0 delivers nothing; it only reports whether the
-    // pid exists. No memory is touched.
-    let ret = unsafe { libc::kill(pid, 0) };
-    ret == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+/// Process observation is separate from signalling authority. Unknown must
+/// preserve markers and keep receipt waits alive, never authorize a signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Presence {
+    Alive,
+    Gone,
+    Unknown,
+}
+
+/// A process table identity, never a process-group selector. Historical starts
+/// may be absent; such evidence proves only current existence, not non-reuse.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessIdentity {
+    #[serde(deserialize_with = "deserialize_pid")]
+    pid: std::num::NonZeroU32,
+    start: Option<u64>,
+}
+fn deserialize_pid<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::num::NonZeroU32, D::Error> {
+    let pid = <u32 as serde::Deserialize>::deserialize(d)?;
+    checked_pid(pid)
+        .ok_or_else(|| serde::de::Error::custom("process pid must be positive and fit pid_t"))
+}
+fn checked_pid(pid: u32) -> Option<std::num::NonZeroU32> {
+    i32::try_from(pid).ok()?;
+    std::num::NonZeroU32::new(pid)
+}
+impl ProcessIdentity {
+    pub fn recorded(pid: u32, start: Option<u64>) -> Option<Self> {
+        Some(Self {
+            pid: checked_pid(pid)?,
+            start,
+        })
+    }
+    pub fn observe(pid: u32) -> Option<Self> {
+        Self::recorded(pid, stat_ppid_start(pid).map(|(_, s)| s))
+    }
+    pub fn pid(self) -> u32 {
+        self.pid.get()
+    }
+    pub fn presence(self) -> Presence {
+        let fd = match pidfd_open(self.pid()) {
+            Ok(fd) => fd,
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => return Presence::Gone,
+            Err(_) => return Presence::Unknown,
+        };
+        if pidfd_exited(&fd) {
+            return Presence::Gone;
+        }
+        if let Some(expected) = self.start {
+            let Some((_, start)) = stat_ppid_start(self.pid()) else {
+                return if pidfd_exited(&fd) {
+                    Presence::Gone
+                } else {
+                    Presence::Unknown
+                };
+            };
+            if start != expected {
+                return Presence::Gone;
+            }
+        }
+        if pidfd_exited(&fd) {
+            Presence::Gone
+        } else {
+            Presence::Alive
+        }
+    }
+    pub fn is_gone(self) -> bool {
+        self.presence() == Presence::Gone
+    }
+    /// Open first, verify the recorded start, then verify non-exit. The fd pins
+    /// signalling authority; keeper membership/parentage remain caller policy.
+    pub fn pin(self) -> std::io::Result<PinnedProcess> {
+        let expected = self
+            .start
+            .ok_or_else(|| std::io::Error::other("recorded process start is unknown"))?;
+        let fd = pidfd_open(self.pid())?;
+        let (parent, start) = stat_ppid_start(self.pid())
+            .ok_or_else(|| std::io::Error::other("process disappeared"))?;
+        if expected != start || pidfd_exited(&fd) {
+            return Err(std::io::Error::other("process identity changed or exited"));
+        }
+        Ok(PinnedProcess {
+            identity: self,
+            fd,
+            parent,
+        })
+    }
+}
+pub struct PinnedProcess {
+    identity: ProcessIdentity,
+    fd: OwnedFd,
+    parent: u32,
+}
+impl PinnedProcess {
+    pub fn is_keeper_of(&self, owner: ProcessIdentity) -> bool {
+        let pid = i32::try_from(self.identity.pid()).expect("validated positive pid");
+        // SAFETY: reads process group membership, no memory access.
+        let Ok(owner_pin) = owner.pin() else {
+            return false;
+        };
+        self.parent == owner.pid()
+            && unsafe { libc::getpgid(pid) } == pid
+            && !pidfd_exited(&self.fd)
+            && !pidfd_exited(&owner_pin.fd)
+    }
+    pub fn signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        pidfd_signal(&self.fd, signal)
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +256,22 @@ mod tests {
         assert!(!identity_alive(pid, Some(start + 1)));
         assert!(identity_alive(pid, None));
         assert!(!identity_alive(u32::MAX, None));
+    }
+
+    #[test]
+    fn unknown_starts_are_observation_only_and_zero_never_names_a_process() {
+        let identity = ProcessIdentity::recorded(std::process::id(), None).expect("identity");
+        assert_eq!(identity.presence(), Presence::Alive);
+        assert!(
+            identity.pin().is_err(),
+            "existence is not signalling authority"
+        );
+        assert!(ProcessIdentity::recorded(0, None).is_none());
+        assert!(ProcessIdentity::recorded(u32::MAX, None).is_none());
+        assert!(
+            serde_json::from_value::<ProcessIdentity>(serde_json::json!({"pid": 0, "start": null}))
+                .is_err()
+        );
     }
 
     #[test]

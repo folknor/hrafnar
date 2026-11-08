@@ -59,7 +59,7 @@ pub struct Digest {
     pub usage: Usage,
     /// Directory of the forensic bundle written for a suspicious run (stderr,
     /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
-    pub incident_path: Option<String>,
+    pub incident_path: Option<std::path::PathBuf>,
 
     pub provider: Option<ProviderForensics>,
 }
@@ -152,10 +152,16 @@ impl Digest {
             cached_input_tokens: self.usage.cached_input,
             output_tokens: self.usage.output,
             reasoning_output_tokens: self.usage.reasoning_output,
-            incident_path: self.incident_path.clone(),
+            incident_path: self
+                .incident_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             terminated_by_review: outcome.termination().map(ToString::to_string),
             quiet_secs: self.codex().and_then(|c| c.quiet_secs),
-            last_rollout_event: self.codex().and_then(|c| c.last_rollout_event.clone()),
+            last_rollout_event: self
+                .codex()
+                .and_then(|c| c.last_rollout_event.as_ref())
+                .map(ToString::to_string),
             turn_error: outcome.stated.clone(),
             review_error: outcome.unverified.clone(),
             interrupted: matches!(outcome.ended_by, EndedBy::Interrupted(_)),
@@ -168,7 +174,10 @@ impl Digest {
             exit_code: self.exit.code(),
             signaled: self.exit.is_signal(),
             quiet_secs: self.codex().and_then(|c| c.quiet_secs),
-            last_event: self.codex().and_then(|c| c.last_rollout_event.as_deref()),
+            last_event: self
+                .codex()
+                .and_then(|c| c.last_rollout_event.as_ref())
+                .map(|event| event as &dyn std::fmt::Display),
             task_complete: self
                 .codex()
                 .and_then(|c| c.transcript.as_ref())
@@ -185,13 +194,19 @@ impl DigestSummary {
             // status: rows are evidence, never re-decoded into a live Exit.
             signaled: self.signal.is_some(),
             quiet_secs: self.quiet_secs,
-            last_event: self.last_rollout_event.as_deref(),
+            last_event: self
+                .last_rollout_event
+                .as_ref()
+                .map(|event| event as &dyn std::fmt::Display),
             task_complete: self.task_complete,
         }
     }
 }
 
 pub struct ProviderResult {
+    pub run_id: Option<crate::sessions::handoff::RunId>,
+    /// Holds namespace ownership through recovery, durable recording and IPC.
+    pub(crate) _reservation: Option<std::sync::Arc<crate::inflight::Reservation>>,
     pub provider: super::Provider,
     /// The turn the run established, or why none was: a spawn failure, an
     /// unknown model, a provider that ended before it showed the session
@@ -305,7 +320,7 @@ pub fn now_epoch_secs() -> u64 {
 /// Internal result of one provider run before it's wrapped into a
 /// `ProviderResult`. Lets the run helpers return the session ID and digest
 /// alongside the text without a widening tuple.
-pub struct RunOutput {
+pub(super) struct RunOutput {
     pub text: String,
     pub outcome: super::Outcome,
     /// Session ID associated with this invocation, including a resumed ID.
