@@ -1,3 +1,8 @@
+//! The host-wide launch lock, `review.lock` in the temp directory. It spaces
+//! out launches across every `review` on the host and is released once a
+//! command's launches have fired, never held for a whole run, so one wedged
+//! run cannot freeze the host's `review` traffic.
+
 use anyhow::{Result, bail};
 use std::fs::File;
 use std::os::unix::fs::OpenOptionsExt;

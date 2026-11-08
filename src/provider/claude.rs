@@ -1,3 +1,9 @@
+//! The claude adapter: `claude -p` with stream-json output, decoded by
+//! `claude_stream`. Claude has no filesystem sandbox, so its permissions are a
+//! permission mode. A first SIGINT ends its turn and keeps the session, which
+//! is what `review interrupt` relies on. Flags and failure modes are in
+//! `reference/claude.md`.
+
 use super::claude_stream::{ClaudeMetrics, ClaudeOutcome, interpret_claude_output, is_claude_init};
 use super::stream::{Capture, Observer, read_stream};
 use super::*;

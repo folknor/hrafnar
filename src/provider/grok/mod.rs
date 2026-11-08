@@ -1,3 +1,11 @@
+//! The grok adapter: one headless JSON result per turn, the prompt given as a
+//! `--prompt-file` since grok takes none on stdin. `run_grok` repeats turns
+//! until grok's own update log shows no background result the model missed,
+//! resuming the session with those results in the prompt (the wake loop). A
+//! `workspace-write` run needs a sandbox profile and folder trust set up in
+//! grok's state directory, which `state` owns. Grok cannot be interrupted.
+//! The mechanism and its evidence are in `reference/grok.md`.
+
 use super::*;
 use std::path::{Path, PathBuf};
 

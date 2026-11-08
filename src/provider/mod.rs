@@ -1,3 +1,11 @@
+//! Running one provider invocation. `invoke` takes a `LaunchSpec`, prepares
+//! the adapter (`prepare::Prepared`: permissions, writable roots, model
+//! arguments, a caller-minted session id where the provider accepts one),
+//! dispatches to that adapter's runner, and returns a `ProviderResult`.
+//! Each runner (`claude`, `codex`, `grok`) drives the shared `lifecycle` and
+//! classifies what it observed into an `Outcome`. Everything that depends on
+//! the provider is an exhaustive match on `Provider` in this module tree.
+
 mod artifacts;
 mod claude;
 mod claude_stream;

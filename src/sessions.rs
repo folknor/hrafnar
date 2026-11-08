@@ -1,3 +1,12 @@
+//! The session log: one append-only JSONL sidecar per log family (public and
+//! private), one `SessionRow` per invocation. It is what `review message`
+//! inherits a session's provider and settings from, what `review sessions`
+//! lists, and what the stale-cache gate reads. Rows are historical evidence:
+//! they keep their fields as strings and defaults, so old rows, and rows
+//! naming a removed provider, still read. `query` resolves a session's state
+//! from markers and rows; `handoff` passes one exact run's result between
+//! processes. Appends and tail repair go through `fsutil` under file locks.
+
 pub mod handoff;
 pub mod query;
 use serde::{Deserialize, Serialize, Serializer};

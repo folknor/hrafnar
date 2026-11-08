@@ -1,3 +1,10 @@
+//! Finding and reading the config files. The project's `.review.toml` is found
+//! by walking up from the selected directory (or taken exactly from a `-C`
+//! root) and is required for a run, because it carries the audit id; the
+//! global file is optional. `load_optional` serves `review config`, which
+//! outside a project shows the global layer alone. Loading is strict: a file
+//! that exists but does not parse is an error, never treated as absent.
+
 use super::{
     CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, Selection, hostname, parse_file,
     resolve,

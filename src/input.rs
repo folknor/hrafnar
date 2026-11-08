@@ -1,3 +1,6 @@
+//! The operator's instructions, read from stdin: required for a run or a
+//! message, and capped at `MAX_STDIN_BYTES`.
+
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Read};
 

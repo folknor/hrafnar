@@ -1,3 +1,9 @@
+//! The only code that writes config. `init` creates a new `.review.toml`;
+//! `ensure_audit_id` is the only writer of an existing one, generating and
+//! persisting the audit id under a lock on the file when it is absent, so two
+//! first runs of an id-less project agree on one id. Archetypes and profiles
+//! are hand-edited and never written here.
+
 use crate::config::load::{Located, entry_exists, locate_config};
 use crate::config::{CONFIG_FILENAME, Selection};
 use anyhow::{Context, Result, bail};

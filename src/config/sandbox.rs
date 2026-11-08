@@ -1,5 +1,7 @@
-// This is serialized review vocabulary. Native translation and grant semantics
-// belong to provider::Permissions, not the config parser or display command.
+//! `review`'s own sandbox vocabulary as it appears in config: `read-only` (the
+//! default), `workspace-write`, `danger-full-access`, or a provider-native
+//! name. Native translation and grant semantics belong to
+//! `provider::Permissions`, not to the config parser or `review config`.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Review's reserved permission vocabulary. Other names belong to the provider.

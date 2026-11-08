@@ -1,3 +1,9 @@
+//! The runtime an invocation runs in, as opposed to what it asks for: the
+//! command `Lifecycle`, the data directory and log family, the run's identity
+//! and reservation, watchdog and teardown timings, and the executable each
+//! provider is launched with (`ProviderCommand`, which tests point at stub
+//! scripts).
+
 /// A trusted executable and its leading arguments. Adapters append their own
 /// arguments and retain ownership of cwd, environment, stdio and containment.
 /// An empty program fails to spawn; it never selects a real provider instead.

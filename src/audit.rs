@@ -1,3 +1,8 @@
+//! The audit log: one append-only `audit.jsonl` per project and log family,
+//! holding each invocation's full prompt and response. It is a record for the
+//! operator; nothing in `review` reads it back. Where it lives is
+//! `data::DataDir::audit`.
+
 use serde::Serialize;
 
 #[derive(Serialize)]

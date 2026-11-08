@@ -1,3 +1,10 @@
+//! What a provider invocation returns. `ProviderResult` carries the turn (or
+//! the launch error), the session id, the `Digest` and the permissions, model
+//! and effort the run actually launched with. `Digest` holds the facts common
+//! to every provider (process exit, turns, usage, incident path) plus optional
+//! `ProviderForensics`; `DigestSummary` is its flat, serializable projection,
+//! persisted into the audit and session rows so failures stay greppable.
+
 pub use super::codex::forensics::CodexForensics;
 use anyhow::Result;
 

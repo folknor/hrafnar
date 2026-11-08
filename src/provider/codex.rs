@@ -1,3 +1,11 @@
+//! The codex adapter: `codex exec --json`, with the final message also taken
+//! from `-o` and, failing both, from the session's rollout transcript (the
+//! three-tier pick). `rollout` decodes rollouts and the exec stream, `watch`
+//! is the progress watchdog's codex source, `roots` renders writable roots as
+//! a config override, and `forensics` renders codex evidence into digests and
+//! incident bundles. Why each flag is passed and how a run fails are in
+//! `reference/codex.md`.
+
 pub(crate) mod forensics;
 pub(crate) mod rollout;
 mod roots;

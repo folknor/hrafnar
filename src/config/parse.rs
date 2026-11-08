@@ -1,3 +1,13 @@
+//! Parsing one config file. The reserved sections (`[archetypes]`,
+//! `[_groups]`, `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a
+//! `toml::Table`; what remains is profiles. A top-level table named after a
+//! known provider is a hostless `[<provider>.<profile>]` table, and any other
+//! is a legacy `[<host>.<provider>.<profile>]` host table, still parsed so old
+//! files need no edit. A provider-named table that also parses as a valid host
+//! table is refused as ambiguous, since a host named like a provider would
+//! otherwise silently change meaning. `[_audit]` in the global file is an
+//! error. The format itself is documented in `docs/config.md`.
+
 use super::{
     AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, ProfileTables,
     Provider, reserved_names, toml_key,

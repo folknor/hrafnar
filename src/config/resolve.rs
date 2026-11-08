@@ -1,3 +1,9 @@
+//! Combining the local and global layers into one `ReviewConfig`. Every
+//! resolved value is `Sourced` (layer and table), and each profile keeps the
+//! definitions it shadows, so `review config` can show both. The precedence
+//! rules and their reasons are in `reference/design.md`; the tests are in
+//! `resolve/tests.rs`.
+
 use super::{
     ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, Provider, ReviewConfig, Sourced,
     toml_key,

@@ -1,3 +1,22 @@
+//! The command line. `review` with no subcommand is the run itself (stdin to
+//! the providers), with the archetype as `-a`, the profile as `-p` and the
+//! global `-C` selecting the project. The verbs are `message`, `interrupt`,
+//! `config`, `sessions`, `incidents`, `init` and `man`.
+//!
+//! Three hidden migration aliases warn when used: the old positional archetype
+//! (`review security`, with `review bare` meaning none), `review resume <ID>`
+//! and `--session <ID>`, both now `review message <ID>`. Run flags beside a
+//! subcommand are refused by hand (`Cli::parse_checked`), because clap would
+//! accept them in front of one and silently drop them. Which commands accept
+//! `-C` is one exhaustive policy here (`Cli::project_scope`).
+//!
+//! The help text is what orchestrating agents read in place of the docs, so it
+//! states the rules they would otherwise trip on: profile precedence and the
+//! sandbox default, the digest fields, exit status, and resume's limits. The
+//! provider lists and stale cutoffs in it are filled in from
+//! `provider::Provider` at runtime, so they cannot drift. Change the behaviour,
+//! change the help.
+
 use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP_TEMPLATE: &str = "\

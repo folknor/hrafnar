@@ -1,5 +1,7 @@
-// Live and persisted summaries share common rendering here. Provider-specific
-// evidence retains its adapter renderer; output is already the rendering owner.
+//! Printing a result: the digest above the message, and the command to
+//! continue the session. Live and persisted summaries share this rendering;
+//! provider-specific evidence keeps its adapter's renderer.
+
 use super::*;
 
 pub fn print_result(result: &ProviderResult) {
