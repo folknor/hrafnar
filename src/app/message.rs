@@ -464,7 +464,7 @@ async fn run_session_resume(
         }
     };
 
-    let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
+    let digest_summary = super::launch::summary_of(&result);
     audit::log_result(
         &project_root,
         private,
@@ -481,7 +481,7 @@ async fn run_session_resume(
     // clock tracks prompt-cache warmth, not answer quality. Reprocessing the
     // session prefix warms the cache regardless of whether the turn produced a
     // real final answer - a codex mid-turn death (which comes back as
-    // `Ok`-with-a-death-digest) warmed it just as much as a clean run. Gating on
+    // `Ok`-with-a-death-outcome) warmed it just as much as a clean run. Gating on
     // "did we get a good answer" (the old `!died_without_answer` clause) meant a
     // dead intermediate resume left the clock pinned to the last *successful*
     // touch, so the next resume of a genuinely-warm session was wrongly refused

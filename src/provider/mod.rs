@@ -3,6 +3,7 @@ mod codex;
 mod grok;
 mod kind;
 mod model;
+mod outcome;
 mod output;
 mod permissions;
 mod result;
@@ -13,6 +14,7 @@ pub use claude::run_claude;
 pub use codex::run_codex_json;
 pub use kind::{Provider, UnknownProvider};
 pub use model::ModelSpec;
+pub use outcome::{Answer, EndedBy, OPERATOR_INTERRUPT, Outcome, SIGNAL_STOP, StatusFacts, Turn};
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
 pub use result::{Digest, DigestSummary, ProviderResult, RunOutput, Served, Usage, now_epoch_secs};
@@ -24,9 +26,7 @@ pub use session::{SessionId, SessionStart};
 
 use codex::run_codex;
 use grok::run_grok;
-use result::{
-    answered_status_digest, no_answer_digest, result_served, review_no_answer_digest, signal_name,
-};
+use result::{answered_status_digest, result_served, signal_name, status_digest};
 
 #[cfg(test)]
 mod tests;
@@ -366,7 +366,10 @@ pub async fn invoke(
     match result {
         Ok(run) => ProviderResult {
             provider,
-            output: Ok(run.text),
+            output: Ok(Turn {
+                text: run.text,
+                outcome: run.outcome,
+            }),
             session_id: run.session_id,
             codex_home: run.codex_home,
             digest: run.digest,

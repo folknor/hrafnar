@@ -9,24 +9,16 @@ pub struct Usage {
     pub reasoning_output_tokens: u64,
 }
 
-/// Structured summary of a codex run, distilled from its NDJSON stream plus the
-/// `-o`/`--output-last-message` backstop. Grok and claude produce one from their
-/// result object only when a run did not end in a clean answer.
+/// The forensic record of a run: process status, counts, and what codex left
+/// on disk. How the run ended is not here - that is the `Outcome` on the
+/// run's `Turn`, which every decision reads. Codex always builds one; grok and
+/// claude only when the process status is worth keeping.
+#[derive(Default)]
 pub struct Digest {
-    /// Process exit code (`None` if terminated by a signal).
+    /// Process exit code (`None` if terminated by a signal or unknown).
     pub exit_code: Option<i32>,
     /// Signal name when the process was killed by one, else `None`.
     pub signal: Option<String>,
-    /// Whether the final message came from the authoritative `-o` file (which
-    /// is written only on a real final message and survives a frozen stream).
-    /// `false` means we fell back to the transcript or the last streamed
-    /// message, or none at all.
-    pub captured: bool,
-    /// The `-o` file was empty but the real `final_answer` was salvaged from the
-    /// on-disk rollout transcript (codex finished the turn but truncated its
-    /// stream/`-o` on a shutdown-exit). The reported text is authentic, not an
-    /// interim note.
-    pub recovered_from_transcript: bool,
     pub turns: u32,
     pub usage: Usage,
     /// Non-JSON stdout lines (codex ERROR/WARN, apply_patch dumps). The harness
@@ -38,13 +30,6 @@ pub struct Digest {
     /// Directory of the forensic bundle written for a suspicious run (stderr,
     /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
     pub incident_path: Option<String>,
-    /// Set when `review` killed codex rather than waiting for it to exit on its
-    /// own: either the rollout watchdog fired (codex had written its final
-    /// answer but would not exit) or the operator signalled us. The exit
-    /// code/signal below will therefore describe *our* kill, not codex's own
-    /// fate - without this field a watchdog kill would be indistinguishable
-    /// from codex being killed by something else.
-    pub terminated_by_review: Option<String>,
     /// How long the rollout had been unchanged when the watchdog decided to act.
     /// Recorded so a stall-timeout misfire on a healthy run shows how close the
     /// call was, rather than only that it happened.
@@ -52,19 +37,6 @@ pub struct Digest {
     /// `type/payload.type` of the last rollout event - what codex was doing when
     /// it went silent.
     pub last_rollout_event: Option<String>,
-    /// Message from a stream `error` / `turn.failed` event: codex itself
-    /// explaining why the turn ended, most commonly an upstream refusal (content
-    /// flagged, rate limit, auth). Distinct from every other failure mode here in
-    /// that the cause is *known and stated*, so it must not be reported as a
-    /// mystery death or retried - see `print_digest` and the auto-resume gate.
-    pub turn_error: Option<String>,
-    /// A failure diagnosed by review, independent of whether a provider
-    /// produced an answer. Never a provider-stated reason or process status.
-    pub review_error: Option<String>,
-    /// The operator ended this run with `review interrupt`. Its missing answer
-    /// is therefore deliberate: no auto-resume, no incident bundle, and the
-    /// output says how to continue the session instead of reporting a death.
-    pub interrupted: bool,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -118,18 +90,15 @@ pub struct DigestSummary {
 }
 
 impl Digest {
-    /// An answer and successful verification are separate facts. Callers use
-    /// this verdict for exit status, retaining captured for answer/retry logic.
-    pub fn failed(&self) -> bool {
-        self.review_error.is_some() || (!self.captured && !self.recovered_from_transcript)
-    }
-
-    pub fn summary(&self) -> DigestSummary {
+    /// The flat persisted form: these forensics plus the outcome's facts,
+    /// under the field names the logs have always used.
+    pub fn summary(&self, outcome: &super::Outcome) -> DigestSummary {
+        use super::outcome::{Answer, EndedBy};
         DigestSummary {
             exit_code: self.exit_code,
             signal: self.signal.clone(),
-            captured: self.captured,
-            recovered_from_transcript: self.recovered_from_transcript,
+            captured: outcome.answer == Answer::Captured,
+            recovered_from_transcript: outcome.answer == Answer::Recovered,
             turns: self.turns,
             task_complete: self.transcript.as_ref().map(|t| t.task_complete),
             stream_error: self.transcript.as_ref().map(|t| t.stream_error),
@@ -138,19 +107,45 @@ impl Digest {
             output_tokens: self.usage.output_tokens,
             reasoning_output_tokens: self.usage.reasoning_output_tokens,
             incident_path: self.incident_path.clone(),
-            terminated_by_review: self.terminated_by_review.clone(),
+            terminated_by_review: outcome.termination().map(str::to_string),
             quiet_secs: self.quiet_secs,
             last_rollout_event: self.last_rollout_event.clone(),
-            turn_error: self.turn_error.clone(),
-            review_error: self.review_error.clone(),
-            interrupted: self.interrupted,
+            turn_error: outcome.stated.clone(),
+            review_error: outcome.unverified.clone(),
+            interrupted: matches!(outcome.ended_by, EndedBy::Interrupted(_)),
+        }
+    }
+
+    /// The facts the outcome lines are read against.
+    pub fn status_facts(&self) -> super::outcome::StatusFacts<'_> {
+        super::outcome::StatusFacts {
+            exit_code: self.exit_code,
+            signal: self.signal.as_deref(),
+            quiet_secs: self.quiet_secs,
+            last_event: self.last_rollout_event.as_deref(),
+            task_complete: self.transcript.as_ref().map(|t| t.task_complete),
+        }
+    }
+}
+
+impl DigestSummary {
+    pub fn status_facts(&self) -> super::outcome::StatusFacts<'_> {
+        super::outcome::StatusFacts {
+            exit_code: self.exit_code,
+            signal: self.signal.as_deref(),
+            quiet_secs: self.quiet_secs,
+            last_event: self.last_rollout_event.as_deref(),
+            task_complete: self.task_complete,
         }
     }
 }
 
 pub struct ProviderResult {
     pub provider: super::Provider,
-    pub output: Result<String>,
+    /// The turn the run established, or why none was: a spawn failure, an
+    /// unknown model, a provider that ended before it showed the session
+    /// began. Launch metadata below exists either way.
+    pub output: Result<super::Turn>,
     /// Session ID associated with this invocation, when one is known to the
     /// caller. Fresh runs capture the newly-created session; resumes retain
     /// the ID they were given.
@@ -158,7 +153,8 @@ pub struct ProviderResult {
     /// Resolved Codex home used for rollout lookup, persisted so resumes and
     /// session forensics can find the same session even when a profile set it.
     pub codex_home: Option<String>,
-    /// Structured run summary (codex only, today).
+    /// Forensics: always for codex, for grok and claude only when the process
+    /// status is worth keeping.
     pub digest: Option<Digest>,
     /// UNIX seconds when this run actually finished. Stamped here rather than at
     /// sidecar-record time so the cold-cache clock reflects completion, not the
@@ -229,6 +225,7 @@ pub fn now_epoch_secs() -> u64 {
 /// alongside the text without a widening tuple.
 pub struct RunOutput {
     pub text: String,
+    pub outcome: super::Outcome,
     /// Session ID associated with this invocation, including a resumed ID.
     pub session_id: Option<String>,
     /// Resolved Codex home used for rollout lookup, when this is a Codex run.
@@ -263,76 +260,24 @@ pub(super) fn result_served(stdout: &str) -> Served {
     }
 }
 
-/// A post-answer process problem is an observed status, not a provider-stated
-/// turn failure. Both runners keep the answer and apply this same rule.
+/// The process status of a grok or claude run, when it is worth keeping: a
+/// non-zero or unknown exit after an answer is still an answer (the outcome
+/// says so), but the status is the only sign something went wrong after the
+/// turn, so it is recorded. `None` for a clean exit.
 pub(super) fn answered_status_digest(status: Option<&std::process::ExitStatus>) -> Option<Digest> {
-    (!status.is_some_and(std::process::ExitStatus::success)).then(|| Digest {
-        captured: true,
-        turn_error: None,
-        ..no_answer_digest(String::new(), status)
-    })
+    (!status.is_some_and(std::process::ExitStatus::success)).then(|| status_digest(status))
 }
 
-/// A grok or claude turn that ran but produced no answer, expressed the same way
-/// codex's deaths are: `Ok` carrying a digest, never `Err`. Written for grok;
-/// claude reports its turns the same way (a result object that says whether it
-/// is an error), so everything below applies to it unchanged.
-///
-/// The distinction that matters is between *never reaching the provider* (a
-/// spawn failure, an unknown model, a session that does not exist - nothing ran,
-/// no session exists to resume, no prompt cache was warmed) and *running a turn
-/// that produced no answer*. Only the first is an `Err`. Collapsing the second
-/// into `Err` too costs two things that are invisible until you need them:
-/// `invoke` forces `session_id: None` on the error path, so the id grok already
-/// minted is dropped and the cut-off turn cannot be resumed - exactly the turn
-/// most worth resuming; and `review resume` refreshes its cold-cache clock on
-/// `output.is_ok()`, so a resume that ran and warmed the cache would leave the
-/// clock stale and get the *next* resume refused. Codex avoids both by returning
-/// `Ok` with a death digest, and grok has no reason to differ.
-///
-/// `turn_error` is the honest field for it: grok stated why the turn ended, so
-/// this is a stated failure in exactly the sense codex means, and it prints
-/// first, persists flat, and never invites a retry. The remaining fields
-/// describe a run with no captured answer, which is what happened; the
-/// codex-specific forensics stay `None` because grok has no rollout.
-pub(super) fn no_answer_digest(
-    reason: String,
-    status: Option<&std::process::ExitStatus>,
-) -> Digest {
+/// A grok or claude run's observed process status as forensics. The *observed*
+/// status, never an assumed one: the exit code is what an operator reads to
+/// tell "the provider declined" from "the provider was killed", and `None`
+/// means the keeper could not report it.
+pub(super) fn status_digest(status: Option<&std::process::ExitStatus>) -> Digest {
     Digest {
-        // The *observed* status, not an assumed one. Hardcoding `1` here made
-        // the digest assert something it had never looked at - and the exit
-        // code is the field an operator reads to tell "grok declined" from
-        // "grok was killed". `None` when the keeper could not report it.
         exit_code: status.and_then(std::process::ExitStatus::code),
         signal: status.and_then(signal_name),
-        captured: false,
-        recovered_from_transcript: false,
-        turns: 0,
-        usage: Usage::default(),
-        log_lines: Vec::new(),
-        transcript: None,
-        incident_path: None,
-        terminated_by_review: None,
-        quiet_secs: None,
-        last_rollout_event: None,
-        turn_error: Some(reason),
-        review_error: None,
-        interrupted: false,
+        ..Digest::default()
     }
-}
-
-/// A missing provider result field is review's diagnosis, not a reason the
-/// provider stated. Keep the no-answer and observed-status facts while
-/// attributing the explanation to `review_error`.
-pub(super) fn review_no_answer_digest(
-    reason: String,
-    status: Option<&std::process::ExitStatus>,
-) -> Digest {
-    let mut digest = no_answer_digest(String::new(), status);
-    digest.turn_error = None;
-    digest.review_error = Some(reason);
-    digest
 }
 
 /// Signal name when a process was terminated by a signal, else `None`.

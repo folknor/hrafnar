@@ -103,19 +103,22 @@ fn grok_cancelled_turn_is_not_an_answer() {
 
     // It must still read as a failure everywhere that matters: exit code,
     // greppable digest, and no auto-resume (a stated reason is not a wedge).
-    let digest = super::no_answer_digest(reason, Some(&exited(1)));
+    let digest = super::status_digest(Some(&exited(1)));
     assert_eq!(
         digest.exit_code,
         Some(1),
         "the digest reports the status we observed"
     );
-    assert!(!digest.captured, "nothing was captured");
+    let outcome = super::Outcome::no_answer().stated(reason);
+    assert!(outcome.failed() && outcome.stated_failure().is_some());
+    let summary = digest.summary(&outcome);
+    assert!(!summary.captured, "nothing was captured");
     assert!(
-        !digest.recovered_from_transcript,
+        !summary.recovered_from_transcript,
         "grok has no rollout to recover from"
     );
     assert!(
-        digest.summary().turn_error.is_some(),
+        summary.turn_error.is_some(),
         "the reason persists flat, so these stay greppable"
     );
 }
@@ -195,15 +198,15 @@ fn grok_missing_stop_reason_is_not_an_answer() {
         review_error,
         "the missing stop reason is review's diagnosis"
     );
-    let digest = super::review_no_answer_digest(reason, Some(&exited(0)));
-    assert!(digest.turn_error.is_none());
+    let outcome = super::Outcome::no_answer().unverified(reason);
+    assert!(outcome.stated.is_none());
     assert!(
-        digest
-            .review_error
+        outcome
+            .unverified
             .as_deref()
             .is_some_and(|message| message.contains("stopReason: missing"))
     );
-    assert!(digest.failed());
+    assert!(outcome.failed());
 }
 
 #[test]
@@ -249,21 +252,38 @@ fn grok_typed_error_line_keeps_its_message() {
     );
 }
 
+/// A grok run as `run_grok_turn` returns it, for the wake-failure tests.
+fn grok_run(outcome: super::Outcome, digest: Option<super::Digest>) -> super::RunOutput {
+    super::RunOutput {
+        text: String::new(),
+        outcome,
+        session_id: None,
+        codex_home: None,
+        digest,
+        served: super::Served::default(),
+        leftovers: crate::contained::Leftovers::default(),
+    }
+}
+
 #[test]
 fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
-    let digest = super::wake_failure_digest("unread background results".to_string(), None);
-    assert!(digest.captured, "verification cannot retract an answer");
+    let mut run = grok_run(super::Outcome::answered(super::Answer::Captured), None);
+    let digest = super::wake_failure(&mut run, "unread background results".to_string());
+    assert!(
+        run.outcome.has_answer(),
+        "verification cannot retract an answer"
+    );
     assert_eq!(
         digest.exit_code,
         Some(0),
         "the completed turn exited cleanly"
     );
     assert!(
-        digest.turn_error.is_none(),
+        run.outcome.stated.is_none(),
         "grok did not state this diagnosis"
     );
-    assert!(digest.failed(), "unverified work still fails the run");
-    let summary = digest.summary();
+    assert!(run.outcome.failed(), "unverified work still fails the run");
+    let summary = digest.summary(&run.outcome);
     assert_eq!(
         summary.review_error.as_deref(),
         Some("unread background results")
@@ -273,33 +293,40 @@ fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
 
 #[test]
 fn review_verification_failure_preserves_provider_failure_and_usage() {
-    let mut last = super::no_answer_digest("cancelled".to_string(), Some(&exited(7)));
+    let mut last = super::status_digest(Some(&exited(7)));
     last.turns = 3;
     last.usage.output_tokens = 42;
-    let digest = super::wake_failure_digest("cannot read update log".to_string(), Some(last));
-    assert!(!digest.captured);
+    let mut run = grok_run(
+        super::Outcome::no_answer().stated("cancelled".to_string()),
+        Some(last),
+    );
+    let digest = super::wake_failure(&mut run, "cannot read update log".to_string());
+    assert!(!run.outcome.has_answer());
     assert_eq!(digest.exit_code, Some(7));
-    assert_eq!(digest.turn_error.as_deref(), Some("cancelled"));
+    assert_eq!(run.outcome.stated.as_deref(), Some("cancelled"));
+    assert_eq!(
+        run.outcome.unverified.as_deref(),
+        Some("cannot read update log")
+    );
     assert_eq!(digest.turns, 3);
     assert_eq!(digest.usage.output_tokens, 42);
-    assert!(digest.failed());
+    assert!(run.outcome.failed());
 }
 
 #[test]
 fn review_verification_failure_preserves_a_signal_after_an_answer() {
     use std::os::unix::process::ExitStatusExt;
     let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
-    let mut last = super::no_answer_digest(String::new(), Some(&status));
-    last.turn_error = None;
-    last.captured = true;
+    let answered = super::Outcome::answered(super::Answer::Captured);
     assert!(
-        !last.failed(),
+        !answered.failed(),
         "post-answer process status alone is not a failed turn"
     );
-    let digest = super::wake_failure_digest("cannot verify results".to_string(), Some(last));
-    assert!(digest.captured);
+    let mut run = grok_run(answered, Some(super::status_digest(Some(&status))));
+    let digest = super::wake_failure(&mut run, "cannot verify results".to_string());
+    assert!(run.outcome.has_answer());
     assert_eq!(digest.exit_code, None);
     assert_eq!(digest.signal.as_deref(), Some("SIGTERM"));
-    assert!(digest.turn_error.is_none());
-    assert!(digest.failed());
+    assert!(run.outcome.stated.is_none());
+    assert!(run.outcome.failed());
 }

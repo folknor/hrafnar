@@ -2,36 +2,15 @@
 
 use crate::{audit, provider, sessions};
 
-/// A run that ended with no real final answer - no `-o` capture and
-/// nothing recovered from the rollout. This is the death worth resuming past;
-/// a run that captured or recovered an answer is not retried.
-fn died_without_answer(r: &provider::ProviderResult) -> bool {
-    match &r.digest {
-        Some(d) => !d.captured && !d.recovered_from_transcript,
-        None => false,
-    }
+/// The persisted summary of a run: its turn's outcome over its forensics,
+/// absent only for a clean answer with nothing to record.
+pub(super) fn summary_of(r: &provider::ProviderResult) -> Option<provider::DigestSummary> {
+    r.output.as_ref().ok()?.summary(r.digest.as_ref())
 }
 
-/// Codex's own stated reason for the turn ending (a stream `error`/`turn.failed`
-/// event) - an upstream refusal, a rate limit, an auth failure.
-///
-/// This is the one death class auto-resume must *not* touch. Auto-resume exists
-/// for the mid-turn wedge, where the work was real and interrupted, so replaying
-/// it can finish the job. A stated failure is a verdict on the request itself:
-/// resending it produces the identical failure, at full cost, and files a second
-/// incident bundle that looks like a second death. Every observed refusal in this
-/// workspace has shown up as exactly that - a pair of bundles seconds apart.
-fn stated_failure(r: &provider::ProviderResult) -> Option<&str> {
-    r.digest.as_ref()?.turn_error.as_deref()
-}
-
-/// A run that produced a real final answer (captured from `-o` or recovered from
-/// the rollout). Used to decide whether an auto-resume actually helped.
-fn got_final_answer(r: &provider::ProviderResult) -> bool {
-    match &r.digest {
-        Some(d) => d.captured || d.recovered_from_transcript,
-        None => false,
-    }
+/// The outcome of a run that established a turn.
+fn outcome_of(r: &provider::ProviderResult) -> Option<&provider::Outcome> {
+    r.output.as_ref().ok().map(|turn| &turn.outcome)
 }
 
 /// Write one provider run to the audit log and, if it captured a session, the
@@ -49,7 +28,7 @@ fn record_run(
     kind: sessions::SessionKind,
 ) {
     let session_for_log = result.session_id.as_deref().unwrap_or("");
-    let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
+    let digest_summary = summary_of(result);
     audit::log_result(
         project_root,
         private,
@@ -207,10 +186,14 @@ enum AfterRun {
 /// an interrupted run, a stated reason for producing nothing, and a teardown
 /// that left processes running are left alone.
 fn after_run(first: &provider::ProviderResult) -> AfterRun {
-    if first.digest.as_ref().is_some_and(|d| d.interrupted) {
+    let outcome = outcome_of(first);
+    if outcome.is_some_and(provider::Outcome::interrupted) {
         return AfterRun::Interrupted;
     }
-    if let Some(why) = stated_failure(first).filter(|_| died_without_answer(first)) {
+    // A stated reason for producing nothing is a verdict on the request
+    // itself: resending it buys the identical failure at full cost, and files
+    // a second incident bundle that looks like a second death.
+    if let Some(why) = outcome.and_then(provider::Outcome::stated_failure) {
         return AfterRun::StatedFailure(why.to_string());
     }
     let Some(nudge) = provider::recovery(first) else {
@@ -237,10 +220,11 @@ fn after_auto_resume(
     first: provider::ProviderResult,
     mut second: provider::ProviderResult,
 ) -> TaskOutcome {
-    if got_final_answer(&second) {
-        if let Ok(text) = second.output.as_mut() {
-            *text = format!(
-                "(auto-resumed after the initial run died without a final answer)\n\n{text}"
+    if outcome_of(&second).is_some_and(provider::Outcome::has_answer) {
+        if let Ok(turn) = second.output.as_mut() {
+            turn.text = format!(
+                "(auto-resumed after the initial run died without a final answer)\n\n{}",
+                turn.text
             );
         }
         return TaskOutcome {
@@ -250,7 +234,7 @@ fn after_auto_resume(
             also_kind: Some(sessions::SessionKind::Run),
         };
     }
-    if second.digest.as_ref().is_some_and(|d| d.interrupted) {
+    if outcome_of(&second).is_some_and(provider::Outcome::interrupted) {
         return TaskOutcome {
             result: second,
             also: Some(first),
@@ -370,7 +354,7 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
     if provider::stop_requested()
         && let (Some(sid), Some(true)) = (
             outcome.result.session_id.as_deref(),
-            outcome.result.digest.as_ref().map(|d| d.interrupted),
+            outcome_of(&outcome.result).map(provider::Outcome::interrupted),
         )
     {
         eprintln!("{}", provider::resume_hint(prov, sid));
@@ -386,27 +370,23 @@ mod tests {
     /// A codex result with session `sid`: `answered` says whether `-o` captured
     /// a final answer; `interrupted` whether `review interrupt` ended it.
     fn codex_run(sid: &str, answered: bool, interrupted: bool) -> provider::ProviderResult {
+        let answer = if answered {
+            provider::Answer::Captured
+        } else {
+            provider::Answer::None
+        };
         provider::ProviderResult {
             provider: provider::Provider::Codex,
-            output: Ok(format!("text of {sid}")),
+            output: Ok(provider::Turn {
+                text: format!("text of {sid}"),
+                outcome: provider::Outcome::answered(answer).ended(interrupted, false, None),
+            }),
             session_id: Some(sid.into()),
             codex_home: None,
             digest: Some(provider::Digest {
                 exit_code: Some(i32::from(!answered)),
-                signal: None,
-                captured: answered,
-                recovered_from_transcript: false,
                 turns: 1,
-                usage: provider::Usage::default(),
-                log_lines: Vec::new(),
-                transcript: None,
-                incident_path: None,
-                terminated_by_review: None,
-                quiet_secs: None,
-                last_rollout_event: None,
-                turn_error: None,
-                review_error: None,
-                interrupted,
+                ..provider::Digest::default()
             }),
             completed_epoch: 0,
             permissions: None,
@@ -488,13 +468,13 @@ mod tests {
             codex_run("second", false, true),
         );
         assert_eq!(
-            outcome.result.output.as_deref().ok(),
+            outcome.result.output.as_ref().ok().map(|t| t.text.as_str()),
             Some("text of second")
         );
         assert!(
             outcome
                 .also
-                .is_some_and(|r| r.output.as_deref().ok() == Some("text of first"))
+                .is_some_and(|r| r.output.as_ref().is_ok_and(|t| t.text == "text of first"))
         );
     }
 
@@ -504,7 +484,10 @@ mod tests {
             codex_run("first", false, false),
             codex_run("second", false, false),
         );
-        assert_eq!(outcome.result.output.as_deref().ok(), Some("text of first"));
+        assert_eq!(
+            outcome.result.output.as_ref().ok().map(|t| t.text.as_str()),
+            Some("text of first")
+        );
     }
 
     #[test]
@@ -513,7 +496,7 @@ mod tests {
             codex_run("first", false, false),
             codex_run("second", true, false),
         );
-        let text = outcome.result.output.expect("text");
+        let text = outcome.result.output.expect("text").text;
         assert!(text.starts_with("(auto-resumed"), "got {text:?}");
         assert!(text.ends_with("text of second"));
     }

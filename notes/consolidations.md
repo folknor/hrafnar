@@ -22,12 +22,14 @@ The per-provider questions below are owned by `provider::Provider`
 (src/provider/kind.rs) and the exhaustive matches beside it, described in
 `notes/structural.md`. Each entry here keeps only its residue.
 
-## CON-006 - Did this run produce an answer?
+## CON-006 - Did codex's evidence hold a final answer?
 
 Reported by: providers, orchestration, forensics.
 
-Sites:
-- `run_codex_json`: `captured` means the `-o` file is non-empty.
+The run-level question is settled: every runner builds one
+`provider::Outcome` and every decision reads `has_answer`/`failed`. What
+remains is codex's evidence readers, which still answer "is there a final
+answer" each in their own way over the rollout and stream:
 - `run_codex_json`'s stream parser: the last `item.completed` agent_message,
   used as fallback text, unphased (it can be commentary the user then sees as
   the answer under a death note).
@@ -35,74 +37,31 @@ Sites:
 - `watchdog::has_final_answer`: any phase-tagged answer since the baseline.
 - `incident::scan_transcript`: the last `task_complete.last_agent_message` is
   non-null.
-- `app::died_without_answer`: digest present, not captured, not recovered;
-  `None` digest reads as answered.
-- `app::got_final_answer`: digest present and captured or recovered; `None`
-  digest reads as not answered. The two are not complements: for a
-  digest-less result both are false, and nothing says so.
-- The fan-out's `all_failed` (`output.is_err() || died_without_answer`) and
-  `run_session_resume`'s exit status, restating the same expression.
-- codex's `interrupted = interrupt_requested && !captured && !recovered`.
-- The grok wake loop's `turn_error.is_some() && !captured`.
-- `app::digest_summary_note`'s `turn_error.is_some() && !d.captured`, whose
-  comment says "The live `print_digest` has the same gate".
-- `provider::print_digest`'s `!d.captured` branch.
-- `app::run_incidents`' verdict (`turn_error`, `recovered_from_transcript`,
-  `final_answer_present`).
 - `run_session_show`: `task_complete && final_answer.is_none()` means "likely
   died mid-work".
 
-They already disagree. The Stranded-kill and `scan_transcript` defects in
-`notes/bugs.md` are two of the disagreements. `got_final_answer` is wrong for
-claude and grok, whose clean answers carry no digest; it is harmless only
-because only codex reaches `after_auto_resume`. `after_auto_resume` uses
-`got_final_answer` while the exit status uses `!died_without_answer`: a maki
-result with no digest would be "answered" for the exit code and "unanswered"
-for auto-resume. Owner proposed: one outcome value computed once by the runner
-(for codex, from one rollout fold plus the `-o` file), persisted in the row,
-with `has_answer()` a method on it. The type is in `notes/structural.md`.
+The Stranded-kill and `scan_transcript` defects in `notes/bugs.md` are two of
+their disagreements. Owner proposed: one rollout fold whose result feeds the
+codex runner's `Answer` and every reader above.
 
-## CON-007 - How did the run end, in words?
+## CON-007 - How did the run end, in words? (codex residue)
 
 Reported by: providers, forensics, orchestration.
 
-Five renderings, each checking `turn_error`, `terminated_by_review`,
-`interrupted`, `recovered_from_transcript`, `captured`, `exit_code` and
-`signal` in its own order:
+The digest's outcome lines have one renderer, `Outcome::lines`, used live and
+by `review sessions <ID>`. Still separate:
 - `run_codex_json`'s fallback text ("codex ended the turn", "interrupted by the
   operator", "codex produced no final message", "codex died without a final
-  answer").
-- `provider::print_digest`'s note ladder (live `Digest`).
-- `app::digest_summary_note` with `print_digest_summary` (persisted
-  `DigestSummary`).
-- `app::run_incidents`' verdict ladder.
-- `run_session_show`'s "rollout has no final answer" note; `run_session_show`
-  also re-renders the transcript block `print_digest` renders.
+  answer"), and claude's "(interrupted by the operator before a final
+  answer)", which restate the outcome as response text.
+- `run_session_show`'s "rollout has no final answer" note and its re-render of
+  the transcript block `print_digest` renders.
 
-They already differ: `print_digest` checks `turn_error` before
-`terminated_by_review` and has no "interrupted" note, relying on
-`terminated_by_review`; `digest_summary_note` checks `interrupted` first and
-ignores `terminated_by_review` unless interrupted. A code comment is the only
-thing keeping two of them aligned. maki's `is_error: true` with exit 0 would
-map onto `captured`/`turn_error`/`exit_code`, which each ladder orders
-differently. Owner proposed: compute the outcome once, persist it, and have one
-renderer over the persisted form called from both the live and the post-hoc
-paths, so `review incidents` and `review sessions` read the verdict instead of
-re-inferring it.
-
-## CON-008 - Is this a stated failure that must not be retried?
-
-Reported by: providers, orchestration.
-
-`app::stated_failure` (any `turn_error`) and the grok wake loop's own check
-answer it against the same fields with the same meaning. Because `turn_error`
-also carries `review`'s own remarks (see the turn-failure entry in
-`notes/bugs.md`), both treat `review`'s verification failures as provider
-statements. The orchestration hunter adds that `AfterRun::StatedFailure(String)`
-is prose; a coarse enum (rate limit, refusal, auth) would be worth having once
-auto-resume policy grows past codex. Owner proposed: a `Stated` cause on the
-typed outcome, separate from an `Unverified` cause for `review`'s own
-diagnoses.
+`run_incidents`' verdict is deliberately separate: it reads bundle metadata,
+whose `final_answer_present` is a tri-state the outcome cannot express (the
+reasoning is at the site). Owner proposed: the placeholder text derived from
+the outcome in one place, so maki and opencode do not write a third and
+fourth copy.
 
 ## CON-009 - Was this run interrupted, and what does an interrupted run say?
 
@@ -121,32 +80,17 @@ Sources of the fact:
   on `watched_session_id` in codex; grok does neither (harmless while a grok
   request cannot be made, but a step a new runner will forget).
 
-What an interrupted run says: claude's `interrupted_digest`/`interrupted_text`
-and codex's interrupted block each write the "(interrupted by the operator
-before a final answer)" text and the two `terminated_by_review` strings, and
-each applies "an answer wins over an interrupt request": claude by matching
-the `Answered` arm before checking the request, codex with
-`!captured && !recovered`. maki and opencode would add a third and fourth
-copy.
+What an interrupted run says: the answer-wins rule and the two termination
+strings now live once, in `Outcome::ended`. The "(interrupted by the operator
+before a final answer)" placeholder text is still written by claude and codex
+separately (see CON-007).
 
 Owner proposed: the keeper reports whether it delivered a SIGINT
 (`Event::Interrupted { by: Control | Signal }` or a field on `Done`), making
 "interrupted" one fact from one source; the request file then only tells the
 owner that an external SIGINT was operator intent, and even that can go if
-`interrupt_cmd` writes `i` down a path the owner reads. The interrupt text and
-the answer-wins rule move into the shared lifecycle driver.
-
-## CON-010 - Answered, but the process exited non-zero or with unknown status
-
-Reported by: providers.
-
-claude's `Answered` arm and grok's `Answered` arm are near-verbatim copies:
-`captured: true` plus `no_answer_digest(...)` with an "exited non-zero after
-producing an answer" or "exit status is unknown" message. codex decides the
-same case differently: the digest records `exit_code`, `captured = true` and
-`suspicious = true`, which writes an incident bundle. Three providers, two
-answers. Owner proposed: an `Answered { after: Option<PostAnswerAnomaly> }`
-shape on the typed outcome, decided once.
+`interrupt_cmd` writes `i` down a path the owner reads. The interrupt text
+moves into the shared lifecycle driver.
 
 ## CON-011 - When does the in-flight marker go up, and when is the pid offered?
 
@@ -469,16 +413,6 @@ call sites, held apart by a comment. `scan_transcript` and the transcript tail
 skip scoping entirely. Owner proposed:
 `enum Scope { WholeFile, From(RolloutOffset), Untrusted }` passed to every
 rollout reader, with `slice` total over it.
-
-## CON-038 - Is this run suspicious, and is it an incident?
-
-Reported by: forensics.
-
-Suspicion is decided once (`!captured || exit != 0 || signal`) and gates the
-transcript read and the bundle, which the hunter calls fine. "Is this an
-incident?" is `suspicious && !interrupted` inline, and `run_incidents`
-re-decides "explained vs mystery" from `turn_error`. Owner proposed: an
-`is_incident()` method on the typed outcome.
 
 ## CON-040 - What does grok think of its trust store?
 

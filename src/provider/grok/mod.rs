@@ -97,8 +97,8 @@ const GROK_MAX_WAKES: u32 = 10;
 /// `GROK_MAX_WAKES` is reached (each wake delivers what it names, so the cap
 /// only stops a model that keeps starting new background work). It does not
 /// wake after a stated failure - grok said why the turn ended, and resending
-/// buys the same answer (`app::stated_failure`); that digest already fails the
-/// run. A wake turn that fails to launch keeps the first turn's output and
+/// buys the same answer (`Outcome::stated_failure`); that outcome already
+/// fails the run. A wake turn that fails to launch keeps the first turn's output and
 /// session id rather than dropping both.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_grok(
@@ -166,7 +166,7 @@ pub(super) async fn run_grok(
         Err(e) => {
             let reason = format!("could not verify grok's background results: {e:#}");
             eprintln!("grok: {reason}");
-            let mut digest = wake_failure_digest(reason, first.digest.take());
+            let mut digest = wake_failure(&mut first, reason);
             digest.turns = first_turns;
             digest.usage = first_usage;
             first.digest = Some(digest);
@@ -190,7 +190,7 @@ pub(super) async fn run_grok(
             Err(e) => {
                 let reason = format!("could not verify grok's background results: {e}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure_digest(reason, out.digest.take()));
+                out.digest = Some(wake_failure(&mut out, reason));
                 break;
             }
         };
@@ -198,12 +198,8 @@ pub(super) async fn run_grok(
             break;
         }
         // A failed turn is not fixed by waking, whether grok stated a reason or
-        // review found its stop reason missing. The digest already fails it.
-        if out
-            .digest
-            .as_ref()
-            .is_some_and(|d| (d.turn_error.is_some() || d.review_error.is_some()) && !d.captured)
-        {
+        // review found its stop reason missing. The outcome already fails it.
+        if out.outcome.explained_failure() {
             break;
         }
         // A signal can arrive after this turn but before we wake it. Do not
@@ -213,7 +209,7 @@ pub(super) async fn run_grok(
         if *runtime.stop.borrow() {
             let reason = "grok wake-up not launched: review was signalled to stop".to_string();
             eprintln!("grok: {reason}");
-            out.digest = Some(wake_failure_digest(reason, out.digest.take()));
+            out.digest = Some(wake_failure(&mut out, reason));
             break;
         }
         let names: Vec<String> = pending.iter().map(state::Unread::id).collect();
@@ -223,7 +219,7 @@ pub(super) async fn run_grok(
                 names.join(", ")
             );
             eprintln!("grok: {reason} - giving up on session {sid}");
-            out.digest = Some(wake_failure_digest(reason, out.digest.take()));
+            out.digest = Some(wake_failure(&mut out, reason));
             break;
         }
         wakes += 1;
@@ -239,9 +235,9 @@ pub(super) async fn run_grok(
         let wake = match SessionId::parse(&sid) {
             Ok(id) => SessionStart::Resume(id),
             Err(e) => {
-                out.digest = Some(wake_failure_digest(
+                out.digest = Some(wake_failure(
+                    &mut out,
                     format!("invalid wake session id: {e}"),
-                    out.digest.take(),
                 ));
                 break;
             }
@@ -266,7 +262,7 @@ pub(super) async fn run_grok(
                 // on `Err`, which would cost the sidecar row and any resume.
                 let reason = format!("wake-up turn for session {sid} failed: {e:#}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure_digest(reason, out.digest.take()));
+                out.digest = Some(wake_failure(&mut out, reason));
                 break;
             }
         };
@@ -308,16 +304,14 @@ pub(super) async fn run_grok(
 }
 
 /// Mark a verification failure without rewriting the provider's answer,
-/// stated reason, or observed process status. No digest from run_grok_turn
-/// means it captured an answer and observed a successful exit.
-fn wake_failure_digest(reason: String, last: Option<Digest>) -> Digest {
-    let mut digest = last.unwrap_or_else(|| Digest {
-        captured: true,
-        turn_error: None,
-        ..no_answer_digest(String::new(), Some(&std::process::ExitStatus::default()))
-    });
-    digest.review_error = Some(reason);
-    digest
+/// stated reason, or observed process status, and return the digest the run
+/// keeps. No digest from `run_grok_turn` means it captured an answer and
+/// observed a successful exit.
+fn wake_failure(run: &mut RunOutput, reason: String) -> Digest {
+    run.outcome.unverified = Some(reason);
+    run.digest
+        .take()
+        .unwrap_or_else(|| status_digest(Some(&std::process::ExitStatus::default())))
 }
 
 /// One grok process: a single headless turn.
@@ -534,6 +528,7 @@ async fn run_grok_turn(
     let run = match interpret_grok_output(&stdout, &stderr)? {
         GrokOutcome::Answered(answer) => RunOutput {
             text: answer.text,
+            outcome: Outcome::answered(Answer::Captured),
             session_id: keep_id(answer.session_id),
             codex_home: None,
             served,
@@ -541,8 +536,7 @@ async fn run_grok_turn(
             // A real answer from a process that nonetheless exited non-zero is
             // still a real answer, but the status is worth surfacing rather
             // than discarding - it is the only sign that something went wrong
-            // after the turn finished. `captured: true` keeps it out of
-            // `died_without_answer`, so the run does not fail on it.
+            // after the turn finished.
             digest: answered_status_digest(status.as_ref()).map(with_usage),
         },
         GrokOutcome::NoAnswer {
@@ -561,16 +555,17 @@ async fn run_grok_turn(
             });
             let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
-            let digest = if review_error {
-                review_no_answer_digest(reason, status.as_ref())
+            let outcome = if review_error {
+                Outcome::no_answer().unverified(reason)
             } else {
-                no_answer_digest(reason, status.as_ref())
+                Outcome::no_answer().stated(reason)
             };
             RunOutput {
                 text,
+                outcome,
                 session_id: keep_id(session_id),
                 codex_home: None,
-                digest: Some(with_usage(digest)),
+                digest: Some(with_usage(status_digest(status.as_ref()))),
                 served,
                 leftovers,
             }

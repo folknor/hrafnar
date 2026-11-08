@@ -500,19 +500,29 @@ pub async fn run_claude(
         usage: usage.clone(),
         ..digest
     };
-    // What an interrupted run's digest says instead of claude's own complaint
-    // about it: the missing answer is explained, so no `turn_error`, and the
-    // run is flagged so it is neither retried nor reported as a failure of
-    // claude's.
-    let interrupted_digest = || Digest {
-        turn_error: None,
-        interrupted: true,
-        terminated_by_review: Some(if stopped_by_signal {
-            "review was signalled to stop".to_string()
+    // An abnormal end always keeps its observed status; a clean answer with a
+    // clean exit records no digest, as for grok.
+    let forensics = |outcome: &Outcome| {
+        if outcome.is_clean() {
+            answered_status_digest(status.as_ref()).map(with_usage)
         } else {
-            "operator interrupt (`review interrupt`)".to_string()
-        }),
-        ..with_usage(no_answer_digest(String::new(), status.as_ref()))
+            Some(with_usage(status_digest(status.as_ref())))
+        }
+    };
+    // An interrupt explains the missing answer, so claude's own complaint
+    // about being cut off is not kept as a stated reason; `ended` applies
+    // "an answer wins over an interrupt request".
+    let settle = |outcome: Outcome| {
+        let outcome = outcome.ended(interrupt_requested, stopped_by_signal, None);
+        if outcome.interrupted() {
+            Outcome {
+                stated: None,
+                unverified: None,
+                ..outcome
+            }
+        } else {
+            outcome
+        }
     };
     // What an interrupted run prints in place of an answer, as codex's does.
     let interrupted_text = |text: String| {
@@ -527,37 +537,39 @@ pub async fn run_claude(
     // that then ends without a result still has a session worth keeping.
     let started = *first_rx.borrow();
 
-    let outcome = match interpret_claude_output(&stdout, &stderr) {
-        Ok(outcome) => outcome,
+    let (text, outcome, session_id) = match interpret_claude_output(&stdout, &stderr) {
+        Ok(ClaudeOutcome::Answered { text, session_id }) => {
+            (text, Outcome::answered(Answer::Captured), session_id)
+        }
+        Ok(ClaudeOutcome::NoAnswer {
+            reason,
+            review_error,
+            text,
+            session_id,
+        }) => {
+            let outcome = if review_error {
+                Outcome::no_answer().unverified(reason)
+            } else {
+                Outcome::no_answer().stated(reason)
+            };
+            (text, outcome, session_id)
+        }
         // No result, but claude had started: interrupted before it could
         // answer for itself, or died (killed from outside, crashed) after
         // starting. Either way the session exists, and dropping its id - as an
         // `Err` would, `invoke` setting none - makes the one turn most worth
-        // resuming unresumable. A death is `Ok` with a death digest, as for
-        // codex: no `turn_error`, because claude stated no reason.
-        Err(e) if started => {
-            let digest = if interrupt_requested {
-                interrupted_digest()
-            } else {
-                Digest {
-                    turn_error: None,
-                    ..with_usage(no_answer_digest(String::new(), status.as_ref()))
-                }
-            };
-            let text = if interrupt_requested {
-                interrupted_text(String::new())
+        // resuming unresumable. A death is `Ok` with no stated reason, as for
+        // codex, because claude stated none.
+        // An interrupted one shows the interrupt text instead of the error.
+        Err(e) if started => (
+            if interrupt_requested {
+                String::new()
             } else {
                 format!("(claude ended without a result: {e})")
-            };
-            return Ok(RunOutput {
-                text,
-                session_id: keep_id(None),
-                codex_home: None,
-                digest: Some(digest),
-                served,
-                leftovers,
-            });
-        }
+            },
+            Outcome::no_answer(),
+            None,
+        ),
         // Stopped before claude's first event: the group was killed before
         // claude could have written anything, so there is no session to name.
         // Recording one would print a resume command that fails.
@@ -571,50 +583,20 @@ pub async fn run_claude(
             Ok(()) => return Err(e),
         },
     };
-    Ok(match outcome {
-        // An answer wins over an interrupt request: claude can finish between
-        // the request and the signal, and calling that interrupted would report
-        // a completed run as cut short.
-        ClaudeOutcome::Answered { text, session_id } => RunOutput {
-            text,
-            session_id: keep_id(session_id),
-            codex_home: None,
-            served,
-            leftovers,
-            // As for grok: a real answer from a process that exited non-zero is
-            // still an answer, but the status is the only sign something went
-            // wrong after the turn, so it is kept. `captured: true` keeps it out
-            // of `died_without_answer`.
-            // Clean answers intentionally have no digest, as for grok. Digest
-            // usage is retained for abnormal runs; widening clean-run records
-            // changes the shared digest and sidecar contract.
-            digest: answered_status_digest(status.as_ref()).map(with_usage),
-        },
-        ClaudeOutcome::NoAnswer {
-            reason,
-            review_error,
-            text,
-            session_id,
-        } => {
-            let (text, digest) = if interrupt_requested {
-                (interrupted_text(text), interrupted_digest())
-            } else if review_error {
-                (
-                    text,
-                    with_usage(review_no_answer_digest(reason, status.as_ref())),
-                )
-            } else {
-                (text, with_usage(no_answer_digest(reason, status.as_ref())))
-            };
-            RunOutput {
-                text,
-                session_id: keep_id(session_id),
-                codex_home: None,
-                digest: Some(digest),
-                served,
-                leftovers,
-            }
-        }
+    let outcome = settle(outcome);
+    let text = if outcome.interrupted() {
+        interrupted_text(text)
+    } else {
+        text
+    };
+    Ok(RunOutput {
+        text,
+        digest: forensics(&outcome),
+        outcome,
+        session_id: keep_id(session_id),
+        codex_home: None,
+        served,
+        leftovers,
     })
 }
 

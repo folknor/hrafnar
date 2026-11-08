@@ -54,54 +54,6 @@ losing malformed provider evidence. Do not claim all paths infallible until
 those consumers take SessionId. Provider result strings need not themselves
 become validated evidence: evidence and executable identity are different.
 
-## STR-004 - A typed run outcome in place of `Result<String>` plus `Option<Digest>` plus flags
-
-Reported by: providers, orchestration, forensics. The providers hunter calls
-it the biggest finding in that scope.
-
-Whether a run answered, failed for a stated reason, died or was interrupted is
-spread across `output: Result<String>` (`Err` meaning it never reached a
-turn), `digest: Option<Digest>` (whose `None` means a clean answer for claude
-and grok but cannot happen for codex), and `captured`,
-`recovered_from_transcript`, `turn_error: Option<String>`, `interrupted`,
-`exit_code`, `signal` and `terminated_by_review: Option<String>`. `captured`
-plus `recovered_from_transcript` encode a three-state answer source with an
-impossible fourth combination; `final_answer_present: Option<bool>` is another
-tri-state. maki (exit 0 with `is_error: true`) and opencode (no result object)
-would each have to fill this matrix in the exact combination the classifiers
-expect. The duplicated predicates and renderings this produces are in
-`notes/consolidations.md`; the overloaded `turn_error` is in `notes/bugs.md`.
-
-Proposed (providers):
-
-```rust
-enum Outcome {
-    Answered { text, provenance: AnswerSource /* Captured | Recovered | Result */,
-               after: Option<PostAnswerAnomaly> /* NonZeroExit(status) | UnknownStatus */ },
-    NoAnswer { cause: NoAnswerCause, partial_text: Option<String> },
-    NotLaunched(LaunchError),
-}
-enum NoAnswerCause {
-    Stated(String),                 // the provider said why
-    Died { status: Option<ExitStatus> },
-    Interrupted(InterruptSource),   // Operator | Signal
-    Killed(WatchdogVerdict),
-    Unverified(String),             // review could not vouch (grok wake loop)
-}
-```
-
-Forensics proposes the equivalent `enum RunEnd { Answered(AnswerSource),
-StatedFailure(msg), Interrupted(Terminator), KilledByReview(Terminator), Died,
-NoMessage }`, and orchestration `RunOutcome { Answered, Recovered,
-StatedFailure(reason), Interrupted(how), Died, LaunchFailed(error) }`. All
-three agree it is computed once by the runner and persisted in
-`DigestSummary`/the row, with `after_run`, `exit_status`, `print_digest`,
-`digest_summary_note`, `run_incidents` and `is_incident` becoming `match`es on
-it. maki and opencode, which state their outcome in the stream, would construct
-it directly rather than fill codex-shaped booleans. `Digest` stays as
-forensics only (see the forensics split below), and `DigestSummary` becomes
-the serialised projection of the outcome plus usage.
-
 ## STR-005 - Termination reason as an enum
 
 Reported by: providers, forensics.

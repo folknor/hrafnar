@@ -2,19 +2,22 @@ use super::*;
 
 pub fn print_result(result: &ProviderResult) {
     match &result.output {
-        Ok(text) => {
+        Ok(turn) => {
             println!("--- {} ---", result.provider);
             if let Some(ref sid) = result.session_id {
                 println!("session: {sid}");
             }
-            if let Some(ref d) = result.digest {
-                print_digest(d);
+            // A clean answer prints no digest; any other outcome does, with or
+            // without forensics behind it.
+            match &result.digest {
+                Some(d) => print_digest(&turn.outcome, d),
+                None if !turn.outcome.is_clean() => {
+                    print_digest(&turn.outcome, &Digest::default());
+                }
+                None => {}
             }
-            println!("{text}");
-            if let (Some(sid), Some(true)) = (
-                result.session_id.as_deref(),
-                result.digest.as_ref().map(|d| d.interrupted),
-            ) {
+            println!("{}", turn.text);
+            if let (Some(sid), true) = (result.session_id.as_deref(), turn.outcome.interrupted()) {
                 println!("\n{}", resume_hint(result.provider, sid));
             }
         }
@@ -35,7 +38,7 @@ pub fn resume_hint(provider: Provider, session_id: &str) -> String {
     )
 }
 
-fn print_digest(d: &Digest) {
+fn print_digest(outcome: &Outcome, d: &Digest) {
     match d.exit_code {
         Some(code) => println!("exit: {code}"),
         None => println!("exit: -"),
@@ -43,59 +46,8 @@ fn print_digest(d: &Digest) {
     if let Some(ref sig) = d.signal {
         println!("signal: {sig}");
     }
-    println!("captured: {}", d.captured);
-    // Ahead of everything else: codex stated why the turn ended, which reframes
-    // the exit code and makes the notes below unnecessary. Most often an upstream
-    // refusal, and the operator's next move (rephrase, get authorised, wait out a
-    // limit) follows from the message, not from the exit status.
-    if let Some(ref msg) = d.turn_error {
-        println!("turn failed: {msg}");
-    }
-    if let Some(ref msg) = d.review_error {
-        println!("review failed: {msg}");
-    }
-    if d.captured && d.exit_code.is_none() && d.signal.is_none() {
-        println!("note: answer captured; process exit status could not be confirmed");
-    }
-    // Print this before the notes below: it reframes the exit code/signal, which
-    // otherwise read as codex dying on its own when in fact we killed it.
-    if let Some(ref why) = d.terminated_by_review {
-        println!("terminated by review: {why}");
-        if let Some(secs) = d.quiet_secs {
-            println!("  rollout silent for: {secs}s");
-        }
-        if let Some(ref ev) = d.last_rollout_event {
-            println!("  last rollout event: {ev}");
-        }
-    }
-    if d.recovered_from_transcript {
-        println!("recovered: final answer restored from transcript (stream/-o truncated)");
-    } else if !d.captured {
-        // No -o and nothing to recover: no final answer was produced. Note that
-        // task_complete is NOT a success signal - it fires on aborted turns too
-        // (task_complete.last_agent_message=null), so the exit status sets tone.
-        // A kill by us is excluded: "died" would be a lie about our own doing.
-        if d.turn_error.is_some() || d.review_error.is_some() {
-            // Already explained above. Saying "died without a final answer"
-            // underneath a diagnosis is the bug this branch avoids: it reframes
-            // an explained no-answer as a mystery.
-            // "Not an answer" rather than "interim": for codex and grok the text
-            // is interim commentary, but for claude it is the error message
-            // itself.
-            println!("note: no conclusion was produced; the text below is not an answer");
-        } else if d.terminated_by_review.is_some() {
-            println!(
-                "note: review terminated the run; the text below is whatever it \
-                 had produced by then"
-            );
-        } else if d.exit_code != Some(0) || d.signal.is_some() {
-            println!(
-                "note: run died without a final answer; the text below is the last \
-                 interim note, not a conclusion"
-            );
-        } else if d.transcript.as_ref().is_some_and(|t| t.task_complete) {
-            println!("note: turn ended without a final answer (text below is interim)");
-        }
+    for line in outcome.lines(&d.status_facts()) {
+        println!("{line}");
     }
     println!("turns: {}", d.turns);
     let u = &d.usage;

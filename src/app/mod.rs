@@ -37,12 +37,12 @@ fn format_runtime(d: std::time::Duration) -> String {
     format!("{}h{:02}m{rem_s:02}s", mins / 60, mins % 60)
 }
 
-/// The exit-status verdict for one result: no answer, or an answer `review`
-/// could not verify (`Digest::review_error`). Distinct from
-/// `died_without_answer`, which decides retries: an unverified answer is a
-/// failure, but resending the request would not verify it.
+/// The exit-status verdict for one result: no turn, no answer, or an answer
+/// `review` could not verify (`Outcome::failed`). Retries are decided
+/// separately: an unverified answer is a failure, but resending the request
+/// would not verify it.
 fn run_failed(r: &provider::ProviderResult) -> bool {
-    r.output.is_err() || r.digest.as_ref().is_some_and(provider::Digest::failed)
+    !r.output.as_ref().is_ok_and(|turn| !turn.outcome.failed())
 }
 
 /// The archetype selection: `-a`, or the positional form it replaced.

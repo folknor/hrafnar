@@ -10,9 +10,9 @@ Continue from exactly where you left off and produce your complete final respons
 /// the original death of this kind; a run that captured or recovered an answer
 /// is not retried. See `provider::recovery` for the vetoes applied before this.
 pub(super) fn recovery(r: &ProviderResult) -> Option<&'static str> {
-    r.digest
+    r.output
         .as_ref()
-        .is_some_and(|d| !d.captured && !d.recovered_from_transcript)
+        .is_ok_and(|turn| !turn.outcome.has_answer())
         .then_some(RESUME_NUDGE)
 }
 
@@ -624,7 +624,7 @@ pub async fn run_codex_json(
     ));
     let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
 
-    // Records that *we* ended the run, and why. See `Digest::terminated_by_review`.
+    // Records that *we* ended the run, and why. See `Outcome::ended`.
     let mut terminated_by_review: Option<String> = None;
     // Forensics from the watchdog verdict, carried onto the digest and into the
     // incident bundle.
@@ -945,19 +945,23 @@ pub async fn run_codex_json(
     let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
     let final_message = final_from_file.or(recovered).or(stream_message);
 
-    // A request only makes this an interrupt if the run has no answer. codex
-    // can finish on its own between `review interrupt` writing the request and
-    // its signal landing, or answer before the signal is read; calling either
-    // interrupted would report a completed run as cut short.
-    let interrupted = interrupt_requested && !captured && !recovered_from_transcript;
-    if interrupted && terminated_by_review.is_none() {
-        terminated_by_review = Some(if stopped_by_signal {
-            "review was signalled to stop".to_string()
-        } else {
-            "operator interrupt (`review interrupt`)".to_string()
-        });
-    }
+    let answer = if captured {
+        Answer::Captured
+    } else if recovered_from_transcript {
+        Answer::Recovered
+    } else {
+        Answer::None
+    };
+    let mut outcome = Outcome::answered(answer);
+    outcome.stated = turn_error;
+    let outcome = outcome.ended(interrupt_requested, stopped_by_signal, terminated_by_review);
+    let interrupted = outcome.interrupted();
 
+    // Whether to bundle is this adapter's policy over its own evidence, not a
+    // property of the outcome: a suspicious codex run is bundled even when it
+    // answered (recovered, or captured with a bad exit), while a claude or grok
+    // answer with a bad exit is not. So there is deliberately no
+    // `is_incident` on `Outcome`; only the interrupt exclusion is shared.
     // Dump a full forensic bundle for the same suspicious runs we post-mortem -
     // stderr (with backtraces), the raw stream, the transcript tail, the exact
     // argv, and codex's version - so the next death is over-instrumented.
@@ -998,10 +1002,10 @@ pub async fn run_codex_json(
             captured,
             recovered_from_transcript,
             turns,
-            terminated_by_review: terminated_by_review.as_deref(),
+            terminated_by_review: outcome.termination(),
             quiet_secs,
             last_rollout_event: last_rollout_event.as_deref(),
-            turn_error: turn_error.as_deref(),
+            turn_error: outcome.stated.as_deref(),
         }) {
             crate::incident::BundleWriteOutcome::Written(path) => {
                 Some(path.to_string_lossy().into_owned())
@@ -1041,19 +1045,13 @@ pub async fn run_codex_json(
     let digest = Digest {
         exit_code,
         signal,
-        captured,
-        recovered_from_transcript,
         turns,
         usage,
         log_lines,
         transcript,
         incident_path,
-        terminated_by_review,
         quiet_secs,
         last_rollout_event,
-        turn_error,
-        review_error: None,
-        interrupted,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -1065,12 +1063,12 @@ pub async fn run_codex_json(
         // answer), so a non-zero exit/signal here means the run died mid-turn.
         // A stated reason outranks our inference: when codex told us why the turn
         // ended, say that instead of guessing from the exit status.
-        let stated = digest
-            .turn_error
+        let stated = outcome
+            .stated
             .as_ref()
             .map(|m| format!("(codex ended the turn: {m})"));
         let base = stated.unwrap_or_else(|| {
-            if digest.interrupted {
+            if outcome.interrupted() {
                 "(interrupted by the operator before a final answer)".to_string()
             } else if digest.exit_code == Some(0) && digest.signal.is_none() {
                 "(codex produced no final message)".to_string()
@@ -1088,6 +1086,7 @@ pub async fn run_codex_json(
     });
     Ok(RunOutput {
         text,
+        outcome,
         session_id,
         codex_home: codex_home.map(|path| path.to_string_lossy().into_owned()),
         digest: Some(digest),

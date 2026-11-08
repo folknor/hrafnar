@@ -60,6 +60,15 @@ use review::provider::{
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// The flat persisted form of a run: its outcome over its forensics (or
+/// none), which is what the assertions below read the outcome facts from.
+fn summary_of(run: &RunOutput) -> review::provider::DigestSummary {
+    match &run.digest {
+        Some(d) => d.summary(&run.outcome),
+        None => Digest::default().summary(&run.outcome),
+    }
+}
+
 /// A stub session id. Fixed rather than random so the stub script and the
 /// assertions can both name the rollout file.
 const STUB_SESSION: &str = "01920000-0000-7000-8000-000000000001";
@@ -414,18 +423,19 @@ sleep 3600
         run.text, "STRANDED ANSWER",
         "the answer on disk must be recovered and reported"
     );
-    let digest = run.digest.expect("codex runs carry a digest");
+    let summary = summary_of(&run);
+    assert!(run.digest.is_some(), "codex runs carry a digest");
     assert!(
-        digest.recovered_from_transcript,
+        summary.recovered_from_transcript,
         "answer came from the rollout, not the -o backstop"
     );
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("watchdog")),
         "digest must record the watchdog kill, got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     assert_eq!(
         run.session_id.as_deref(),
@@ -458,12 +468,13 @@ sleep 3600
         ));
         let run = run_stub(&scratch, stub).await.expect("run completes");
         assert_eq!(run.text, "STRANDED ANSWER", "trailing event: {trailing}");
+        let summary = summary_of(&run);
         let digest = run.digest.expect("digest");
-        assert!(!digest.captured);
-        assert!(digest.recovered_from_transcript);
-        assert!(!digest.interrupted);
+        assert!(!summary.captured);
+        assert!(summary.recovered_from_transcript);
+        assert!(!summary.interrupted);
         assert!(
-            digest
+            summary
                 .terminated_by_review
                 .as_deref()
                 .is_some_and(|why| why.contains("stranded"))
@@ -501,8 +512,10 @@ sleep 3600
         .await
         .expect("run completes");
 
-    let digest = run.digest.expect("digest");
-    let why = digest.terminated_by_review.unwrap_or_default();
+    let summary = summary_of(&run);
+
+    assert!(run.digest.is_some(), "digest");
+    let why = summary.terminated_by_review.unwrap_or_default();
     assert!(
         why.contains("stranded"),
         "an answered run must be stranded, not stalled; got {why:?}"
@@ -536,22 +549,24 @@ sleep 3600
 
     let run = run_stub(&scratch, stub).await.expect("run completes");
 
+    let summary = summary_of(&run);
+
     let digest = run.digest.expect("digest");
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("stall timeout")),
         "the stall timeout must be what ended this run, got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     // The whole point of the answer gate: nothing was produced, so nothing may
     // be reported as a result.
     assert!(
-        !digest.captured && !digest.recovered_from_transcript,
+        !summary.captured && !summary.recovered_from_transcript,
         "a wedged run must not report an answer (captured={}, recovered={})",
-        digest.captured,
-        digest.recovered_from_transcript
+        summary.captured,
+        summary.recovered_from_transcript
     );
     assert!(
         !run.text.contains("regenerating the pilot"),
@@ -614,12 +629,16 @@ printf '%s\n' '{"type":"event_msg","payload":{"type":"turn_aborted","reason":"in
         let run = run_resume_stub(&scratch, &stub)
             .await
             .unwrap_or_else(|error| panic!("{case}: {error}"));
-        let digest = run.digest.expect("codex digest");
+        let summary = summary_of(&run);
+        assert!(run.digest.is_some(), "codex digest");
         if expected_answer {
-            assert!(digest.recovered_from_transcript, "{case}: answer recovered");
+            assert!(
+                summary.recovered_from_transcript,
+                "{case}: answer recovered"
+            );
         } else {
             assert!(
-                !digest.recovered_from_transcript,
+                !summary.recovered_from_transcript,
                 "{case}: no answer recovered"
             );
         }
@@ -667,8 +686,9 @@ sleep 3600
     let run = run_resume_stub(&scratch, &stub)
         .await
         .expect("resume completes after watchdog kill");
-    let digest = run.digest.expect("codex digest");
-    assert!(!digest.recovered_from_transcript);
+    let summary = summary_of(&run);
+    assert!(run.digest.is_some(), "codex digest");
+    assert!(!summary.recovered_from_transcript);
 
     let dirs = scratch.incident_dirs();
     assert_eq!(dirs.len(), 1, "one incident bundle");
@@ -757,11 +777,13 @@ exit 0
 
     let run = run_stub(&scratch, stub).await.expect("run completes");
 
+    let summary = summary_of(&run);
+
     let digest = run.digest.expect("digest");
     assert!(
-        digest.terminated_by_review.is_none(),
+        summary.terminated_by_review.is_none(),
         "an active run must never be killed even once its answer exists, got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     assert_eq!(
         digest.exit_code,
@@ -774,7 +796,7 @@ exit 0
         digest.signal
     );
     assert!(
-        digest.captured,
+        summary.captured,
         "the stub wrote the -o backstop, so this is a clean capture"
     );
     assert_eq!(run.text, "REAL ANSWER");
@@ -895,14 +917,16 @@ sleep 300
 
     let run = run_stub(&scratch, stub).await.expect("run completes");
 
-    let digest = run.digest.expect("digest");
+    let summary = summary_of(&run);
+
+    assert!(run.digest.is_some(), "digest");
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("watchdog")),
         "the watchdog must be what ended this run, got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
 
     // The keeper is reaped only after its teardown, so the descendant is gone
@@ -966,24 +990,25 @@ exit 1
     ));
 
     let run = run_stub(&scratch, stub).await.expect("run completes");
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
 
     // The point of the fix: codex's stated reason is carried, not discarded.
     assert_eq!(
-        digest.turn_error.as_deref(),
+        summary.turn_error.as_deref(),
         Some(REFUSAL),
         "the turn.failed / error message must be captured"
     );
     // The surrounding failure signature is unchanged - this still *is* a run
     // that produced no answer, and must keep reporting as one.
     assert_eq!(digest.exit_code, Some(1));
-    assert!(!digest.captured, "no -o file was written");
+    assert!(!summary.captured, "no -o file was written");
     assert!(
-        !digest.recovered_from_transcript,
+        !summary.recovered_from_transcript,
         "there is no final_answer to recover - a refusal is not a truncation"
     );
     // It is persisted, so refusals stay greppable in the sidecar and audit logs.
-    assert_eq!(digest.summary().turn_error.as_deref(), Some(REFUSAL));
+    assert_eq!(summary.turn_error.as_deref(), Some(REFUSAL));
 
     // The interim note is still returned (it is all there is), but the reported
     // text must not be the bare "died without a final answer" fabrication.
@@ -1045,7 +1070,7 @@ async fn interrupt_stub(
             "audit_id": "a", "provider": "codex", "archetype": "bare",
             "session_id": run.session_id.clone().expect("session id"),
             "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
-            "digest": run.digest.as_ref().map(Digest::summary),
+            "digest": run.digest.as_ref().map(|d| d.summary(&run.outcome)),
         });
         rows.lock()
             .expect("rows")
@@ -1086,17 +1111,18 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
     let (run, outcome) = interrupt_stub(&scratch, &stub).await;
     let outcome = outcome.expect("the verb succeeds");
     assert!(outcome.interrupted, "the verb reports the interrupt");
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
 
-    assert!(digest.interrupted, "the digest must record the interrupt");
-    assert!(digest.summary().interrupted, "and persist it");
+    assert!(summary.interrupted, "the digest must record the interrupt");
+    assert!(summary.interrupted, "and persist it");
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("operator interrupt")),
         "got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     assert_eq!(digest.exit_code, Some(1));
     assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
@@ -1141,21 +1167,22 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
     };
     let (run, ()) = tokio::join!(run_stub_with(&scratch, &stub, &runtime), stopper);
     let run = run.expect("run completes");
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
 
-    assert!(digest.interrupted, "the digest must record the interrupt");
+    assert!(summary.interrupted, "the digest must record the interrupt");
     assert_eq!(
         digest.exit_code,
         Some(1),
         "codex answered SIGINT, not a kill"
     );
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("signalled")),
         "got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
     assert!(scratch.incident_dirs().is_empty());
@@ -1177,10 +1204,12 @@ async fn a_run_that_already_answered_is_not_marked_interrupted() {
     let stub = interruptible_stub(&scratch, r#"printf '%s' 'THE ANSWER' > "$LAST_MSG""#);
     let (run, outcome) = interrupt_stub(&scratch, &stub).await;
 
-    let digest = run.digest.expect("digest");
-    assert!(digest.captured, "the answer was written before the signal");
-    assert!(!digest.interrupted, "so the run is not an interrupt");
-    assert!(digest.terminated_by_review.is_none());
+    let summary = summary_of(&run);
+
+    assert!(run.digest.is_some(), "digest");
+    assert!(summary.captured, "the answer was written before the signal");
+    assert!(!summary.interrupted, "so the run is not an interrupt");
+    assert!(summary.terminated_by_review.is_none());
     assert_eq!(run.text, "THE ANSWER");
     assert!(
         !outcome.expect("the verb succeeds").interrupted,
@@ -1343,7 +1372,7 @@ async fn claude_interrupt_stub_at(
             "audit_id": "a", "provider": "claude", "archetype": "bare",
             "session_id": run.session_id.clone().expect("session id"),
             "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
-            "digest": run.digest.as_ref().map(Digest::summary),
+            "digest": run.digest.as_ref().map(|d| d.summary(&run.outcome)),
         });
         rows.lock()
             .expect("rows")
@@ -1416,20 +1445,21 @@ async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
     let outcome = outcome.expect("the verb succeeds");
     assert!(outcome.interrupted, "the verb reports the interrupt");
     assert_eq!(outcome.provider, review::provider::Provider::Claude);
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
-    assert!(digest.interrupted);
+    assert!(summary.interrupted);
     assert!(
-        digest.turn_error.is_none(),
+        summary.turn_error.is_none(),
         "claude's complaint about the abort is not a stated failure"
     );
     assert_eq!(digest.exit_code, Some(0), "claude answered SIGINT itself");
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("operator interrupt")),
         "got {:?}",
-        digest.terminated_by_review
+        summary.terminated_by_review
     );
     assert!(run.text.contains("interrupted"), "got {:?}", run.text);
     let sid = run.session_id.expect("the session survives the interrupt");
@@ -1456,7 +1486,7 @@ async fn review_interrupt_waits_for_a_claude_that_has_not_spoken_yet() {
             .interrupted,
         "and then interrupts"
     );
-    assert!(run.digest.expect("digest").interrupted);
+    assert!(run.outcome.interrupted());
 }
 
 #[tokio::test]
@@ -1468,7 +1498,7 @@ async fn a_claude_answer_that_beats_the_interrupt_stands() {
     );
     let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
     assert_eq!(run.text, "THE ANSWER");
-    assert!(run.digest.is_none_or(|d| !d.interrupted));
+    assert!(!run.outcome.interrupted());
     assert!(
         !outcome.expect("the verb succeeds").interrupted,
         "the verb says the run ended first"
@@ -1488,11 +1518,12 @@ async fn a_stop_signal_ends_a_started_claude_turn_as_an_interrupt() {
     };
     let (run, ()) = tokio::join!(run_claude_stub(&scratch, &body, &runtime, None), stopper);
     let run = run.expect("run completes");
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
-    assert!(digest.interrupted);
+    assert!(summary.interrupted);
     assert_eq!(digest.exit_code, Some(0), "SIGINT, not a group kill");
     assert!(
-        digest
+        summary
             .terminated_by_review
             .as_deref()
             .is_some_and(|why| why.contains("signalled"))
@@ -1544,11 +1575,12 @@ async fn a_claude_that_dies_after_starting_keeps_its_session() {
     let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), None)
         .await
         .expect("a death after starting is not a launch failure");
+    let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
-    assert!(!digest.captured);
-    assert!(!digest.interrupted);
+    assert!(!summary.captured);
+    assert!(!summary.interrupted);
     assert!(
-        digest.turn_error.is_none(),
+        summary.turn_error.is_none(),
         "claude stated no reason, so this is a death, not a stated failure"
     );
     assert_eq!(digest.exit_code, Some(3));
@@ -1584,15 +1616,19 @@ async fn a_stale_interrupt_request_does_not_mark_a_claude_resume_interrupted() {
     let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), Some(sid))
         .await
         .expect("run completes");
-    let digest = run.digest.expect("digest");
-    assert!(!digest.interrupted, "the request was not aimed at this run");
+    let summary = summary_of(&run);
+    assert!(run.digest.is_some(), "digest");
     assert!(
-        digest
+        !summary.interrupted,
+        "the request was not aimed at this run"
+    );
+    assert!(
+        summary
             .turn_error
             .as_deref()
             .is_some_and(|e| e.contains("rate limited")),
         "claude's reason is kept: {:?}",
-        digest.turn_error
+        summary.turn_error
     );
 }
 
@@ -1721,8 +1757,9 @@ exit 0
     assert_eq!(run.text, "DONE");
     // The teardown takes longer than the stub's quiet grace (the script needs
     // the SIGKILL rounds), and must not read as codex refusing to exit.
-    let digest = run.digest.as_ref().expect("codex digest");
-    assert_eq!(digest.terminated_by_review, None);
+    let summary = summary_of(&run);
+    assert!(run.digest.is_some(), "codex digest");
+    assert_eq!(summary.terminated_by_review, None);
     assert!(
         scratch.incident_dirs().is_empty(),
         "a clean run is no incident"
@@ -1846,12 +1883,13 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
         .expect("the answer survives the exit");
     assert_eq!(run.text, "THE ANSWER");
     assert!(run.session_id.is_some());
+    let summary = summary_of(&run);
     let digest = run.digest.expect("nonzero status is recorded");
-    assert!(digest.captured);
+    assert!(summary.captured);
     assert_eq!(digest.exit_code, Some(7));
-    assert!(digest.turn_error.is_none());
-    assert!(digest.review_error.is_none());
-    assert!(!digest.failed());
+    assert!(summary.turn_error.is_none());
+    assert!(summary.review_error.is_none());
+    assert!(!run.outcome.failed());
     assert_eq!(digest.turns, 2);
     assert_eq!(digest.usage.input_tokens, 28);
     assert_eq!(digest.usage.output_tokens, 32);
@@ -1892,7 +1930,7 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
         &runtime,
     )
     .await;
-    assert_eq!(result.output.expect("answer"), "ok");
+    assert_eq!(result.output.expect("answer").text, "ok");
     assert_eq!(result.model.as_deref(), Some("chosen-model"));
     assert_eq!(result.effort.as_deref(), Some("high"));
     let args = std::fs::read_to_string(scratch.root.join("args")).expect("stub args");
@@ -2003,9 +2041,8 @@ exit 1
     .await
     .expect("fixture ran");
     assert!(
-        run.digest
-            .expect("digest")
-            .turn_error
+        run.outcome
+            .stated
             .expect("stated failure")
             .contains("fixture refusal")
     );
@@ -2190,20 +2227,25 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             &runtime,
         )
         .await;
-        assert_eq!(result.output.expect("fixture ran"), "fixture answer");
+        assert!(result.output.is_ok(), "fixture ran");
         assert_eq!(result.session_id.as_deref(), Some(sid));
+        let turn = result.output.expect("fixture ran");
+        assert_eq!(turn.text, "fixture answer");
         if stop == "cancelled" {
+            let summary = turn
+                .summary(result.digest.as_ref())
+                .expect("failure summary");
             let digest = result.digest.expect("failure digest");
             assert_eq!(digest.exit_code, Some(0));
-            assert!(digest.failed());
+            assert!(turn.outcome.failed());
             assert!(
-                digest
+                summary
                     .turn_error
                     .expect("stated stop")
                     .contains("cancelled")
             );
             assert!(
-                digest.review_error.is_none(),
+                summary.review_error.is_none(),
                 "background verification succeeded"
             );
         } else {
@@ -2262,6 +2304,7 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
         result
             .output
             .expect("wake answer")
+            .text
             .contains("grok woken 1 time(s)")
     );
     assert_eq!(

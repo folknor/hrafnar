@@ -1,6 +1,5 @@
 //! Unit tests of claude provider behavior.
 
-use super::super::tests::exited;
 use super::*;
 
 #[tokio::test]
@@ -155,13 +154,13 @@ fn claude_result_without_is_error_fails_closed() {
     };
     assert!(reason.contains("no is_error flag"), "{reason}");
     assert!(review_error, "the missing flag is review's diagnosis");
-    let digest = super::review_no_answer_digest(reason, Some(&exited(0)));
-    assert!(digest.turn_error.is_none());
+    let outcome = super::Outcome::no_answer().unverified(reason);
+    assert!(outcome.stated.is_none());
     assert_eq!(
-        digest.review_error.as_deref(),
+        outcome.unverified.as_deref(),
         Some("review could not classify claude result (no is_error flag): maybe")
     );
-    assert!(digest.failed());
+    assert!(outcome.failed());
 }
 
 #[test]

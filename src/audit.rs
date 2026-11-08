@@ -56,7 +56,7 @@ pub fn log_result(
     provider: &str,
     session: &str,
     prompt: &str,
-    result: &Result<String>,
+    result: &Result<crate::provider::Turn>,
     digest: Option<&crate::provider::DigestSummary>,
     leftovers: &crate::contained::Leftovers,
 ) {
@@ -81,7 +81,7 @@ pub fn log_result(
         provider: provider.to_string(),
         session: session.to_string(),
         prompt: prompt.to_string(),
-        response: result.as_ref().ok().cloned(),
+        response: result.as_ref().ok().map(|turn| turn.text.clone()),
         error: result.as_ref().err().map(ToString::to_string),
         digest: digest.cloned(),
         leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),

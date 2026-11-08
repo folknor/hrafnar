@@ -36,6 +36,10 @@ pub(super) fn run_incidents(limit: usize) -> Result<()> {
             Some(c) => c.to_string(),
             None => "-".to_string(),
         };
+        // Bundle metadata, not a session row: it records whether the rollout
+        // held a final answer as a tri-state (`None` when no transcript was
+        // read), which the outcome cannot express, so this one-word verdict is
+        // read from the bundle rather than from `Outcome::lines`.
         // A stated reason wins over every inferred verdict: these bundles are
         // explained, and listing them as "died" sends the reader hunting for a
         // cause codex already gave. Truncated so one refusal can't wrap the line.
@@ -227,19 +231,8 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     if let Some(ref sig) = d.signal {
         println!("signal: {sig}");
     }
-    println!("captured: {}", d.captured);
-    if let Some(ref msg) = d.turn_error {
-        println!("turn failed: {msg}");
-    }
-    if let Some(ref msg) = d.review_error {
-        println!("review failed: {msg}");
-    }
-    // Like the live digest, this status note can appear alongside the
-    // end-of-turn note below.
-    if d.captured && d.exit_code.is_none() && d.signal.is_none() {
-        println!("note: answer captured; process exit status could not be confirmed");
-    }
-    if let Some(line) = digest_summary_note(d) {
+    // The same lines the run printed live, read back from the row.
+    for line in provider::Outcome::interpret_summary(d).lines(&d.status_facts()) {
         println!("{line}");
     }
     if let Some(false) = d.task_complete {
@@ -255,37 +248,6 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     );
     if let Some(ref path) = d.incident_path {
         println!("incident: {path}");
-    }
-}
-
-/// The one line `print_digest_summary` adds to say how the run ended, if any.
-/// Pure so each case is tested.
-fn digest_summary_note(d: &provider::DigestSummary) -> Option<String> {
-    if d.recovered_from_transcript {
-        Some("recovered: final answer restored from transcript".to_string())
-    } else if d.interrupted {
-        // The recorded reason, not an assumed one: a signalled `review` ends its
-        // turns the same way `review interrupt` does, and saying the operator
-        // ran the verb would misdescribe how the turn ended.
-        let how = d
-            .terminated_by_review
-            .as_deref()
-            .unwrap_or("operator interrupt (`review interrupt`)");
-        Some(format!("note: interrupted - {how}"))
-    } else if d.turn_error.is_some() && !d.captured {
-        // Explained by `turn failed:` - don't also guess "died mid-turn" at
-        // it. Gated on the missing answer: rows written before post-answer exit
-        // problems moved out of `turn_error` record a grok or claude answer
-        // followed by a non-zero exit as captured *with* a `turn_error`, and
-        // "no conclusion" would contradict the answer printed below. The live
-        // `print_digest` has the same gate.
-        Some("note: no conclusion was produced".to_string())
-    } else if !d.captured && (d.exit_code != Some(0) || d.signal.is_some()) {
-        // No real final answer obtained and the process failed: a mid-turn
-        // death. task_complete alone doesn't refute this - it fires on aborts.
-        Some("note: no final answer captured - run likely died mid-turn".to_string())
-    } else {
-        None
     }
 }
 
@@ -447,6 +409,16 @@ mod tests {
         serde_json::from_value(v).expect("summary parses")
     }
 
+    /// The note lines (everything after the stated and diagnosed reasons)
+    /// a persisted summary renders to.
+    fn notes(d: &provider::DigestSummary) -> Vec<String> {
+        provider::Outcome::interpret_summary(d)
+            .lines(&d.status_facts())
+            .into_iter()
+            .filter(|l| l.starts_with("note:") || l.starts_with("terminated by review:"))
+            .collect()
+    }
+
     #[test]
     fn an_answer_with_a_non_zero_exit_is_not_called_inconclusive() {
         // What grok and claude record for an answer from a process that then
@@ -457,16 +429,18 @@ mod tests {
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
             "reasoning_output_tokens": 0,
         }));
-        assert_eq!(digest_summary_note(&d), None);
+        assert!(notes(&d).is_empty());
         // Rows recorded before that change carry a `turn_error` instead, and
-        // still must not be called inconclusive.
+        // still must not be called inconclusive or a failure.
         let legacy = summary(serde_json::json!({
             "exit_code": 1, "captured": true, "turns": 1,
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
             "reasoning_output_tokens": 0,
             "turn_error": "claude exited non-zero after producing an answer",
         }));
-        assert_eq!(digest_summary_note(&legacy), None);
+        assert!(notes(&legacy).is_empty());
+        let outcome = provider::Outcome::interpret_summary(&legacy);
+        assert!(!outcome.failed() && outcome.stated_failure().is_none());
     }
 
     #[test]
@@ -478,22 +452,24 @@ mod tests {
             "turn_error": "claude reported an error (API status 404)",
         }));
         assert_eq!(
-            digest_summary_note(&d).as_deref(),
-            Some("note: no conclusion was produced")
+            notes(&d),
+            ["note: no conclusion was produced; the text below is not an answer"]
         );
     }
 
     #[test]
-    fn an_interrupt_note_names_how_the_run_was_stopped() {
+    fn an_interrupt_names_how_the_run_was_stopped() {
         let d = summary(serde_json::json!({
             "exit_code": 0, "captured": false, "turns": 1,
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
             "reasoning_output_tokens": 0, "interrupted": true,
             "terminated_by_review": "review was signalled to stop",
         }));
+        let lines = notes(&d);
         assert_eq!(
-            digest_summary_note(&d).as_deref(),
-            Some("note: interrupted - review was signalled to stop")
+            lines[0],
+            "terminated by review: review was signalled to stop"
         );
+        assert!(lines[1].starts_with("note: interrupted"), "{lines:?}");
     }
 }
