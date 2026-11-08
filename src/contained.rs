@@ -458,8 +458,10 @@ impl Contained {
         self.label = label;
     }
 
-    /// Let the keeper start the provider, then wait until it has (or failed
-    /// to). Returns the provider's pid.
+    /// Let the keeper start the provider, then wait for its launch
+    /// acknowledgement (or failure). Returns the provider's pid. `Ok` does
+    /// not prove the provider exec'd (see `keeper::Event::Spawned`); its
+    /// wait status, from `wait`, does.
     pub async fn go(&mut self) -> Result<u32> {
         self.control
             .send(keeper::Control::Go.byte())

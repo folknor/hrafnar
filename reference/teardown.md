@@ -128,7 +128,10 @@ overwrite them, their numbers in the spec, private to the keeper once it starts
 - **control**, `review` to keeper: `g` launch, `i` interrupt, `t` terminate.
   EOF means `review` is gone. Nothing launches before `g`, so `review` records
   the keeper's identity in the in-flight marker first.
-- **events**, keeper to `review`, one JSON line each: `spawned`,
+- **events**, keeper to `review`, one JSON line each: `spawned` (the
+  exec-status pipe closed with no errno - an acknowledgement, since a child
+  killed by someone else before its exec closes it too; only `exited` says
+  what became of the process, and the two can arrive in either order),
   `exec_failed`, `exited` (the provider itself has been reaped), one
   `survivor` per process still alive, one `killed` per ended process named in
   accounting, and compact `done` with the verdict and both event counts. The keeper

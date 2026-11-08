@@ -286,6 +286,90 @@ fn empty_and_literal_tilde_path_components_use_child_cwd() {
     std::fs::remove_dir_all(root).expect("cleanup");
 }
 
+/// A child killed before its exec closes the exec-status pipe exactly as a
+/// successful exec does, so the launch is acknowledged; what must hold is that
+/// the death itself survives into `exited` and `done`, and teardown completes.
+/// The two earlier events may arrive in either order.
+#[test]
+fn a_death_before_exec_is_acknowledged_and_reported_as_the_death_it_was() {
+    let launch = keeper::Launch::new(
+        std::ffi::OsStr::new("/bin/true"),
+        [],
+        &std::env::current_dir().expect("cwd"),
+        keeper::Environment::Inherit(Vec::new()),
+    )
+    .expect("launch")
+    .hold_before_exec();
+    let keeper::Launcher {
+        mut command,
+        control,
+        events,
+        inherited,
+    } = keeper::Launcher::new(
+        std::path::Path::new(env!("CARGO_BIN_EXE_review")),
+        launch,
+        keeper::TeardownSchedule::default(),
+        std::time::Duration::from_secs(10),
+        "pre-exec death",
+        None,
+        std::process::Stdio::null(),
+    )
+    .expect("launcher");
+    let mut child = command.spawn().expect("keeper");
+    drop(inherited);
+    let mut control = std::fs::File::from(control);
+    control.write_all(&[Control::Go.byte()]).expect("go");
+
+    // The held child announces itself before exec; kill it there.
+    let mut held = String::new();
+    std::io::BufReader::new(child.stdout.take().expect("keeper stdout"))
+        .read_line(&mut held)
+        .expect("held child pid");
+    let pid: libc::pid_t = held.trim().parse().expect("pid");
+    // SAFETY: plain kill of the held child, which cannot exit on its own.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+
+    let events: Vec<Event> = std::io::BufReader::new(std::fs::File::from(events))
+        .lines()
+        .map(|line| serde_json::from_str(&line.expect("event line")).expect("event"))
+        .collect();
+    assert!(child.wait().expect("keeper exits").success());
+    drop(control);
+
+    let killed = |status: i32| libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+    let spawned = events
+        .iter()
+        .filter(|e| matches!(e, Event::Spawned { .. }))
+        .count();
+    let failed = events
+        .iter()
+        .filter(|e| matches!(e, Event::ExecFailed { .. }))
+        .count();
+    let exited: Vec<i32> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Exited { status } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spawned, 1, "the launch is acknowledged once: {events:?}");
+    assert_eq!(failed, 0, "no errno was written: {events:?}");
+    assert_eq!(exited.len(), 1, "{events:?}");
+    assert!(killed(exited[0]), "exited carries the SIGKILL: {events:?}");
+    let Some(Event::Done(outcome)) = events.last() else {
+        panic!("done comes last: {events:?}");
+    };
+    assert_eq!(
+        outcome.status,
+        Some(exited[0]),
+        "done keeps the wait status"
+    );
+    assert!(
+        matches!(outcome.teardown, keeper::Teardown::Clean { .. }),
+        "{events:?}"
+    );
+}
+
 #[test]
 fn keeper_reports_successful_interrupt_delivery() {
     let root = scratch();

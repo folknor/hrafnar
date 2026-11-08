@@ -187,6 +187,30 @@ defence.
    tool JSON, falling back to {}"). It should go back to the model as an
    error. This one hits open models hardest, which is the whole use case.
 
+## What the lifecycle already provides, and what it does not
+
+The shared run lifecycle (`src/provider/lifecycle.rs`) was prepared for maki
+and opencode. `ProcessSpec` layers environment as adapter defaults, then
+profile, then adapter-forced values and `PWD`, so isolation a provider requires
+goes in the forced layer and a profile cannot undo it. Readiness to take a
+SIGINT is a lease fact the adapter's reader sets (maki after `init`, opencode
+after its first event). The adapter `prepare` hook and its owned prepared
+context exist for per-run setup such as maki's generated config, but no maki
+configuration or permission mechanism is implemented. `Ended.status` is
+forensics only.
+
+Still to do when the providers land:
+
+- maki's effort: the per-run config mechanism, if the upstream `--effort`
+  patch does not land first (see Effort above).
+- opencode's `--standalone` must be non-optional. Without it the run attaches
+  to a background service outside the keeper's tree, and the keeper's "clean"
+  verdict would then be true but meaningless. Nothing in the lifecycle can
+  detect that, so it belongs in opencode's argv builder, with a test.
+- opencode's read-only is an agent definition that denies edit and shell: a
+  third permission mechanism, beside an OS sandbox (codex, grok) and none
+  (claude, maki).
+
 ## Open questions
 
 - Translating Claude settings into maki permissions. maki does not read

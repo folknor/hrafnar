@@ -79,6 +79,11 @@ pub struct Outcome<Processes = Vec<Proc>> {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    /// The provider's exec-status pipe closed with no errno: a launch
+    /// acknowledgement, not proof that it exec'd. A child killed by someone
+    /// else before its exec reports this too, and only `Exited` carries the
+    /// truth. The two can arrive in either order, since the keeper may reap
+    /// a dead child before it reads the pipe.
     Spawned {
         pid: u32,
     },

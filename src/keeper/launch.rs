@@ -23,6 +23,14 @@ pub struct Launch {
     /// Exact environment, resolved once in the parent. The keeper itself never
     /// receives this through its own environment.
     pub(super) env: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Test seam, never set in production: the forked child writes its pid and
+    /// a newline to its stdout, then blocks before `execve`, still holding the
+    /// exec-status pipe's write end. A test kills it there to prove what a
+    /// death before exec reports (see `Event::Spawned`). The keeper is the
+    /// real binary, so `cfg(test)` cannot reach it; the flag travels in the
+    /// spec instead.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) hold_before_exec: bool,
 }
 
 impl Launch {
@@ -73,9 +81,18 @@ impl Launch {
                 .into_iter()
                 .map(|(k, v)| (k.into_vec(), v.into_vec()))
                 .collect(),
+            hold_before_exec: false,
         };
         launch.validate()?;
         Ok(launch)
+    }
+
+    /// Hold the forked child before `execve`; see the field. Tests only.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn hold_before_exec(mut self) -> Self {
+        self.hold_before_exec = true;
+        self
     }
 
     pub(super) fn validate(&self) -> std::io::Result<()> {

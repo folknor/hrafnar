@@ -71,16 +71,46 @@ impl DataDir {
             LogFamily::Public => "audit",
             LogFamily::Private => "audit-private",
         };
-        Some(
-            self.child(family)?
-                .join(format!("{}-{name}-{}", crate::config::hostname(), scope.id)),
-        )
+        Some(self.child(family)?.join(audit_component(
+            &crate::config::hostname(),
+            &name,
+            &scope.id,
+        )))
     }
+}
+
+/// The audit directory's name, `<host>-<project>-<id>`, as exactly one path
+/// component. The audit id is opaque config (a committed `.review.toml` can
+/// hold `x/../../elsewhere`) and `sethostname` accepts `/` too, so the whole
+/// name is escaped: `/`, `%` and NUL become `%2F`, `%25` and `%00`, and every
+/// other byte is kept. A name with none of those three is unchanged, so every
+/// generated id keeps the directory it always had. The `<host>-` prefix means
+/// the result is never `.` or `..`, so it cannot leave the family directory it
+/// is joined to.
+///
+/// The name is a label, not an injective identity key: the hyphens are not
+/// escaped, so hand-written ids can collide (`foo` with id `bar-baz` and
+/// `foo-bar` with id `baz` share one directory; generated hex ids cannot), and
+/// escaping a percent sign triples it, which can push a near-limit name past
+/// the filesystem's component length. Neither is worth renaming every
+/// existing audit directory for.
+fn audit_component(host: &str, project: &str, id: &str) -> String {
+    let raw = format!("{host}-{project}-{id}");
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '/' => out.push_str("%2F"),
+            '%' => out.push_str("%25"),
+            '\0' => out.push_str("%00"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Historical ids are opaque nonempty strings, not necessarily generated hex.
 /// This is identity, NOT proof of a safe path component. Tightening its syntax
-/// would reject existing operator config; audit path confinement is separate.
+/// would reject existing operator config; `audit_component` confines it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditId(String);
 
@@ -191,6 +221,35 @@ mod tests {
             "unavailable-data-test",
             &data
         ));
+    }
+
+    #[test]
+    fn hostile_audit_names_stay_one_component_in_their_own_family() {
+        assert_eq!(
+            audit_component("host", "proj", "0123abcd"),
+            "host-proj-0123abcd",
+            "an ordinary name is unchanged"
+        );
+        assert_eq!(
+            audit_component("h/st", "proj", "../../x/../%2F\0é"),
+            "h%2Fst-proj-..%2F..%2Fx%2F..%2F%252F%00é"
+        );
+        let data = DataDir::at("/data");
+        for private in [false, true] {
+            let family = if private { "audit-private" } else { "audit" };
+            for id in ["../../../../etc", "a/../../b", "%2F..%2F", "x\0y", "/abs"] {
+                let scope = LogScope::new(AuditId::from_record(id).expect("id"), private);
+                let path = data.audit(Path::new("/p/proj"), &scope).expect("path");
+                assert_eq!(
+                    path.parent(),
+                    Some(Path::new("/data/review").join(family).as_path()),
+                    "{id:?} must stay directly under {family}"
+                );
+                let name = path.file_name().expect("name").to_string_lossy();
+                assert!(!name.contains('/') && !name.contains('\0'), "{name}");
+                assert!(name != "." && name != "..");
+            }
+        }
     }
 
     #[test]

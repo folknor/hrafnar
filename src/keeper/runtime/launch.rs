@@ -68,6 +68,7 @@ impl Keeper {
         env.push(std::ptr::null());
         let mut argv: Vec<*const libc::c_char> = argv_c.iter().map(|c| c.as_ptr()).collect();
         argv.push(std::ptr::null());
+        let hold = launch.hold_before_exec;
         let mut status_fds = [0 as RawFd; 2];
         // SAFETY: fills two descriptors we then own.
         check(unsafe { libc::pipe2(status_fds.as_mut_ptr(), libc::O_CLOEXEC) })
@@ -95,6 +96,16 @@ impl Keeper {
                 // The Rust runtime ignores SIGPIPE; a provider gets the
                 // default, as it would from `std::process::Command`.
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                if hold {
+                    // Test seam (`Launch::hold_before_exec`): announce, then
+                    // wait to be killed with `status_w` still open, so its
+                    // close is the death and not an exec or an errno write.
+                    let line = format!("{}\n", libc::getpid());
+                    libc::write(1, line.as_ptr().cast::<libc::c_void>(), line.len());
+                    loop {
+                        libc::pause();
+                    }
+                }
                 if libc::chdir(cwd_c.as_ptr()) == 0 {
                     libc::execve(path_c.as_ptr(), argv.as_ptr(), env.as_ptr());
                 }
@@ -153,9 +164,18 @@ impl Keeper {
         // SAFETY: reads into a buffer we own.
         let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast::<libc::c_void>(), 4) };
         if n == 0 {
-            // Conventionally closed by successful exec. An external pre-exec
-            // death can also close it; this handshake alone is not proof that
-            // the provider ever ran an instruction in its new image.
+            // EOF is an acknowledgement, not proof of exec. A successful exec
+            // closes the pipe, and so does a child killed by someone else
+            // before its exec (the setup calls before it are unchecked, and
+            // scheduling puts no bound on that window). Nothing can tell the
+            // two apart once the child is dead: an exec followed by an
+            // immediate death looks the same, so classifying on "already
+            // dead when inspected" would judge identical runs by timing.
+            // Nothing downstream needs to: `Spawned` only resolves the
+            // launch to a pid, readiness comes from the provider's own
+            // stream, and the true wait status still follows in `Exited` and
+            // `Done`. `tests/keeper.rs` holds a child before exec and kills it
+            // to keep that so.
             if let Some((pid, _)) = &self.leader {
                 let pid = *pid;
                 self.queue(&Event::Spawned { pid });
