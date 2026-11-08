@@ -110,3 +110,8 @@ Subcommand names are reserved because the legacy positional archetype form
 archetype", whether or not `[archetypes].bare` exists. Existing `bare = ""`
 definitions remain valid, but a non-empty prompt is refused because the
 selector cannot prime. No group may be named `bare`.
+
+Config discovery propagates filesystem inspection errors; it never treats them
+as a missing file and falls back to another project or the global layer. A
+dangling .review.toml symlink is selected and fails to read. A dangling .git
+entry still stops upward discovery. Init refuses any existing config entry.

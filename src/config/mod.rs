@@ -1,14 +1,15 @@
-mod ids;
-mod load;
+//! File-format vocabulary and resolved configuration. Shared data types stay at
+//! this boundary; parsing, resolution, discovery and writing each have one owner.
+//! Native permissions belong to providers, registry rules to project::registry,
+//! and random identifiers to the dependency-free ids module.
+pub(crate) mod load;
 mod parse;
 mod profile;
 mod resolve;
 mod sandbox;
 
-pub use ids::{generate_uuid, try_generate_short_id};
-pub use load::{
-    Selection, global_config_path, global_projects, init, load, load_optional, project_root,
-};
+pub use crate::ids::{generate_uuid, try_generate_short_id};
+pub use load::{global_config_path, global_projects, load, load_optional, project_root};
 pub use parse::parse_file;
 pub use resolve::resolve;
 pub use sandbox::SandboxLevel;
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 
 pub use crate::provider::Provider;
 
-const CONFIG_FILENAME: &str = ".review.toml";
+pub(crate) const CONFIG_FILENAME: &str = ".review.toml";
 
 /// Names that can't be archetypes or groups: `all`, the `-a` keyword for every
 /// configured archetype except `bare`, and the subcommand names. `-a` itself
@@ -220,6 +221,74 @@ pub struct ReviewConfig {
 }
 
 impl ReviewConfig {
+    /// Expand names, groups and the synthetic bare selector in selection order.
+    pub(crate) fn select_archetypes(
+        &self,
+        selector: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        use anyhow::bail;
+        let mut archetypes_to_run: Vec<(String, String)> = Vec::new();
+        match selector {
+            None => archetypes_to_run.push((BARE.to_string(), String::new())),
+            Some(arg) => {
+                for name in arg.split(',') {
+                    if name == BARE {
+                        // The legacy positional form has always meant this without
+                        // consulting config; keep the explicit flag equivalent.
+                        archetypes_to_run.push((BARE.to_string(), String::new()));
+                    } else if name == "all" {
+                        archetypes_to_run.extend(
+                            self.archetypes
+                                .iter()
+                                .filter(|(n, _)| n.as_str() != BARE)
+                                .map(|(n, p)| (n.clone(), p.value.clone())),
+                        );
+                    } else if let Some(group) = self.groups.get(name) {
+                        // Config resolution removes cross-layer losers and rejects
+                        // same-layer clashes, so group-first lookup is not precedence.
+                        for member in &group.value {
+                            // Resolution checked every member exists.
+                            let prime = self.archetype(member).ok_or_else(|| {
+                                anyhow::anyhow!("group member {member} has no archetype")
+                            })?;
+                            archetypes_to_run.push((member.clone(), prime.to_string()));
+                        }
+                    } else if let Some(prime) = self.archetype(name) {
+                        archetypes_to_run.push((name.to_string(), prime.to_string()));
+                    } else {
+                        let mut available: Vec<&str> =
+                            self.archetypes.keys().map(String::as_str).collect();
+                        available.extend(self.groups.keys().map(String::as_str));
+                        bail!(
+                            "'{name}' not found in {}\n  \
+                         configured: {}",
+                            self.searched(),
+                            if available.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        );
+                    }
+                }
+            }
+        }
+
+        // Deduplicate (e.g. "all" + a specific archetype, or overlapping groups)
+        let mut seen = std::collections::HashSet::new();
+        archetypes_to_run.retain(|(name, _)| seen.insert(name.clone()));
+
+        if archetypes_to_run.is_empty() {
+            bail!(
+                "no priming archetypes configured in {}\n  \
+             Use -a bare or omit -a to send stdin unchanged, or add one under [archetypes].",
+                self.searched()
+            );
+        }
+
+        Ok(archetypes_to_run)
+    }
+
     /// The effective profile for `provider`, if any layer defines it.
     pub fn resolve_profile(&self, provider: Provider, profile: &str) -> Option<&Profile> {
         self.profiles
@@ -301,11 +370,38 @@ pub fn hostname() -> String {
     gethostname::gethostname().to_string_lossy().to_string()
 }
 
-/// Format a hostname as a TOML key, quoting only if it contains dots.
-pub fn toml_key(key: &str) -> String {
-    if key.contains('.') {
-        format!("\"{key}\"")
-    } else {
-        key.to_string()
+pub use crate::toml_key::toml_key;
+
+pub use crate::config_write::init;
+pub use crate::project::Selection;
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn selection_expands_groups_deduplicates_and_keeps_bare_unprimed() {
+        let raw = "[archetypes]\na = 'prime'\nb = 'second'\nbare = ''\n[_groups]\ng = ['b', 'a']\n";
+        let mut cfg = resolve(
+            parse_file(raw, "fixture", Layer::Local).expect("parse"),
+            None,
+            "host",
+            ConfigFiles::default(),
+        )
+        .expect("resolve");
+        assert_eq!(
+            cfg.select_archetypes(Some("g,a,bare")).expect("select"),
+            vec![
+                ("b".into(), "second".into()),
+                ("a".into(), "prime".into()),
+                ("bare".into(), String::new())
+            ]
+        );
+        assert_eq!(
+            cfg.select_archetypes(None).expect("bare"),
+            vec![("bare".into(), String::new())]
+        );
+        assert!(cfg.select_archetypes(Some("unknown")).is_err());
+        cfg.archetypes.remove("b");
+        assert!(cfg.select_archetypes(Some("g")).is_err());
     }
 }

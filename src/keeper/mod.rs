@@ -51,7 +51,6 @@ mod process;
 mod protocol;
 mod runtime;
 
-pub use process::{pidfd_exited, pidfd_open, pidfd_signal, stat_ppid_start};
 pub use protocol::{ARG, Control, Event, KILLED_MAX, Outcome, Proc, Spec};
 pub use runtime::{block_handled_signals, main};
 

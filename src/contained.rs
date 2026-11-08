@@ -1,21 +1,8 @@
-//! `review`'s side of the keeper (see `keeper`): every provider process
-//! `review` starts is launched through `spawn`, which puts a keeper between the
-//! two, and a run is not over until that keeper has torn down whatever the
-//! provider left behind and been reaped.
-//!
-//! Three process-wide records hang off it:
-//!
-//! - the ledger: one verdict per invocation, whichever answer is reported. The
-//!   exit status reads it (exit 3), so a run whose teardown failed fails the command even
-//!   when an auto-resume, a grok wake or another provider in the fan-out
-//!   produced the answer;
-//! - the registry of live keepers, which the signal supervisor terminates and
-//!   waits for on its way out;
-//! - the admission gate: once shutdown has begun no keeper is spawned, checked
-//!   under the same lock the registry is updated under, so a launch can never
-//!   slip between the supervisor's snapshot and its exit.
+//! Provider invocation containment. Command-owned bookkeeping lives in
+//! `supervisor::Lifecycle`; every handle retains its exact owner through drop.
 
 use crate::keeper::{self, Event, Outcome, Proc};
+use crate::supervisor::{Control, Lifecycle};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -113,138 +100,6 @@ impl Leftovers {
             self.unknown = other.unknown;
         }
     }
-}
-
-/// One invocation whose teardown did not establish that nothing is alive.
-#[derive(Clone, Debug)]
-pub struct Unresolved {
-    pub label: String,
-    pub keeper_pid: u32,
-    pub leftovers: Leftovers,
-}
-
-static LEDGER: Mutex<Vec<Unresolved>> = Mutex::new(Vec::new());
-
-fn record(label: &str, keeper_pid: u32, leftovers: &Leftovers) {
-    if leftovers.is_clean() {
-        return;
-    }
-    if let Ok(mut ledger) = LEDGER.lock() {
-        ledger.push(Unresolved {
-            label: label.to_string(),
-            keeper_pid,
-            leftovers: leftovers.clone(),
-        });
-    }
-}
-
-/// Every invocation so far whose teardown was not clean.
-pub fn unresolved() -> Vec<Unresolved> {
-    LEDGER.lock().map(|l| l.clone()).unwrap_or_default()
-}
-
-/// The closing report: what is still running, or may be. Empty when every
-/// teardown was clean. Plain lines: printed to stdout above the `runtime:`
-/// line, or to stderr by the signal supervisor on its way out.
-pub fn report_lines(entries: &[Unresolved]) -> Vec<String> {
-    let mut out = Vec::new();
-    for e in entries {
-        let l = &e.leftovers;
-        if let Some(why) = &l.unknown {
-            out.push(format!(
-                "teardown outcome unknown: {} (keeper pid {}) - {why}; processes it started \
-                 may still be running",
-                e.label, e.keeper_pid
-            ));
-            if !l.survivors.is_empty() {
-                out.push("  known to have survived:".to_string());
-            }
-            for p in &l.survivors {
-                out.push(format!(
-                    "  pid {}  {}{}",
-                    p.pid,
-                    p.cmdline,
-                    if p.truncated { " ..." } else { "" }
-                ));
-            }
-            continue;
-        }
-        let n = l.survivors.len();
-        out.push(format!(
-            "left running: {}{} process{} {} started survived teardown",
-            if l.incomplete { "at least " } else { "" },
-            n.max(1),
-            if n.max(1) == 1 { "" } else { "es" },
-            e.label
-        ));
-        for p in &l.survivors {
-            out.push(format!(
-                "  pid {}  {}{}",
-                p.pid,
-                p.cmdline,
-                if p.truncated { " ..." } else { "" }
-            ));
-        }
-        if l.incomplete {
-            out.push("  (more remain that could not be identified)".to_string());
-        }
-    }
-    out
-}
-
-/// The control pipe's write end, shared by a run and the registry.
-struct Control(OwnedFd);
-
-impl Control {
-    fn send(&self, byte: u8) -> std::io::Result<()> {
-        // SAFETY: one byte from a local into a descriptor we own; the pipe is
-        // non-blocking, and the keeper drains it promptly.
-        let n = unsafe {
-            libc::write(
-                self.0.as_raw_fd(),
-                (&raw const byte).cast::<libc::c_void>(),
-                1,
-            )
-        };
-        if n == 1 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-}
-
-#[derive(Default)]
-struct Registry {
-    closed: bool,
-    live: std::collections::HashMap<u32, Arc<Control>>,
-}
-
-static REGISTRY: Mutex<Option<Registry>> = Mutex::new(None);
-
-fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> Option<T> {
-    REGISTRY
-        .lock()
-        .ok()
-        .map(|mut g| f(g.get_or_insert_with(Default::default)))
-}
-
-/// Begin shutdown: no keeper spawns from here on, and every live one is told
-/// to terminate. Returns how many were told.
-pub fn terminate_all() -> usize {
-    with_registry(|r| {
-        r.closed = true;
-        for control in r.live.values() {
-            let _ = control.send(keeper::Control::Terminate.byte());
-        }
-        r.live.len()
-    })
-    .unwrap_or(0)
-}
-
-/// Keeper pids still running, for the shutdown report.
-pub fn live_keepers() -> Vec<u32> {
-    with_registry(|r| r.live.keys().copied().collect()).unwrap_or_default()
 }
 
 /// A pipe pair with both ends close-on-exec and numbered at least 3, so the
@@ -349,6 +204,7 @@ pub struct Contained {
     /// The keeper process. Its stdio is the provider's.
     pub child: Child,
     keeper_pid: u32,
+    lifecycle: Lifecycle,
     control: Arc<Control>,
     events: Option<tokio::task::JoinHandle<()>>,
     collected: Arc<Mutex<Events>>,
@@ -368,6 +224,7 @@ pub struct Contained {
 /// Refused once shutdown has begun, checked under the registry lock that
 /// shutdown closes, and registered under it before the spawn returns.
 pub fn spawn(
+    lifecycle: &Lifecycle,
     provider: &Command,
     stdin: std::process::Stdio,
     settings: &Settings,
@@ -429,17 +286,7 @@ pub fn spawn(
         });
     }
     let control = Arc::new(Control(control_w));
-    let child = with_registry(|r| -> Result<Child> {
-        if r.closed || crate::provider::stop_requested() {
-            anyhow::bail!("not launched: review was signalled to stop");
-        }
-        let child = cmd.spawn().context("failed to spawn the keeper")?;
-        if let Some(pid) = child.id() {
-            r.live.insert(pid, Arc::clone(&control));
-        }
-        Ok(child)
-    })
-    .unwrap_or_else(|| Err(anyhow::anyhow!("keeper registry unavailable")))?;
+    let child = lifecycle.spawn(&mut cmd, &control)?;
     // The keeper has its own copies now.
     drop(control_r);
     drop(events_w);
@@ -469,6 +316,7 @@ pub fn spawn(
     Ok(Contained {
         child,
         keeper_pid,
+        lifecycle: lifecycle.clone(),
         control,
         events: Some(events),
         collected,
@@ -631,9 +479,12 @@ impl Contained {
                 }
             }
         };
-        record(&self.label, self.keeper_pid, &finished.leftovers);
-        let pid = self.keeper_pid;
-        with_registry(|r| r.live.remove(&pid));
+        self.lifecycle.complete(
+            &self.label,
+            self.keeper_pid,
+            &self.control,
+            &finished.leftovers,
+        );
         self.finished = true;
         finished
     }
@@ -648,91 +499,16 @@ impl Drop for Contained {
             return;
         }
         self.terminate();
-        record(
+        self.lifecycle.complete(
             &self.label,
             self.keeper_pid,
+            &self.control,
             &Leftovers {
                 unknown: Some("the run ended before its teardown was confirmed".to_string()),
                 ..Leftovers::default()
             },
         );
-        let pid = self.keeper_pid;
-        with_registry(|r| r.live.remove(&pid));
     }
-}
-
-/// `binary <leading_args> --version` under a keeper, for incident bundles: a wrapper or a
-/// stub can fork too. Its leftovers join the run's.
-pub async fn version_probe(
-    binary: &str,
-    leading_args: &[String],
-    settings: &Settings,
-) -> (Option<String>, Leftovers) {
-    let mut cmd = Command::new(binary);
-    cmd.args(leading_args).arg("--version");
-    let label = format!("{binary} --version probe");
-    // Never inherit our stdin: a binary that reads stdin before parsing its
-    // arguments would block forever, taking the incident write with it.
-    let mut contained = match spawn(&cmd, std::process::Stdio::null(), settings, &label, None) {
-        Ok(c) => c,
-        Err(_) => return (None, Leftovers::default()),
-    };
-    let stdout = contained.child.stdout.take();
-    let stderr = contained.child.stderr.take();
-    // Both pipes drained to EOF, keeping only a version's worth: a probe left
-    // blocked on a full pipe would never exit, and its keeper never start the
-    // teardown.
-    async fn drain<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
-        use tokio::io::AsyncReadExt;
-        let mut kept = Vec::new();
-        let Some(mut pipe) = pipe else {
-            return kept;
-        };
-        let mut chunk = [0u8; 4096];
-        while let Ok(n) = pipe.read(&mut chunk).await {
-            if n == 0 {
-                break;
-            }
-            let room = (64usize << 10).saturating_sub(kept.len()).min(n);
-            kept.extend_from_slice(&chunk[..room]);
-        }
-        kept
-    }
-    let run = async {
-        let launched = contained.go().await.is_ok();
-        let (buf, _, status) = tokio::join!(drain(stdout), drain(stderr), contained.wait());
-        (launched, buf, status)
-    };
-    // Bounded end to end, launch included: a probe that has not finished
-    // within the startup bound is terminated, and given the keeper's own
-    // teardown bound. Past that it is abandoned, which `Drop` records as an
-    // unknown outcome; an incident bundle is not worth a hung run.
-    let outcome = tokio::time::timeout(settings.startup, run).await;
-    let (launched, buf, status) = match outcome {
-        Ok(done) => done,
-        Err(_) => {
-            contained.terminate();
-            match tokio::time::timeout(settings.terminate_bound(), contained.wait()).await {
-                Ok(status) => (false, Vec::new(), status),
-                Err(_) => {
-                    drop(contained);
-                    return (
-                        None,
-                        Leftovers {
-                            unknown: Some(
-                                "the version probe's keeper did not finish in time".to_string(),
-                            ),
-                            ..Leftovers::default()
-                        },
-                    );
-                }
-            }
-        }
-    };
-    let finished = contained.finish(&status).await;
-    let text = String::from_utf8_lossy(&buf).trim().to_string();
-    let version = (launched && !text.is_empty()).then_some(text);
-    (version, finished.leftovers)
 }
 
 #[cfg(test)]
@@ -745,84 +521,6 @@ mod tests {
             cmdline: cmdline.to_string(),
             truncated: false,
         }
-    }
-
-    fn entry(leftovers: Leftovers) -> Unresolved {
-        Unresolved {
-            label: "the codex run of session s".to_string(),
-            keeper_pid: 7,
-            leftovers,
-        }
-    }
-
-    #[test]
-    fn cleanly_killed_leftovers_report_nothing() {
-        let killed = Leftovers {
-            killed: vec![proc_(1, "sleep 600")],
-            ..Leftovers::default()
-        };
-        assert!(killed.is_clean());
-        assert!(!killed.is_empty(), "but they are recorded");
-    }
-
-    #[test]
-    fn survivors_are_named_one_per_line() {
-        let lines = report_lines(&[entry(Leftovers {
-            survivors: vec![proc_(41233, "python3 a.py"), proc_(41240, "python3 b.py")],
-            ..Leftovers::default()
-        })]);
-        assert_eq!(
-            lines,
-            vec![
-                "left running: 2 processes the codex run of session s started survived teardown",
-                "  pid 41233  python3 a.py",
-                "  pid 41240  python3 b.py",
-            ]
-        );
-    }
-
-    #[test]
-    fn an_incomplete_enumeration_is_a_lower_bound_not_a_count() {
-        let lines = report_lines(&[entry(Leftovers {
-            incomplete: true,
-            ..Leftovers::default()
-        })]);
-        assert!(
-            lines[0].starts_with("left running: at least 1 process "),
-            "{lines:?}"
-        );
-        assert!(lines[1].contains("could not be identified"), "{lines:?}");
-    }
-
-    #[test]
-    fn an_unknown_outcome_never_reads_as_clean() {
-        let unknown = Leftovers {
-            unknown: Some("the keeper exited abnormally".to_string()),
-            ..Leftovers::default()
-        };
-        assert!(!unknown.is_clean());
-        let lines = report_lines(&[entry(unknown)]);
-        assert!(
-            lines[0].starts_with("teardown outcome unknown:"),
-            "{lines:?}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_outcome_still_names_the_survivors_it_knew() {
-        let lines = report_lines(&[entry(Leftovers {
-            survivors: vec![proc_(9, "python3 hung.py")],
-            unknown: Some("the keeper's report was cut off".to_string()),
-            ..Leftovers::default()
-        })]);
-        assert!(
-            lines[0].starts_with("teardown outcome unknown:"),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains("pid 9  python3 hung.py")),
-            "{lines:?}"
-        );
     }
 
     #[test]

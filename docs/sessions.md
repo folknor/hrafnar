@@ -32,7 +32,10 @@ provider, archetype, project, model, effort, sandbox and writable roots, the
 digest, and the response. A deleted project still shows. With `-C`, the
 session must belong to the selected project.
 Fresh runs are recorded as `run`; resumes, including automatic resumes, are
-recorded as `session`.
+recorded as `session`. Each row's assembled prompt is what that invocation
+received. An automatic recovery row records the recovery nudge and retains the
+original operator prompt separately. Recovery pairs are appended in invocation
+order after recovery ends, whichever answer is displayed.
 
 For codex it also reads the session's transcript under the resolved
 `CODEX_HOME` recorded with the session: its path, whether the turn completed,
@@ -64,13 +67,14 @@ transcript excerpt, so the run can be diagnosed without reproducing it. A
 bundle path is reported only when every artifact was written; partial writes
 are reported with their failed paths. `review incidents` lists readable
 bundles and warns about metadata it could not read or parse. Interrupted runs
-are never bundled.
+are never bundled. Metadata uses schema 1; older schema-1 bundles remain
+readable, and unsupported versions or invalid metadata produce a warning.
 
 ## Querying further
 
 The session log is one JSON object per line. Fields include `session_id`,
 `provider`, `project`, `archetype`, `model`, `effort`, `sandbox`,
-`writable_roots`, `env_keys` (env var names only), `codex_home` (the resolved
+`writable_roots`, `profile_origin` (selected profile layer and table), `env_keys` (env var names only), `codex_home` (the resolved
 Codex rollout directory), the prompts, the response or error, and a flat
 `digest`, so `jq` answers what the listing does not (with the default data
 directory):

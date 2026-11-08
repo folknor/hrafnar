@@ -1,3 +1,5 @@
+// This is serialized review vocabulary. Native translation and grant semantics
+// belong to provider::Permissions, not the config parser or display command.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Review's reserved permission vocabulary. Other names belong to the provider.

@@ -36,7 +36,8 @@ use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::config::Selection;
+pub(crate) mod registry;
+pub use registry::check_name;
 
 #[path = "path_expansion.rs"]
 pub(crate) mod path_expansion;
@@ -51,25 +52,6 @@ fn is_path(selector: &str) -> bool {
         || ["/", "./", "../"]
             .iter()
             .any(|p| selector.starts_with(p))
-}
-
-/// A registry key must be a name: anything spelled as a path could never be
-/// selected by it, so it is refused where it is written.
-pub fn check_name(name: &str) -> std::result::Result<(), String> {
-    if name.trim().is_empty() {
-        return Err("a project name cannot be empty".to_string());
-    }
-    if is_path(name) {
-        return Err(format!(
-            "'{name}' is spelled like a path, so `-C {name}` would never look it up"
-        ));
-    }
-    if name.ends_with('/') || name.chars().any(char::is_whitespace) {
-        return Err(format!(
-            "'{name}' has a trailing slash or whitespace, which no selector can match"
-        ));
-    }
-    Ok(())
 }
 
 /// Resolve `-C`. `None` is the invoking directory, as without the flag.
@@ -186,6 +168,38 @@ fn canonical(path: &Path) -> PathBuf {
 pub fn same_project(recorded: &str, root: &Path) -> bool {
     let rec = Path::new(recorded);
     rec == root || canonical(rec) == canonical(root)
+}
+
+/// Where to look for the project's `.review.toml`.
+///
+/// The two cases are kept apart because they permit different things, and a
+/// bare directory would lose which one applies. `Discover` is the ambient
+/// rule - walk up to the git root - for the invoking directory and for an
+/// explicit `-C ./path`. `Exact` is a root that is already known to be the
+/// project, a registered name or a session's recorded root: its config must sit
+/// directly in it. Walking up from one would let a registered or recorded root
+/// whose config had gone adopt an ancestor's - another project's audit id and
+/// privacy setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Discover(PathBuf),
+    Exact(PathBuf),
+}
+
+impl Selection {
+    /// The invoking directory, walked up as `review` always has.
+    pub fn cwd() -> Result<Self> {
+        let dir = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+        Ok(Selection::Discover(dir))
+    }
+
+    /// The directory the selection starts from.
+    pub fn dir(&self) -> &std::path::Path {
+        match self {
+            Selection::Discover(d) | Selection::Exact(d) => d,
+        }
+    }
 }
 
 #[cfg(test)]

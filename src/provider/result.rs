@@ -1,3 +1,4 @@
+pub use super::codex::forensics::CodexForensics;
 use anyhow::Result;
 
 /// Token accounting summed across a run's `turn.completed` events (codex).
@@ -21,22 +22,26 @@ pub struct Digest {
     pub signal: Option<String>,
     pub turns: u32,
     pub usage: Usage,
-    /// Non-JSON stdout lines (codex ERROR/WARN, apply_patch dumps). The harness
-    /// can halt NDJSON emission on these, so we keep them visible.
-    pub log_lines: Vec<String>,
-    /// On-disk transcript forensics, read only when the run looks wrong
-    /// (not captured, non-zero exit, or killed by a signal).
-    pub transcript: Option<crate::transcript::TranscriptSummary>,
     /// Directory of the forensic bundle written for a suspicious run (stderr,
     /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
     pub incident_path: Option<String>,
-    /// How long the rollout had been unchanged when the watchdog decided to act.
-    /// Recorded so a stall-timeout misfire on a healthy run shows how close the
-    /// call was, rather than only that it happened.
-    pub quiet_secs: Option<u64>,
-    /// `type/payload.type` of the last rollout event - what codex was doing when
-    /// it went silent.
-    pub last_rollout_event: Option<String>,
+
+    pub provider: Option<ProviderForensics>,
+}
+
+/// Provider evidence is optional; providers without extra artifacts have no block.
+/// This enum is internal. The documented flat DigestSummary remains the wire
+/// projection so historical sidecar and audit rows never require a tagged block.
+pub enum ProviderForensics {
+    Codex(CodexForensics),
+}
+
+impl Digest {
+    pub fn codex(&self) -> Option<&CodexForensics> {
+        match self.provider.as_ref()? {
+            ProviderForensics::Codex(evidence) => Some(evidence),
+        }
+    }
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -100,16 +105,22 @@ impl Digest {
             captured: outcome.answer == Answer::Captured,
             recovered_from_transcript: outcome.answer == Answer::Recovered,
             turns: self.turns,
-            task_complete: self.transcript.as_ref().map(|t| t.task_complete),
-            stream_error: self.transcript.as_ref().map(|t| t.stream_error),
+            task_complete: self
+                .codex()
+                .and_then(|c| c.transcript.as_ref())
+                .map(|t| t.task_complete),
+            stream_error: self
+                .codex()
+                .and_then(|c| c.transcript.as_ref())
+                .map(|t| t.stream_error),
             input_tokens: self.usage.input_tokens,
             cached_input_tokens: self.usage.cached_input_tokens,
             output_tokens: self.usage.output_tokens,
             reasoning_output_tokens: self.usage.reasoning_output_tokens,
             incident_path: self.incident_path.clone(),
             terminated_by_review: outcome.termination().map(str::to_string),
-            quiet_secs: self.quiet_secs,
-            last_rollout_event: self.last_rollout_event.clone(),
+            quiet_secs: self.codex().and_then(|c| c.quiet_secs),
+            last_rollout_event: self.codex().and_then(|c| c.last_rollout_event.clone()),
             turn_error: outcome.stated.clone(),
             review_error: outcome.unverified.clone(),
             interrupted: matches!(outcome.ended_by, EndedBy::Interrupted(_)),
@@ -121,9 +132,12 @@ impl Digest {
         super::outcome::StatusFacts {
             exit_code: self.exit_code,
             signal: self.signal.as_deref(),
-            quiet_secs: self.quiet_secs,
-            last_event: self.last_rollout_event.as_deref(),
-            task_complete: self.transcript.as_ref().map(|t| t.task_complete),
+            quiet_secs: self.codex().and_then(|c| c.quiet_secs),
+            last_event: self.codex().and_then(|c| c.last_rollout_event.as_deref()),
+            task_complete: self
+                .codex()
+                .and_then(|c| c.transcript.as_ref())
+                .map(|t| t.task_complete),
         }
     }
 }
@@ -193,7 +207,7 @@ pub struct ProviderResult {
     pub grok_trust: Option<String>,
     /// What the run's processes left behind (see `contained`). Recorded in
     /// the audit and sidecar rows; never printed from here, since the closing
-    /// report reads the process-wide ledger instead.
+    /// report reads its command's Lifecycle ledger instead.
     pub leftovers: crate::contained::Leftovers,
 }
 
@@ -236,12 +250,9 @@ pub struct RunOutput {
     pub leftovers: crate::contained::Leftovers,
 }
 
-/// Pull what served the run out of a grok or claude result object - both name
-/// the fields `modelUsage` (keyed by model) and `total_cost_usd`. Parsed
-/// separately from `interpret_grok_output` / `interpret_claude_output` because
-/// it is record-only: nothing about whether the run answered depends on it, and
-/// a result lacking these fields is still a valid result - it just records
-/// nothing here.
+/// Record-only served fields from Grok's single result object. Claude-compatible
+/// streams sum every result through claude_stream::ClaudeMetrics instead: the
+/// coincident field names do not make these protocols interchangeable.
 pub(super) fn result_served(stdout: &str) -> Served {
     #[derive(serde::Deserialize)]
     struct Raw {

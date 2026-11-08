@@ -20,6 +20,11 @@ effort = "medium"
 
 `review config` lists every profile visible here, where each one comes from,
 and any definition it hides. Ask it before choosing a profile for a role.
+Session rows record the selected definition as `profile_origin` (layer and
+table), including automatic retries. This describes the requested launch
+source, not proof of successful execution or that the profile still exists.
+Only runs with a session ID get a session row. Unprofiled runs and manual
+messages have no profile origin.
 
 ## Selecting one
 

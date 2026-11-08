@@ -22,47 +22,6 @@ The per-provider questions below are owned by `provider::Provider`
 (src/provider/kind.rs) and the exhaustive matches beside it, described in
 `notes/structural.md`. Each entry here keeps only its residue.
 
-## CON-006 - Did codex's evidence hold a final answer?
-
-Reported by: providers, orchestration, forensics.
-
-The run-level question is settled: every runner builds one
-`provider::Outcome` and every decision reads `has_answer`/`failed`. What
-remains is codex's evidence readers, which still answer "is there a final
-answer" each in their own way over the rollout and stream:
-- `run_codex_json`'s stream parser: the last `item.completed` agent_message,
-  used as fallback text, unphased (it can be commentary the user then sees as
-  the answer under a death note).
-- `transcript::parse`: the `final_answer` of the last turn (phase-tagged).
-- `watchdog::has_final_answer`: any phase-tagged answer since the baseline.
-- `incident::scan_transcript`: the last `task_complete.last_agent_message` is
-  non-null.
-- `run_session_show`: `task_complete && final_answer.is_none()` means "likely
-  died mid-work".
-
-The Stranded-kill and `scan_transcript` defects in `notes/bugs.md` are two of
-their disagreements. Owner proposed: one rollout fold whose result feeds the
-codex runner's `Answer` and every reader above.
-
-## CON-007 - How did the run end, in words? (codex residue)
-
-Reported by: providers, forensics, orchestration.
-
-The digest's outcome lines have one renderer, `Outcome::lines`, used live and
-by `review sessions <ID>`. Still separate:
-- `run_codex_json`'s fallback text ("codex ended the turn", "interrupted by the
-  operator", "codex produced no final message", "codex died without a final
-  answer"), and claude's "(interrupted by the operator before a final
-  answer)", which restate the outcome as response text.
-- `run_session_show`'s "rollout has no final answer" note and its re-render of
-  the transcript block `print_digest` renders.
-
-`run_incidents`' verdict is deliberately separate: it reads bundle metadata,
-whose `final_answer_present` is a tri-state the outcome cannot express (the
-reasoning is at the site). Owner proposed: the placeholder text derived from
-the outcome in one place, so maki and opencode do not write a third and
-fourth copy.
-
 ## CON-009 - Was this run interrupted, and what does an interrupted run say?
 
 Reported by: providers, lifecycle.
@@ -76,8 +35,6 @@ is the lifecycle's stop arm. Still separate sources of the one fact:
   (`Event::Interrupted { by: Control | Signal }` or a field on `Done`), and the
   request file then only says an external SIGINT was operator intent.
 - `interrupt_cmd`'s row scan for `digest.interrupted`.
-- The "(interrupted by the operator before a final answer)" placeholder text,
-  still written by claude and codex separately (see CON-007).
 
 ## CON-013 - Is shutdown under way?
 
@@ -314,36 +271,17 @@ the handling inside each verb (`message_target`, `run_session_show`,
 `run_sessions`). Owner proposed: `cli::Command::project_scope() -> Scope { None,
 Asserted, Selected }`, driving both the refusal and the verbs.
 
-## CON-035 - How is the codex rollout format read?
+## CON-035 - Shared Codex forensic fixtures
 
-Reported by: forensics.
+Reported by: forensics. Narrowed: Codex rollout decoding now has one fold in
+provider/codex/rollout.rs. Transcript summaries, watchdog evidence and incident
+rate limits read its distinct projections; exec-stream fallback decoding shares
+that owner while retaining its separate unphased/interim authority.
 
-Four hand-rolled `serde_json::Value` line loops read it, each with its own
-`get("payload").get("type")` matching: `transcript::parse`,
-`watchdog::has_final_answer`, `watchdog::last_event` and
-`incident::scan_transcript`. The 0.157.0 `message`/`output_text` change was
-fixed in only one place (`final_answer_text`) and nearly missed the watchdog.
-Related decisions made twice:
-- "What is the tool in flight?": `ends_with("_call")` /
-  `ends_with("_call_output")` in `parse`; nothing in the watchdog, whose
-  `last_event` reports `custom_tool_call` but cannot say whether it is open.
-- `last_event` formatted as `"type/ptype"` by two independent `format!` sites
-  (`transcript::parse`, `watchdog::last_event`).
-- Fixtures: the same JSON shapes (`FINAL_ANSWER`, `TASK_STARTED`, the 0.157.0
-  assistant message) hand-typed separately in `transcript.rs`, `watchdog.rs`,
-  `incident.rs` tests and `tests/provider_runs.rs`.
-
-The watchdog depends on `transcript` for half its job (`final_answer_text`,
-`slice_from_offset`, `find_transcript_path`) and deliberately avoids `parse`
-with a paragraph explaining why; `scan_from_baseline` is a one-line wrapper
-restating that dependency. Owner proposed: a `codex::rollout::Event` enum
-parsed once (`TaskStarted`, `TaskComplete { last_agent_message }`,
-`TurnAborted`, `UserMessage`, `Reasoning`, `Message { role, phase, text }`,
-`AgentMessage { phase, text }`, `ToolCall { call_id, name, args }`,
-`ToolOutput { call_id }`, `StreamError`, `TokenCount { rate_limits }`,
-`Other { top, ptype }`), each reader a fold over it, `transcript` and
-`watchdog` siblings depending on a `rollout.rs`, and a test-only fixtures
-module with builders per codex version.
+Residue: the same JSON fixture shapes (task_started, final_answer, assistant
+message/output_text) remain hand-typed across transcript tests, Codex watchdog
+and rollout tests, and tests/provider_runs.rs. A test-only fixture module with
+builders per Codex version would give those representations one owner.
 
 ## CON-036 - Which rollout bytes belong to this run?
 
@@ -354,8 +292,8 @@ unknown is decided twice by different mechanisms: the watchdog pends forever
 (`None => pending()`), and recovery uses `Some(baseline.unwrap_or(u64::MAX))`,
 turning "untrustworthy" into "past EOF" because `None` would have meant
 "everything". The same `Option<u64>` means opposite things at two adjacent
-call sites, held apart by a comment. `scan_transcript` and the transcript tail
-skip scoping entirely. Owner proposed:
+call sites, held apart by a comment. The incident artifact boundary now requires a u64 run offset and scopes its
+tail/rate limits; it cannot request the whole file accidentally. Owner proposed:
 `enum Scope { WholeFile, From(RolloutOffset), Untrusted }` passed to every
 rollout reader, with `slice` total over it.
 

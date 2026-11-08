@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use crate::config::load::{Located, entry_exists, locate_config};
+use crate::config::{CONFIG_FILENAME, Selection};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
@@ -77,6 +79,66 @@ fn set_audit_id(doc: &mut DocumentMut, id: &str) -> Result<()> {
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[_audit] is not a table in .review.toml"))?;
     audit_table.insert("id", value(id));
+    Ok(())
+}
+
+const INIT_TEMPLATE_PREFIX: &str = "\
+# Project config for `review`. Everything here is optional except [_audit].
+# Settings resolve command line, then this file, then the operator's global
+# config (~/.config/review/config.toml, same format). Run `review config` to see
+# the effective result and where each value came from.
+#
+# Archetypes are priming prompts: a name mapped to text prepended to stdin.
+# A run without an archetype sends stdin unchanged.
+#
+# [archetypes]
+# security = \"You are a security expert for this project. Read the codebase.\"
+#
+# Providers to fan out to when --provider is omitted:
+# [_defaults]
+# providers = [\"codex\"]
+#
+# Groups fan out to multiple archetypes:
+# [_groups]
+# sweep = [\"security\", \"bugs\"]
+#
+# Named profiles, selected with --profile, as [<provider>.<profile>]. A profile
+# here replaces a global profile of the same name entirely.
+# [codex.deep]
+# model = \"gpt-6-luna\"
+# effort = \"high\"
+# sandbox = \"read-only\"
+";
+
+/// Create a starter config in the selected directory itself - never in an
+/// ancestor, whichever kind of selection it is.
+pub fn init(sel: &Selection) -> Result<()> {
+    let dir = sel.dir();
+    let path = dir.join(CONFIG_FILENAME);
+
+    if entry_exists(&path)? {
+        bail!("{CONFIG_FILENAME} already exists in {}", dir.display());
+    }
+
+    if let Located::Found(existing) = locate_config(&Selection::Discover(dir.to_path_buf()))? {
+        bail!(
+            "{CONFIG_FILENAME} already exists at {}\n  \
+             Creating another here would shadow it.",
+            existing.display()
+        );
+    }
+
+    let audit_id = crate::ids::try_generate_short_id()?;
+    let mut content = INIT_TEMPLATE_PREFIX.to_string();
+    content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
+    std::fs::write(&path, content)
+        .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
+
+    println!("Created {}", path.display());
+    println!();
+    println!("Next steps:");
+    println!("  1. Run `review config` to see what the global config already provides");
+    println!("  2. Run: echo \"check for issues\" | review --provider codex");
     Ok(())
 }
 

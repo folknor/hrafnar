@@ -22,6 +22,7 @@ fn record_run(
     audit_id: &str,
     archetype: &str,
     env_keys: &[String],
+    profile_origin: Option<&provider::ProfileOrigin>,
     operator_prompt: &str,
     prompt: &str,
     result: &provider::ProviderResult,
@@ -68,6 +69,7 @@ fn record_run(
             digest_summary.as_ref(),
             &result.leftovers,
             result.codex_home.as_deref(),
+            profile_origin,
         );
     }
 }
@@ -79,83 +81,89 @@ pub(super) struct RecordCtx {
     pub(super) audit_id: String,
     pub(super) archetype: String,
     pub(super) env_keys: Vec<String>,
+    pub(super) profile_origin: Option<provider::ProfileOrigin>,
     pub(super) operator_prompt: String,
-    pub(super) prompt: String,
 }
 
 impl RecordCtx {
-    pub(super) fn record(&self, result: &provider::ProviderResult) {
-        self.record_as(result, sessions::SessionKind::Run);
+    pub(super) fn record(&self, result: &provider::ProviderResult, prompt: &str) {
+        self.record_as(result, sessions::SessionKind::Run, prompt);
     }
 
-    fn record_as(&self, result: &provider::ProviderResult, kind: sessions::SessionKind) {
+    fn record_as(
+        &self,
+        result: &provider::ProviderResult,
+        kind: sessions::SessionKind,
+        prompt: &str,
+    ) {
         record_run(
             &self.project_root,
             self.private,
             &self.audit_id,
             &self.archetype,
             &self.env_keys,
+            self.profile_origin.as_ref(),
             &self.operator_prompt,
-            &self.prompt,
+            prompt,
             result,
             kind,
         );
     }
 }
 
-/// One provider launch in the fan-out, with its resolved profile.
+/// Scheduling and execution context around one complete launch request.
 pub(super) struct Launch {
-    pub(super) provider: provider::Provider,
-    pub(super) model: Option<String>,
-    pub(super) effort: Option<String>,
-    pub(super) sandbox: Option<crate::config::SandboxLevel>,
-    pub(super) writable_roots: Vec<String>,
-    pub(super) env: Option<std::collections::BTreeMap<String, String>>,
-    pub(super) config: Vec<String>,
-    pub(super) prompt: String,
-    pub(super) root: std::path::PathBuf,
+    pub(super) spec: provider::LaunchSpec,
     pub(super) runtime: provider::ProviderRuntime,
     pub(super) delay: std::time::Duration,
 }
 
 impl Launch {
-    /// A fresh run or the auto-resume of one, on this
-    /// launch's profile. An auto-resume must reuse the profile whole - roots
-    /// included - or the retry launches narrower than the run it replaces.
     async fn invoke(
         &self,
-        session: provider::SessionStart,
+        start: provider::SessionStart,
         prompt: &str,
     ) -> provider::ProviderResult {
-        provider::invoke(
-            self.provider,
-            session,
-            self.model.as_deref(),
-            self.effort.as_deref(),
-            provider::Permissions::profile(self.provider, self.sandbox.as_ref()),
-            &self.writable_roots,
-            self.env.as_ref(),
-            &self.config,
-            prompt,
-            &self.root,
-            // The fan-out serializes launches with its own stagger sleep, and an
-            // auto-resume runs inside an already-launched task, so neither needs
-            // a launch handshake.
-            None,
-            &self.runtime,
-        )
-        .await
+        let spec = provider::LaunchSpec {
+            start,
+            prompt: prompt.to_owned(),
+            ..self.spec.clone()
+        };
+        // Fan-out stagger and internal retries do not need a launch handshake.
+        provider::invoke(spec, None, &self.runtime).await
     }
 }
 
-/// A task's reportable `result` plus, when auto-resume ran, the *other*
-/// invocation (`also`). Both are persisted so no provider work or death is
-/// invisible to the audit/sidecar logs.
+/// One completed invocation and the exact prompt submitted to it. Recording
+/// order is independent of which invocation supplies the displayed result.
+struct RecordedInvocation {
+    result: provider::ProviderResult,
+    kind: sessions::SessionKind,
+    prompt: String,
+}
+
 pub(super) struct TaskOutcome {
-    pub(super) result: provider::ProviderResult,
-    also: Option<provider::ProviderResult>,
-    result_kind: sessions::SessionKind,
-    also_kind: Option<sessions::SessionKind>,
+    invocations: Vec<RecordedInvocation>,
+    selected: usize,
+}
+
+impl TaskOutcome {
+    fn single(result: provider::ProviderResult, prompt: String) -> Self {
+        Self {
+            invocations: vec![RecordedInvocation {
+                result,
+                kind: sessions::SessionKind::Run,
+                prompt,
+            }],
+            selected: 0,
+        }
+    }
+    fn result(&self) -> &provider::ProviderResult {
+        &self.invocations[self.selected].result
+    }
+    pub(super) fn into_result(mut self) -> provider::ProviderResult {
+        self.invocations.swap_remove(self.selected).result
+    }
 }
 
 /// What to do about a fresh run that has just ended.
@@ -219,94 +227,78 @@ fn after_run(first: &provider::ProviderResult) -> AfterRun {
 fn after_auto_resume(
     first: provider::ProviderResult,
     mut second: provider::ProviderResult,
+    first_prompt: String,
+    second_prompt: String,
 ) -> TaskOutcome {
-    if outcome_of(&second).is_some_and(provider::Outcome::has_answer) {
-        if let Ok(turn) = second.output.as_mut() {
-            turn.text = format!(
-                "(auto-resumed after the initial run died without a final answer)\n\n{}",
-                turn.text
-            );
-        }
-        return TaskOutcome {
-            result: second,
-            also: Some(first),
-            result_kind: sessions::SessionKind::Resume,
-            also_kind: Some(sessions::SessionKind::Run),
-        };
+    let answered = outcome_of(&second).is_some_and(provider::Outcome::has_answer);
+    let selected =
+        usize::from(answered || outcome_of(&second).is_some_and(provider::Outcome::interrupted));
+    if answered && let Ok(turn) = second.output.as_mut() {
+        // Existing application annotation is also persisted in the response;
+        // it is independent of the actual submitted prompt retained below.
+        turn.text = format!(
+            "(auto-resumed after the initial run died without a final answer)\n\n{}",
+            turn.text
+        );
     }
-    if outcome_of(&second).is_some_and(provider::Outcome::interrupted) {
-        return TaskOutcome {
-            result: second,
-            also: Some(first),
-            result_kind: sessions::SessionKind::Resume,
-            also_kind: Some(sessions::SessionKind::Run),
-        };
-    }
-    // Resume didn't help: keep the death as the result, but still persist the
-    // resume's digest/incident.
     TaskOutcome {
-        result: first,
-        also: Some(second),
-        result_kind: sessions::SessionKind::Run,
-        also_kind: Some(sessions::SessionKind::Resume),
+        invocations: vec![
+            RecordedInvocation {
+                result: first,
+                kind: sessions::SessionKind::Run,
+                prompt: first_prompt,
+            },
+            RecordedInvocation {
+                result: second,
+                kind: sessions::SessionKind::Resume,
+                prompt: second_prompt,
+            },
+        ],
+        selected,
     }
 }
 
 /// One fan-out task: launch, maybe auto-resume, then record.
 ///
-/// Recorded here, as each run ends, rather than once every run in the fan-out
-/// has: `review resume` needs the sidecar row, and `review interrupt` waits for
+/// Recorded within each fan-out task, after any recovery, rather than after
+/// every sibling task has finished: `review resume` needs the sidecar row, and `review interrupt` waits for
 /// it, so a run must not stay unresumable until its slowest sibling finishes.
 /// Rows are written in launch order, so the most recent invocation also wins a
 /// same-second timestamp tie.
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
     // Held until the rows below are written, so a signalled `review` does not
-    // exit with this session unrecorded (see `provider::install_signal_supervisor`).
-    let _unrecorded = provider::Unrecorded::for_provider(launch.provider);
+    // exit with this session unrecorded (see `supervisor::install_signal_supervisor`).
+    let _unrecorded = launch
+        .runtime
+        .lifecycle
+        .unrecorded_for(launch.spec.provider);
     if !launch.delay.is_zero() {
         tokio::time::sleep(launch.delay).await;
     }
-    let prov = launch.provider;
+    let prov = launch.spec.provider;
     let first = launch
-        .invoke(provider::SessionStart::Fresh { id: None }, &launch.prompt)
+        .invoke(
+            provider::SessionStart::Fresh { id: None },
+            &launch.spec.prompt,
+        )
         .await;
     let outcome = match after_run(&first) {
-        AfterRun::Report => TaskOutcome {
-            result: first,
-            also: None,
-            result_kind: sessions::SessionKind::Run,
-            also_kind: None,
-        },
+        AfterRun::Report => TaskOutcome::single(first, launch.spec.prompt.clone()),
         AfterRun::Interrupted => {
             eprintln!("{prov} run interrupted - not auto-resuming");
-            TaskOutcome {
-                result: first,
-                also: None,
-                result_kind: sessions::SessionKind::Run,
-                also_kind: None,
-            }
+            TaskOutcome::single(first, launch.spec.prompt.clone())
         }
         AfterRun::LeftRunning => {
             eprintln!(
                 "{prov} run died without a final answer; not auto-resuming - processes \
                  it started survived teardown, or its teardown could not be confirmed"
             );
-            TaskOutcome {
-                result: first,
-                also: None,
-                result_kind: sessions::SessionKind::Run,
-                also_kind: None,
-            }
+            TaskOutcome::single(first, launch.spec.prompt.clone())
         }
         AfterRun::StatedFailure(why) => {
             eprintln!("{prov} ended the turn without a final answer: {why}");
             eprintln!("not auto-resuming - {prov} stated a reason, so a retry would hit it again");
-            TaskOutcome {
-                result: first,
-                also: None,
-                result_kind: sessions::SessionKind::Run,
-                also_kind: None,
-            }
+            TaskOutcome::single(first, launch.spec.prompt.clone())
         }
         AfterRun::AutoResume {
             session: sid,
@@ -322,7 +314,7 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
                     nudge,
                 )
                 .await;
-            after_auto_resume(first, second)
+            after_auto_resume(first, second, launch.spec.prompt.clone(), nudge.to_string())
         }
     };
     // Both runs are recorded only now, after any auto-resume. Keep paired rows
@@ -334,27 +326,19 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
     // and the message would start a second turn on the session. A message
     // arriving while the auto-resume runs finds its marker (written before its
     // spawn) and interrupts it, as for any run.
-    if let Some(other) = &outcome.also {
-        let other_kind = outcome
-            .also_kind
-            .clone()
-            .expect("an additional run has a row kind");
-        if outcome.result_kind == sessions::SessionKind::Run {
-            ctx.record_as(&outcome.result, outcome.result_kind.clone());
-            ctx.record_as(other, other_kind);
-        } else {
-            ctx.record_as(other, other_kind);
-            ctx.record_as(&outcome.result, outcome.result_kind.clone());
-        }
-    } else {
-        ctx.record_as(&outcome.result, outcome.result_kind.clone());
+    for invocation in &outcome.invocations {
+        ctx.record_as(
+            &invocation.result,
+            invocation.kind.clone(),
+            &invocation.prompt,
+        );
     }
     // A signalled `review` exits once every codex run is recorded, before the
     // results are printed, so say here how to continue this one.
-    if provider::stop_requested()
+    if launch.runtime.lifecycle.stop_requested()
         && let (Some(sid), Some(true)) = (
-            outcome.result.session_id.as_deref(),
-            outcome_of(&outcome.result).map(provider::Outcome::interrupted),
+            outcome.result().session_id.as_deref(),
+            outcome_of(outcome.result()).map(provider::Outcome::interrupted),
         )
     {
         eprintln!("{}", provider::resume_hint(prov, sid));
@@ -404,6 +388,25 @@ mod tests {
         AfterRun::AutoResume {
             session: sid.into(),
             nudge,
+        }
+    }
+
+    #[test]
+    fn recovery_invocations_keep_prompts_in_chronological_order() {
+        for (answered, interrupted, selected) in
+            [(true, false, 1), (false, true, 1), (false, false, 0)]
+        {
+            let outcome = after_auto_resume(
+                codex_run("s", false, false),
+                codex_run("s", answered, interrupted),
+                "assembled".into(),
+                "actual nudge".into(),
+            );
+            assert_eq!(outcome.selected, selected);
+            assert_eq!(outcome.invocations[0].prompt, "assembled");
+            assert_eq!(outcome.invocations[1].prompt, "actual nudge");
+            assert_eq!(outcome.invocations[0].kind, sessions::SessionKind::Run);
+            assert_eq!(outcome.invocations[1].kind, sessions::SessionKind::Resume);
         }
     }
 
@@ -466,15 +469,24 @@ mod tests {
         let outcome = after_auto_resume(
             codex_run("first", false, false),
             codex_run("second", false, true),
+            "initial".into(),
+            "nudge".into(),
         );
         assert_eq!(
-            outcome.result.output.as_ref().ok().map(|t| t.text.as_str()),
+            outcome
+                .result()
+                .output
+                .as_ref()
+                .ok()
+                .map(|t| t.text.as_str()),
             Some("text of second")
         );
         assert!(
-            outcome
-                .also
-                .is_some_and(|r| r.output.as_ref().is_ok_and(|t| t.text == "text of first"))
+            outcome.invocations[0]
+                .result
+                .output
+                .as_ref()
+                .is_ok_and(|t| t.text == "text of first")
         );
     }
 
@@ -483,9 +495,16 @@ mod tests {
         let outcome = after_auto_resume(
             codex_run("first", false, false),
             codex_run("second", false, false),
+            "initial".into(),
+            "nudge".into(),
         );
         assert_eq!(
-            outcome.result.output.as_ref().ok().map(|t| t.text.as_str()),
+            outcome
+                .result()
+                .output
+                .as_ref()
+                .ok()
+                .map(|t| t.text.as_str()),
             Some("text of first")
         );
     }
@@ -495,8 +514,10 @@ mod tests {
         let outcome = after_auto_resume(
             codex_run("first", false, false),
             codex_run("second", true, false),
+            "initial".into(),
+            "nudge".into(),
         );
-        let text = outcome.result.output.expect("text").text;
+        let text = outcome.into_result().output.expect("text").text;
         assert!(text.starts_with("(auto-resumed"), "got {text:?}");
         assert!(text.ends_with("text of second"));
     }

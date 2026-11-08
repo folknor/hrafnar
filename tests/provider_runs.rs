@@ -49,7 +49,7 @@
 //! that window fails with `ETXTBSY`. Exec'ing the system shell avoids the race
 //! by construction while preserving the real child/process-group behaviour.
 //! Suspicious runs consequently probe `/bin/sh --version`, not the script;
-//! `contained::version_probe` must keep its stdin set to null so a shell that
+//! `incident::version_probe` must keep its stdin set to null so a shell that
 //! handles an unknown option by reading stdin cannot hang the bundle write.
 
 use anyhow::Result;
@@ -255,8 +255,8 @@ fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
         },
         drain_grace: std::time::Duration::from_millis(300),
         data_root: Some(scratch.data_root()),
-        // Never flips; a test of the signal path passes its own.
-        stop: tokio::sync::watch::channel(false).1,
+        // One domain per fixture, shared by its turns and version probes.
+        lifecycle: review::supervisor::Lifecycle::default(),
         teardown: fast_teardown(),
         orphan_log: Some(scratch.data_root().join("review/teardowns.jsonl")),
     }
@@ -311,6 +311,19 @@ async fn run_stub_with(
     );
     let project = scratch.project();
     run_codex_json(
+        &review::provider::LaunchSpec {
+            provider: Provider::Codex,
+            start: review::provider::SessionStart::Fresh { id: None },
+            settings: fixture_settings(
+                Provider::Codex,
+                review::config::Profile {
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            ),
+            prompt: ("review this").to_owned(),
+            root: project.clone(),
+        },
         vec![
             script.to_string(),
             "exec".to_string(),
@@ -319,12 +332,7 @@ async fn run_stub_with(
             out_file.clone(),
         ],
         &out_file,
-        // Fresh run: the session id must be learned from the stream, which also
-        // exercises the stdout scanner that feeds the watchdog.
         None,
-        Some(&env),
-        "review this",
-        &project,
         None,
         runtime,
     )
@@ -352,6 +360,21 @@ async fn run_resume_stub(scratch: &Scratch, script: &str) -> Result<RunOutput> {
     let project = scratch.project();
     let runtime = fast_runtime(scratch);
     run_codex_json(
+        &review::provider::LaunchSpec {
+            provider: Provider::Codex,
+            start: review::provider::SessionStart::Resume(
+                review::provider::SessionId::parse(STUB_SESSION).expect("test id"),
+            ),
+            settings: fixture_settings(
+                Provider::Codex,
+                review::config::Profile {
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            ),
+            prompt: ("continue review").to_owned(),
+            root: project.clone(),
+        },
         vec![
             script.to_string(),
             "exec".to_string(),
@@ -363,9 +386,6 @@ async fn run_resume_stub(scratch: &Scratch, script: &str) -> Result<RunOutput> {
         ],
         &out_file,
         Some(STUB_SESSION.to_string()),
-        Some(&env),
-        "continue review",
-        &project,
         None,
         &runtime,
     )
@@ -480,7 +500,14 @@ sleep 3600
                 .is_some_and(|why| why.contains("stranded"))
         );
         assert!(
-            digest.transcript.expect("summary").final_answer.is_none(),
+            digest
+                .codex()
+                .expect("codex")
+                .transcript
+                .as_ref()
+                .expect("summary")
+                .final_answer
+                .is_none(),
             "the current-turn summary must still reflect the trailing turn"
         );
     }
@@ -575,11 +602,11 @@ sleep 3600
     );
     // Forensics that make a misfire on a healthy run diagnosable.
     assert!(
-        digest.quiet_secs.is_some(),
+        digest.codex().expect("codex").quiet_secs.is_some(),
         "the observed silence duration must be recorded"
     );
     assert_eq!(
-        digest.last_rollout_event.as_deref(),
+        digest.codex().expect("codex").last_rollout_event.as_deref(),
         Some("response_item/custom_tool_call"),
         "the last thing codex was doing must be recorded"
     );
@@ -849,11 +876,13 @@ exit 0
     // the scenario the code exists to diagnose.
     assert!(
         digest
+            .codex()
+            .expect("codex")
             .log_lines
             .iter()
             .any(|l| l.contains("codex log line before the hang")),
         "output captured before the drain grace expired must be preserved, got {:?}",
-        digest.log_lines
+        digest.codex().expect("codex").log_lines
     );
     // The answer was written to the rollout before the hang, so recovery still
     // works even though the stream was cut short.
@@ -1143,10 +1172,8 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
 async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
     let scratch = Scratch::new();
     let stub = interruptible_stub(&scratch, "");
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let mut runtime = fast_runtime(&scratch);
     runtime.timings.stall_grace = None;
-    runtime.stop = stop_rx;
     let data_root = scratch.data_root();
 
     let stopper = async {
@@ -1163,7 +1190,7 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        stop_tx.send_replace(true);
+        runtime.lifecycle.request_stop();
     };
     let (run, ()) = tokio::join!(run_stub_with(&scratch, &stub, &runtime), stopper);
     let run = run.expect("run completes");
@@ -1289,20 +1316,28 @@ async fn run_claude_stub(
         scratch.root.to_string_lossy().into_owned(),
     );
     run_claude(
-        &{
-            let mut start = match resume {
-                Some(id) => {
-                    review::provider::SessionStart::Resume(review::provider::SessionId::parse(id)?)
-                }
-                None => review::provider::SessionStart::Fresh { id: None },
-            };
-            start.prepare(review::provider::Provider::Claude)?;
-            start
+        &review::provider::LaunchSpec {
+            provider: Provider::Claude,
+            start: {
+                let mut start = match resume {
+                    Some(id) => review::provider::SessionStart::Resume(
+                        review::provider::SessionId::parse(id)?,
+                    ),
+                    None => review::provider::SessionStart::Fresh { id: None },
+                };
+                start.prepare(review::provider::Provider::Claude)?;
+                start
+            },
+            settings: fixture_settings(
+                Provider::Claude,
+                review::config::Profile {
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            ),
+            prompt: ("review this").to_owned(),
+            root: scratch.project(),
         },
-        &review::provider::ModelSpec::new(review::provider::Provider::Claude, None, None, &[]),
-        Some(&env),
-        "review this",
-        &scratch.project(),
         None,
         &runtime,
     )
@@ -1508,13 +1543,11 @@ async fn a_claude_answer_that_beats_the_interrupt_stands() {
 #[tokio::test]
 async fn a_stop_signal_ends_a_started_claude_turn_as_an_interrupt() {
     let scratch = Scratch::new();
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut runtime = fast_runtime(&scratch);
-    runtime.stop = stop_rx;
+    let runtime = fast_runtime(&scratch);
     let body = format!("{CLAUDE_STUB_INIT}\n{}", claude_stub_await_sigint());
     let stopper = async {
         claude_signalable(&scratch).await;
-        stop_tx.send_replace(true);
+        runtime.lifecycle.request_stop();
     };
     let (run, ()) = tokio::join!(run_claude_stub(&scratch, &body, &runtime, None), stopper);
     let run = run.expect("run completes");
@@ -1544,9 +1577,7 @@ async fn a_claude_stopped_before_its_first_event_names_no_session() {
     // Killed before claude could have written a session: recording one would
     // print a resume command for a session that does not exist.
     let scratch = Scratch::new();
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let mut runtime = fast_runtime(&scratch);
-    runtime.stop = stop_rx;
+    let runtime = fast_runtime(&scratch);
     let data_root = scratch.data_root();
     let stopper = async {
         // The marker goes up at spawn; claude never speaks, so no pid is offered.
@@ -1555,7 +1586,7 @@ async fn a_claude_stopped_before_its_first_event_names_no_session() {
             assert!(std::time::Instant::now() < deadline, "no marker");
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        stop_tx.send_replace(true);
+        runtime.lifecycle.request_stop();
     };
     let body = "while :; do sleep 0.05; done";
     let (run, ()) = tokio::join!(run_claude_stub(&scratch, body, &runtime, None), stopper);
@@ -1682,16 +1713,23 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
     );
     let selection =
         review::provider::ModelSpec::new(review::provider::Provider::Claude, None, None, &[]);
-    let (run, marked) = tokio::join!(
-        run_claude(
-            &start,
-            &selection,
-            Some(&env),
-            "more",
-            &project,
-            Some(tx),
-            &runtime
+    let launch = review::provider::LaunchSpec {
+        provider: Provider::Claude,
+        start: start.clone(),
+        settings: fixture_settings(
+            Provider::Claude,
+            review::config::Profile {
+                model: selection.model().map(str::to_owned),
+                effort: selection.effort().map(str::to_owned),
+                env: Some(env.clone()),
+                ..Default::default()
+            },
         ),
+        prompt: ("more").to_owned(),
+        root: project.clone(),
+    };
+    let (run, marked) = tokio::join!(
+        run_claude(&launch, Some(tx), &runtime),
         marked_at_launch(rx, sid, &data_root)
     );
     assert!(run.is_ok_and(|r| r.text == "ok"));
@@ -1716,16 +1754,29 @@ async fn a_codex_resume_is_marked_in_flight_before_it_launches() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let data_root = scratch.data_root();
     let project = scratch.project();
+    let launch = review::provider::LaunchSpec {
+        provider: Provider::Codex,
+        start: review::provider::SessionStart::Resume(
+            review::provider::SessionId::parse(STUB_SESSION).expect("test id"),
+        ),
+        settings: fixture_settings(
+            Provider::Codex,
+            review::config::Profile {
+                env: Some(env),
+                ..Default::default()
+            },
+        ),
+        prompt: "more".into(),
+        root: project,
+    };
     let (run, marked) = tokio::join!(
         run_codex_json(
+            &launch,
             vec![stub, "exec".to_string(), "resume".to_string()],
             &out_file,
             Some(STUB_SESSION.to_string()),
-            Some(&env),
-            "more",
-            &project,
             Some(tx),
-            &runtime,
+            &runtime
         ),
         marked_at_launch(rx, STUB_SESSION, &data_root)
     );
@@ -1821,7 +1872,10 @@ sleep 1
 "#,
         preamble = stub_preamble()
     ));
-    let run = run_stub(&scratch, stub).await.expect("the run is still Ok");
+    let runtime = fast_runtime(&scratch);
+    let run = run_stub_with(&scratch, &stub, &runtime)
+        .await
+        .expect("the run is still Ok");
     assert_eq!(
         run.session_id.as_deref(),
         Some(STUB_SESSION),
@@ -1834,10 +1888,16 @@ sleep 1
         "an unreported status is not invented"
     );
     assert!(
-        review::contained::unresolved()
+        runtime
+            .lifecycle
+            .unresolved()
             .iter()
             .any(|u| u.leftovers.unknown.is_some() && u.label.contains("codex")),
         "the ledger records the unknown outcome"
+    );
+    assert!(
+        fast_runtime(&scratch).lifecycle.unresolved().is_empty(),
+        "another runtime cannot inherit the unknown teardown"
     );
 }
 
@@ -1897,7 +1957,7 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
 
 #[tokio::test]
 async fn model_selection_arguments_and_record_share_the_prepared_spec() {
-    use review::provider::{Permissions, Provider, SessionStart};
+    use review::provider::{Provider, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(&format!(
         "{CLAUDE_STUB_PREAMBLE}\n{CLAUDE_STUB_INIT}\n{}",
@@ -1916,16 +1976,21 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
         scratch.root.to_string_lossy().into_owned(),
     )]);
     let result = review::provider::invoke(
-        Provider::Claude,
-        SessionStart::Fresh { id: None },
-        Some("chosen-model"),
-        Some("high"),
-        Permissions::profile(Provider::Claude, None),
-        &[],
-        Some(&env),
-        &[],
-        "review this",
-        &scratch.project(),
+        review::provider::LaunchSpec {
+            provider: Provider::Claude,
+            start: SessionStart::Fresh { id: None },
+            settings: fixture_settings(
+                Provider::Claude,
+                review::config::Profile {
+                    model: Some("chosen-model".into()),
+                    effort: Some("high".into()),
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            ),
+            prompt: ("review this").to_owned(),
+            root: scratch.project(),
+        },
         None,
         &runtime,
     )
@@ -1942,19 +2007,25 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
 
 #[tokio::test]
 async fn invalid_model_selection_is_refused_before_a_session_launches() {
-    use review::provider::{Permissions, Provider, SessionStart};
+    use review::provider::{Provider, SessionStart};
     let scratch = Scratch::new();
     let result = review::provider::invoke(
-        Provider::Codex,
-        SessionStart::Fresh { id: None },
-        Some("chosen"),
-        Some("high"),
-        Permissions::profile(Provider::Codex, None),
-        &[],
-        None,
-        &["model_reasoning_effort=123".into()],
-        "review this",
-        &scratch.project(),
+        review::provider::LaunchSpec {
+            provider: Provider::Codex,
+            start: SessionStart::Fresh { id: None },
+            settings: fixture_settings(
+                Provider::Codex,
+                review::config::Profile {
+                    model: Some("chosen".into()),
+                    effort: Some("high".into()),
+                    env: None,
+                    config: vec!["model_reasoning_effort=123".into()],
+                    ..Default::default()
+                },
+            ),
+            prompt: ("review this").to_owned(),
+            root: scratch.project(),
+        },
         None,
         &fast_runtime(&scratch),
     )
@@ -2029,12 +2100,22 @@ exit 1
     let out_file = new_output_file().expect("output file");
     let args = vec!["exec".into(), "--json".into()];
     let run = run_codex_json(
+        &review::provider::LaunchSpec {
+            provider: Provider::Codex,
+            start: review::provider::SessionStart::Fresh { id: None },
+            settings: fixture_settings(
+                Provider::Codex,
+                review::config::Profile {
+                    env: None,
+                    ..Default::default()
+                },
+            ),
+            prompt: ("prompt").to_owned(),
+            root: scratch.project(),
+        },
         args.clone(),
         &out_file,
         None,
-        None,
-        "prompt",
-        &scratch.project(),
         None,
         &runtime,
     )
@@ -2086,7 +2167,7 @@ async fn empty_command_program_fails_to_launch() {
 
 #[tokio::test]
 async fn grok_prefix_drives_fresh_resume_and_stated_failure_through_invoke() {
-    use review::provider::{Permissions, SessionId, SessionStart};
+    use review::provider::{SessionId, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(r#"
 [ "$1" = 'prefix with spaces' ] || exit 71
@@ -2213,16 +2294,21 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
     ] {
         env.insert("STUB_STOP".into(), stop.into());
         let result = review::provider::invoke(
-            Provider::Grok,
-            start,
-            Some("chosen-model"),
-            Some("high"),
-            Permissions::profile(Provider::Grok, None),
-            &[],
-            Some(&env),
-            &[],
-            "inspect this prompt",
-            &scratch.project(),
+            review::provider::LaunchSpec {
+                provider: Provider::Grok,
+                start,
+                settings: fixture_settings(
+                    Provider::Grok,
+                    review::config::Profile {
+                        model: Some("chosen-model".into()),
+                        effort: Some("high".into()),
+                        env: Some(env.clone()),
+                        ..Default::default()
+                    },
+                ),
+                prompt: ("inspect this prompt").to_owned(),
+                root: scratch.project(),
+            },
             None,
             &runtime,
         )
@@ -2279,18 +2365,23 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
     env.insert("STUB_STOP".into(), "end_turn".into());
     let wake_sid = "grok-wake-session";
     let result = review::provider::invoke(
-        Provider::Grok,
-        SessionStart::Fresh {
-            id: Some(SessionId::parse(wake_sid).expect("id")),
+        review::provider::LaunchSpec {
+            provider: Provider::Grok,
+            start: SessionStart::Fresh {
+                id: Some(SessionId::parse(wake_sid).expect("id")),
+            },
+            settings: fixture_settings(
+                Provider::Grok,
+                review::config::Profile {
+                    model: Some("chosen-model".into()),
+                    effort: Some("high".into()),
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            ),
+            prompt: ("start background work").to_owned(),
+            root: scratch.project(),
         },
-        Some("chosen-model"),
-        Some("high"),
-        Permissions::profile(Provider::Grok, None),
-        &[],
-        Some(&env),
-        &[],
-        "start background work",
-        &scratch.project(),
         None,
         &runtime,
     )
@@ -2314,4 +2405,146 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             .contains("fixture build passed")
     );
     assert_args("--resume", wake_sid);
+}
+
+// Fixture settings go through the same profile constructor as production.
+fn fixture_settings(
+    provider: Provider,
+    profile: review::config::Profile,
+) -> review::provider::RunSettings {
+    review::provider::RunSettings::from_profile(
+        provider,
+        Some(&review::config::ProfileDef {
+            profile,
+            layer: review::config::Layer::Local,
+            table: "[fixture]".into(),
+            host: None,
+        }),
+    )
+}
+
+/// Durable grants belong to adapter post-processing, including when Grok emits
+/// a pre-turn error. A merely requested or process-local grant is never a fact.
+#[tokio::test]
+async fn grok_prepared_trust_is_verified_even_after_returned_error() {
+    use review::provider::{LaunchSpec, SessionStart};
+    for durable in [false, true] {
+        let scratch = Scratch::new();
+        let base = std::fs::canonicalize(&scratch.root).expect("canonical scratch");
+        let home = base.join("grok-home");
+        let script = scratch.write_stub(
+            r#"
+seen_trust=0
+for arg in "$@"; do
+    [ "$arg" != --trust ] || seen_trust=1
+done
+[ "$seen_trust" = 1 ] || exit 81
+printf '%s\n' launched > "$STUB_DIR/launched"
+if [ "$DURABLE" = 1 ]; then
+    printf '[folders."%s"]\ntrusted = true\n' "$TRUST_KEY" > "$GROK_HOME/trusted_folders.toml"
+fi
+printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
+"#,
+        );
+        let mut runtime = fast_runtime(&scratch);
+        runtime.commands.set(
+            Provider::Grok,
+            ProviderCommand {
+                program: "/bin/sh".into(),
+                leading_args: vec![script],
+            },
+        );
+        // Give this fixture its own repository boundary, independent of the
+        // target directory's symlink or any enclosing repository.
+        std::fs::create_dir(scratch.project().join(".git")).expect("fixture git root");
+        let key = std::fs::canonicalize(scratch.project()).expect("project root");
+        let env = BTreeMap::from([
+            ("GROK_HOME".into(), home.to_string_lossy().into_owned()),
+            ("HOME".into(), "/home/nobody-here".into()),
+            ("STUB_DIR".into(), base.to_string_lossy().into_owned()),
+            ("TRUST_KEY".into(), key.to_string_lossy().into_owned()),
+            ("DURABLE".into(), if durable { "1" } else { "0" }.into()),
+        ]);
+        let result = review::provider::invoke(
+            LaunchSpec {
+                provider: Provider::Grok,
+                start: SessionStart::Fresh { id: None },
+                settings: fixture_settings(
+                    Provider::Grok,
+                    review::config::Profile {
+                        sandbox: Some(review::config::SandboxLevel::WorkspaceWrite),
+                        env: Some(env),
+                        ..Default::default()
+                    },
+                ),
+                prompt: "test".into(),
+                root: scratch.project(),
+            },
+            None,
+            &runtime,
+        )
+        .await;
+        assert!(base.join("launched").exists());
+        let error = result.output.expect_err("typed pre-turn failure");
+        assert!(
+            error.to_string().contains("fixture auth failure"),
+            "{error:#}"
+        );
+        assert_eq!(
+            result.grok_trust,
+            durable.then(|| key.to_string_lossy().into_owned())
+        );
+        assert!(
+            result
+                .permissions
+                .expect("prepared permissions")
+                .native_to_record()
+                .expect("native selector")
+                .starts_with("review-ws-")
+        );
+        assert!(home.join("sandbox.toml").exists());
+    }
+}
+
+#[tokio::test]
+async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
+    use review::provider::{LaunchSpec, SessionStart};
+    let scratch = Scratch::new();
+    let result = review::provider::invoke(
+        LaunchSpec {
+            provider: Provider::Grok,
+            start: SessionStart::Fresh { id: None },
+            settings: fixture_settings(
+                Provider::Grok,
+                review::config::Profile {
+                    env: Some(BTreeMap::from([(
+                        "GROK_HOME".into(),
+                        "relative-home".into(),
+                    )])),
+                    ..Default::default()
+                },
+            ),
+            prompt: "test".into(),
+            root: scratch.project(),
+        },
+        None,
+        &fast_runtime(&scratch),
+    )
+    .await;
+    assert!(
+        result
+            .output
+            .expect_err("invalid home")
+            .to_string()
+            .contains("relative")
+    );
+    assert!(result.session_id.is_none());
+    assert!(result.grok_trust.is_none());
+    assert_eq!(
+        result
+            .permissions
+            .expect("requested permissions")
+            .selector(),
+        Some("read-only")
+    );
 }

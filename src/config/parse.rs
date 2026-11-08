@@ -191,7 +191,12 @@ mod tests {
     /// Parse a single local file and resolve it alone, as a project with no
     /// global config would be.
     fn local_only(raw: &str, host: &str) -> Result<ReviewConfig> {
-        resolve(parse_file(raw, "local", Layer::Local)?, None, host)
+        resolve(
+            parse_file(raw, "local", Layer::Local)?,
+            None,
+            host,
+            crate::config::ConfigFiles::default(),
+        )
     }
 
     #[test]

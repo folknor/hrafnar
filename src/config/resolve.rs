@@ -15,6 +15,7 @@ pub fn resolve(
     local: ConfigFile,
     global: Option<ConfigFile>,
     hostname: &str,
+    files: ConfigFiles,
 ) -> Result<ReviewConfig> {
     let audit = local.audit.clone();
     let mut layers: Vec<(Layer, ConfigFile)> = vec![(Layer::Local, local)];
@@ -34,7 +35,7 @@ pub fn resolve(
         // A named `-C` selection checks this same registry in `global_projects`
         // before the full project config is loaded; both passes use this helper.
         if let Some(mine) = file.projects.remove(hostname) {
-            check_projects(&mine, hostname, layer.as_str())?;
+            crate::project::registry::check_projects(&mine, hostname, layer.as_str())?;
             projects = mine;
         }
         for (name, prime) in file.archetypes {
@@ -181,32 +182,9 @@ pub fn resolve(
         stall_timeout_secs,
         profiles,
         hostname: hostname.to_string(),
-        files: ConfigFiles::default(),
+        files,
         projects,
     })
-}
-
-/// Validate this host's registry. Only this host's: another machine's table is
-/// that machine's business, and a clash in it must not stop this one loading.
-pub(super) fn check_projects(
-    names: &BTreeMap<String, String>,
-    host: &str,
-    layer: &str,
-) -> Result<()> {
-    let mut folded = std::collections::HashMap::new();
-    for name in names.keys() {
-        if let Err(why) = crate::project::check_name(name) {
-            bail!("[_projects.{}] ({layer} config): {why}", toml_key(host));
-        }
-        if let Some(prev) = folded.insert(name.to_ascii_lowercase(), name) {
-            bail!(
-                "[_projects.{}] ({layer} config): '{prev}' and '{name}' differ only in case, \
-                 and names match ignoring case",
-                toml_key(host)
-            );
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

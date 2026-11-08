@@ -116,6 +116,8 @@ struct SessionEntry<'a> {
     session_id: &'a str,
     /// "run" for a fresh run, "session" for a resume.
     kind: SessionKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_origin: Option<&'a crate::provider::ProfileOrigin>,
     model: Option<&'a str>,
     /// Reasoning effort the run launched with. Recorded alongside `model`
     /// because a `review resume` inherits both from this row, and a resume
@@ -192,8 +194,10 @@ pub struct SessionRecord {
     /// The row kind, preserving historical and future string values.
     #[serde(default)]
     pub kind: SessionKind,
-    /// Read back by `app::message::inherited_settings` so a `review resume` launches
-    /// on the session's own model rather than the provider's default.
+    /// Selected launch source, absent on legacy rows and manual messages.
+    #[serde(default)]
+    pub profile_origin: Option<crate::provider::ProfileOrigin>,
+    /// Restored by InheritedSettings so a message uses the session's model.
     pub model: Option<String>,
     /// Absent on rows written before this was recorded, and on any run that
     /// passed no effort at all.
@@ -342,6 +346,7 @@ pub(crate) fn record_with_kind(
     digest: Option<&crate::provider::DigestSummary>,
     leftovers: &crate::contained::Leftovers,
     codex_home: Option<&str>,
+    profile_origin: Option<&crate::provider::ProfileOrigin>,
 ) {
     let path = match sessions_path(private) {
         Some(p) => p,
@@ -368,6 +373,7 @@ pub(crate) fn record_with_kind(
         archetype,
         session_id,
         kind,
+        profile_origin,
         model,
         effort,
         env_keys,
@@ -425,5 +431,59 @@ mod tests {
         assert_eq!(format_age(0), "0s");
         assert_eq!(format_age(12), "12s");
         assert_eq!(format_age(59), "59s");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn profile_origin_round_trips_and_legacy_rows_remain_readable() {
+        let origin = crate::provider::ProfileOrigin {
+            layer: "local".into(),
+            table: "[codex.deep]".into(),
+        };
+        let mut entry = SessionEntry {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            epoch_secs: 1,
+            project: "/project",
+            hostname: "host".into(),
+            audit_id: "audit",
+            provider: "codex",
+            archetype: "bare",
+            session_id: "session",
+            kind: SessionKind::Run,
+            profile_origin: Some(&origin),
+            model: None,
+            effort: None,
+            env_keys: vec![],
+            sandbox: None,
+            provider_sandbox: None,
+            writable_roots: vec![],
+            served_model: None,
+            cost_usd: None,
+            grok_trust: None,
+            operator_prompt: "p",
+            assembled_prompt: "p",
+            response: None,
+            error: Some("launch failed".into()),
+            review_version: env!("CARGO_PKG_VERSION"),
+            digest: None,
+            leftovers: None,
+            codex_home: None,
+        };
+        let json = serde_json::to_value(&entry).expect("serialize row");
+        let restored: SessionRecord = serde_json::from_value(json).expect("read row");
+        assert_eq!(restored.profile_origin, Some(origin.clone()));
+        entry.profile_origin = None;
+        let legacy = serde_json::to_value(&entry).expect("serialize absent origin");
+        assert!(legacy.get("profile_origin").is_none());
+        assert!(
+            serde_json::from_value::<SessionRecord>(legacy)
+                .expect("read legacy row")
+                .profile_origin
+                .is_none()
+        );
     }
 }

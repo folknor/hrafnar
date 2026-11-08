@@ -35,6 +35,12 @@
 //! not. Every failure in here warns and continues - a liveness hint must never
 //! be able to derail an actual run.
 
+// Markers, requests and launch locks deliberately share this store. The lock
+// protocol is operator-owned; splitting just markers/requests would divide the
+// directory and identity rules without introducing an independent store rule.
+// Executable SessionId conversion belongs at action boundaries, not in serde
+// for historical markers, whose original strings must remain readable.
+pub use crate::process::identity_alive;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -78,25 +84,9 @@ pub struct Marker {
     pub cleanup_pending: bool,
 }
 
-/// Whether the process recorded as `pid` with start time `start` is alive.
-/// Through a pidfd: opened first, the start time read after, then the pidfd
-/// checked still unexited, so the start time read was this process's. A zombie
-/// leader whose other threads still run counts as alive, which its `/proc`
-/// state would not.
-pub fn identity_alive(pid: u32, start: Option<u64>) -> bool {
-    let Some(start) = start else {
-        return pid_alive(pid);
-    };
-    let Ok(pidfd) = crate::keeper::pidfd_open(pid) else {
-        return false;
-    };
-    crate::keeper::stat_ppid_start(pid).is_some_and(|(_, s)| s == start)
-        && !crate::keeper::pidfd_exited(&pidfd)
-}
-
 /// This process's start time, for its markers.
 fn own_start() -> Option<u64> {
-    crate::keeper::stat_ppid_start(std::process::id()).map(|(_, s)| s)
+    crate::process::stat_ppid_start(std::process::id()).map(|(_, s)| s)
 }
 
 /// Where markers live. `data_root` overrides the real XDG location and exists so
@@ -131,19 +121,6 @@ pub(crate) fn is_safe_session_id(id: &str) -> bool {
     crate::provider::SessionId::is_safe(id)
 }
 
-/// Is `pid` a live process? Signal 0 performs permission and existence checks
-/// without delivering anything. `ESRCH` means gone; `EPERM` means it exists but
-/// belongs to someone else, which still counts as alive.
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: `kill` with signal 0 delivers nothing; it only reports whether the
-    // pid exists. No memory is touched.
-    let ret = unsafe { libc::kill(pid, 0) };
-    ret == 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
-}
-
 /// Removes its marker file on drop, so the marker's lifetime is exactly the
 /// run's - including on early returns and panics.
 ///
@@ -173,7 +150,7 @@ impl Guard {
             && still_ours(path, marker)
         {
             marker.keeper = Some(keeper);
-            marker.keeper_start = crate::keeper::stat_ppid_start(keeper).map(|(_, s)| s);
+            marker.keeper_start = crate::process::stat_ppid_start(keeper).map(|(_, s)| s);
             if let Err(e) = write_marker(path, marker) {
                 eprintln!("warning: failed to update inflight marker: {e}");
             }
@@ -230,14 +207,20 @@ pub fn mark(
     project: &str,
     data_root: Option<&Path>,
 ) -> Guard {
-    // Refuse to build a path out of anything that is not plainly a session id.
-    // Skipping the marker only costs liveness reporting for that run; letting it
-    // through would let a crafted resume id write and delete an arbitrary
-    // file.
-    if !is_safe_session_id(session_id) {
+    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
         return Guard(None);
-    }
+    };
+    mark_checked(&id, provider, project, data_root)
+}
+
+fn mark_checked(
+    session_id: &crate::provider::SessionId,
+    provider: crate::provider::Provider,
+    project: &str,
+    data_root: Option<&Path>,
+) -> Guard {
+    let session_id = session_id.as_str();
     let Some(dir) = dir(data_root) else {
         return Guard(None);
     };
@@ -255,7 +238,7 @@ pub fn mark(
         pid: std::process::id(),
         // Offered later, once it is safe to signal - see `Guard::record_child_pid`.
         child_pid: None,
-        run_id: crate::config::generate_uuid(),
+        run_id: crate::ids::generate_uuid(),
         pid_start: own_start(),
         keeper: None,
         keeper_start: None,
@@ -330,6 +313,8 @@ pub fn read_live(data_root: Option<&Path>) -> Vec<Marker> {
 
 /// The live marker for `session_id`, if a run of it is in flight on this host.
 pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Marker> {
+    let id = crate::provider::SessionId::parse(session_id).ok()?;
+    let session_id = id.as_str();
     read_live(data_root)
         .into_iter()
         .find(|m| m.session_id == session_id)
@@ -471,10 +456,15 @@ pub fn interrupt_pending(session_id: &str, data_root: Option<&Path>) -> bool {
 
 /// Path of `session_id`'s interrupt request, beside its marker.
 fn interrupt_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBuf> {
-    if !is_safe_session_id(session_id) {
-        return None;
-    }
-    Some(dir(data_root)?.join(format!("{session_id}.interrupt")))
+    let id = crate::provider::SessionId::parse(session_id).ok()?;
+    interrupt_path_checked(&id, data_root)
+}
+
+fn interrupt_path_checked(
+    session_id: &crate::provider::SessionId,
+    data_root: Option<&Path>,
+) -> Option<PathBuf> {
+    Some(dir(data_root)?.join(format!("{}.interrupt", session_id.as_str())))
 }
 
 /// Record that the operator asked for `session_id`'s run to be interrupted.
@@ -509,7 +499,7 @@ mod tests {
     fn scratch_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-scratch")
-            .join(crate::config::generate_uuid())
+            .join(crate::ids::generate_uuid())
     }
 
     #[test]

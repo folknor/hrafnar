@@ -11,6 +11,7 @@ pub mod config;
 pub mod config_cmd;
 pub mod config_write;
 pub mod contained;
+mod fsutil;
 pub mod incident;
 pub mod inflight;
 pub mod input;
@@ -26,3 +27,10 @@ pub mod timings;
 pub mod transcript;
 pub mod watchdog;
 pub mod writable_roots;
+
+pub mod process;
+pub mod report;
+pub mod supervisor;
+
+mod ids;
+mod toml_key;

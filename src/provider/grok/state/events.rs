@@ -49,7 +49,11 @@ pub(in crate::provider::grok) fn session_events(
     grok_home: &Path,
     session_id: &str,
 ) -> Option<String> {
-    session_file(grok_home, session_id, "events.jsonl")
+    session_file(
+        grok_home,
+        &crate::provider::SessionId::parse(session_id).ok()?,
+        "events.jsonl",
+    )
 }
 
 /// The `updates.jsonl` body for a session (the ACP update stream: tool calls,
@@ -58,21 +62,25 @@ pub(in crate::provider::grok) fn session_updates(
     grok_home: &Path,
     session_id: &str,
 ) -> Option<String> {
-    session_file(grok_home, session_id, "updates.jsonl")
+    session_file(
+        grok_home,
+        &crate::provider::SessionId::parse(session_id).ok()?,
+        "updates.jsonl",
+    )
 }
 
 /// A per-session file, found by id under any cwd directory.
 ///
 /// Located by scanning `sessions/*/<id>/` rather than by re-encoding the cwd,
 /// so this does not depend on grok's path-encoding scheme.
-fn session_file(grok_home: &Path, session_id: &str, name: &str) -> Option<String> {
-    // Keep this path check identical to markers, launch locks and interrupts.
-    if !crate::inflight::is_safe_session_id(session_id) {
-        return None;
-    }
+fn session_file(
+    grok_home: &Path,
+    session_id: &crate::provider::SessionId,
+    name: &str,
+) -> Option<String> {
     let sessions = std::fs::read_dir(grok_home.join("sessions")).ok()?;
     sessions.flatten().find_map(|cwd_dir| {
-        std::fs::read_to_string(cwd_dir.path().join(session_id).join(name)).ok()
+        std::fs::read_to_string(cwd_dir.path().join(session_id.as_str()).join(name)).ok()
     })
 }
 

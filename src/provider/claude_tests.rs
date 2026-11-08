@@ -1,6 +1,7 @@
 //! Unit tests of claude provider behavior.
 
 use super::*;
+use std::path::Path;
 
 #[tokio::test]
 async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() {
@@ -15,7 +16,6 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
     stream.push_str(CLAUDE_OK);
     stream.push('\n');
     let head = new_shared_buf();
-    let tail = new_shared_buf();
     let metrics = std::sync::Arc::new(std::sync::Mutex::new(super::ClaudeMetrics::default()));
     // A lease with no marker: `ready` only records the fact.
     let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
@@ -24,35 +24,27 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
     // stream is several times larger, so the tail really is trimmed.
     let keep = 1024;
     assert!(CLAUDE_OK.len() < keep && stream.len() > 4 * keep);
-    read_claude_stream(
+    let capture = Capture::head_tail(std::sync::Arc::clone(&head), 100, keep);
+    read_stream(
         stream.as_bytes(),
-        100,
-        keep,
-        std::sync::Arc::clone(&head),
-        std::sync::Arc::clone(&tail),
-        std::sync::Arc::clone(&metrics),
-        lease.clone(),
+        capture.clone(),
+        ClaudeObserver {
+            metrics: std::sync::Arc::clone(&metrics),
+            lease: lease.clone(),
+        },
     )
     .await;
     assert!(lease.is_ready(), "the init event is seen");
     let head = head.lock().expect("head").clone();
-    let tail = tail.lock().expect("tail").clone();
+    let joined_bytes = capture.snapshot();
     assert_eq!(head.len(), 100, "the head is capped");
-    assert!(
-        tail.len() <= 2 * keep,
-        "the tail is bounded: {}",
-        tail.len()
-    );
-    let joined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&head),
-        String::from_utf8_lossy(&tail)
-    );
+    let joined = String::from_utf8_lossy(&joined_bytes);
     assert!(
         !joined.contains("MIDDLE-ANSWER"),
         "the head-tail capture trims the middle event"
     );
-    let outcome = super::interpret_claude_output(&joined, "").expect("the result survived");
+    let outcome =
+        super::interpret_claude_output("claude", &joined, "").expect("the result survived");
     assert!(matches!(outcome, super::ClaudeOutcome::Answered { .. }));
     let metrics = metrics.lock().expect("metrics").clone();
     assert_eq!(metrics.turns, 5);
@@ -75,9 +67,9 @@ fn a_missing_claude_result_does_not_dump_the_stream_into_the_error() {
         CLAUDE_INIT,
         &format!(r#"{{"type":"user","tool_result":"{big}"}}"#),
     ]);
-    let err = super::interpret_claude_output(&stdout, "").expect_err("no result");
+    let err = super::interpret_claude_output("claude", &stdout, "").expect_err("no result");
     assert!(
-        err.to_string().len() < CLAUDE_DETAIL_MAX + 200,
+        err.to_string().len() < 2000 + 200,
         "error is {} chars",
         err.to_string().len()
     );
@@ -97,7 +89,7 @@ fn claude_stream(events: &[&str]) -> String {
 #[test]
 fn claude_clean_result_is_an_answer() {
     let stdout = claude_stream(&[CLAUDE_INIT, CLAUDE_OK]);
-    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
+    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
     let super::ClaudeOutcome::Answered { text, session_id } = outcome else {
         panic!("is_error false is an answer");
     };
@@ -118,6 +110,7 @@ fn claude_api_error_is_a_stated_failure_that_keeps_its_session() {
         r#"{"type":"result","subtype":"success","is_error":true,"result":"There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.","session_id":"ff2d6c14-1b45-481f-85a2-24e367d9e6ad","num_turns":1,"terminal_reason":"api_error","api_error_status":404,"total_cost_usd":0}"#,
     ]);
     let outcome = super::interpret_claude_output(
+        "claude",
         &unknown_model,
         r#"[claude-code:unrecognized_model] {"model":"no-such-model-xyz"}"#,
     )
@@ -145,7 +138,7 @@ fn claude_result_without_is_error_fails_closed() {
     // A claude that stopped reporting the flag must not pass every run off as
     // answered.
     let unflagged = r#"{"type": "result", "result": "maybe", "session_id": "s"}"#;
-    let outcome = super::interpret_claude_output(unflagged, "").expect("a result object");
+    let outcome = super::interpret_claude_output("claude", unflagged, "").expect("a result object");
     let super::ClaudeOutcome::NoAnswer {
         reason,
         review_error,
@@ -167,13 +160,13 @@ fn claude_result_without_is_error_fails_closed() {
 
 #[test]
 fn claude_output_without_a_result_object_is_a_launch_failure() {
-    let err = super::interpret_claude_output("", "Error: not logged in")
+    let err = super::interpret_claude_output("claude", "", "Error: not logged in")
         .expect_err("no result object: nothing ran");
     assert!(err.to_string().contains("not logged in"), "{err}");
     // A stream cut off after its first event is not a result either - the
     // shape a claude killed mid-turn leaves. (`run_claude` still keeps that
     // run's session: see `a_claude_that_dies_after_starting_keeps_its_session`.)
-    let err = super::interpret_claude_output(&claude_stream(&[CLAUDE_INIT]), "")
+    let err = super::interpret_claude_output("claude", &claude_stream(&[CLAUDE_INIT]), "")
         .expect_err("a system event is not a result");
     assert!(err.to_string().contains("no result object"), "{err}");
 }
@@ -187,7 +180,7 @@ fn claude_interrupted_turn_is_not_an_answer() {
         CLAUDE_INIT,
         r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"4397a6d5-4943-4b52-a0b6-d20c75078bd9","num_turns":3,"terminal_reason":"aborted_tools","stop_reason":"tool_use"}"#,
     ]);
-    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
+    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
     let super::ClaudeOutcome::NoAnswer {
         reason, session_id, ..
     } = outcome
@@ -209,7 +202,7 @@ fn claude_last_result_in_the_stream_is_the_answer() {
     let first = CLAUDE_OK;
     let last = r#"{"type":"result","subtype":"success","is_error":false,"result":"PROBE-B-DONE","session_id":"2f8b2c2f-d939-4823-a615-7ebd6637f958","num_turns":1}"#;
     let stdout = claude_stream(&[CLAUDE_INIT, first, CLAUDE_INIT, last]);
-    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
+    let outcome = super::interpret_claude_output("claude", &stdout, "").expect("a result object");
     let super::ClaudeOutcome::Answered { text, .. } = outcome else {
         panic!("the last result is an answer");
     };
@@ -262,4 +255,79 @@ fn claude_usage_counts_every_result_and_ignores_other_events() {
     assert_eq!(usage.reasoning_output_tokens, 4);
     let (turns, usage) = super::claude_usage(r#"{"type":"result"}"#);
     assert_eq!((turns, usage.input_tokens), (0, 0));
+}
+
+#[tokio::test]
+async fn claude_eof_metrics_and_abort_facts_are_independent_of_capture() {
+    use tokio::io::AsyncWriteExt;
+    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let lease = Lease::clone(&owner);
+    let metrics: SharedClaudeMetrics = Default::default();
+    read_stream(
+        CLAUDE_OK.as_bytes(),
+        Capture::head(new_shared_buf(), 0),
+        ClaudeObserver {
+            metrics: std::sync::Arc::clone(&metrics),
+            lease: lease.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        metrics.lock().expect("test operation succeeds").turns,
+        2,
+        "EOF partial result counted"
+    );
+    let (mut writer, reader) = tokio::io::duplex(4096);
+    let task = tokio::spawn(read_stream(
+        reader,
+        Capture::head(new_shared_buf(), 0),
+        ClaudeObserver {
+            metrics: std::sync::Arc::clone(&metrics),
+            lease: lease.clone(),
+        },
+    ));
+    writer
+        .write_all(format!("{CLAUDE_INIT}\n{CLAUDE_OK}\nunfinished").as_bytes())
+        .await
+        .expect("test operation succeeds");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while metrics.lock().expect("metrics").turns != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("metrics published before abort");
+    task.abort();
+    let _ = task.await;
+    assert!(lease.is_ready());
+    assert_eq!(metrics.lock().expect("test operation succeeds").turns, 4);
+}
+
+#[tokio::test]
+async fn claude_init_does_not_accept_an_oversized_line_suffix() {
+    let owner = Lease::learned(Provider::Claude, Path::new("/nonexistent"), None);
+    let lease = Lease::clone(&owner);
+    let mut bytes = vec![b' '; CLAUDE_INIT_SCAN_MAX + 1];
+    bytes.extend_from_slice(CLAUDE_INIT.as_bytes());
+    bytes.push(b'\n');
+    read_stream(
+        bytes.as_slice(),
+        Capture::head(new_shared_buf(), 0),
+        ClaudeObserver {
+            metrics: Default::default(),
+            lease: lease.clone(),
+        },
+    )
+    .await;
+    assert!(!lease.is_ready());
+    read_stream(
+        CLAUDE_INIT.as_bytes(),
+        Capture::head(new_shared_buf(), 0),
+        ClaudeObserver {
+            metrics: Default::default(),
+            lease: lease.clone(),
+        },
+    )
+    .await;
+    assert!(lease.is_ready(), "eligible EOF init accepted");
 }

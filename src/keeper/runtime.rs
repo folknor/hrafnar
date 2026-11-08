@@ -5,8 +5,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use super::last_error;
-use super::process::pidfd_signal;
 use super::protocol::{Control, Event, Outcome, Proc, Spec};
+use crate::process::pidfd_signal;
 
 mod events;
 mod launch;

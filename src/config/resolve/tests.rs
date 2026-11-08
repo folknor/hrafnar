@@ -19,7 +19,12 @@ mod layering {
     }
 
     fn layered(local_raw: &str, global_raw: &str, host: &str) -> Result<ReviewConfig> {
-        resolve(local(local_raw), Some(global(global_raw)), host)
+        resolve(
+            local(local_raw),
+            Some(global(global_raw)),
+            host,
+            ConfigFiles::default(),
+        )
     }
 
     fn entry<'a>(cfg: &'a ReviewConfig, provider: &str, profile: &str) -> &'a ProfileEntry {
@@ -594,8 +599,9 @@ providers = [\"codex\"]
 [codex.deep]
 model = \"m\"
 ";
-        let without = resolve(local(raw), None, "h").unwrap();
-        let with_empty = resolve(local(raw), Some(global("")), "h").unwrap();
+        let without = resolve(local(raw), None, "h", ConfigFiles::default()).unwrap();
+        let with_empty =
+            resolve(local(raw), Some(global("")), "h", ConfigFiles::default()).unwrap();
         for cfg in [&without, &with_empty] {
             assert_eq!(cfg.archetypes["bugs"].layer, Layer::Local);
             assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Local);
@@ -609,12 +615,12 @@ model = \"m\"
     fn searched_lists_the_global_path_and_marks_it_when_absent() {
         // Error messages about an undefined archetype/profile quote this, so
         // the operator can see the global file was looked for but not found.
-        let mut cfg = resolve(local(""), None, "h").unwrap();
-        cfg.files = ConfigFiles {
+        let files = ConfigFiles {
             local: Some("/p/.review.toml".into()),
             global: Some("/home/u/.config/review/config.toml".into()),
             global_loaded: false,
         };
+        let mut cfg = resolve(local(""), None, "h", files).unwrap();
         assert_eq!(
             cfg.searched(),
             "/p/.review.toml, /home/u/.config/review/config.toml (absent)"

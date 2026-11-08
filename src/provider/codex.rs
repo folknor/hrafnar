@@ -1,3 +1,7 @@
+pub(crate) mod forensics;
+pub(crate) mod rollout;
+pub(crate) mod watch;
+
 use super::*;
 
 /// Nudge sent when auto-resuming a codex run that died without a final answer.
@@ -16,70 +20,26 @@ pub(super) fn recovery(r: &ProviderResult) -> Option<&'static str> {
         .then_some(RESUME_NUDGE)
 }
 
-/// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
-/// the NDJSON for the `thread.started` event and publish the session id on
-/// the run's lease the moment it appears.
-///
-/// The watchdog (`crate::watchdog`) needs the session id to locate the rollout
-/// transcript. On a resume we already know it, but on a fresh run codex only
-/// reveals it mid-stream - and the old code could not see it until the whole
-/// stream had hit EOF, which is precisely the thing that never happens on a
-/// wedged run. Scanning stops as soon as the id is found, so the steady-state
-/// cost is the same byte-copy loop as before.
-///
-/// The published id also survives a reader that never reaches EOF: it is a
-/// lease fact as soon as it is seen, so a truncated `stdout_buf` can
-/// no longer cost us the session id (and with it the transcript, the recovery
-/// path and the sidecar row).
-async fn read_capped_stdout<R>(
-    mut r: R,
-    cap: usize,
-    out: SharedBuf,
-    lease: Lease,
-    mut scanning: bool,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut chunk = [0u8; 16384];
-    // Carry for a line split across two reads; only maintained while scanning.
-    let mut partial: Vec<u8> = Vec::new();
-    let mut seen_output = false;
-    loop {
-        match r.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                // Codex's first byte, not its first line, is readiness: output
-                // proves the node wrapper got far enough to forward SIGINT.
-                if !std::mem::replace(&mut seen_output, true) {
-                    lease.ready();
-                }
-                if scanning {
-                    partial.extend_from_slice(&chunk[..n]);
-                    // Process whole lines; keep the trailing fragment.
-                    while let Some(nl) = partial.iter().position(|b| *b == b'\n') {
-                        let line: Vec<u8> = partial.drain(..=nl).collect();
-                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&line)
-                            && val.get("type").and_then(|t| t.as_str()) == Some("thread.started")
-                            && let Some(id) = val.get("thread_id").and_then(|t| t.as_str())
-                        {
-                            // Puts the marker up and wakes the watchdog.
-                            lease.set_session(id);
-                            scanning = false;
-                            partial.clear();
-                            break;
-                        }
-                    }
-                    // Guard against a pathological unterminated first line
-                    // growing without bound while we wait for a newline.
-                    if partial.len() > 1 << 20 {
-                        partial.clear();
-                    }
-                }
-                // Past the cap this keeps draining but stops buffering, so the
-                // child never blocks on a full pipe.
-                push_capped(&out, &chunk[..n], cap);
-            }
+// Readiness is a byte-level fact; session discovery is a bounded line-level fact.
+pub(super) struct CodexObserver {
+    pub(super) lease: Lease,
+    pub(super) scanning: bool,
+}
+
+impl super::stream::Observer for CodexObserver {
+    fn first_bytes(&mut self) {
+        self.lease.ready();
+    }
+    fn line_cap(&self) -> Option<usize> {
+        self.scanning.then_some(1 << 20)
+    }
+    fn line(&mut self, line: &[u8]) {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(line)
+            && val.get("type").and_then(|t| t.as_str()) == Some("thread.started")
+            && let Some(id) = val.get("thread_id").and_then(|t| t.as_str())
+        {
+            self.lease.set_session(id);
+            self.scanning = false;
         }
     }
 }
@@ -175,18 +135,16 @@ fn codex_sandbox_args(level: &str) -> Vec<String> {
     ]
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_codex(
-    session: &SessionStart,
-    selection: &super::ModelSpec,
+    launch: &super::LaunchSpec,
     sandbox: &str,
     root_paths: &[String],
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    let session = &launch.start;
+    let selection = &launch.settings.selection;
+
     selection.validate(Provider::Codex)?;
     session.validate(Provider::Codex)?;
     // The helper returns the exclusively-created path needed in argv. Cleanup
@@ -342,12 +300,10 @@ pub(super) async fn run_codex(
     };
 
     run_codex_json(
+        launch,
         args,
         &last_msg_path,
         known_session_id,
-        env,
-        prompt,
-        project_root,
         launched,
         runtime,
     )
@@ -360,22 +316,17 @@ pub(super) async fn run_codex(
 /// backstop. `known_session_id` is `Some` on resume (we already know it) and
 /// `None` on a fresh run (parsed from `thread.started`). Never bails on a
 /// non-zero exit: a halted/errored run still reports what it produced.
-// Every argument here is an independent axis of one invocation (argv, the `-o`
-// path, the known session id, env, prompt, cwd, the launch handshake, the
-// injectable runtime). Bundling them into a struct would add a type whose only
-// purpose is to be destructured immediately, so the lint is waived rather than
-// worked around.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_codex_json(
+    launch: &super::LaunchSpec,
     args: Vec<String>,
     last_msg_path: &str,
     known_session_id: Option<String>,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    let env = launch.settings.env.as_ref();
+    let prompt = launch.prompt.as_str();
+    let project_root = launch.root.as_path();
     let command = runtime.commands.get(Provider::Codex);
     // Launched under a keeper (`contained::spawn`), which puts codex in a
     // process group of its own, out of reach of a terminal SIGINT - the signal
@@ -523,12 +474,13 @@ pub async fn run_codex_json(
     // signal - see the reaping comment further down.
     let stdout_shared = new_shared_buf();
     let stderr_shared = new_shared_buf();
-    let stdout_task = tokio::spawn(read_capped_stdout(
+    let stdout_task = tokio::spawn(super::stream::read_stream(
         pipes.stdout,
-        STDOUT_CAPTURE_CAP,
-        std::sync::Arc::clone(&stdout_shared),
-        lease.clone(),
-        scanning_for_session_id,
+        super::stream::Capture::head(std::sync::Arc::clone(&stdout_shared), STDOUT_CAPTURE_CAP),
+        CodexObserver {
+            lease: lease.clone(),
+            scanning: scanning_for_session_id,
+        },
     ));
     let stderr_task = tokio::spawn(read_capped(
         pipes.stderr,
@@ -644,81 +596,14 @@ pub async fn run_codex_json(
     // exit here - the whole point of the digest is that a halted or errored run
     // still yields whatever it produced, with the exit status recorded.
     let stdout = String::from_utf8_lossy(&stdout_buf);
-    let mut parsed_session_id: Option<String> = None;
-    let mut stream_message: Option<String> = None;
-    let mut turns: u32 = 0;
-    let mut usage = Usage::default();
-    let mut log_lines: Vec<String> = Vec::new();
-    let mut turn_error: Option<String> = None;
-    for line in stdout.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => {
-                // Plain-text log line (codex ERROR/WARN, apply_patch dump). The
-                // harness can halt NDJSON emission here, so keep it visible.
-                log_lines.push(line.to_string());
-                continue;
-            }
-        };
-        match val.get("type").and_then(|t| t.as_str()) {
-            Some("thread.started") => {
-                parsed_session_id = val
-                    .get("thread_id")
-                    .and_then(|t| t.as_str())
-                    .map(String::from);
-            }
-            Some("item.completed") => {
-                let item = val.get("item");
-                // Only agent_message items carry the reportable final text;
-                // reasoning / command items also arrive as item.completed.
-                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                    == Some("agent_message")
-                {
-                    stream_message = item
-                        .and_then(|i| i.get("text"))
-                        .and_then(|t| t.as_str())
-                        .map(String::from);
-                }
-            }
-            // Codex stating why the turn ended: an upstream refusal (content
-            // flagged, rate limit, auth) or a harness error. Dropping these was
-            // what made a policy refusal - fully explained, at the end of the
-            // stream - surface as an unexplained death with a bare interim note,
-            // then get pointlessly auto-resumed into the identical refusal.
-            // `turn.failed` nests the message; the bare `error` event carries it
-            // at the top level. They arrive as a pair saying the same thing, so
-            // last-writer-wins is fine; a genuine second failure is more
-            // informative than the first anyway.
-            Some("error") => {
-                if let Some(m) = val.get("message").and_then(|m| m.as_str()) {
-                    turn_error = Some(m.to_string());
-                }
-            }
-            Some("turn.failed") => {
-                if let Some(m) = val
-                    .get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(|m| m.as_str())
-                {
-                    turn_error = Some(m.to_string());
-                }
-            }
-            Some("turn.completed") => {
-                turns += 1;
-                if let Some(u) = val.get("usage") {
-                    let get = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                    usage.input_tokens += get("input_tokens");
-                    usage.cached_input_tokens += get("cached_input_tokens");
-                    usage.output_tokens += get("output_tokens");
-                    usage.reasoning_output_tokens += get("reasoning_output_tokens");
-                }
-            }
-            _ => {}
-        }
-    }
+    let rollout::Stream {
+        session_id: parsed_session_id,
+        interim_message: stream_message,
+        turns,
+        usage,
+        log_lines,
+        turn_error,
+    } = rollout::stream(&stdout);
 
     // The -o file is written via a path separate from the NDJSON stream, only
     // on a real final message. A non-empty file is thus the authoritative
@@ -758,7 +643,8 @@ pub async fn run_codex_json(
     // a point past the end of the file so nothing is attributed to this run.
     // `u64::MAX` is exact for that purpose - `slice_from_offset` yields an empty
     // slice for any offset beyond the file.
-    let recovery_scope = Some(rollout_baseline.unwrap_or(u64::MAX));
+    let rollout_offset = rollout_baseline.unwrap_or(u64::MAX);
+    let recovery_scope = Some(rollout_offset);
     let transcript = if suspicious {
         // Scoped to the bytes this run appended (see `rollout_baseline`), so a
         // previous turn's `final_answer` can never be recovered as ours. When
@@ -840,7 +726,8 @@ pub async fn run_codex_json(
     let incident_path = if suspicious && !interrupted {
         // The version probe runs a provider binary too, so it is contained
         // like the run, and what it leaves joins the run's leftovers.
-        let (codex_version, probe_leftovers) = crate::contained::version_probe(
+        let (codex_version, probe_leftovers) = crate::incident::version_probe(
+            &runtime.lifecycle,
             &command.program,
             &command.leading_args,
             &runtime.teardown,
@@ -848,8 +735,8 @@ pub async fn run_codex_json(
         .await;
         leftovers.merge(probe_leftovers);
         match crate::incident::write_bundle(&crate::incident::Incident {
-            codex_version,
-            provider: "codex",
+            provider_version: codex_version,
+            provider: Provider::Codex,
             // The process exactly as it was spawned - program, argv, cwd and
             // every env override, the runner's own included - so the replay
             // in meta.json is the spawn by construction.
@@ -861,18 +748,19 @@ pub async fn run_codex_json(
             stdin_write_error: stdin_write_error.as_deref(),
             stdout: &stdout_buf,
             stderr: &stderr_buf,
-            transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
-            transcript_offset: recovery_scope,
-            final_answer_present: transcript.as_ref().map(|_| answer_in_scope),
             duration_ms,
             data_root: runtime.data_root.as_deref(),
-            captured,
-            recovered_from_transcript,
+            outcome: &outcome,
             turns,
-            terminated_by_review: outcome.termination(),
-            quiet_secs,
-            last_rollout_event: last_rollout_event.as_deref(),
-            turn_error: outcome.stated.as_deref(),
+            forensics: Some(crate::incident::IncidentForensics::Codex(
+                crate::incident::CodexIncident {
+                    transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
+                    transcript_offset: rollout_offset,
+                    final_answer_present: transcript.as_ref().map(|_| answer_in_scope),
+                    quiet_secs,
+                    last_rollout_event: last_rollout_event.as_deref(),
+                },
+            )),
         }) {
             crate::incident::BundleWriteOutcome::Written(path) => {
                 Some(path.to_string_lossy().into_owned())
@@ -914,35 +802,20 @@ pub async fn run_codex_json(
         signal,
         turns,
         usage,
-        log_lines,
-        transcript,
         incident_path,
-        quiet_secs,
-        last_rollout_event,
+        provider: Some(super::ProviderForensics::Codex(super::CodexForensics {
+            log_lines,
+            transcript,
+            quiet_secs,
+            last_rollout_event,
+        })),
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
     // the very case forensics exist to explain), return the digest rather than a
     // bare error - otherwise `invoke` would drop the session id and transcript.
     let text = final_message.unwrap_or_else(|| {
-        // No final answer at all - not even an interim message. task_complete
-        // is not a success signal (it fires on aborted turns with a null final
-        // answer), so a non-zero exit/signal here means the run died mid-turn.
-        // A stated reason outranks our inference: when codex told us why the turn
-        // ended, say that instead of guessing from the exit status.
-        let stated = outcome
-            .stated
-            .as_ref()
-            .map(|m| format!("(codex ended the turn: {m})"));
-        let base = stated.unwrap_or_else(|| {
-            if outcome.interrupted() {
-                "(interrupted by the operator before a final answer)".to_string()
-            } else if digest.exit_code == Some(0) && digest.signal.is_none() {
-                "(codex produced no final message)".to_string()
-            } else {
-                "(codex died without a final answer)".to_string()
-            }
-        });
+        let base = outcome.placeholder(Provider::Codex);
         let stderr = String::from_utf8_lossy(&stderr_buf);
         let detail = stderr.trim();
         if detail.is_empty() {
@@ -965,3 +838,54 @@ pub async fn run_codex_json(
 #[cfg(test)]
 #[path = "codex_tests.rs"]
 mod tests;
+
+/// Resolve Codex's raw-config root precedence before arguments or records use it.
+pub(super) fn prepare(launch: &super::LaunchSpec, plan: &mut super::permissions::PermissionPlan) {
+    if let Some(paths) = config_writable_roots_override(&launch.settings.config) {
+        plan.paths = paths;
+    }
+}
+
+/// The writable roots a profile `config` entry sets, when one does.
+///
+/// Profile overrides are passed after the derived `-c`, so codex takes the last
+/// one and a profile restating this key replaces the derivation entirely. The
+/// last entry wins here for the same reason. Returns `None` when no entry
+/// touches the key, and `Some(vec![])` for an explicit empty override - which is
+/// a real, recordable state, not the absence of one.
+pub(super) fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
+    const KEY: &str = "sandbox_workspace_write.writable_roots";
+    // Keep this override supported: the typed `writable_roots` field adds to
+    // derived roots, while codex `-c` deliberately replaces the whole list.
+    // Match the complete key before parsing its value. A neighboring setting
+    // such as `sandbox_workspace_write.writable_roots_extra` must not hide an
+    // earlier override of the actual roots key.
+    let value = config.iter().rev().find_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        (key.trim() == KEY).then_some(value.trim())
+    })?;
+    // Parse rather than string-scrape: the value is TOML, and a hand-written
+    // profile can spell an array in ways a regex would get wrong. Codex falls
+    // back to a string for values that are not TOML, but this setting requires
+    // an array of paths; such a string is not an effective writable-roots
+    // override.
+    let parsed = format!("{KEY} = {value}").parse::<toml::Table>().ok()?;
+    let roots = parsed
+        .get("sandbox_workspace_write")?
+        .get("writable_roots")?
+        .as_array()?;
+    Some(
+        roots
+            .iter()
+            .filter_map(|v| v.as_str().map(ToString::to_string))
+            .collect(),
+    )
+}
+
+/// Codex alone has a measured wake cadence; unmeasured sources default off.
+pub(super) fn watchdog_timings() -> crate::watchdog::Timings {
+    crate::watchdog::Timings {
+        stall_grace: Some(crate::timings::STALL_GRACE),
+        ..crate::watchdog::Timings::default()
+    }
+}

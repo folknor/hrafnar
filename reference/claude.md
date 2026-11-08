@@ -60,7 +60,20 @@ exit code or signal. That status is not a provider-stated `turn_error`.
 
 The stream is buffered up to 64 MiB from the start and, past that, the last
 8 MiB or more, because the result is the *last* line: keeping only the head
-would lose the answer of any run that outgrew the cap.
+would lose the answer of any run that outgrew the cap. The shared reader in
+`src/provider/stream.rs` owns capture and physical-line framing. When the head
+and tail are discontinuous, it removes the cut fragments and keeps a newline
+between surviving regions, so retention cannot fabricate a result object.
+An intact final line without a newline is still eligible at EOF or read error.
+The live observer uses a separate 64 MiB physical-line cap for metrics and
+accepts init only on lines at most 1 MiB. Oversized lines are discarded through
+their delimiter. Capture keeps draining after it fills; observation continues
+independently. Completed metrics and readiness observations survive a cancelled
+reader; an unfinished line is not observed on cancellation.
+
+`src/provider/claude_stream.rs` owns pure Claude-compatible result, init and
+metric decoding, with provider wording supplied by its adapter. Launch flags
+and readiness publication stay in the Claude adapter.
 
 Two details from Claude Code 2.1.284 decide the shape. `subtype` is no guide:
 an unknown `--model` came back `subtype: "success"`, `is_error: true`,

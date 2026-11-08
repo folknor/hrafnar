@@ -1,4 +1,5 @@
 use super::*;
+use std::path::{Path, PathBuf};
 
 mod state;
 
@@ -100,18 +101,17 @@ const GROK_MAX_WAKES: u32 = 10;
 /// buys the same answer (`Outcome::stated_failure`); that outcome already
 /// fails the run. A wake turn that fails to launch keeps the first turn's output and
 /// session id rather than dropping both.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_grok(
-    session: &SessionStart,
-    selection: &super::ModelSpec,
+    launch: &super::LaunchSpec,
     sandbox: Option<&str>,
-    trust: bool,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
+    prepared: &Prepared,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    let session = &launch.start;
+    let selection = &launch.settings.selection;
+    let project_root = launch.root.as_path();
+
     selection.validate(Provider::Grok)?;
     session.validate(Provider::Grok)?;
     let session_id = session.id().expect("validated grok identity").as_str();
@@ -126,14 +126,11 @@ pub(super) async fn run_grok(
     // through the wakes, each kept current with the turn's keeper. One lease
     // for the whole run, closed when this function returns however it does.
     let lease = Lease::known(session_id, Provider::Grok, project_root, data_root);
-    let (mut first, first_turns, first_usage) = run_grok_turn(
-        session,
-        selection,
+    let (first, first_turns, first_usage) = run_grok_turn(
+        launch,
         sandbox,
-        trust,
-        env,
-        prompt,
-        project_root,
+        prepared,
+        prepared.trust_grant.is_some(),
         launched,
         runtime,
         &lease,
@@ -148,20 +145,7 @@ pub(super) async fn run_grok(
     if sid != session_id {
         lease.alias(&sid);
     }
-    // Fail closed: without grok's home the results cannot be checked, and an
-    // unchecked run must not pass as one whose results were seen.
-    let grok = match state::Grok::resolve(env) {
-        Ok(g) => g,
-        Err(e) => {
-            let reason = format!("could not verify grok's background results: {e:#}");
-            eprintln!("grok: {reason}");
-            let mut digest = wake_failure(&mut first, reason);
-            digest.turns = first_turns;
-            digest.usage = first_usage;
-            first.digest = Some(digest);
-            return Ok(first);
-        }
-    };
+    let grok = &prepared.grok;
     let mut out = first;
     let mut cost = out.served.cost_usd;
     let mut turns = first_turns;
@@ -195,7 +179,7 @@ pub(super) async fn run_grok(
         // start another turn just to have the keeper shut it down. Preserve
         // the answer, but fail the run because its background results stayed
         // unread.
-        if *runtime.stop.borrow() {
+        if runtime.lifecycle.stop_requested() {
             let reason = "grok wake-up not launched: review was signalled to stop".to_string();
             eprintln!("grok: {reason}");
             out.digest = Some(wake_failure(&mut out, reason));
@@ -231,14 +215,16 @@ pub(super) async fn run_grok(
                 break;
             }
         };
+        let wake_launch = super::LaunchSpec {
+            start: wake,
+            prompt,
+            ..launch.clone()
+        };
         let (next, next_turns, next_usage) = match run_grok_turn(
-            &wake,
-            selection,
+            &wake_launch,
             sandbox,
+            prepared,
             false,
-            env,
-            &prompt,
-            project_root,
             None,
             runtime,
             &lease,
@@ -304,19 +290,23 @@ fn wake_failure(run: &mut RunOutput, reason: String) -> Digest {
 }
 
 /// One grok process: a single headless turn.
-#[allow(clippy::too_many_arguments)]
 async fn run_grok_turn(
-    session: &SessionStart,
-    selection: &super::ModelSpec,
+    launch: &super::LaunchSpec,
+    // Prepared selector: never reconstruct this from requested permissions,
+    // including on a wake whose request still describes a fresh workspace.
     sandbox: Option<&str>,
+    prepared: &Prepared,
     trust: bool,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
     lease: &Lease,
 ) -> Result<(RunOutput, u32, Usage)> {
+    let grok = &prepared.grok;
+    let session = &launch.start;
+    let selection = &launch.settings.selection;
+    let env = launch.settings.env.as_ref();
+    let prompt = launch.prompt.as_str();
+    let project_root = launch.root.as_path();
     selection.validate(Provider::Grok)?;
     session.validate(Provider::Grok)?;
     // Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read
@@ -368,7 +358,7 @@ async fn run_grok_turn(
     // `trusted_folders.toml` under grok's key and lock before the turn starts.
     // Without it every edit in an untrusted folder cancels the turn under
     // `dontAsk`. Passed only when the project has no decision yet, and
-    // announced by `invoke`, which has also refused the cases where the grant
+    // announced by adapter preparation, which has also refused the cases where the grant
     // would be wrong (see `prepare_grok_write`).
     if trust {
         args.push("--trust".to_string());
@@ -417,15 +407,14 @@ async fn run_grok_turn(
         &[],
         Stdin::Null,
     );
-    let grok = state::Grok::resolve(env).ok();
-    // Re-checked immediately before spawn. `check_trust` in `invoke` and grok's
+    // Re-checked immediately before spawn. `check_trust` in preparation and grok's
     // own grant are two separate reads of the store, and grok's grant overwrites
     // a `trusted = false` - so a "no" recorded between them (by the operator, or
     // another grok) would be overturned. This cannot close that race from
     // outside grok, which offers no "grant unless declined" operation; it
     // shrinks the window from the whole setup to the time grok takes to start.
-    if trust && let Some(ref g) = grok {
-        g.check_trust(project_root)?;
+    if trust {
+        prepared.check_grant_target(project_root)?;
     }
     // The lifecycle checks the stop channel immediately before launch, and
     // records this turn's keeper on the run's lease (every marker it holds)
@@ -523,13 +512,13 @@ async fn run_grok_turn(
         } => {
             // The result object says only `cancelled`; grok's own event log
             // says why, and folder trust is the cause worth naming outright.
-            let cause = grok.as_ref().and_then(|g| {
+            let cause = {
                 let sid = session_id.as_deref().unwrap_or(&lookup_id);
-                state::session_events(&g.home, sid)
+                state::session_events(&grok.home, sid)
                     .as_deref()
                     .and_then(state::cancel_cause)
-            });
-            let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
+            };
+            let untrusted = grok.untrusted_hint(project_root);
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
             let outcome = if review_error {
                 Outcome::no_answer().unverified(reason)
@@ -724,7 +713,7 @@ pub(super) struct GrokPrepared {
     /// The trust key `--trust` will grant, when the project had no decision
     /// yet. `None` when it was already trusted: no flag, no grant, nothing to
     /// announce.
-    pub(super) trust_grant: Option<String>,
+    pub(super) trust_grant: Option<PathBuf>,
 }
 
 /// Get grok's own config ready for a write run.
@@ -741,13 +730,12 @@ pub(super) struct GrokPrepared {
 /// Creating a profile is printed, because it edits the operator's file and an
 /// edit nobody saw is the ambient widening the rest of this file refuses; an
 /// existing profile is silent - it was announced when it was made.
-pub(super) fn prepare_grok_write(
+fn prepare_grok_write(
     kind: &GrokWrite,
     project_root: &Path,
     roots: &[String],
-    env: Option<&std::collections::BTreeMap<String, String>>,
+    grok: &state::Grok,
 ) -> Result<GrokPrepared> {
-    let grok = state::Grok::resolve(env)?;
     let mut prepared = GrokPrepared::default();
     let (key, trust) = grok.check_trust(project_root)?;
     if trust == state::Trust::Undecided {
@@ -758,7 +746,7 @@ pub(super) fn prepare_grok_write(
             key.display(),
             grok.home.join("trusted_folders.toml").display()
         );
-        prepared.trust_grant = Some(key.to_string_lossy().into_owned());
+        prepared.trust_grant = Some(key);
     }
     let name = match kind {
         GrokWrite::BuiltinWorkspace => return Ok(prepared),
@@ -793,15 +781,93 @@ pub(super) fn prepare_grok_write(
     Ok(prepared)
 }
 
-/// Whether the project is now trusted in grok's store, as the child's
-/// environment resolves it. Read after a run that passed `--trust`, because a
-/// grant grok accepted for the session is not proof that it was persisted.
-pub(super) fn trust_landed(
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    project_root: &Path,
-) -> bool {
-    state::Grok::resolve(env)
-        .is_ok_and(|g| matches!(g.check_trust(project_root), Ok((_, state::Trust::Trusted))))
+/// Prepared adapter state. The grant remains provisional until the post-run
+/// store read; neither preparation nor passing --trust proves persistence.
+pub(super) struct Prepared {
+    grok: state::Grok,
+    trust_grant: Option<PathBuf>,
+    verified_grant: Option<String>,
+}
+
+pub(super) async fn prepare(
+    launch: &super::LaunchSpec,
+    plan: &mut super::permissions::PermissionPlan,
+) -> Result<Prepared> {
+    let grok = state::Grok::resolve(launch.settings.env.as_ref())?;
+    let mut prepared = Prepared {
+        grok,
+        trust_grant: None,
+        verified_grant: None,
+    };
+    if let Some(kind) = plan.permissions.write_setup() {
+        let root = launch.root.clone();
+        let roots = plan.paths.clone();
+        let state = prepared.grok.clone();
+        let write =
+            tokio::task::spawn_blocking(move || prepare_grok_write(&kind, &root, &roots, &state))
+                .await
+                .map_err(|e| anyhow::anyhow!("grok setup task failed: {e}"))??;
+        if let Some(name) = write.profile {
+            plan.grok_profile(name);
+        }
+        prepared.trust_grant = write.trust_grant;
+    }
+    Ok(prepared)
+}
+
+impl Prepared {
+    pub(super) async fn run(
+        &mut self,
+        launch: &super::LaunchSpec,
+        sandbox: Option<&str>,
+        launched: Option<LaunchSignal>,
+        runtime: &ProviderRuntime,
+    ) -> Result<RunOutput> {
+        let result = run_grok(launch, sandbox, self, launched, runtime).await;
+        self.verify_trust(&launch.root);
+        result
+    }
+
+    /// Only a turn passing --trust needs this extra admission check. Turns
+    /// without a grant leave trust enforcement to Grok itself.
+    fn check_grant_target(&self, root: &Path) -> Result<()> {
+        let (current, _) = self.grok.check_trust(root)?;
+        if self.trust_grant.as_deref() != Some(current.as_path()) {
+            anyhow::bail!(
+                "grok trust key changed before granting trust - refusing launch for {}",
+                root.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_trust(&mut self, root: &Path) {
+        self.verified_grant = None;
+        if let Some(key) = &self.trust_grant {
+            match self.grok.check_trust(root) {
+                Ok((current, state::Trust::Trusted)) if current == *key => {
+                    self.verified_grant = Some(key.to_string_lossy().into_owned());
+                }
+                Ok((current, _)) if current != *key => {
+                    eprintln!(
+                        "warning: grok trust key changed from {} to {} - no durable grant recorded",
+                        key.display(),
+                        current.display()
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "warning: grok --trust did not durably trust {} - the next write run there will try again",
+                        key.display()
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) fn record(&self, result: &mut ProviderResult) {
+        result.grok_trust = self.verified_grant.clone();
+    }
 }
 
 #[cfg(test)]

@@ -1,228 +1,31 @@
+use super::claude_stream::{ClaudeMetrics, ClaudeOutcome, interpret_claude_output, is_claude_init};
+use super::stream::{Capture, Observer, read_stream};
 use super::*;
 
 type SharedClaudeMetrics = std::sync::Arc<std::sync::Mutex<ClaudeMetrics>>;
 
-#[derive(Default, Clone)]
-struct ClaudeMetrics {
-    turns: u32,
-    usage: Usage,
-    models: std::collections::BTreeSet<String>,
-    cost_usd: Option<f64>,
-}
+const CLAUDE_INIT_SCAN_MAX: usize = 1 << 20;
+const CLAUDE_TAIL_KEEP: usize = 8 << 20;
 
-#[derive(Default, serde::Deserialize)]
-#[serde(default)]
-struct ClaudeMetricEvent {
-    #[serde(rename = "type")]
-    kind: String,
-    num_turns: u32,
-    usage: ClaudeMetricUsage,
-    #[serde(rename = "modelUsage")]
-    model_usage: Option<serde_json::Map<String, serde_json::Value>>,
-    total_cost_usd: Option<f64>,
-}
-
-#[derive(Default, serde::Deserialize)]
-#[serde(default)]
-struct ClaudeMetricUsage {
-    input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    cache_read_input_tokens: u64,
-    output_tokens: u64,
-    output_tokens_details: Option<ClaudeMetricUsageDetails>,
-}
-
-#[derive(Default, serde::Deserialize)]
-#[serde(default)]
-struct ClaudeMetricUsageDetails {
-    thinking_tokens: u64,
-}
-
-impl ClaudeMetrics {
-    fn record_line(&mut self, line: &[u8]) {
-        let Ok(event) = serde_json::from_slice::<ClaudeMetricEvent>(line) else {
-            return;
-        };
-        if event.kind != "result" {
-            return;
-        }
-        self.turns += event.num_turns;
-        self.usage.input_tokens += event.usage.input_tokens
-            + event.usage.cache_creation_input_tokens
-            + event.usage.cache_read_input_tokens;
-        self.usage.cached_input_tokens += event.usage.cache_read_input_tokens;
-        self.usage.output_tokens += event.usage.output_tokens;
-        self.usage.reasoning_output_tokens += event
-            .usage
-            .output_tokens_details
-            .map_or(0, |details| details.thinking_tokens);
-        if let Some(model_usage) = event.model_usage {
-            self.models
-                .extend(model_usage.into_iter().map(|(name, _)| name));
-        }
-        if let Some(cost) = event.total_cost_usd {
-            self.cost_usd = Some(self.cost_usd.unwrap_or_default() + cost);
-        }
-    }
-
-    fn served(&self) -> Served {
-        let models: Vec<&str> = self.models.iter().map(String::as_str).collect();
-        Served {
-            model: (!models.is_empty()).then(|| models.join(",")),
-            cost_usd: self.cost_usd,
-        }
-    }
-}
-
-/// Keep the event scanner bounded like stdout capture. A result line longer
-/// than this cannot survive the existing head/tail capture as a parseable line.
-const CLAUDE_METRIC_LINE_CAP: usize = STDOUT_CAPTURE_CAP;
-
-fn extend_claude_metric_line(pending: &mut Vec<u8>, too_long: &mut bool, bytes: &[u8]) {
-    if *too_long {
-        return;
-    }
-    if pending.len().saturating_add(bytes.len()) > CLAUDE_METRIC_LINE_CAP {
-        pending.clear();
-        *too_long = true;
-    } else {
-        pending.extend_from_slice(bytes);
-    }
-}
-
-fn record_claude_metric_line(metrics: &SharedClaudeMetrics, line: &[u8]) {
-    if let Ok(mut metrics) = metrics.lock() {
-        metrics.record_line(line);
-    }
-}
-
-fn record_claude_metric_bytes(
-    bytes: &[u8],
-    pending: &mut Vec<u8>,
-    too_long: &mut bool,
-    metrics: &SharedClaudeMetrics,
-) {
-    let mut start = 0;
-    while let Some(relative_end) = bytes[start..].iter().position(|&byte| byte == b'\n') {
-        let end = start + relative_end;
-        extend_claude_metric_line(pending, too_long, &bytes[start..end]);
-        if !*too_long {
-            record_claude_metric_line(metrics, pending);
-        }
-        pending.clear();
-        *too_long = false;
-        start = end + 1;
-    }
-    extend_claude_metric_line(pending, too_long, &bytes[start..]);
-}
-
-/// Read claude's stream like `read_capped`, with two differences.
-///
-/// `lease.ready()` fires once claude's `init` event has arrived: that event is what
-/// makes it safe to signal, and what shows its session exists (see
-/// `run_claude`).
-///
-/// Past `cap`, the most recent `tail_keep` to `2 * tail_keep` bytes go to
-/// `tail` instead of being dropped. The stream *ends* in the result object,
-/// the one line `review` needs, so keeping only the head - right for codex,
-/// whose answer comes from `-o` - would lose the answer and the session id of
-/// any run that outgrew the cap. Result metrics are accumulated as the stream
-/// arrives so result events trimmed from the middle remain accounted for. The
-/// buffers and metrics are shared rather than returned, so what was read
-/// survives the reader being aborted.
-async fn read_claude_stream<R>(
-    mut r: R,
-    cap: usize,
-    tail_keep: usize,
-    head: SharedBuf,
-    tail: SharedBuf,
+struct ClaudeObserver {
     metrics: SharedClaudeMetrics,
     lease: Lease,
-) where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let mut chunk = [0u8; 16384];
-    let mut metric_line = Vec::new();
-    let mut metric_line_too_long = false;
-    // Lines read so far while looking for claude's `init` event; `None` once
-    // it has been seen. Only that event counts as claude having started: it
-    // carries the session id, so from then on the session exists. A stray byte
-    // or diagnostic before it proves nothing, and treating one as a start
-    // would keep the id of a session claude never wrote.
-    let mut scanning: Option<Vec<u8>> = Some(Vec::new());
-    loop {
-        match r.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                record_claude_metric_bytes(
-                    &chunk[..n],
-                    &mut metric_line,
-                    &mut metric_line_too_long,
-                    &metrics,
-                );
-                if let Some(pending) = scanning.as_mut() {
-                    pending.extend_from_slice(&chunk[..n]);
-                    let mut found = false;
-                    while let Some(end) = pending.iter().position(|&b| b == b'\n') {
-                        let line: Vec<u8> = pending.drain(..=end).collect();
-                        if is_claude_init(&line) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if found {
-                        lease.ready();
-                        scanning = None;
-                    } else if pending.len() > CLAUDE_INIT_SCAN_MAX {
-                        // One unterminated line this long is not an init
-                        // event; stop holding it.
-                        pending.clear();
-                    }
-                }
-                let mut bytes = &chunk[..n];
-                if let Ok(mut h) = head.lock()
-                    && h.len() < cap
-                {
-                    let take = (cap - h.len()).min(bytes.len());
-                    h.extend_from_slice(&bytes[..take]);
-                    bytes = &bytes[take..];
-                }
-                if !bytes.is_empty()
-                    && let Ok(mut t) = tail.lock()
-                {
-                    t.extend_from_slice(bytes);
-                    if t.len() > 2 * tail_keep {
-                        let excess = t.len() - tail_keep;
-                        t.drain(..excess);
-                    }
-                }
-            }
+}
+
+impl Observer for ClaudeObserver {
+    fn line_cap(&self) -> Option<usize> {
+        Some(STDOUT_CAPTURE_CAP)
+    }
+
+    fn line(&mut self, line: &[u8]) {
+        if !self.lease.is_ready() && line.len() <= CLAUDE_INIT_SCAN_MAX && is_claude_init(line) {
+            self.lease.ready();
+        }
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_line(line);
         }
     }
-    if !metric_line_too_long && !metric_line.is_empty() {
-        record_claude_metric_line(&metrics, &metric_line);
-    }
 }
-
-/// Whether `line` is claude's `init` event: `{"type":"system","subtype":"init",...}`.
-fn is_claude_init(line: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|v| {
-        v.get("type").and_then(|t| t.as_str()) == Some("system")
-            && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
-    })
-}
-
-/// Longest unterminated line `read_claude_stream` holds while looking for the
-/// `init` event, which is a few KiB.
-const CLAUDE_INIT_SCAN_MAX: usize = 1 << 20; // 1 MiB
-
-/// How much of claude's stream past `STDOUT_CAPTURE_CAP` is kept: enough for a
-/// result line carrying a long answer.
-const CLAUDE_TAIL_KEEP: usize = 8 << 20; // 8 MiB
-
-/// Longest explanation `interpret_claude_output` puts in an error, in chars.
-const CLAUDE_DETAIL_MAX: usize = 2000;
 
 /// How long `review` lets a claude shell command run in the foreground: 20
 /// minutes, the allowance grok gets (`GROK_COMMAND_WAIT_SECS`) for the same
@@ -232,19 +35,17 @@ const CLAUDE_DETAIL_MAX: usize = 2000;
 /// matters.
 const CLAUDE_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_claude(
-    session: &SessionStart,
-    selection: &super::ModelSpec,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
+    launch: &super::LaunchSpec,
     launched: Option<LaunchSignal>,
-    // Named for codex, whose runner it was written for; claude uses its
-    // command, stop channel, data root, teardown settings, orphan log, and
-    // drain grace.
     runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    let session = &launch.start;
+    let selection = &launch.settings.selection;
+    let env = launch.settings.env.as_ref();
+    let prompt = launch.prompt.as_str();
+    let project_root = launch.root.as_path();
+
     // The invocation owner supplies a fresh UUID; runners never mint IDs.
     // Entry validation also protects direct runner callers.
     selection.validate(Provider::Claude)?;
@@ -359,17 +160,20 @@ pub async fn run_claude(
     )?;
 
     let stdout_shared = new_shared_buf();
-    let stdout_tail = new_shared_buf();
-    let claude_metrics = std::sync::Arc::new(std::sync::Mutex::new(ClaudeMetrics::default()));
-    let stderr_shared = new_shared_buf();
-    let stdout_task = tokio::spawn(read_claude_stream(
-        pipes.stdout,
+    let capture = Capture::head_tail(
+        std::sync::Arc::clone(&stdout_shared),
         STDOUT_CAPTURE_CAP,
         CLAUDE_TAIL_KEEP,
-        std::sync::Arc::clone(&stdout_shared),
-        std::sync::Arc::clone(&stdout_tail),
-        std::sync::Arc::clone(&claude_metrics),
-        lease.clone(),
+    );
+    let claude_metrics = std::sync::Arc::new(std::sync::Mutex::new(ClaudeMetrics::default()));
+    let stderr_shared = new_shared_buf();
+    let stdout_task = tokio::spawn(read_stream(
+        pipes.stdout,
+        capture.clone(),
+        ClaudeObserver {
+            metrics: std::sync::Arc::clone(&claude_metrics),
+            lease: lease.clone(),
+        },
     ));
     let stderr_task = tokio::spawn(read_capped(
         pipes.stderr,
@@ -397,21 +201,14 @@ pub async fn run_claude(
     // what claude printed - its answer and session survive an unknown
     // teardown, which the ledger already fails the command for.
     let status = ended.status;
-    let mut stdout_buf = collect_reader(
+    let _ = collect_reader(
         stdout_task,
         &stdout_shared,
         runtime.drain_grace,
         "claude stdout",
     )
     .await;
-    // The tail starts mid-line; the newline makes that fragment a line of its
-    // own, which fails to parse and is skipped like any other.
-    if let Ok(tail) = stdout_tail.lock()
-        && !tail.is_empty()
-    {
-        stdout_buf.push(b'\n');
-        stdout_buf.extend_from_slice(&tail);
-    }
+    let stdout_buf = capture.snapshot();
     let stderr_buf = collect_reader(
         stderr_task,
         &stderr_shared,
@@ -462,20 +259,12 @@ pub async fn run_claude(
             outcome
         }
     };
-    // What an interrupted run prints in place of an answer, as codex's does.
-    let interrupted_text = |text: String| {
-        if text.trim().is_empty() {
-            "(interrupted by the operator before a final answer)".to_string()
-        } else {
-            text
-        }
-    };
     // Whether claude printed its first event, which carries the session id:
     // past that point the session exists (its transcript is on disk), so a run
     // that then ends without a result still has a session worth keeping.
     let started = lease.is_ready();
 
-    let (text, outcome, session_id) = match interpret_claude_output(&stdout, &stderr) {
+    let (text, outcome, session_id) = match interpret_claude_output("claude", &stdout, &stderr) {
         Ok(ClaudeOutcome::Answered { text, session_id }) => {
             (text, Outcome::answered(Answer::Captured), session_id)
         }
@@ -522,8 +311,8 @@ pub async fn run_claude(
         },
     };
     let outcome = settle(outcome);
-    let text = if outcome.interrupted() {
-        interrupted_text(text)
+    let text = if outcome.interrupted() && text.trim().is_empty() {
+        outcome.placeholder(Provider::Claude)
     } else {
         text
     };
@@ -535,142 +324,6 @@ pub async fn run_claude(
         codex_home: None,
         served,
         leftovers,
-    })
-}
-
-/// The last result object in claude's `stream-json` output, as its own line.
-/// Every event is one line; a run ends with a `result`, and a run in which
-/// claude woke the model for a background subagent carries one per turn, the
-/// last being the answer.
-fn last_claude_result(stdout: &str) -> Option<&str> {
-    stdout.lines().rev().find(|line| {
-        serde_json::from_str::<ClaudeResult>(line)
-            .is_ok_and(|r| r.kind.as_deref() == Some("result"))
-    })
-}
-
-/// The result object that ends claude's `--output-format stream-json` output:
-/// one per run, whatever the outcome. Only the fields that decide the outcome
-/// are modelled here; `ClaudeMetrics` accumulates usage and served details while
-/// the full stream is read.
-#[derive(serde::Deserialize)]
-struct ClaudeResult {
-    /// `"result"`. Checked so that some other JSON on stdout is not mistaken
-    /// for a result - every other field here is optional.
-    #[serde(rename = "type", default)]
-    kind: Option<String>,
-    /// `"success"` even for an API error (a model claude could not find
-    /// reported `subtype: "success"`, `is_error: true`) - so `is_error`, not
-    /// this, decides. Named in the reason when it says something else.
-    #[serde(default)]
-    subtype: Option<String>,
-    #[serde(default)]
-    is_error: Option<bool>,
-    #[serde(default)]
-    result: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    /// `"completed"` on a normal turn, `"api_error"` on the unknown model.
-    #[serde(default)]
-    terminal_reason: Option<String>,
-    #[serde(default)]
-    api_error_status: Option<u32>,
-}
-
-/// What a finished claude run amounts to. An `Err` alongside these means no
-/// result object came back at all.
-#[derive(Debug)]
-enum ClaudeOutcome {
-    Answered {
-        text: String,
-        session_id: Option<String>,
-    },
-    /// Claude produced a result object that is either flagged as an error or
-    /// missing the flag needed to trust it as an answer. The session exists, so
-    /// this is `Ok` with its ID kept.
-    NoAnswer {
-        reason: String,
-        /// `true` when review inferred a failure because Claude omitted the
-        /// field that says whether the result is an error.
-        review_error: bool,
-        text: String,
-        session_id: Option<String>,
-    },
-}
-
-/// Decide whether a finished claude run produced an answer, from its streams
-/// alone. Pure, so each shape is tested without a claude binary.
-///
-/// Only `is_error: false` is an answer. A result missing the flag is treated
-/// as a failure rather than a success: a claude that stopped reporting it
-/// should fail loudly, not pass every run off as answered.
-fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> {
-    // Why there is no result, for the error message - which is printed and
-    // persisted in `audit.jsonl`, so it is bounded. stderr is claude's own
-    // account when it gives one. Otherwise only the last line of the stream:
-    // the whole stream is every event of the run, tool output included, up to
-    // `STDOUT_CAPTURE_CAP`.
-    let detail = || {
-        let source = if stderr.trim().is_empty() {
-            stdout
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("(no output)")
-        } else {
-            stderr.trim()
-        };
-        truncate(source, CLAUDE_DETAIL_MAX)
-    };
-    let Some(result) =
-        last_claude_result(stdout).and_then(|line| serde_json::from_str::<ClaudeResult>(line).ok())
-    else {
-        anyhow::bail!("claude produced no result object: {}", detail());
-    };
-    let text = result.result.unwrap_or_default();
-    if result.is_error == Some(false) {
-        return Ok(ClaudeOutcome::Answered {
-            text,
-            session_id: result.session_id,
-        });
-    }
-    let mut facts: Vec<String> = Vec::new();
-    if result.is_error.is_none() {
-        facts.push("no is_error flag".to_string());
-    }
-    if let Some(s) = result.subtype.as_deref().filter(|s| *s != "success") {
-        facts.push(format!("subtype: {s}"));
-    }
-    if let Some(t) = result
-        .terminal_reason
-        .as_deref()
-        .filter(|t| *t != "completed")
-    {
-        facts.push(format!("terminal_reason: {t}"));
-    }
-    if let Some(status) = result.api_error_status {
-        facts.push(format!("API status {status}"));
-    }
-    let mut reason = if result.is_error.is_none() {
-        "review could not classify claude result".to_string()
-    } else {
-        "claude reported an error".to_string()
-    };
-    if !facts.is_empty() {
-        reason.push_str(&format!(" ({})", facts.join(", ")));
-    }
-    // On an error the result text is claude's own explanation (the unknown
-    // model: "There's an issue with the selected model ..."). It is persisted
-    // with the provider reason; a missing `is_error` is described as review's
-    // classification failure and routes to `review_error` below.
-    if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
-        reason.push_str(&format!(": {}", line.trim()));
-    }
-    Ok(ClaudeOutcome::NoAnswer {
-        reason,
-        review_error: result.is_error.is_none(),
-        text,
-        session_id: result.session_id,
     })
 }
 
@@ -701,3 +354,6 @@ fn claude_served(stdout: &str) -> Served {
 #[cfg(test)]
 #[path = "claude_tests.rs"]
 mod tests;
+
+/// Claude has no review-managed permission files to prepare.
+pub(super) fn prepare(_launch: &super::LaunchSpec) {}

@@ -93,7 +93,7 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
             .ok()
             .and_then(|s| s.trim().parse().ok())
         {
-            let pidfd = match keeper::pidfd_open(pid) {
+            let pidfd = match review::process::pidfd_open(pid) {
                 Ok(pidfd) => Some(pidfd),
                 Err(err) if err.raw_os_error() == Some(libc::ESRCH) => None,
                 Err(err) => panic!("open detached pidfd: {err}"),
@@ -109,12 +109,14 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
     drop(events);
     let status = child.wait().expect("keeper exits");
     assert!(status.success(), "{status}");
-    let gone = detached_pidfd.as_ref().is_none_or(keeper::pidfd_exited);
+    let gone = detached_pidfd
+        .as_ref()
+        .is_none_or(review::process::pidfd_exited);
     if let Some(pidfd) = detached_pidfd
         .as_ref()
-        .filter(|pidfd| !keeper::pidfd_exited(pidfd))
+        .filter(|pidfd| !review::process::pidfd_exited(pidfd))
     {
-        let _ = keeper::pidfd_signal(pidfd, libc::SIGKILL);
+        let _ = review::process::pidfd_signal(pidfd, libc::SIGKILL);
     }
     assert!(
         gone,

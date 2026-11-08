@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use super::{Grok, has_symlink_component};
+use crate::fsutil::locked_update;
 
 impl Grok {
     /// Make sure profile `name` exists in `<home>/sandbox.toml` granting exactly
@@ -14,6 +14,13 @@ impl Grok {
         name: &str,
         roots: &[String],
     ) -> anyhow::Result<bool> {
+        let path = self.home.join("sandbox.toml");
+        if has_symlink_component(&path) {
+            anyhow::bail!(
+                "{} is reached through a symlink - grok refuses to load it, so review will not write it",
+                path.display()
+            );
+        }
         let mut created = false;
         locked_update(&self.home, "sandbox.toml", |text| {
             let (new_text, c) = merge_profile(text, name, roots)?;
@@ -22,87 +29,6 @@ impl Grok {
         })?;
         Ok(created)
     }
-}
-
-/// Locked read-modify-write of `<grok_home>/<name>`: an exclusive `flock` on
-/// `<name>.lock` for the whole cycle, then a unique 0600 temp file renamed over
-/// the original. `update` returns the new body, or `None` to leave the file
-/// untouched.
-///
-/// The discipline is copied from grok's writer for `trusted_folders.toml`
-/// (`trust.rs` `record_decision_strict`/`persist_doc`). Grok has no writer for
-/// `sandbox.toml` at all, so for that file the lock serializes `review`
-/// processes against each other - a fan-out launching several grok runs at
-/// once - not against grok. The rename is what protects grok: a grok starting
-/// mid-write reads either the old file or the new one.
-///
-/// A path through a symlink is refused: grok refuses to load its
-/// trust-boundary files (`sandbox.toml` among them) through one
-/// (`resolve_trust_boundary_sources`), so a profile written there could never
-/// be used, and following the link would drop lock and temp files into
-/// wherever it points.
-fn locked_update(
-    grok_home: &Path,
-    name: &str,
-    update: impl FnOnce(&str) -> anyhow::Result<Option<String>>,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    let path = grok_home.join(name);
-    if has_symlink_component(&path) {
-        anyhow::bail!(
-            "{} is reached through a symlink - grok refuses to load it, so review will not write it",
-            path.display()
-        );
-    }
-    std::fs::create_dir_all(grok_home)?;
-    let dir = grok_home.to_path_buf();
-    let file_name = name.to_string();
-
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(dir.join(format!("{file_name}.lock")))?;
-    // SAFETY: a valid fd owned by `lock`, which outlives the lock; the kernel
-    // releases the flock when the fd closes.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        anyhow::bail!(
-            "cannot lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let Some(new_text) = update(&text).map_err(|e| anyhow::anyhow!("{e} ({})", path.display()))?
-    else {
-        return Ok(());
-    };
-    let tmp = dir.join(format!(
-        "{file_name}.review-{}",
-        crate::config::generate_uuid()
-    ));
-    let mut f = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(new_text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    Ok(())
 }
 
 /// Prefix of the grok sandbox profiles `review` creates for write runs.

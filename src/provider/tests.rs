@@ -36,7 +36,7 @@ fn a_resume_result_retains_the_session_id_known_to_its_caller() {
 fn a_profile_config_override_of_writable_roots_is_what_gets_recorded() {
     let config = vec![r#"sandbox_workspace_write.writable_roots=["/secret"]"#.to_string()];
     assert_eq!(
-        super::config_writable_roots_override(&config),
+        super::codex::config_writable_roots_override(&config),
         Some(vec!["/secret".to_string()])
     );
 }
@@ -46,7 +46,10 @@ fn a_profile_config_override_of_writable_roots_is_what_gets_recorded() {
 #[test]
 fn an_empty_writable_roots_override_is_recorded_as_empty_not_absent() {
     let config = vec!["sandbox_workspace_write.writable_roots=[]".to_string()];
-    assert_eq!(super::config_writable_roots_override(&config), Some(vec![]));
+    assert_eq!(
+        super::codex::config_writable_roots_override(&config),
+        Some(vec![])
+    );
 }
 
 #[test]
@@ -55,7 +58,7 @@ fn unrelated_profile_config_entries_leave_the_derived_roots_recorded() {
         r#"model_provider="openai-http""#.to_string(),
         r#"sandbox_workspace_write.network_access=true"#.to_string(),
     ];
-    assert_eq!(super::config_writable_roots_override(&config), None);
+    assert_eq!(super::codex::config_writable_roots_override(&config), None);
 }
 
 #[test]
@@ -65,11 +68,11 @@ fn a_longer_config_key_does_not_hide_the_writable_roots_override() {
         r#"sandbox_workspace_write.writable_roots_extra=["/ignored"]"#.to_string(),
     ];
     assert_eq!(
-        super::config_writable_roots_override(&config),
+        super::codex::config_writable_roots_override(&config),
         Some(vec!["/first".to_string()])
     );
     assert_eq!(
-        super::config_writable_roots_override(&config[1..]),
+        super::codex::config_writable_roots_override(&config[1..]),
         None,
         "a key that only shares the prefix is not the override"
     );
@@ -83,7 +86,7 @@ fn the_last_writable_roots_override_wins() {
         r#"sandbox_workspace_write.writable_roots=["/second"]"#.to_string(),
     ];
     assert_eq!(
-        super::config_writable_roots_override(&config),
+        super::codex::config_writable_roots_override(&config),
         Some(vec!["/second".to_string()])
     );
 }
@@ -220,4 +223,45 @@ fn persisted_sandbox_levels_normalize_known_grok_names() {
         super::Permissions::restore(super::Provider::Grok, None, None, &[]).recorded_level(),
         None
     );
+}
+
+#[test]
+fn codex_preparation_replaces_effective_paths_without_changing_root_provenance() {
+    use super::*;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut launch = LaunchSpec {
+        provider: Provider::Codex,
+        start: SessionStart::Fresh { id: None },
+        settings: RunSettings::from_profile(Provider::Codex, None),
+        prompt: "test".into(),
+        root: root.clone(),
+    };
+    launch.settings.permissions = Permissions::profile(
+        Provider::Codex,
+        Some(&crate::config::SandboxLevel::WorkspaceWrite),
+    );
+    for paths in [vec!["/raw-override".to_string()], Vec::new()] {
+        launch.settings.config = vec![format!("sandbox_workspace_write.writable_roots={paths:?}")];
+        let mut plan =
+            permissions::PermissionPlan::new(launch.settings.permissions.clone(), &root, &[]);
+        let derived: Vec<_> = plan
+            .granted
+            .iter()
+            .map(|grant| grant.path.clone())
+            .collect();
+        codex::prepare(&launch, &mut plan);
+        assert_eq!(plan.paths, paths);
+        assert!(plan.derives());
+        assert_eq!(
+            plan.granted
+                .iter()
+                .map(|grant| grant.path.clone())
+                .collect::<Vec<_>>(),
+            derived
+        );
+        assert!(
+            launch.settings.writable_roots.is_empty(),
+            "raw effective paths never become requested roots"
+        );
+    }
 }

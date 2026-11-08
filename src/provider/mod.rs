@@ -1,41 +1,46 @@
+mod artifacts;
 mod claude;
-mod codex;
+mod claude_stream;
+pub(crate) mod codex;
 mod grok;
 mod kind;
+mod launch;
 mod lifecycle;
 mod model;
 mod outcome;
 mod output;
 mod permissions;
+mod prepare;
 mod result;
 mod runtime;
 mod session;
+mod stream;
 
+pub(crate) use artifacts::session_artifacts;
 pub use claude::run_claude;
 pub use codex::run_codex_json;
 pub use kind::{Provider, UnknownProvider};
+pub use launch::{InheritedSettings, LaunchSpec, ProfileOrigin, RunSettings};
 use lifecycle::{Lease, LeaseUse, Run};
 pub use lifecycle::{ProcessSpec, Stdin};
 pub use model::ModelSpec;
 pub use outcome::{Answer, EndedBy, OPERATOR_INTERRUPT, Outcome, SIGNAL_STOP, StatusFacts, Turn};
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
-pub use result::{Digest, DigestSummary, ProviderResult, RunOutput, Served, Usage, now_epoch_secs};
-pub use runtime::{
-    ProviderCommand, ProviderCommands, ProviderRuntime, Unrecorded, install_signal_supervisor,
-    orphan_log_path, stop_requested,
+pub use result::{
+    CodexForensics, Digest, DigestSummary, ProviderForensics, ProviderResult, RunOutput, Served,
+    Usage, now_epoch_secs,
 };
+pub use runtime::{ProviderCommand, ProviderCommands, ProviderRuntime, orphan_log_path};
 pub use session::{SessionId, SessionStart};
 
 use codex::run_codex;
-use grok::run_grok;
 use result::{answered_status_digest, result_served, signal_name, status_digest};
 
 #[cfg(test)]
 mod tests;
 
 use anyhow::{Context, Result};
-use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
 /// Check whether a provider binary is available on PATH.
@@ -78,10 +83,7 @@ pub fn new_output_file() -> Result<String> {
 fn new_temp_file(tag: &str) -> Result<String> {
     let dir = std::env::temp_dir();
     for _ in 0..8 {
-        let path = dir.join(format!(
-            "review-{tag}-{}.txt",
-            crate::config::generate_uuid()
-        ));
+        let path = dir.join(format!("review-{tag}-{}.txt", crate::ids::generate_uuid()));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -154,18 +156,11 @@ fn push_capped(buf: &SharedBuf, chunk: &[u8], cap: usize) {
 
 /// Read `r` to EOF into `out`, buffering at most `cap` bytes but continuing to
 /// drain the rest (so the child never blocks on a full pipe).
-async fn read_capped<R>(mut r: R, cap: usize, out: SharedBuf)
+async fn read_capped<R>(r: R, cap: usize, out: SharedBuf)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
-    let mut chunk = [0u8; 16384];
-    loop {
-        match r.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => push_capped(&out, &chunk[..n], cap),
-        }
-    }
+    stream::read_stream(r, stream::Capture::head(out, cap), stream::Ignore).await;
 }
 
 /// Take a reader's output once the child is reaped, without waiting on it
@@ -183,6 +178,9 @@ async fn collect_reader(
 ) -> Vec<u8> {
     if tokio::time::timeout(grace, &mut handle).await.is_err() {
         handle.abort();
+        // Abort requests cancellation; joining also waits for any synchronous
+        // chunk processing and its fact publication to finish before snapshot.
+        let _ = handle.await;
         eprintln!(
             "warning: {what} was still open {}s after the process was reaped \
              (something inherited the pipe); using the {} bytes captured so far",
@@ -212,22 +210,16 @@ impl Drop for RemoveOnDrop {
 /// is what tells the caller it is safe to release.
 pub type LaunchSignal = tokio::sync::oneshot::Sender<()>;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn invoke(
-    provider: Provider,
-    mut session: SessionStart,
-    model: Option<&str>,
-    effort: Option<&str>,
-    permissions: Permissions,
-    profile_roots: &[String],
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    config: &[String],
-    prompt: &str,
-    project_root: &Path,
+    mut launch: LaunchSpec,
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
 ) -> ProviderResult {
-    let selection = ModelSpec::new(provider, model, effort, config);
+    let provider = launch.provider;
+    let selection = &launch.settings.selection;
+    let permissions = launch.settings.permissions.clone();
+    let project_root = launch.root.as_path();
+    let profile_roots = &launch.settings.writable_roots;
     let selection_check = selection.validate(provider);
     if permissions.provider() != provider || selection_check.is_err() {
         return ProviderResult {
@@ -251,13 +243,23 @@ pub async fn invoke(
             leftovers: crate::contained::Leftovers::default(),
         };
     }
-    let mut plan =
-        permissions::PermissionPlan::new(permissions, project_root, profile_roots, config);
-    let setup = match session.prepare(provider) {
-        Ok(()) => plan.prepare(project_root, env).await,
+    let mut plan = permissions::PermissionPlan::new(permissions, project_root, profile_roots);
+    let setup = match launch.start.prepare(provider) {
         Err(e) => Err(e),
+        Ok(()) => match provider {
+            Provider::Claude => {
+                claude::prepare(&launch);
+                Ok(prepare::Prepared::Claude)
+            }
+            Provider::Codex => {
+                codex::prepare(&launch, &mut plan);
+                Ok(prepare::Prepared::Codex)
+            }
+            Provider::Grok => grok::prepare(&launch, &mut plan)
+                .await
+                .map(prepare::Prepared::Grok),
+        },
     };
-    let mut trust_grant = setup.as_ref().ok().cloned().flatten();
     let derives = plan.derives();
     let resumes_profile = plan.uses_recorded_roots();
     let root_paths = &plan.paths;
@@ -299,73 +301,17 @@ pub async fn invoke(
         );
     }
 
-    let sandbox = plan.permissions.selector();
-
+    let mut prepared = None;
     let result = match setup {
         Err(e) => Err(e),
-        Ok(_) => match provider {
-            // Profile validation rejects unsupported fields; native permissions
-            // and model selection have already been prepared for this adapter.
-            Provider::Claude => {
-                run_claude(
-                    &session,
-                    &selection,
-                    env,
-                    prompt,
-                    project_root,
-                    launched,
-                    runtime,
-                )
-                .await
-            }
-            Provider::Grok => {
-                run_grok(
-                    &session,
-                    &selection,
-                    sandbox,
-                    trust_grant.is_some(),
-                    env,
-                    prompt,
-                    project_root,
-                    launched,
-                    runtime,
-                )
-                .await
-            }
-            Provider::Codex => {
-                run_codex(
-                    &session,
-                    &selection,
-                    sandbox.expect("codex permission plan always resolves a selector"),
-                    root_paths,
-                    env,
-                    prompt,
-                    project_root,
-                    launched,
-                    runtime,
-                )
-                .await
-            }
-        },
-    };
-    // Record a trust grant only if it actually landed. Grok reports a refused or
-    // process-local grant only on stderr (surfaced by `run_grok`), and a
-    // process-local one leaves the next run untrusted - so "we passed --trust"
-    // is not "the folder is now permanently trusted", and the sidecar field
-    // claims the latter. Re-read after the run; small file, no lock.
-    if trust_grant.is_some() {
-        let landed = grok::trust_landed(env, project_root);
-        if !landed {
-            eprintln!(
-                "warning: grok --trust did not durably trust {} - the next write run \
-                 there will try again",
-                trust_grant.as_deref().unwrap_or_default()
-            );
-            trust_grant = None;
+        Ok(mut state) => {
+            let result = state.run(&launch, &plan, launched, runtime).await;
+            prepared = Some(state);
+            result
         }
-    }
+    };
     let completed_epoch = now_epoch_secs();
-    match result {
+    let mut result = match result {
         Ok(run) => ProviderResult {
             provider,
             output: Ok(Turn {
@@ -381,7 +327,7 @@ pub async fn invoke(
             model: selection.model().map(str::to_string),
             effort: selection.effort().map(str::to_string),
             served: run.served,
-            grok_trust: trust_grant,
+            grok_trust: None,
             leftovers: run.leftovers,
         },
         Err(e) => ProviderResult {
@@ -399,15 +345,17 @@ pub async fn invoke(
             model: selection.model().map(str::to_string),
             effort: selection.effort().map(str::to_string),
             served: Served::default(),
-            // Requested, as `sandbox` is: if grok got as far as running, the
-            // grant happened before whatever failed.
-            grok_trust: trust_grant,
+            grok_trust: None,
             // A runner that failed after its launch left its verdict in the
             // ledger (`contained::Contained`'s drop), which the exit status
             // reads; this row has no outcome to carry.
             leftovers: crate::contained::Leftovers::default(),
         },
+    };
+    if let Some(prepared) = prepared {
+        prepared.record(&mut result);
     }
+    result
 }
 
 /// The `writable root` lines for a launch: one per **effective** root, carrying
@@ -439,42 +387,6 @@ fn announcement_lines(
         .collect()
 }
 
-/// The writable roots a profile `config` entry sets, when one does.
-///
-/// Profile overrides are passed after the derived `-c`, so codex takes the last
-/// one and a profile restating this key replaces the derivation entirely. The
-/// last entry wins here for the same reason. Returns `None` when no entry
-/// touches the key, and `Some(vec![])` for an explicit empty override - which is
-/// a real, recordable state, not the absence of one.
-fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
-    const KEY: &str = "sandbox_workspace_write.writable_roots";
-    // Keep this override supported: the typed `writable_roots` field adds to
-    // derived roots, while codex `-c` deliberately replaces the whole list.
-    // Match the complete key before parsing its value. A neighboring setting
-    // such as `sandbox_workspace_write.writable_roots_extra` must not hide an
-    // earlier override of the actual roots key.
-    let value = config.iter().rev().find_map(|entry| {
-        let (key, value) = entry.split_once('=')?;
-        (key.trim() == KEY).then_some(value.trim())
-    })?;
-    // Parse rather than string-scrape: the value is TOML, and a hand-written
-    // profile can spell an array in ways a regex would get wrong. Codex falls
-    // back to a string for values that are not TOML, but this setting requires
-    // an array of paths; such a string is not an effective writable-roots
-    // override.
-    let parsed = format!("{KEY} = {value}").parse::<toml::Table>().ok()?;
-    let roots = parsed
-        .get("sandbox_workspace_write")?
-        .get("writable_roots")?
-        .as_array()?;
-    Some(
-        roots
-            .iter()
-            .filter_map(|v| v.as_str().map(ToString::to_string))
-            .collect(),
-    )
-}
-
 /// Write the prompt to stdin and close it. Run on the task `lifecycle::Run`
 /// owns, so aborting that task cancels the write itself.
 async fn write_stdin(
@@ -494,3 +406,5 @@ fn truncate(s: &str, max: usize) -> String {
     out.push_str("...");
     out
 }
+
+pub(crate) use output::print_digest_summary;

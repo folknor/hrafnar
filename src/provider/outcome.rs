@@ -193,6 +193,22 @@ impl Outcome {
         }
     }
 
+    /// Text when a turn returned no reportable text. Evidence classification is
+    /// already complete; process exit alone does not decide whether a turn died.
+    pub fn placeholder(&self, provider: super::Provider) -> String {
+        if let Some(reason) = &self.stated {
+            format!("({provider} ended the turn: {reason})")
+        } else if self.interrupted() {
+            "(interrupted by the operator before a final answer)".into()
+        } else if self.termination().is_some() {
+            format!("({provider} was terminated without a final answer)")
+        } else if let Some(reason) = &self.unverified {
+            format!("({provider} result could not be verified: {reason})")
+        } else {
+            format!("({provider} produced no final answer)")
+        }
+    }
+
     /// The outcome lines of a digest, live or persisted, in reading order: what
     /// was stated, what `review` diagnosed, the status note, who ended the run,
     /// and how the missing answer (if any) should be read. The one renderer, so

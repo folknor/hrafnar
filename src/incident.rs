@@ -12,12 +12,15 @@
 //! them without derailing the run. Only suspicious runs write a bundle, so
 //! clean runs stay uncluttered.
 
+mod probe;
+pub(crate) use probe::version_probe;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Everything known about a finished provider run, handed to the bundle writer.
 pub struct Incident<'a> {
-    pub provider: &'a str,
+    pub provider: crate::provider::Provider,
     /// The process as it was spawned: argv[0] and the args, the working
     /// directory and the env overrides (adapter defaults, profile, forced,
     /// `PWD`). The replay command and the env list are rendered from it, so
@@ -30,9 +33,9 @@ pub struct Incident<'a> {
     /// probes the binary that actually ran, not the provider name: those differ
     /// whenever the binary is overridden (the test harness runs a stub), and
     /// probing the name recorded the host's real codex for a stub run. Taken by
-    /// the caller (`contained::version_probe`), so the probe is contained like
+    /// the caller (`incident::version_probe`), so the probe is contained like
     /// any provider process.
-    pub codex_version: Option<String>,
+    pub provider_version: Option<String>,
     pub session_id: Option<&'a str>,
     /// The prompt piped on the child's stdin - part of the invocation, so a
     /// replay is impossible without it.
@@ -44,87 +47,78 @@ pub struct Incident<'a> {
     pub stdin_write_error: Option<&'a str>,
     pub stdout: &'a [u8],
     pub stderr: &'a [u8],
-    pub transcript_path: Option<&'a str>,
-    /// The same scope passed to transcript recovery. An offset beyond EOF
-    /// means no bytes can safely be attributed to this run.
-    pub transcript_offset: Option<u64>,
-    /// Whether the runner's scoped transcript summary found a final answer.
-    pub final_answer_present: Option<bool>,
     pub duration_ms: u128,
     /// Overrides the XDG data root the bundle is written under. `None` in
     /// production; set by tests so a stub run cannot write into the operator's
     /// real incident directory.
     pub data_root: Option<&'a Path>,
-    pub captured: bool,
-    pub recovered_from_transcript: bool,
+    pub outcome: &'a crate::provider::Outcome,
     pub turns: u32,
-    /// Why `review` killed the run, when it did (watchdog verdict or operator
-    /// signal). `None` means codex ended on its own.
-    pub terminated_by_review: Option<&'a str>,
-    /// How long the rollout had been unchanged when the watchdog acted, and the
-    /// last event it saw. The pair that makes a stall-timeout misfire on a
-    /// healthy run diagnosable after the fact.
-    pub quiet_secs: Option<u64>,
-    pub last_rollout_event: Option<&'a str>,
-    /// Codex's own stated reason for the turn ending (stream `error` /
-    /// `turn.failed`) - typically an upstream refusal. Recorded so a bundle that
-    /// has an explanation says so on its face, rather than being filed alongside
-    /// the genuinely unexplained deaths this directory exists for.
-    pub turn_error: Option<&'a str>,
+    pub forensics: Option<IncidentForensics<'a>>,
 }
+
+/// Provider-owned inputs, projected explicitly into the stable bundle schema.
+pub enum IncidentForensics<'a> {
+    Codex(CodexIncident<'a>),
+}
+
+pub use crate::provider::codex::forensics::CodexIncident;
 
 /// Keep the last MiB of the raw NDJSON stream - the death is at the end, and a
 /// long agentic run's stream can be tens of MiB.
 const STDOUT_TAIL_BYTES: usize = 1 << 20;
-/// Raw transcript lines to keep in the tail (the full file stays on disk).
-const TRANSCRIPT_TAIL_LINES: usize = 80;
 const INCIDENT_SCHEMA: u32 = 1;
 
-#[derive(Serialize)]
-struct Meta {
-    schema: u32,
-    timestamp: String,
-    provider: String,
-    session_id: Option<String>,
-    review_version: &'static str,
-    codex_version: Option<String>,
+// This is the schema-1 compatibility DTO, not the internal provider model.
+// Historical writers omitted some fields; default omissions, but reject invalid
+// present values and unsupported schema versions. Both read and write use it.
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Meta {
+    pub schema: u32,
+    pub timestamp: String,
+    pub provider: String,
+    pub session_id: Option<String>,
+    pub review_version: String,
+    // Historical schema-1 key: keep it even though Incident uses provider_version.
+    pub codex_version: Option<String>,
     /// Full argv including argv[0] (the binary).
-    argv: Vec<String>,
+    pub argv: Vec<String>,
     /// A copy-pasteable shell command that reproduces the run: the injected env
     /// prefix, the quoted argv, and `< prompt.txt` (the prompt is piped on
     /// stdin, so it's written alongside as `prompt.txt`). Secret env values are
     /// shown as `<redacted>` - fill them back in to actually run it.
-    command: String,
-    cwd: String,
-    prompt_bytes: usize,
-    exit_code: Option<i32>,
-    signal: Option<String>,
-    stdin_write_error: Option<String>,
-    duration_ms: u128,
-    captured: bool,
-    recovered_from_transcript: bool,
-    turns: u32,
-    terminated_by_review: Option<String>,
-    quiet_secs: Option<u64>,
-    last_rollout_event: Option<String>,
+    pub command: String,
+    pub cwd: String,
+    pub prompt_bytes: usize,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub stdin_write_error: Option<String>,
+    pub duration_ms: u128,
+    pub captured: bool,
+    pub recovered_from_transcript: bool,
+    pub turns: u32,
+    pub terminated_by_review: Option<String>,
+    pub quiet_secs: Option<u64>,
+    pub last_rollout_event: Option<String>,
     /// Codex's stated reason for the turn ending, when it gave one.
-    turn_error: Option<String>,
-    stdout_bytes: usize,
-    stderr_bytes: usize,
-    stdout_truncated: bool,
-    transcript_path: Option<String>,
+    pub turn_error: Option<String>,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+    pub stdout_truncated: bool,
+    pub transcript_path: Option<String>,
     /// Whether the shared transcript summary found a final-answer phase in the
     /// scoped bytes. `Some(false)` means it found none.
-    final_answer_present: Option<bool>,
+    pub final_answer_present: Option<bool>,
     /// Rate-limit snapshot from the last `token_count` event (raw JSON), so a
     /// limit-driven stop is visible without re-reading the transcript.
-    rate_limits: Option<serde_json::Value>,
+    pub rate_limits: Option<serde_json::Value>,
     /// Env var names configured for the run; values only when non-secret.
-    env: Vec<EnvVar>,
+    pub env: Vec<EnvVar>,
 }
 
-#[derive(Serialize)]
-struct EnvVar {
+#[derive(Serialize, Deserialize)]
+pub struct EnvVar {
     name: String,
     value: Option<String>,
 }
@@ -241,28 +235,18 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         failures.push(error);
     }
 
-    // The excerpt and metadata must describe this invocation, not an earlier
-    // turn in the same resumed session. Use the exact byte baseline that scoped
-    // recovery; an untrusted baseline is represented by an offset beyond EOF.
-    let mut rate_limits = None;
-    if let Some(path) = inc.transcript_path {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let scoped = crate::transcript::slice_from_offset(&bytes, inc.transcript_offset);
-                let content = String::from_utf8_lossy(scoped);
-                let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
-                if let Err(error) = write_file(&dir, "transcript.tail.jsonl", tail.as_bytes()) {
-                    failures.push(error);
-                }
-                rate_limits = scan_rate_limits(&content);
-            }
-            Err(error) => failures.push(IncidentFailure {
-                path: Some(PathBuf::from(path)),
-                message: format!("failed to read rollout transcript: {error}"),
-            }),
+    let codex = inc.forensics.as_ref().map(|evidence| match evidence {
+        IncidentForensics::Codex(codex) => codex,
+    });
+    let rate_limits = match codex {
+        Some(codex) => {
+            let (rate_limits, errors) = codex.write_artifacts(&dir);
+            failures.extend(errors);
+            rate_limits
         }
-    }
-    let final_answer_present = inc.final_answer_present;
+        None => None,
+    };
+    let final_answer_present = codex.and_then(|c| c.final_answer_present);
 
     let env = inc
         .process
@@ -279,8 +263,8 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         timestamp,
         provider: inc.provider.to_string(),
         session_id: inc.session_id.map(str::to_string),
-        review_version: env!("CARGO_PKG_VERSION"),
-        codex_version: inc.codex_version.clone(),
+        review_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_version: inc.provider_version.clone(),
         argv: full_argv,
         command,
         cwd: inc.process.cwd.to_string_lossy().into_owned(),
@@ -289,17 +273,17 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         signal: inc.signal.map(str::to_string),
         stdin_write_error: inc.stdin_write_error.map(str::to_string),
         duration_ms: inc.duration_ms,
-        captured: inc.captured,
-        recovered_from_transcript: inc.recovered_from_transcript,
+        captured: inc.outcome.answer == crate::provider::Answer::Captured,
+        recovered_from_transcript: inc.outcome.answer == crate::provider::Answer::Recovered,
         turns: inc.turns,
-        terminated_by_review: inc.terminated_by_review.map(str::to_string),
-        quiet_secs: inc.quiet_secs,
-        last_rollout_event: inc.last_rollout_event.map(str::to_string),
-        turn_error: inc.turn_error.map(str::to_string),
+        terminated_by_review: inc.outcome.termination().map(str::to_string),
+        quiet_secs: codex.and_then(|c| c.quiet_secs),
+        last_rollout_event: codex.and_then(|c| c.last_rollout_event).map(str::to_string),
+        turn_error: inc.outcome.stated.clone(),
         stdout_bytes: inc.stdout.len(),
         stderr_bytes: inc.stderr.len(),
         stdout_truncated,
-        transcript_path: inc.transcript_path.map(str::to_string),
+        transcript_path: codex.and_then(|c| c.transcript_path).map(str::to_string),
         final_answer_present,
         rate_limits,
         env,
@@ -330,7 +314,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
 }
 
 /// Write `bytes` to `dir/name`, retaining the failed path and cause.
-fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), IncidentFailure> {
+pub(crate) fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), IncidentFailure> {
     let path = dir.join(name);
     match std::fs::write(&path, bytes) {
         Ok(()) => Ok(()),
@@ -351,30 +335,10 @@ fn tail_bytes(data: &[u8], max: usize) -> (&[u8], bool) {
 }
 
 /// Last `max` non-empty lines, rejoined.
-fn tail_lines(content: &str, max: usize) -> String {
+pub(crate) fn tail_lines(content: &str, max: usize) -> String {
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(max);
     lines[start..].join("\n")
-}
-
-/// Extract the last non-null rate-limit snapshot from an already run-scoped
-/// rollout excerpt. Answer recognition belongs to `transcript::summarize`.
-fn scan_rate_limits(content: &str) -> Option<serde_json::Value> {
-    let mut rate_limits = None;
-    for line in content.lines() {
-        let val: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let payload = val.get("payload");
-        if payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) == Some("token_count")
-            && let Some(rl) = payload.and_then(|p| p.get("rate_limits"))
-            && !rl.is_null()
-        {
-            rate_limits = Some(rl.clone());
-        }
-    }
-    rate_limits
 }
 
 /// Build a copy-pasteable shell command that reproduces the run: `cd` to the
@@ -420,36 +384,31 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// A subset of `meta.json` read back for `review incidents`. Fields default for
-/// deserialization, but `read_incident_summary` lists only a bundle whose
-/// `schema` matches and that carries a provider and a UTC timestamp.
-#[derive(Deserialize, Default)]
-pub struct IncidentSummary {
-    #[serde(default)]
-    pub timestamp: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub provider: String,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
-    #[serde(default)]
-    pub signal: Option<String>,
-    #[serde(default)]
-    pub recovered_from_transcript: bool,
-    #[serde(default)]
-    pub final_answer_present: Option<bool>,
-    #[serde(default)]
-    pub codex_version: Option<String>,
-    /// Codex's stated reason for the turn ending. When present it *is* the
-    /// verdict - the bundle is explained, not a mystery death.
-    #[serde(default)]
-    pub turn_error: Option<String>,
+impl Meta {
+    /// Bundle evidence is tri-state, unlike Outcome: no readable transcript is
+    /// not proof of no answer. Preserve that distinction for historical bundles.
+    pub fn verdict(&self) -> String {
+        if let Some(reason) = &self.turn_error {
+            let mut chars = reason.lines().next().unwrap_or("").chars();
+            let text: String = chars.by_ref().take(90).collect();
+            let suffix = if chars.next().is_some() { "..." } else { "" };
+            format!("turn failed: {text}{suffix}")
+        } else if self.recovered_from_transcript {
+            "recovered from transcript".into()
+        } else {
+            match self.final_answer_present {
+                Some(false) => "no final answer (died)",
+                Some(true) => "completed (stream/-o truncated)",
+                None => "suspicious",
+            }
+            .into()
+        }
+    }
 }
 
 pub struct ListedIncident {
     pub dir: PathBuf,
-    pub meta: IncidentSummary,
+    pub meta: Meta,
 }
 
 pub struct IncidentListing {
@@ -546,27 +505,24 @@ fn list_recent_from(base: &Path, limit: usize) -> IncidentListing {
     }
 }
 
-fn read_incident_summary(dir: &Path) -> Result<IncidentSummary, IncidentFailure> {
+fn read_incident_summary(dir: &Path) -> Result<Meta, IncidentFailure> {
     let path = dir.join("meta.json");
     let content = std::fs::read_to_string(&path).map_err(|error| IncidentFailure {
         path: Some(path.clone()),
         message: format!("failed to read incident metadata: {error}"),
     })?;
-    let value: serde_json::Value =
-        serde_json::from_str(&content).map_err(|error| IncidentFailure {
-            path: Some(path.clone()),
-            message: format!("failed to parse incident metadata: {error}"),
-        })?;
-    if value.get("schema").and_then(serde_json::Value::as_u64) != Some(u64::from(INCIDENT_SCHEMA)) {
+    let meta: Meta = serde_json::from_str(&content).map_err(|error| IncidentFailure {
+        path: Some(path.clone()),
+        message: format!("failed to decode incident metadata: {error}"),
+    })?;
+    // A default schema of zero is deliberately unsupported, never a silent
+    // interpretation of an unversioned or future bundle as today's schema.
+    if meta.schema != INCIDENT_SCHEMA {
         return Err(IncidentFailure {
             path: Some(path),
             message: "unsupported incident metadata schema".to_string(),
         });
     }
-    let meta: IncidentSummary = serde_json::from_value(value).map_err(|error| IncidentFailure {
-        path: Some(path.clone()),
-        message: format!("failed to decode incident metadata: {error}"),
-    })?;
     if meta.provider.is_empty() || !is_utc_timestamp(&meta.timestamp) {
         return Err(IncidentFailure {
             path: Some(path),
@@ -642,32 +598,6 @@ mod tests {
         let dir = base.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("meta.json"), content).unwrap();
-    }
-
-    #[test]
-    fn scan_keeps_the_last_non_null_rate_limit_snapshot() {
-        let rollout = concat!(
-            r#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":31.0}}}}"#,
-            "\n",
-            r#"{"payload":{"type":"token_count","rate_limits":null}}"#,
-        );
-        assert_eq!(
-            scan_rate_limits(rollout),
-            Some(serde_json::json!({"primary":{"used_percent":31.0}}))
-        );
-    }
-
-    #[test]
-    fn scan_skips_malformed_lines() {
-        let rollout = concat!(
-            "not json\n",
-            r#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":31.0}}}}"#,
-            "\n",
-        );
-        assert_eq!(
-            scan_rate_limits(rollout),
-            Some(serde_json::json!({"primary":{"used_percent":31.0}}))
-        );
     }
 
     #[test]
@@ -766,6 +696,117 @@ mod tests {
             Some("newer")
         );
         assert!(list_recent_from(&base, 0).incidents.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    // Shape of the first schema-1 writer (before replay/prompt/watchdog fields).
+    // Missing later fields must remain readable; the old codex_version key stays.
+    #[test]
+    fn original_schema_one_metadata_stays_readable() {
+        let base = scratch_incident_dir();
+        let original = r#"{
+            "schema":1,"timestamp":"2026-01-01T00:00:00Z","provider":"codex",
+            "session_id":"old","review_version":"0.1.0","codex_version":"codex 0.146.0",
+            "argv":["codex","exec"],"cwd":"/project","exit_code":1,"signal":null,
+            "stdin_write_error":null,"duration_ms":1234,"captured":false,
+            "recovered_from_transcript":false,"turns":0,"stdout_bytes":12,"stderr_bytes":4,
+            "stdout_truncated":false,"transcript_path":"/rollout","final_answer_present":false,
+            "rate_limits":{"primary":{"used_percent":10}},"env":[{"name":"API_KEY","value":null}]
+        }"#;
+        write_test_meta(&base, "original", original);
+        let meta = read_incident_summary(&base.join("original")).expect("historical schema");
+        assert_eq!(meta.codex_version.as_deref(), Some("codex 0.146.0"));
+        assert_eq!(meta.verdict(), "no final answer (died)");
+        assert!(meta.command.is_empty() && meta.quiet_secs.is_none());
+        let value = serde_json::to_value(&meta).expect("same DTO writes");
+        assert_eq!(value["codex_version"], "codex 0.146.0");
+        assert!(value.get("forensics").is_none());
+        assert_eq!(value["env"][0]["value"], serde_json::Value::Null);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn generic_bundle_and_codex_extension_both_use_the_same_schema() {
+        use crate::provider::{Outcome, ProcessSpec, Provider, Stdin};
+        let base = scratch_incident_dir();
+        let process = ProcessSpec {
+            program: "stub".into(),
+            args: vec!["arg with space".into()],
+            cwd: base.clone(),
+            env: [("PWD".into(), base.to_string_lossy().into_owned())].into(),
+            stdin: Stdin::Pipe(Vec::new()),
+        };
+        let outcome = Outcome::no_answer().stated("refused".into());
+        let rollout = base.join("rollout.jsonl");
+        std::fs::write(&rollout, concat!(
+            "{\"payload\":{\"type\":\"agent_message\",\"phase\":\"final_answer\",\"message\":\"old\"}}\n",
+            "{\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit\":5}}}\n"
+        )).unwrap();
+        let baseline = std::fs::metadata(&rollout).unwrap().len();
+        let path = rollout.to_str().expect("test path");
+        let mut incident = Incident {
+            provider: Provider::Codex,
+            process: &process,
+            provider_version: Some("stub version".into()),
+            session_id: Some("session"),
+            prompt: "request",
+            exit_code: Some(1),
+            signal: None,
+            stdin_write_error: None,
+            stdout: b"stream",
+            stderr: b"error",
+            duration_ms: 12,
+            data_root: Some(&base),
+            outcome: &outcome,
+            turns: 0,
+            forensics: None,
+        };
+        // Current-run evidence must exclude the earlier answer and limits.
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap()
+            .write_all(b"{\"payload\":{\"type\":\"token_count\",\"rate_limits\":{\"limit\":7}}}\n")
+            .unwrap();
+        for offset in [None, Some(baseline), Some(u64::MAX)] {
+            incident.forensics = offset.map(|offset| {
+                IncidentForensics::Codex(CodexIncident {
+                    transcript_path: Some(path),
+                    transcript_offset: offset,
+                    final_answer_present: Some(false),
+                    quiet_secs: Some(3),
+                    last_rollout_event: None,
+                })
+            });
+            let directory = match write_bundle(&incident) {
+                BundleWriteOutcome::Written(path) => path,
+                other => panic!("bundle failed: {other:?}"),
+            };
+            let meta = read_incident_summary(&directory).expect("written schema reads");
+            assert_eq!(meta.verdict(), "turn failed: refused");
+            assert_eq!(meta.codex_version.as_deref(), Some("stub version"));
+            assert_eq!(
+                meta.command,
+                replay_command(
+                    &meta.argv,
+                    &process.env,
+                    &process.cwd,
+                    &directory.join("prompt.txt")
+                )
+            );
+            assert_eq!(
+                meta.rate_limits,
+                (offset == Some(baseline)).then(|| serde_json::json!({"limit":7}))
+            );
+            assert_eq!(meta.final_answer_present, offset.map(|_| false));
+            if let Some(offset) = offset {
+                let tail =
+                    std::fs::read_to_string(directory.join("transcript.tail.jsonl")).unwrap();
+                assert!(!tail.contains("old"));
+                assert_eq!(tail.is_empty(), offset == u64::MAX);
+            }
+        }
         std::fs::remove_dir_all(base).unwrap();
     }
 

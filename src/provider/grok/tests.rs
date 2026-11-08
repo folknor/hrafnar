@@ -330,3 +330,157 @@ fn review_verification_failure_preserves_a_signal_after_an_answer() {
     assert!(run.outcome.stated.is_none());
     assert!(run.outcome.failed());
 }
+
+/// Preparation commits only successful native setup and keeps the provenance of
+/// derived roots; an intervening explicit distrust must still refuse spawning.
+#[tokio::test]
+async fn grok_preparation_retains_request_and_rechecks_distrust_before_spawn() {
+    use super::*;
+    let scratch = || {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(crate::ids::generate_uuid());
+        std::fs::create_dir_all(&dir).expect("scratch");
+        std::fs::canonicalize(dir).expect("canonical scratch")
+    };
+    let home = scratch();
+    let project = scratch();
+    let env = std::collections::BTreeMap::from([
+        ("GROK_HOME".into(), home.to_string_lossy().into_owned()),
+        ("HOME".into(), "/home/nobody-here".into()),
+    ]);
+    let mut launch = LaunchSpec {
+        provider: Provider::Grok,
+        start: SessionStart::Fresh { id: None },
+        settings: RunSettings::from_profile(Provider::Grok, None),
+        prompt: "test".into(),
+        root: project.clone(),
+    };
+    launch.start.prepare(Provider::Grok).expect("identity");
+    launch.settings.env = Some(env);
+    launch.settings.permissions = Permissions::profile(
+        Provider::Grok,
+        Some(&crate::config::SandboxLevel::WorkspaceWrite),
+    );
+    let mut plan = super::super::permissions::PermissionPlan::new(
+        launch.settings.permissions.clone(),
+        &project,
+        &[],
+    );
+    let original_paths = plan.paths.clone();
+    let mut prepared = prepare(&launch, &mut plan).await.expect("setup");
+    assert_eq!(launch.settings.permissions.selector(), Some("workspace"));
+    assert_eq!(plan.paths, original_paths);
+    assert!(plan.derives());
+    assert!(
+        plan.permissions
+            .selector()
+            .expect("native profile")
+            .starts_with("review-ws-")
+    );
+    assert!(prepared.trust_grant.is_some());
+    assert!(prepared.verified_grant.is_none());
+    let key = prepared.grok.workspace_key(&project);
+    let store = home.join("trusted_folders.toml");
+    std::fs::write(
+        &store,
+        format!("[folders.\"{}\"]\ntrusted = false\n", key.display()),
+    )
+    .expect("decline after setup");
+    let runtime = ProviderRuntime {
+        data_root: Some(home.join("data")),
+        ..Default::default()
+    };
+    let error = match prepared
+        .run(&launch, plan.permissions.selector(), None, &runtime)
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("intervening distrust must refuse launch"),
+    };
+    assert!(
+        error.to_string().contains("explicitly untrusted"),
+        "{error:#}"
+    );
+    assert!(prepared.verified_grant.is_none());
+    // A setup failure must not replace the request with a generated selector.
+    let mut failed = super::super::permissions::PermissionPlan::new(
+        launch.settings.permissions.clone(),
+        &project,
+        &[],
+    );
+    assert!(prepare(&launch, &mut failed).await.is_err());
+    assert_eq!(failed.permissions, launch.settings.permissions);
+    assert_eq!(failed.paths, original_paths);
+    let _ = std::fs::remove_dir_all(home);
+    let _ = std::fs::remove_dir_all(project);
+}
+
+/// A trusted replacement workspace does not prove the originally announced key
+/// was granted. Check admission and post-run verification independently.
+#[tokio::test]
+async fn grok_trust_key_drift_is_not_a_verified_grant() {
+    use super::*;
+    let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/test-scratch")
+        .join(crate::ids::generate_uuid());
+    std::fs::create_dir_all(base.join("project/.git")).expect("fixture project");
+    std::fs::create_dir_all(base.join("main/.git/worktrees/linked"))
+        .expect("fixture main checkout");
+    let base = std::fs::canonicalize(base).expect("canonical fixture");
+    let project = base.join("project");
+    let home = base.join("grok-home");
+    let mut launch = LaunchSpec {
+        provider: Provider::Grok,
+        start: SessionStart::Fresh { id: None },
+        settings: RunSettings::from_profile(Provider::Grok, None),
+        prompt: "test".into(),
+        root: project.clone(),
+    };
+    launch.start.prepare(Provider::Grok).expect("identity");
+    launch.settings.env = Some(std::collections::BTreeMap::from([
+        ("GROK_HOME".into(), home.to_string_lossy().into_owned()),
+        ("HOME".into(), "/home/nobody-here".into()),
+    ]));
+    launch.settings.permissions = Permissions::profile(
+        Provider::Grok,
+        Some(&crate::config::SandboxLevel::WorkspaceWrite),
+    );
+    let mut plan = super::super::permissions::PermissionPlan::new(
+        launch.settings.permissions.clone(),
+        &project,
+        &[],
+    );
+    let mut prepared = prepare(&launch, &mut plan).await.expect("setup A");
+    assert_eq!(prepared.trust_grant.as_deref(), Some(project.as_path()));
+    prepared
+        .check_grant_target(&project)
+        .expect("original target allowed");
+    // Model the workspace identity changing after the launch-time check.
+    std::fs::remove_dir(project.join(".git")).expect("remove git directory");
+    std::fs::write(
+        project.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            base.join("main/.git/worktrees/linked").display()
+        ),
+    )
+    .expect("new worktree identity");
+    let replacement = base.join("main");
+    std::fs::write(
+        home.join("trusted_folders.toml"),
+        format!("[folders.\"{}\"]\ntrusted = true\n", replacement.display()),
+    )
+    .expect("B already trusted");
+    prepared.verify_trust(&project);
+    assert!(
+        prepared.verified_grant.is_none(),
+        "B being trusted says nothing about A"
+    );
+    // Independently model the same drift before launch-time admission.
+    let error = prepared
+        .check_grant_target(&project)
+        .expect_err("changed grant target");
+    assert!(error.to_string().contains("trust key changed"), "{error:#}");
+    std::fs::remove_dir_all(base).expect("cleanup");
+}

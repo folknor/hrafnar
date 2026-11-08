@@ -3,9 +3,9 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
-use super::super::process::pidfd_open;
 use super::super::protocol::Event;
 use super::{Keeper, Phase, check, last_error};
+use crate::process::pidfd_open;
 
 impl Keeper {
     pub(super) fn launch(&mut self) {

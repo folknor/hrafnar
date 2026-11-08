@@ -1,3 +1,5 @@
+// Live and persisted summaries share common rendering here. Provider-specific
+// evidence retains its adapter renderer; output is already the rendering owner.
 use super::*;
 
 pub fn print_result(result: &ProviderResult) {
@@ -39,43 +41,72 @@ pub fn resume_hint(provider: Provider, session_id: &str) -> String {
 }
 
 fn print_digest(outcome: &Outcome, d: &Digest) {
-    match d.exit_code {
-        Some(code) => println!("exit: {code}"),
-        None => println!("exit: -"),
-    }
-    if let Some(ref sig) = d.signal {
-        println!("signal: {sig}");
-    }
-    for line in outcome.lines(&d.status_facts()) {
-        println!("{line}");
-    }
-    println!("turns: {}", d.turns);
-    let u = &d.usage;
-    println!(
-        "usage: input={} cached={} output={} reasoning={}",
-        u.input_tokens, u.cached_input_tokens, u.output_tokens, u.reasoning_output_tokens
-    );
-    if !d.log_lines.is_empty() {
-        println!("--- codex log lines ({}) ---", d.log_lines.len());
-        for line in &d.log_lines {
-            println!("{line}");
-        }
-        println!("--- end log lines ---");
-    }
-    if let Some(ref t) = d.transcript {
-        println!("transcript: {}", t.path);
-        println!(
-            "  task_complete={} stream_error={}",
-            t.task_complete, t.stream_error
-        );
-        if let Some(ref last) = t.last_event {
-            println!("  last_event: {last}");
-        }
-        if let Some(ref tool) = t.last_in_flight_tool {
-            println!("  last_in_flight_tool: {tool}");
+    print_status(d.exit_code, d.signal.as_deref(), outcome, &d.status_facts());
+    print_usage(d.turns, &d.usage);
+    if let Some(evidence) = &d.provider {
+        match evidence {
+            ProviderForensics::Codex(c) => c.print(),
         }
     }
     if let Some(ref path) = d.incident_path {
         println!("incident: {path}");
     }
+}
+
+/// Print a persisted `DigestSummary` (from the sidecar) in the same shape as the
+/// inline post-mortem, so `review sessions <id>` reads like a live run.
+pub(crate) fn print_digest_summary(d: &super::DigestSummary) {
+    print_status(
+        d.exit_code,
+        d.signal.as_deref(),
+        &Outcome::interpret_summary(d),
+        &d.status_facts(),
+    );
+    if let Some(false) = d.task_complete {
+        println!("task_complete: false");
+    }
+    if let Some(true) = d.stream_error {
+        println!("stream_error: true");
+    }
+    print_usage(
+        d.turns,
+        &Usage {
+            input_tokens: d.input_tokens,
+            cached_input_tokens: d.cached_input_tokens,
+            output_tokens: d.output_tokens,
+            reasoning_output_tokens: d.reasoning_output_tokens,
+        },
+    );
+    if let Some(ref path) = d.incident_path {
+        println!("incident: {path}");
+    }
+}
+
+fn print_status(
+    exit_code: Option<i32>,
+    signal: Option<&str>,
+    outcome: &Outcome,
+    facts: &super::outcome::StatusFacts<'_>,
+) {
+    match exit_code {
+        Some(code) => println!("exit: {code}"),
+        None => println!("exit: -"),
+    }
+    if let Some(signal) = signal {
+        println!("signal: {signal}");
+    }
+    for line in outcome.lines(facts) {
+        println!("{line}");
+    }
+}
+
+fn print_usage(turns: u32, usage: &Usage) {
+    println!("turns: {turns}");
+    println!(
+        "usage: input={} cached={} output={} reasoning={}",
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.output_tokens,
+        usage.reasoning_output_tokens
+    );
 }

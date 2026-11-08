@@ -3,6 +3,8 @@
 use anyhow::{Result, bail};
 
 use super::{exit_status, format_runtime, print_left_running, run_failed, selected_root};
+// Interrupt remains a separate verb owner; message composes its signalling
+// and wording without duplicating it or moving storage policy into the app.
 use crate::{
     audit, config, config_write, inflight, input, interrupt_cmd, lock, project, provider, sessions,
 };
@@ -49,76 +51,6 @@ fn resume_record(
         );
     };
     Ok((record, provider))
-}
-
-/// What a `review resume` launches with, taken from the session's own last
-/// recorded run: sandbox level, writable roots, model and reasoning effort.
-///
-/// A resume carries no profile; before restoration was explicit, a
-/// resume used to silently drop the permissions the session was created with: a
-/// `workspace-write` run that died mid-turn came back as a read-only resume that
-/// could not touch the files it had been editing, and the failure surfaced as
-/// the model reporting a read-only filesystem rather than as anything about
-/// `review`. The permissions are a property of the *session*, not of the
-/// invocation that happens to be driving it.
-///
-/// The sidecar already records both, and records the **effective** values (what
-/// the run received, not what its profile asked for), which is exactly what has
-/// to carry forward - the recurring lesson of the codex sandbox work is that
-/// those two differ. Roots are passed as profile roots rather than as a verbatim
-/// list so they go back through the same filters and are re-derived against
-/// *this* host: a host fact like the build lock belongs to the machine the
-/// resume runs on, not to the one that recorded the row.
-///
-/// Known levels are recorded in review's vocabulary. Grok also saves its
-/// native selector in `provider_sandbox`, since a session cannot change profiles.
-/// Old rows have only `sandbox`, already in Grok's native form, so that field
-/// remains the fallback. A row predating both fields inherits nothing.
-///
-/// Model and effort carry forward for the same reason and were originally left
-/// out on the grounds that only `model` was recorded, so a partial restoration
-/// would be less predictable than none. Measurement killed that argument: every
-/// resume ran on codex's **built-in default model** at its default
-/// effort, not the profile's, and since `--ignore-user-config` that default is
-/// not even the operator's configured one. A session's first turn on
-/// `gpt-5.6-sol`/`low` followed by five resumed turns on a different model is
-/// not a neutral fallback - it silently changes the model mid-session, at a
-/// different price, with nothing in the output saying so. The fix is to record
-/// `effort` too rather than to keep inheriting neither.
-///
-/// Env and profile `config` are still *not* inherited: env values are
-/// deliberately never recorded (they can carry secrets) and `config` is not
-/// recorded at all, so there is nothing to restore from. That is an absence of
-/// data, not a judgement about predictability.
-fn inherited_settings(
-    record: Option<&sessions::SessionRecord>,
-    provider: provider::Provider,
-) -> InheritedSettings {
-    let Some(record) = record.filter(|r| r.provider == provider.as_str()) else {
-        return InheritedSettings::default();
-    };
-    InheritedSettings {
-        sandbox: Some(provider::Permissions::restore(
-            provider,
-            record.sandbox.as_deref(),
-            record.provider_sandbox.as_deref(),
-            &record.writable_roots,
-        )),
-        // For grok these are exactly the roots the session's `review-ws-*`
-        // profile is named for, and a resume uses them verbatim rather than
-        // re-deriving - see `provider::grok::GrokWrite::Resume`.
-        writable_roots: record.writable_roots.clone(),
-        model: record.model.clone(),
-        effort: record.effort.clone(),
-    }
-}
-
-#[derive(Default)]
-struct InheritedSettings {
-    sandbox: Option<provider::Permissions>,
-    writable_roots: Vec<String>,
-    model: Option<String>,
-    effort: Option<String>,
 }
 
 /// The project a message to `session_id` runs in, with its config: the one
@@ -206,10 +138,11 @@ pub(super) async fn run_message(
     dry_run: bool,
     selector: Option<&str>,
     started: std::time::Instant,
+    lifecycle: &crate::supervisor::Lifecycle,
 ) -> Result<()> {
     // Reject unsafe executable identities before locks or interruption. Rows
     // remain permissive historical evidence and are not changed on disk.
-    let _validated_id = provider::SessionId::parse(session_id)?;
+    let validated_id = provider::SessionId::parse(session_id)?;
     // Read before interrupting anything: a missing message must not cost the
     // turn in flight.
     let instructions = input::read_stdin()?;
@@ -273,45 +206,13 @@ pub(super) async fn run_message(
             );
         }
     }
-    run_session_resume(
-        session_id,
-        dry_run,
-        selector,
-        started,
-        Some(instructions),
-        launch_lock,
-        Some(expected),
-    )
-    .await
-}
-
-/// `review resume <id>`: continue a specific provider session and send raw
-/// stdin. No prime and no profile - the session already has its grounding from
-/// the run that created it, and its provider, permissions, model and effort
-/// come from that run's record. The archetype recorded for the resume is the
-/// session's own, so its rows stay grouped under what the session was opened as.
-async fn run_session_resume(
-    session_id: &str,
-    dry_run: bool,
-    selector: Option<&str>,
-    started: std::time::Instant,
-    instructions: Option<String>,
-    // `review message`'s per-session lock, released with the global lock once
-    // the run has launched (see `run_message`).
-    launch_lock: Option<inflight::LaunchLock>,
-    // The project and audit id `run_message` validated before interrupting.
-    expected: Option<(std::path::PathBuf, Option<String>)>,
-) -> Result<()> {
     // Looked up once and reused by the cache-age gate and inheritance below.
     let (record, provider_name) =
         resume_record(session_id, sessions::latest_for_session(session_id))?;
     eprintln!("provider: {provider_name} (from the session record)");
     let archetype = record.archetype.as_str();
 
-    let stdin_instructions = match instructions {
-        Some(text) => text,
-        None => input::read_stdin()?,
-    };
+    let stdin_instructions = instructions;
     // Checked again on the record as it is now: an interrupted fresh run has
     // only just written its first row, which `run_message` could not see. The
     // config decides whether this resume's rows go to the private log, so one
@@ -320,9 +221,8 @@ async fn run_session_resume(
     // And it must still be the project validated before the interrupt: the
     // row the interrupted run wrote is checked against its own config above,
     // which on its own would accept a row naming some other valid project.
-    if let Some((root, audit)) = expected
-        && (root != project_root || audit != cfg.audit.id)
-    {
+    let (root, audit) = expected;
+    if root != project_root || audit != cfg.audit.id {
         bail!(
             "session {session_id} now records {} (audit id {}), not {} as it did before \
              the interrupt\n  Nothing was sent.",
@@ -346,8 +246,11 @@ async fn run_session_resume(
     // A resume bypasses the config for prompt/profile purposes, but the
     // stall timeout is a safety setting rather than a prompt input, so it is
     // still honoured.
-    let provider_runtime =
-        provider::ProviderRuntime::from_config(cfg.stall_timeout_secs(), cfg.audit.private);
+    let provider_runtime = provider::ProviderRuntime::from_config(
+        lifecycle.clone(),
+        cfg.stall_timeout_secs(),
+        cfg.audit.private,
+    );
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
     // last ended; past the provider's cutoff (`Provider::stale_cutoff`: 27 min
@@ -385,7 +288,7 @@ async fn run_session_resume(
     // letting every queued resume through to spawn simultaneously - the rate
     // limiting the lock exists to provide.
     // Held to the end, past the sidecar row: see `run_launch`.
-    let _unrecorded = provider::Unrecorded::for_provider(provider_name);
+    let _unrecorded = lifecycle.unrecorded_for(provider_name);
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
@@ -396,10 +299,10 @@ async fn run_session_resume(
     let private = cfg.audit.private;
 
     // Permissions, model and effort are inherited from the session's own last
-    // recorded run rather than defaulted (see `inherited_settings`). Each is
+    // recorded run rather than defaulted (see `InheritedSettings::from_record`). Each is
     // announced, because the failure this replaced was entirely silent: the
     // resume simply ran on a different model and nothing said so.
-    let inherited = inherited_settings(Some(&record), provider_name);
+    let inherited = provider::InheritedSettings::from_record(Some(&record), provider_name);
     if let Some(level) = inherited
         .sandbox
         .as_ref()
@@ -417,31 +320,15 @@ async fn run_session_resume(
     // A session created under a profile CODEX_HOME must resume against that
     // same storage directory. Older rows have no saved path and keep using the
     // current process environment/default.
-    let codex_home_env = match provider_name {
-        provider::Provider::Codex => record.codex_home.as_ref().map(|home| {
-            std::collections::BTreeMap::from([("CODEX_HOME".to_string(), home.clone())])
-        }),
-        provider::Provider::Claude | provider::Provider::Grok => None,
+    let spec = provider::LaunchSpec {
+        provider: provider_name,
+        start: provider::SessionStart::Resume(validated_id),
+        settings: provider::RunSettings::from_inherited(provider_name, inherited),
+        prompt: stdin_instructions.clone(),
+        root: project_root.clone(),
     };
-
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
-    let invoke = provider::invoke(
-        provider_name,
-        provider::SessionStart::Resume(provider::SessionId::parse(session_id)?),
-        inherited.model.as_deref(),
-        inherited.effort.as_deref(),
-        inherited
-            .sandbox
-            .clone()
-            .unwrap_or_else(|| provider::Permissions::restore(provider_name, None, None, &[])),
-        &inherited.writable_roots,
-        codex_home_env.as_ref(),
-        &[],
-        &stdin_instructions,
-        &project_root,
-        Some(launched_tx),
-        &provider_runtime,
-    );
+    let invoke = provider::invoke(spec, Some(launched_tx), &provider_runtime);
     tokio::pin!(invoke);
 
     // Release the lock as soon as the process is spawned. `launched_rx` also
@@ -520,11 +407,12 @@ async fn run_session_resume(
             digest_summary.as_ref(),
             &result.leftovers,
             result.codex_home.as_deref(),
+            None,
         );
     }
 
     provider::print_result(&result);
-    let left_running = print_left_running();
+    let left_running = print_left_running(lifecycle);
     println!("\nruntime: {}", format_runtime(started.elapsed()));
 
     // A stalled or dead resume comes back as `Ok` (so its session id, digest and
@@ -587,7 +475,7 @@ mod tests {
             let mut rec = minimal_row("grok");
             rec.sandbox = Some(native.to_string());
             assert_eq!(
-                inherited_settings(Some(&rec), provider::Provider::Grok)
+                provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Grok)
                     .sandbox
                     .as_ref()
                     .and_then(provider::Permissions::selector),
@@ -599,7 +487,7 @@ mod tests {
                     .recorded_level()
                     .map(str::to_string);
             assert_eq!(
-                inherited_settings(Some(&rec), provider::Provider::Grok)
+                provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Grok)
                     .sandbox
                     .as_ref()
                     .and_then(provider::Permissions::selector),
@@ -628,7 +516,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
+        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
         assert_eq!(
             got.sandbox
                 .as_ref()
@@ -660,7 +548,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
+        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(got.effort, None);
     }
@@ -682,7 +570,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
+        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
         assert_eq!(
             got.sandbox
                 .as_ref()
@@ -715,7 +603,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = inherited_settings(Some(&rec), provider::Provider::Codex);
+        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         // The model is provider-scoped too: a grok model name handed to codex
@@ -725,7 +613,7 @@ mod tests {
 
     #[test]
     fn no_record_inherits_nothing() {
-        let got = inherited_settings(None, provider::Provider::Codex);
+        let got = provider::InheritedSettings::from_record(None, provider::Provider::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);

@@ -145,8 +145,8 @@ terminate) - is an unknown outcome, never a clean one.
 
 ## Recording and reporting
 
-Every invocation's non-clean verdict goes into a process-wide ledger
-(`contained::unresolved`), whichever result is reported: an auto-resume, a grok
+Every invocation's non-clean verdict goes into its command's ledger
+(`supervisor::Lifecycle::unresolved`), whichever result is reported: an auto-resume, a grok
 wake or another provider's answer cannot hide a teardown that failed. The run's
 audit and sidecar rows carry `leftovers`: what was killed (capped, with a
 dropped count), what survived, whether enumeration was incomplete, or why the
@@ -157,10 +157,29 @@ line, and the command exits 3, which outranks the 1 of a run with no answer
 (`app::exit_status`). A codex death with a non-clean teardown is not
 auto-resumed.
 
-The signal supervisor terminates every live keeper on its way out, closes
-admission to new launches under the same lock the registry is updated under,
-waits up to the keepers' bound, prints the ledger and names any keeper still
-tearing down.
+`app::run` creates one `supervisor::Lifecycle`, shared through ProviderRuntime
+by fan-out attempts, automatic retries, Grok wakes, messages and incident version
+probes. It owns stop notification, the initialized keeper registry/admission gate,
+the recording obligations and the ledger. A fresh default runtime creates an
+independent domain for tests; cloning a runtime preserves its owner. Contained
+handles retain that owner through finish and abandonment. Completion publishes
+non-clean evidence before removing its exact control-pipe registration. Report
+formatting lives in `report.rs`; the bounded version probe lives beside the
+incident writer in `incident/probe.rs`.
+
+The command installs one signal supervisor capturing that lifecycle. Its first
+signal closes admission and publishes stop under the same mutex used for spawn
+and recording-guard registration. Existing interruptible turns retain recording
+guards through their sidecar writes; guards cannot register after stop. The count
+then determines whether to wait gracefully. Escalation separately terminates every
+live keeper, waits up to the keepers' bound, prints the ledger and names any keeper
+still tearing down. Process signal registration remains process-wide; lifecycle
+state has no process-wide mutable fallback.
+
+Shared pidfd and `/proc` identity primitives live in `process.rs`. The keeper
+retains tree-membership policy and discovery; the interrupt verb retains its
+keeper-ownership checks. `inflight.rs` remains the marker/request/launch-lock store:
+its lock protocol and the host-wide launch lock are unchanged.
 
 ## Limits
 
@@ -195,3 +214,9 @@ ticket's case), a double-forked daemon, a pipe-holding leftover, a keeper that
 dies (unknown outcome), a provider that cannot exec. `tests/keeper.rs` drives a
 keeper over its protocol for owner death (tears down, writes the orphan log) and
 for an owner gone before `g` (launches nothing).
+
+Lifecycle unit tests cover independent runtime domains, clone sharing, stop and
+recording registration ordering, late stop subscribers, exact registration
+ownership, poisoned-state evidence preservation and admission refusal. Existing
+runner stubs exercise graceful stop with real containment using the same lifecycle
+as production. Run::wait retains its stop arm in both provider and keeper phases.

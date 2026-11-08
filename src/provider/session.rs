@@ -47,7 +47,7 @@ impl SessionStart {
             match provider {
                 Provider::Claude | Provider::Grok => {
                     if id.is_none() {
-                        *id = Some(SessionId::parse(&crate::config::generate_uuid())?);
+                        *id = Some(SessionId::parse(&crate::ids::generate_uuid())?);
                     }
                 }
                 Provider::Codex => {}

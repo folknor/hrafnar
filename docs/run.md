@@ -100,3 +100,7 @@ record them within a bounded wait, so the sessions can be continued with
 time loses the record. Launch with the largest
 timeout the harness allows, and never stop or kill `review` to steer an agent:
 use `review message` (see `review man message`).
+
+When no response text was produced, the placeholder describes the settled
+outcome: a stated failure, interruption, termination, verification failure, or
+no final answer. Process status and diagnostic stderr remain in the output.

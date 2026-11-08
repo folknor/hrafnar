@@ -28,3 +28,17 @@ this double counts. One `claude -p` invocation normally emits a single result,
 so this is unverified rather than known wrong; a probe of a multi-result run
 (a background subagent wake) would settle it. Not a wave item: it needs a real
 provider run.
+
+## BUG-052 - Codex rollout suffix lookup does not prove exact session identity
+
+Reported by: app/config/path spar (lateral), verified in transcript::find_session_path.
+
+The search accepts the first filename ending in `-<session_id>.jsonl`.
+Both `foo` and `bar-foo` are valid SessionId values, so looking up `foo`
+can select `rollout-date-bar-foo.jsonl`. The type prevents malformed identity
+paths but does not make this suffix match unique. Real Codex IDs are currently
+UUIDs, which is the assumption the existing search comment makes; executable
+identity validation intentionally accepts historical opaque IDs too. Establish
+an exact identity check from the rollout metadata or documented filename format
+without rejecting old opaque IDs. This link preserves discovery semantics and
+does not claim exact matching or symlink confinement.

@@ -409,7 +409,7 @@ impl Run {
         // told to stop would otherwise start a turn nobody sees the end of.
         // The keeper gate in `contained::spawn` checks again under its
         // registry lock, closing the race between this check and the spawn.
-        if *runtime.stop.borrow() {
+        if runtime.lifecycle.stop_requested() {
             anyhow::bail!("not launched: review was signalled to stop");
         }
         let stdin_cfg = match spec.stdin {
@@ -417,6 +417,7 @@ impl Run {
             Stdin::Null => std::process::Stdio::null(),
         };
         let mut contained = crate::contained::spawn(
+            &runtime.lifecycle,
             &spec.command(),
             stdin_cfg,
             &runtime.teardown,
@@ -455,7 +456,7 @@ impl Run {
             stdin,
             writer: None,
             readers: Vec::new(),
-            stop: runtime.stop.clone(),
+            stop: runtime.lifecycle.subscribe(),
             stopped_by_signal: false,
             keeper: None,
         };
@@ -627,6 +628,22 @@ mod tests {
         let path = root.join("review/inflight").join(format!("{sid}.json"));
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    #[test]
+    fn malformed_first_identity_remains_evidence_without_path_authority() {
+        let lease = Lease::learned(
+            crate::provider::Provider::Codex,
+            Path::new("/project"),
+            None,
+        );
+        lease.set_session("../malformed");
+        lease.set_session("valid");
+        assert_eq!(lease.session().as_deref(), Some("../malformed"));
+        assert_eq!(
+            lease.session_watch().borrow().as_deref(),
+            Some("../malformed")
+        );
     }
 
     #[test]

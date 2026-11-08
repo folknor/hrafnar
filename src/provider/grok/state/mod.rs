@@ -67,7 +67,7 @@ impl Grok {
     /// Resolve from a profile `env` and the process environment. The grok home
     /// must be absolute: grok's trust store refuses a relative one and would
     /// trust nothing. (A symlink anywhere on the path to its files is refused
-    /// where they are used - `check_trust`, `locked_update` - because grok
+    /// where they are used - `check_trust`, `ensure_profile` - because grok
     /// refuses to load its trust-boundary files through one.)
     pub(super) fn resolve(env: Option<&BTreeMap<String, String>>) -> anyhow::Result<Self> {
         let var = |name: &str| {
@@ -114,7 +114,7 @@ mod test_support {
     pub(super) fn scratch() -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-scratch")
-            .join(crate::config::generate_uuid());
+            .join(crate::ids::generate_uuid());
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         std::fs::canonicalize(&dir).expect("canonicalize scratch dir")
     }

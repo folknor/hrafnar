@@ -20,3 +20,45 @@ fn post_answer_status_is_recorded_without_inventing_a_turn_failure() {
         assert!(!outcome.failed());
     }
 }
+
+#[test]
+fn provider_extension_projects_the_unchanged_flat_digest_schema() {
+    use super::super::{Answer, CodexForensics, Digest, Outcome, ProviderForensics};
+    let legacy = serde_json::json!({
+        "exit_code": null, "signal": "SIGKILL", "captured": false,
+        "recovered_from_transcript": true, "turns": 2,
+        "task_complete": true, "stream_error": false,
+        "input_tokens": 0, "cached_input_tokens": 0,
+        "output_tokens": 0, "reasoning_output_tokens": 0,
+        "incident_path": "/bundle", "terminated_by_review": "watchdog: stranded completion",
+        "quiet_secs": 30, "last_rollout_event": "event_msg/task_complete"
+    });
+    let parsed: super::DigestSummary = serde_json::from_value(legacy.clone()).expect("old row");
+    assert_eq!(serde_json::to_value(&parsed).expect("round trip"), legacy);
+    let digest = Digest {
+        signal: Some("SIGKILL".into()),
+        turns: 2,
+        incident_path: Some("/bundle".into()),
+        provider: Some(ProviderForensics::Codex(CodexForensics {
+            transcript: Some(
+                crate::provider::codex::rollout::fold("{\"payload\":{\"type\":\"task_complete\"}}")
+                    .current_turn,
+            ),
+            quiet_secs: Some(30),
+            last_rollout_event: Some("event_msg/task_complete".into()),
+            ..CodexForensics::default()
+        })),
+        ..Digest::default()
+    };
+    let outcome = Outcome::answered(Answer::Recovered).ended(
+        false,
+        false,
+        Some("watchdog: stranded completion".into()),
+    );
+    assert_eq!(
+        serde_json::to_value(digest.summary(&outcome)).expect("projection"),
+        legacy
+    );
+    let generic = Digest::default().summary(&Outcome::no_answer());
+    assert!(generic.task_complete.is_none() && generic.quiet_secs.is_none());
+}

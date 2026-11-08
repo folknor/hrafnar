@@ -26,33 +26,19 @@ before adding maki; the providers hunter calls for a rewrite around all three.
 
 ## Types
 
-## STR-001 - Provider residue: session artifact ownership
+## STR-003 - Session identity plumbing residue
 
-Reported by: providers, lifecycle, config, orchestration, grok-man, forensics.
+Executable launch identity is typed. Inflight marker/interrupt facades, Grok
+session-file facades and Codex transcript facades now parse raw evidence before
+passing SessionId to their actual path builders/search. Malformed first stream
+IDs remain accepted evidence without path authority; historical rows still read.
 
-Provider identity and runtime command prefixes are shared and typed. The remaining
-artifact selection in app::history (review sessions <id>) already parses the
-persisted provider and matches exhaustively: Codex has a rollout; Claude and Grok
-do not. The old string-comparison claim is stale. Move artifact discovery and
-rendering to their provider/forensic owners with the forensics split, rather
-than inventing a static artifact capability flag. That ownership move remains.
-
-## STR-003 - Session start and session id as types
-
-Reported by: providers, lifecycle, orchestration, forensics, grok-man.
-
-Launch intent and caller-side minting are now typed in provider::session:
-SessionStart reaches all runners and SessionId checks supplied launch IDs.
-The shared grammar owns the 128-byte path-component bound. Historical rows
-and provider evidence intentionally remain strings, not validated serde types.
-
-Residue: inflight's string-facing marker/interrupt/lock APIs and Grok session
-file reads still use fallible safety guards; Codex live stream IDs, transcript
-lookup and session artifact APIs still carry strings. Convert executable/path
-identities at those boundaries without rejecting malformed historical rows or
-losing malformed provider evidence. Do not claim all paths infallible until
-those consumers take SessionId. Provider result strings need not themselves
-become validated evidence: evidence and executable identity are different.
+Remaining: the operator-frozen inflight LaunchLock API remains a string facade
+with its existing validator. Lease's channel and result evidence remain strings;
+callers that already have SessionId still round-trip through some string facades.
+A future API-only conversion can remove those redundant parses, but must retain
+raw malformed evidence and leave frozen lock handling untouched. Do not claim
+these types establish unique Codex suffix matches or symlink confinement.
 
 ## STR-005 - Termination reason as an enum
 
@@ -201,30 +187,11 @@ config, so no call site can pair a private project's id with the public log.
 Reported by: config.
 
 Beyond the canonical-identity question in `notes/consolidations.md`:
-`expected: Option<(PathBuf, Option<String>)>` in `run_session_resume` is a bare
-tuple carrying the validated target, and should be named. `load` returns
+`expected: (PathBuf, Option<String>)` in `run_message` is a bare tuple
+carrying the validated target, and should be named. `load` returns
 `(ReviewConfig, PathBuf)` and `load_optional` `(ReviewConfig,
 Option<PathBuf>)`, where the root is derivable from `files.local`. Proposed:
 `project_root: Option<ProjectRoot>` on `ReviewConfig`, no tuples.
-
-## STR-020 - Pass a resolved launch, not its fields
-
-Reported by: providers, orchestration, config.
-
-`app` copies six fields out of `Profile` into `Launch` field by field (`model`,
-`effort`, `sandbox`, `env`, `config`, `writable_roots`, plus env keys
-separately), and `invoke` takes them again as seven positional parameters.
-Every runner carries `#[allow(clippy::too_many_arguments)]` with a comment
-arguing the arguments are independent axes; they are mostly one resolved
-launch passed one field at a time. Which profile table a run used is lost,
-though `review config` knows it. Proposed: move `Launch` into `provider` and
-pass it whole as a `LaunchSpec { provider, start: SessionStart, settings:
-RunSettings, prompt, root }`, where `RunSettings` is also what a resume builds
-from `InheritedSettings`, so the profile and the inheritance are two
-constructors of one type and "what a resume inherits" is visibly the same
-struct as "what a run launches with" (today `env` and `config` are silently
-absent on one side). `Launch` carries the resolved profile and its `Sourced`
-origin so the row can record the table.
 
 ## STR-021 - Smaller forensic types
 
@@ -288,59 +255,11 @@ adapter control flow a trait would have to expose as a hook per step with
 shared state between them.
 
 What remains:
-- One line-splitting stream reader with a capture policy (head cap, or head
-  plus rolling tail) and a per-adapter observer, replacing `read_capped`,
-  `read_claude_stream` and codex's `read_capped_stdout`. Its framing rules,
-  each load-bearing today: raw capture continues after the observer stops
-  scanning; observer parsing continues after capture fills; line accumulation
-  is bounded independently of capture; an oversized line is discarded through
-  its delimiter, never parsed from an arbitrary suffix; an unterminated final
-  line is still offered at EOF (claude's metrics need it); observer facts
-  survive reader cancellation; claude's head and tail are joined with a
-  delimiter so fragments cannot combine into a fabricated JSON line; codex's
-  readiness is its first byte, not its first line.
-- A `claude_stream` decoder (`last_claude_result`, `ClaudeResult`,
-  `interpret_claude_output`, `ClaudeMetrics`, `is_claude_init`) shared by the
-  claude and maki adapters, whose argv builders stay separate (maki ignores
-  `--effort`, `--permission-mode` and others). `result_served` is shared by
-  grok and claude by field-name coincidence.
-- A `prepare(&Launch)` hook per adapter for permission setup (grok's
-  `prepare_grok_write` and trust re-read, codex's
-  `config_writable_roots_override`, maki's permissions config and per-run
-  effort config, opencode's agent definition and private config and DB), so
-  `invoke` stops carrying the grok-only `grok_trust` field and its post-run
-  trust check.
 - Grok's wake loop merges usage, cost, turns and leftovers by hand;
   `RunOutput::absorb(next)` on the types.
-- `provider/render.rs`: `print_result`, `print_digest`, `resume_hint`, merged
-  with `app`'s summary rendering.
 - `run_codex_json`, `run_claude`, `RunOutput` and `new_output_file` are `pub`
   only for `tests/provider_runs.rs`; a test seam through `invoke` (or a
   lifecycle-level stub suite) lets them go.
-
-## STR-025 - Lifecycle module moves around the `Run` handle
-
-Reported by: lifecycle, providers. Narrowed: the `Run` handle exists as
-`provider::lifecycle::Run` with its `Lease` (marker, readiness and session
-facts, interrupt-request consumption, one-shot stop and kill arms); a runner's
-lifecycle is `Run::spawn`, `launch`, `wait`, `finish`, and the ordering
-invariants are unit-tested on the lease without a provider stub.
-
-What remains is placement, not mechanism:
-- `process.rs`: `Pid`, `ProcessIdentity`, `PinnedProcess`, pidfd and `/proc`
-  primitives, out of `keeper/` and `inflight.rs`, which `interrupt_cmd` also
-  needs.
-- `supervisor.rs`: the `STOP` channel, `Unrecorded`, the registry and
-  admission gate, the ledger and `install_signal_supervisor` (today split
-  between `provider/runtime.rs` and `contained.rs`): one module answering
-  "what happens when `review` is told to stop". See STR-027 for making it a
-  value.
-- `store.rs` (from `inflight`): markers, launch locks and interrupt requests
-  keyed by `SessionId`, returning a typed run state.
-- `report.rs`: `report_lines`, out of the ledger.
-- `contained::version_probe` moves beside the incident writer.
-- `interrupt_cmd`'s `cleanup_pending_message` is policy owned by a CLI verb
-  and imported by `app`.
 
 ## STR-026 - Stop using the sidecar log as an IPC channel
 
@@ -356,17 +275,6 @@ and `run_message` + `run_session_resume` + `interrupt` read it three or more
 times per message. Proposed: the owner, which already knows the answer when it
 consumes the request, writes a small `<session>.<run_id>.result` beside the
 marker for the verb to read; and the log is parsed once per process.
-
-## STR-027 - Replace the process-wide statics with a `Lifecycle` value
-
-Reported by: lifecycle.
-
-The `LEDGER`, `REGISTRY`, `STOP` and `UNRECORDED` statics make the lifecycle
-unobservable per test: every test in a process shares one ledger, so a test
-that leaves an unknown teardown can poison another's exit-status assertion.
-Proposed: a `Lifecycle` value created in `app::run` (or one per runtime) and
-passed down, making the ledger and registry assertable in unit tests and
-removing the `Option<Registry>` lazy init.
 
 ## STR-028 - `contained::spawn` should pass exactly what the runner built
 
@@ -387,46 +295,6 @@ environment explicitly (a full `Vec<(OsString, OsString)>` sent as bytes, or
 what the runner built; and when a cwd is given, the spawn primitive sets `PWD`
 to match for every provider.
 
-## STR-029 - Split `config.rs` and fix its dependency edges
-
-Reported by: config. Narrowed: the file has been split mechanically into
-`src/config/` (parse, resolve, load, sandbox, ids) with every path kept; what
-remains is the moves and edge fixes below.
-
-`config.rs` does six jobs: the file format (`parse_file`), the layered
-resolver, filesystem discovery (`Selection`, `locate_config`, `load*`), the
-`init` command, random id generation, and the provider sandbox vocabulary
-(`sandbox_for`). Proposed:
-- `config/file.rs`: `ConfigFile`, `Profile`, `parse_file`, pure.
-- `config/resolve.rs`: `ReviewConfig`, `Sourced`, `ProfileEntry`, `resolve`,
-  and the archetype resolver now in `app`.
-- `config/locate.rs`: `Selection`, `locate_config`, `load`, `load_optional`,
-  `project_root`, `global_config_path`. `Selection` arguably belongs with
-  `project.rs`, whose `select` is its only interesting constructor; config
-  should only consume a located path.
-- `config/write.rs`: `config_write` plus `init` (the only writers of
-  `.review.toml`) and `ensure_audit_id`.
-- `generate_uuid` moves to the provider spec's session-id capability (the
-  grok-man hunter: a leaf util; `grok_home` depending on `config` for a uuid
-  is an edge pointing the wrong way). `generate_short_id` goes with the audit
-  id type.
-- `sandbox_for` moves to the provider layer.
-
-Other edges and state:
-- `config::check_projects` calls `project::check_name`, and `project` calls
-  `config::global_projects` and `config::hostname`: a cycle. Merge the
-  registry (parse, validate, lookup) into `project.rs`, with config handing it
-  the raw table.
-- `config_cmd` imports `provider::is_available` and hand-encodes claude's
-  sandbox semantics; with a capability table it imports the table only.
-- `ReviewConfig.files` is filled after `resolve` returns (`cfg.files = ...`),
-  so `resolve` produces a value that is wrong until the caller patches it, and
-  tests build configs with no files. Pass the file metadata into `resolve`, or
-  return it alongside.
-- `config_tests.rs` is included as a `#[path]` module beside a second
-  `mod tests` in `config.rs` that also exercises `resolve`; after the split
-  each file owns its tests.
-
 ## STR-030 - Split `writable_roots` into derivation and rendering; consider moving the toolchain facts to config
 
 Reported by: config.
@@ -442,70 +310,6 @@ that they are deterministic and flags it as the one place config-ish policy
 lives in code, not urgent: a global `[_sandbox].derive = [...]` or named
 derivers selected in config would move it out of the binary.
 
-## STR-031 - Archetype selection belongs to config
-
-Reported by: config, orchestration.
-
-The `-a` expansion (`all`, groups, comma lists, the unknown-name error listing
-configured names, dedup, the empty check) is inline in `app::run`, splitting a
-comma string and matching `"all"` and group/archetype names there. It relies
-on a config invariant ("Resolution checked every member exists") through
-`unwrap_or_default()`, a silent empty prime if the invariant breaks. The
-results are a bare `Vec<(String, String)>` of (label, prime). Proposed:
-`cfg.select_archetypes(&str) -> Result<Vec<ArchetypeRun { label, prime }>>`
-owning `all`, `bare`, groups and dedup together, with config owning the
-messages.
-
-## STR-032 - Split `app.rs` along its seams
-
-Reported by: orchestration. Narrowed: the file has been split mechanically into
-`src/app/` (dispatch, launch, message, history) with every path kept; what
-remains is the provider knowledge, vestigial optionality and bookkeeping below.
-
-`app.rs` (about 2100 lines) does five jobs: top-level dispatch; the fan-out
-(archetype expansion, provider selection, profile validation, launch
-construction, stagger and lock, collection, printing, exit status);
-codex-specific auto-resume policy; message and resume (target validation,
-interrupt, inheritance, stale gate, lock handshake, recording); and three
-read-only views (`sessions`, `sessions <id>` with codex transcript rendering,
-`incidents`) plus a `DigestSummary` renderer. The hunter reads it as the de
-facto provider registry and run-outcome classifier without admitting to
-either. Proposed:
-- `app.rs`: one `match cli.command` returning an exit status (today a chain of
-  `if let Some(Command::X)` with the run as the fallthrough and `--session`
-  handled after the subcommands).
-- `run.rs`: the fan-out.
-- `message.rs`: message and resume, with `interrupt_cmd` folded beside it
-  (`run_message` already calls its internals such as
-  `cleanup_pending_message`).
-- `session.rs`: the session lookup and state query.
-- `views.rs` or per-verb files for `sessions`, `sessions <id>`, `incidents`.
-- Outcome rendering moves to the provider side with the typed outcome.
-
-Also in this scope:
-- Provider knowledge in orchestration: `run_session_show` renders codex
-  rollouts directly (`transcript::summarize_session`, `provider == "codex"`
-  twice) and cannot honour `CODEX_HOME` overrides; maki and opencode have their
-  own session stores (opencode's private database), so a per-provider "show
-  what this session left" hook is the seam. Same for `RESUME_NUDGE`,
-  `after_run`'s codex gates and `Unrecorded::for_provider`.
-- `run_session_resume` carries vestigial optionality: `instructions:
-  Option<String>` is always `Some` (the `None => read_stdin()` branch has been
-  dead since `resume` became an alias of `message`); `expected` is always
-  `Some`; `launch_lock` is `None` only on a dry run, which returns before it
-  matters. Fold it into `run_message` or make the parameters non-optional.
-- Fan-out bookkeeping is split from its data: results are collected as
-  `Vec<(String, ProviderResult)>` keyed by a label cloned out of `RecordCtx`,
-  and printing groups by comparing consecutive labels, which only works because
-  tasks are awaited in launch order. A
-  `Vec<ArchetypeRun { archetype, launches: Vec<JoinHandle> }>` makes grouping
-  structural.
-- `cli.rs`: `RUN_ONLY` is a hand-kept list of clap ids that must be updated for
-  any new run flag; a run-flag `ArgGroup` or a flattened `RunArgs` struct
-  checked by "any arg present" removes it. `provider` should be
-  `Vec<Provider>`. The hunter finds `prompt.rs`, `input.rs`, `main.rs` and
-  `lib.rs` small and fine, and `main.rs`'s keeper-first dispatch right.
-
 ## STR-033 - `sessions.rs`: one row type for both directions
 
 Reported by: orchestration.
@@ -519,81 +323,6 @@ read (`sandbox`, `writable_roots`, `audit_id`). Proposed: one `SessionRow` for
 both directions, with `served` excluded from inheritance by the `RunSettings`
 constructor rather than by its absence from the read struct; `record` taking
 it whole; and a reader that parses the file once per process.
-
-## STR-034 - Split forensics into a generic core and provider extensions
-
-Reported by: forensics.
-
-- `Digest` is codex's struct dressed as everyone's: `transcript`,
-  `last_rollout_event`, `quiet_secs`, `recovered_from_transcript`, `log_lines`
-  ("codex log lines" in `print_digest`), and `task_complete`/`stream_error` in
-  `DigestSummary` are codex concepts that claude and grok fill with `None`
-  (`no_answer_digest`, `wake_failure_digest`), and maki and opencode would too;
-  for opencode, "recovered" vs "captured" is meaningless. Proposed: a common
-  core (outcome, usage, exit, terminator, incident path, cost) plus
-  `enum ProviderForensics { Codex(CodexForensics), Claude(..), Maki(..),
-  Opencode(..) }`, serialised tagged, with `print_digest` dispatching the
-  provider block.
-- `incident` is about 60% generic and 40% codex. Generic: stderr, stdout tail,
-  prompt, argv, cwd, env, exit, duration, the replay command, directory
-  naming. Codex: `codex_version`, `transcript_path`, `final_answer_present`,
-  `rate_limits`, `quiet_secs`, `last_rollout_event`, `turns`. Proposed: build
-  the generic part from the actual `Command` that `contained::spawn` launched
-  (`tokio::process::Command::as_std()` exposes `get_program`, `get_args`,
-  `get_envs`, `get_current_dir`), so the replay is the spawn by construction:
-  opencode's isolation env and `PWD` appear automatically, the hand-maintained
-  `RUST_BACKTRACE=1` goes, and so does the comment explaining why `binary` is
-  not `"codex"`. Each provider adds an extension block. This is also what would
-  give maki and opencode bundles at all; today claude and grok get none, and
-  maki's "is_error but exit 0" is the kind of failure a bundle exists for.
-- Generalise the watchdog into "progress source plus answer evidence",
-  thresholds provider-owned. The loop shape is provider-agnostic; only the
-  progress source (rollout length) and the answer predicate are codex's.
-  opencode streams every event on stdout, so its stdout byte count is a
-  progress source, and its stream says when the last assistant `text` arrived.
-  Whether opencode shares codex's "cannot stay silent" property is unknown and
-  the module's doc says claude does not, so `stall_grace` must default to off
-  for any unmeasured provider: a per-provider policy with one home. The 0.147.0
-  history belongs in the codex reference, not the generic loop. Today whether
-  the watchdog applies is implicit: it runs only because only
-  `run_codex_json` constructs one.
-- `IncidentSummary` is a hand-maintained subset of `Meta`, mirroring field
-  names by convention with `#[serde(default)]` everywhere, so renaming a
-  `Meta` field makes `review incidents` silently show defaults. The listing's
-  verdict ladder lives in `app.rs`, away from the schema. Proposed: `Meta`
-  itself `Deserialize` with defaults (or a shared struct), and the verdict a
-  method on the persisted type, ideally reading the persisted outcome.
-- `schema: 1` is written and never read; check it on read or drop it, now,
-  while the bundle schema is changing.
-
-## STR-035 - Split `grok_home.rs` and give grok a module of its own
-
-Reported by: grok-man. Narrowed: the file has been split and moved under the
-grok runner as `src/provider/grok/state/` (trust, sandbox, events,
-background), private to the runner, and grok's write setup moved from the
-dispatcher into the runner. What remains is a general `prepare` hook for every
-provider, the `fsutil` move and resolving `Grok` once.
-
-`grok_home.rs` is four modules in one file: the trust store mirror and
-decision; sandbox profile naming, TOML merge and the locked atomic write; the
-session log location; and background-result analysis with the wake prompt.
-The last is turn-outcome logic that belongs with the grok runner
-(`provider/grok/wake.rs`). The first two are provider-local permission setup,
-the job the `prepare` hook in the provider split above generalises.
-`locked_update` is a generic flock-plus-atomic-replace primitive used once;
-opencode's isolated config will want it, so it belongs in a small `fsutil`
-module. `provider.rs` depends on grok internals by path (`crate::grok_home::...`
-at a dozen sites, plus `provider_tests.rs` hashing a profile name); once the
-grok runner has its own module, `grok_home` becomes its private child and
-nothing else sees `PROFILE_PREFIX`. `Grok::resolve` is called four times per
-run (`prepare_grok_write`, the landed check, `run_grok`, `run_grok_turn`) from
-the same env, each re-reading the process environment and re-canonicalizing;
-resolve once per launch and pass it, which also makes the child's view a value
-rather than a re-derivation that could see a changed environment.
-
-`man.rs` is small and well-shaped. A `build.rs` generating `TOPICS` from
-`docs/*.md` would remove the catalog test but lose the hand-written
-summaries; the hunter calls it not obviously better.
 
 ## STR-036 - Test layouts that follow the design
 
@@ -652,5 +381,6 @@ What remains, each landing with its provider:
   detect a violation: encode it in the opencode argv builder with a test.
 - opencode's read-only is an agent definition: a third permission mechanism
   beside an OS sandbox and none.
-- Effort via maki's config means writing maki's config per run, a setup step
-  for the `prepare` hook in STR-024.
+- Effort via maki's config still needs its actual per-run config implementation
+  when maki lands. The adapter `prepare` operation and owned prepared context
+  now exist; no maki configuration or permission mechanism is implemented.

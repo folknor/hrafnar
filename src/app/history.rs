@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 
 use super::selected_root;
-use crate::{config, incident, inflight, project, provider, sessions, transcript};
+use crate::{config, incident, inflight, project, provider, sessions};
 
 /// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
 /// dead run is triageable at a glance instead of buried under the incidents dir.
@@ -36,24 +36,7 @@ pub(super) fn run_incidents(limit: usize) -> Result<()> {
             Some(c) => c.to_string(),
             None => "-".to_string(),
         };
-        // Bundle metadata, not a session row: it records whether the rollout
-        // held a final answer as a tri-state (`None` when no transcript was
-        // read), which the outcome cannot express, so this one-word verdict is
-        // read from the bundle rather than from `Outcome::lines`.
-        // A stated reason wins over every inferred verdict: these bundles are
-        // explained, and listing them as "died" sends the reader hunting for a
-        // cause codex already gave. Truncated so one refusal can't wrap the line.
-        let stated = m
-            .turn_error
-            .as_deref()
-            .map(|e| format!("turn failed: {}", first_line_truncated(e, 90)));
-        let verdict = match &stated {
-            Some(s) => s.as_str(),
-            None if m.recovered_from_transcript => "recovered from transcript",
-            None if m.final_answer_present == Some(false) => "no final answer (died)",
-            None if m.final_answer_present == Some(true) => "completed (stream/-o truncated)",
-            None => "suspicious",
-        };
+        let verdict = m.verdict();
         let sig = m
             .signal
             .as_deref()
@@ -137,75 +120,12 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
     }
 
     if let Some(ref d) = latest.digest {
-        print_digest_summary(d);
+        provider::print_digest_summary(d);
     }
 
-    // The recorded home keeps custom CODEX_HOME sessions visible. Older rows
-    // have no path and use the current process environment/default.
-    // Only codex keeps a rollout `review` reads. A recorded name that no
-    // longer parses (a removed provider) is shown as recorded, with none.
-    let has_rollout = match latest.provider.parse::<provider::Provider>() {
-        Ok(provider::Provider::Codex) => true,
-        Ok(provider::Provider::Claude | provider::Provider::Grok) | Err(_) => false,
-    };
-    let transcript = if has_rollout {
-        let home = transcript::codex_home(
-            latest.codex_home.as_deref(),
-            None,
-            std::path::Path::new(&latest.project),
-        );
-        let lookup = match home.as_deref() {
-            Some(home) => transcript::summarize_session_in_home_lookup(session_id, home, None),
-            None => transcript::Lookup::UnknownHome,
-        };
-        match lookup {
-            transcript::Lookup::Found(summary) => Some(summary),
-            transcript::Lookup::Absent => {
-                println!("transcript: (not found under the resolved CODEX_HOME)");
-                None
-            }
-            transcript::Lookup::Unreadable(error) => {
-                println!("transcript: (unreadable: {error})");
-                None
-            }
-            transcript::Lookup::UnknownHome => {
-                println!("transcript: (Codex home could not be resolved)");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(ref t) = transcript {
-        println!("transcript: {}", t.path);
-        println!(
-            "  task_complete={} stream_error={}",
-            t.task_complete, t.stream_error
-        );
-        if let Some(ref last) = t.last_event {
-            println!("  last_event: {last}");
-        }
-        if let Some(ref tool) = t.last_in_flight_tool {
-            println!("  last_in_flight_tool: {tool}");
-        }
-    }
-
-    // Prefer the transcript's authoritative final_answer when it exists: it
-    // recovers the real report even for rows recorded before runtime recovery
-    // landed (whose sidecar `response` may be a truncated interim note).
-    let recovered = transcript.as_ref().and_then(|t| t.final_answer.as_deref());
-    // A codex rollout that reached task_complete but carries no final_answer
-    // produced no conclusion - the turn died mid-work (task_complete fires on
-    // aborted turns too). Flag it even for old rows that predate digest
-    // persistence and so have no stored exit code.
-    if transcript
-        .as_ref()
-        .is_some_and(|t| t.final_answer.is_none() && t.task_complete)
-    {
-        println!(
-            "note: rollout has no final answer - the turn produced no conclusion (likely died mid-work)"
-        );
-    }
+    let artifacts = provider::session_artifacts(latest);
+    artifacts.print();
+    let recovered = artifacts.final_answer();
     println!("--- response ---");
     match (recovered, &latest.response, &latest.error) {
         (Some(fa), sidecar, _) => {
@@ -219,36 +139,6 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
         (None, None, None) => println!("(no response recorded)"),
     }
     Ok(())
-}
-
-/// Print a persisted `DigestSummary` (from the sidecar) in the same shape as the
-/// inline post-mortem, so `review sessions <id>` reads like a live run.
-fn print_digest_summary(d: &provider::DigestSummary) {
-    match d.exit_code {
-        Some(code) => println!("exit: {code}"),
-        None => println!("exit: -"),
-    }
-    if let Some(ref sig) = d.signal {
-        println!("signal: {sig}");
-    }
-    // The same lines the run printed live, read back from the row.
-    for line in provider::Outcome::interpret_summary(d).lines(&d.status_facts()) {
-        println!("{line}");
-    }
-    if let Some(false) = d.task_complete {
-        println!("task_complete: false");
-    }
-    if let Some(true) = d.stream_error {
-        println!("stream_error: true");
-    }
-    println!("turns: {}", d.turns);
-    println!(
-        "usage: input={} cached={} output={} reasoning={}",
-        d.input_tokens, d.cached_input_tokens, d.output_tokens, d.reasoning_output_tokens
-    );
-    if let Some(ref path) = d.incident_path {
-        println!("incident: {path}");
-    }
 }
 
 /// `review sessions` - aggregate sidecar records by session_id and print

@@ -140,7 +140,7 @@ impl Permissions {
         }
     }
 
-    fn write_setup(&self) -> Option<grok::GrokWrite> {
+    pub(super) fn write_setup(&self) -> Option<grok::GrokWrite> {
         match &self.0 {
             NativePermissions::Claude | NativePermissions::Codex(_) => None,
             NativePermissions::Grok(selection) => match selection {
@@ -176,7 +176,7 @@ impl Permissions {
     }
 }
 
-/// One permission decision feeds setup, arguments, announcements and records.
+/// Effective grant facts shared by adapter setup, arguments, announcements and records.
 /// Reasons retain derivation provenance even when raw Codex config replaces
 /// the effective set; only effective paths are ever announced or rendered.
 pub(super) struct PermissionPlan {
@@ -189,12 +189,7 @@ pub(super) struct PermissionPlan {
 }
 
 impl PermissionPlan {
-    pub fn new(
-        permissions: Permissions,
-        root: &Path,
-        profile_roots: &[String],
-        config: &[String],
-    ) -> Self {
+    pub fn new(permissions: Permissions, root: &Path, profile_roots: &[String]) -> Self {
         let policy = permissions.roots();
         let granted = match policy {
             RootPolicy::Derive => crate::writable_roots::derive_with(
@@ -211,11 +206,7 @@ impl PermissionPlan {
             _ => granted.iter().map(|g| g.path.clone()).collect(),
         };
         match &permissions.0 {
-            NativePermissions::Codex(_) => {
-                if let Some(overridden) = super::config_writable_roots_override(config) {
-                    paths = overridden;
-                }
-            }
+            NativePermissions::Codex(_) => {}
             NativePermissions::Grok(_) => {
                 if policy == RootPolicy::Derive {
                     paths = grok::canonical_roots(&paths);
@@ -245,30 +236,12 @@ impl PermissionPlan {
         self.policy == RootPolicy::Recorded
     }
 
-    pub async fn prepare(
-        &mut self,
-        root: &Path,
-        env: Option<&std::collections::BTreeMap<String, String>>,
-    ) -> anyhow::Result<Option<String>> {
-        let Some(kind) = self.permissions.write_setup() else {
-            return Ok(None);
-        };
-        let root = root.to_path_buf();
-        let roots = self.paths.clone();
-        let env = env.cloned();
-        let prepared = tokio::task::spawn_blocking(move || {
-            grok::prepare_grok_write(&kind, &root, &roots, env.as_ref())
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("grok setup task failed: {e}"))??;
-        if let Some(name) = prepared.profile {
-            self.permissions =
-                Permissions(NativePermissions::Grok(GrokPermissions::RecordedProfile {
-                    name,
-                    roots: self.paths.clone(),
-                }));
-        }
-        Ok(prepared.trust_grant)
+    /// Commit a successfully created native profile without changing provenance.
+    pub fn grok_profile(&mut self, name: String) {
+        self.permissions = Permissions(NativePermissions::Grok(GrokPermissions::RecordedProfile {
+            name,
+            roots: self.paths.clone(),
+        }));
     }
 }
 

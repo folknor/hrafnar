@@ -371,7 +371,7 @@ model = \"opus\"
     fn cfg() -> ReviewConfig {
         let local = parse_file(LOCAL, "local", Layer::Local).unwrap();
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
-        resolve(local, Some(global), "host").unwrap()
+        resolve(local, Some(global), "host", config::ConfigFiles::default()).unwrap()
     }
 
     fn avail(codex: bool) -> impl Fn(Provider) -> bool {
@@ -495,7 +495,13 @@ model = \"opus\"
         // An orchestrator asks before it has picked a project; the global
         // profiles and provider availability are the answer it needs.
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
-        let c = resolve(config::ConfigFile::default(), Some(global), "host").unwrap();
+        let c = resolve(
+            config::ConfigFile::default(),
+            Some(global),
+            "host",
+            config::ConfigFiles::default(),
+        )
+        .unwrap();
         let text = render_text(&c, None, &avail(true));
         assert!(text.contains("not in a project"), "{text}");
         assert!(text.contains("project:   none"), "{text}");

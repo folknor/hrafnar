@@ -152,15 +152,15 @@ pub async fn interrupt(
              finishing on its own"
         )
     };
-    let pidfd = crate::keeper::pidfd_open(child_pid).map_err(|_| gone())?;
+    let pidfd = crate::process::pidfd_open(child_pid).map_err(|_| gone())?;
     // SAFETY: `getpgid` only reads the process table.
     let leads_group = unsafe { libc::getpgid(pid) } == pid;
-    let identity = crate::keeper::stat_ppid_start(child_pid);
+    let identity = crate::process::stat_ppid_start(child_pid);
     let ours = leads_group
         && identity.is_some_and(|(ppid, start)| {
             ppid == marker.pid && marker.keeper_start.is_none_or(|s| s == start)
         })
-        && !crate::keeper::pidfd_exited(&pidfd);
+        && !crate::process::pidfd_exited(&pidfd);
     if !ours {
         return Err(gone());
     }
@@ -168,7 +168,7 @@ pub async fn interrupt(
     let count = |rows: &[SessionRecord]| rows.iter().filter(|r| r.session_id == session_id).count();
     let rows_before = count(&rows());
     crate::inflight::request_interrupt(session_id, data_root)?;
-    if let Err(err) = crate::keeper::pidfd_signal(&pidfd, libc::SIGINT) {
+    if let Err(err) = crate::process::pidfd_signal(&pidfd, libc::SIGINT) {
         // Gone already, and the owner may have consumed the request on its way
         // out; then there is a run to report on after all.
         if crate::inflight::interrupt_pending(session_id, data_root) {
@@ -186,7 +186,7 @@ pub async fn interrupt(
     // the turn is over - without guessing from sidecar timestamps, which are
     // whole seconds and can tie with the session's previous row.
     while crate::inflight::interrupt_pending(session_id, data_root) {
-        if !crate::inflight::identity_alive(marker.pid, marker.pid_start) {
+        if !crate::process::identity_alive(marker.pid, marker.pid_start) {
             // Nobody is left to consume it; withdraw it so it cannot mark a
             // later resume of this session as interrupted.
             let _ = crate::inflight::take_interrupt_request(session_id, data_root);
@@ -229,7 +229,7 @@ pub async fn interrupt(
                 });
             }
             looked_again = true;
-        } else if !crate::inflight::identity_alive(marker.pid, marker.pid_start) {
+        } else if !crate::process::identity_alive(marker.pid, marker.pid_start) {
             bail!(
                 "the owning review (pid {}) exited without recording session {session_id}, \
                  so it cannot be resumed through review",
@@ -243,6 +243,8 @@ pub async fn interrupt(
 /// Why nothing may launch on, or interrupt, a session whose owning `review` is
 /// gone while its keeper still tears the run down. Shared with `review
 /// message`.
+// This wording is CLI policy: the store reports liveness, while message
+// imports the interrupt verb's explanation rather than teaching storage prose.
 pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Marker) -> String {
     format!(
         "session {session_id}: the review that ran it (pid {}) is gone and its processes are \

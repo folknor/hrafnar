@@ -2,11 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::process::{
-    children_of, pidfd_exited, pidfd_open, pidfd_signal, read_cmdline, stat_ppid_start,
-};
+use super::super::process::{children_of, read_cmdline};
 use super::super::protocol::{Event, KILLED_MAX, Outcome, Proc};
 use super::{Keeper, Member};
+use crate::process::{pidfd_exited, pidfd_open, pidfd_signal, stat_ppid_start};
 
 impl Keeper {
     /// Walk the tree from the keeper down, admitting what can be proven ours.

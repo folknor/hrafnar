@@ -184,6 +184,13 @@ pub struct Cli {
     #[arg(short = 'C', long = "project", global = true, value_name = "PROJECT")]
     pub project: Option<String>,
 
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(clap::Args)]
+#[group(multiple = true)]
+pub struct RunArgs {
     /// Archetype(s) to prime with: a name, a group, a comma-separated list, or
     /// "all". "bare" selects an unprimed run even when absent from config.
     /// Omit to send stdin unchanged.
@@ -221,16 +228,13 @@ pub struct Cli {
     pub session: Option<String>,
 }
 
-/// The run's own flags, by clap id. With a subcommand they are refused.
-const RUN_ONLY: &[(&str, &str)] = &[
-    ("archetype", "-a"),
-    ("profile", "-p"),
-    ("provider", "--provider"),
-    ("dry_run", "--dry-run"),
-    ("stagger", "--stagger"),
-    ("legacy_archetype", "a positional archetype"),
-    ("session", "--session"),
-];
+// Keep field access convenient while Clap owns the run-argument membership.
+impl std::ops::Deref for Cli {
+    type Target = RunArgs;
+    fn deref(&self) -> &RunArgs {
+        &self.run
+    }
+}
 
 impl Cli {
     /// Parse the real command line, exiting with clap's diagnostic on error.
@@ -260,8 +264,25 @@ impl Cli {
         let mut cmd = Self::command();
         let matches = cmd.try_get_matches_from_mut(args)?;
         if let Some((sub, _)) = matches.subcommand() {
-            for (id, shown) in RUN_ONLY {
+            let run = cmd
+                .get_groups()
+                .find(|g| g.get_id() == "RunArgs")
+                .expect("flattened run arguments have a group");
+            let ids: Vec<_> = run.get_args().cloned().collect();
+            for id in ids {
+                let id = id.as_str();
                 if matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
+                    let arg = cmd
+                        .get_arguments()
+                        .find(|a| a.get_id() == id)
+                        .expect("group member is an argument");
+                    let shown = if let Some(short) = arg.get_short() {
+                        format!("-{short}")
+                    } else if let Some(long) = arg.get_long() {
+                        format!("--{long}")
+                    } else {
+                        "a positional archetype".to_string()
+                    };
                     return Err(cmd.error(
                         clap::error::ErrorKind::ArgumentConflict,
                         format!("{shown} belongs to a run and cannot be used with `review {sub}`"),
@@ -445,6 +466,7 @@ mod tests {
             &["-a", "bugs", "resume", "abc"],
             &["--provider", "claude", "resume", "abc"],
             &["--stagger", "0", "message", "abc"],
+            &["--stagger", crate::timings::STAGGER_SECS_STR, "config"],
             &["-p", "deep", "config"],
             &["--session", "abc", "sessions"],
         ] {

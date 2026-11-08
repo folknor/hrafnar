@@ -1,65 +1,13 @@
-//! Linux process identity, command lines, and child discovery.
+//! Keeper tree discovery and bounded command-line collection.
+//! Shared process identity primitives live in `crate::process`.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Instant;
 
-use super::last_error;
 use super::protocol::Proc;
+use crate::process::stat_ppid_start;
 
 /// Longest command line kept for a process, in bytes.
 const CMDLINE_MAX: usize = 512;
-
-pub fn pidfd_open(pid: u32) -> std::io::Result<OwnedFd> {
-    let pid = libc::pid_t::try_from(pid).map_err(std::io::Error::other)?;
-    // SAFETY: plain syscall; the returned descriptor is ours to own.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(last_error());
-    }
-    let fd = RawFd::try_from(fd).map_err(std::io::Error::other)?;
-    // SAFETY: a fresh descriptor nobody else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// Whether the process behind `pidfd` has exited (its pidfd is readable). For
-/// a multithreaded process that is when its last thread has exited, unlike its
-/// leader's `/proc` state.
-pub fn pidfd_exited(pidfd: &OwnedFd) -> bool {
-    let mut pfd = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one pollfd we own, no timeout.
-    let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
-    ret > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-}
-
-pub fn pidfd_signal(pidfd: &OwnedFd, sig: libc::c_int) -> std::io::Result<()> {
-    // SAFETY: plain syscall on a pidfd we own; no siginfo.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            sig,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    };
-    if ret < 0 { Err(last_error()) } else { Ok(()) }
-}
-
-/// `pid`'s parent and start time, from `/proc/<pid>/stat`. `comm` may hold
-/// spaces and parentheses, so fields are read after the last `)`: state is
-/// field 3, ppid 4, starttime 22.
-pub fn stat_ppid_start(pid: u32) -> Option<(u32, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, rest) = stat.rsplit_once(')')?;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let ppid = fields.get(1)?.parse().ok()?;
-    let start = fields.get(19)?.parse().ok()?;
-    Some((ppid, start))
-}
 
 /// `pid`'s command line, and whether it is only the `comm` fallback (an empty
 /// command line: mid-`execve`, a zombie, or a process that cleared its argv).
@@ -146,24 +94,4 @@ fn children_by_scan(parent: u32, deadline: Instant) -> std::io::Result<Vec<u32>>
         }
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_process_knows_its_parent_and_start_time() {
-        // SAFETY: getppid has no failure mode.
-        let parent = u32::try_from(unsafe { libc::getppid() }).expect("pid fits");
-        let (ppid, start) = stat_ppid_start(std::process::id()).expect("own stat");
-        assert_eq!(ppid, parent);
-        assert!(start > 0);
-    }
-
-    #[test]
-    fn a_live_process_has_an_unexited_pidfd() {
-        let fd = pidfd_open(std::process::id()).expect("own pidfd");
-        assert!(!pidfd_exited(&fd));
-    }
 }

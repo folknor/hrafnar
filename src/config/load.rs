@@ -1,8 +1,8 @@
-use super::resolve::check_projects;
 use super::{
-    CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, hostname, parse_file, resolve,
-    try_generate_short_id,
+    CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, Selection, hostname, parse_file,
+    resolve,
 };
+use crate::project::registry::check_projects;
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -29,38 +29,6 @@ fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Opt
             .join(".config"),
     };
     Some(base.join("review").join("config.toml"))
-}
-
-/// Where to look for the project's `.review.toml`.
-///
-/// The two cases are kept apart because they permit different things, and a
-/// bare directory would lose which one applies. `Discover` is the ambient
-/// rule - walk up to the git root - for the invoking directory and for an
-/// explicit `-C ./path`. `Exact` is a root that is already known to be the
-/// project, a registered name or a session's recorded root: its config must sit
-/// directly in it. Walking up from one would let a registered or recorded root
-/// whose config had gone adopt an ancestor's - another project's audit id and
-/// privacy setting.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Selection {
-    Discover(PathBuf),
-    Exact(PathBuf),
-}
-
-impl Selection {
-    /// The invoking directory, walked up as `review` always has.
-    pub fn cwd() -> Result<Self> {
-        let dir = std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
-        Ok(Selection::Discover(dir))
-    }
-
-    /// The directory the selection starts from.
-    pub fn dir(&self) -> &std::path::Path {
-        match self {
-            Selection::Discover(d) | Selection::Exact(d) => d,
-        }
-    }
 }
 
 /// Load the project's `.review.toml` (required: it carries the audit id) and
@@ -123,35 +91,57 @@ fn load_layers(local_path: Option<PathBuf>) -> Result<ReviewConfig> {
 
     let global_path = global_config_path();
     let global = match global_path {
-        Some(ref p) => match std::fs::read_to_string(p) {
-            Ok(raw) => Some(parse_file(&raw, &p.display().to_string(), Layer::Global)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => bail!("failed to read {}: {e}", p.display()),
-        },
+        Some(ref p) => read_optional_file(p)?
+            .map(|raw| parse_file(&raw, &p.display().to_string(), Layer::Global))
+            .transpose()?,
         None => None,
     };
     let global_loaded = global.is_some();
 
-    let mut cfg = resolve(local, global, &hostname())?;
-    cfg.files = ConfigFiles {
+    let files = ConfigFiles {
         local: local_path,
         global: global_path,
         global_loaded,
     };
-    Ok(cfg)
+    resolve(local, global, &hostname(), files)
 }
 
-enum Located {
+/// Presence of a reachable directory entry, including dangling symlinks.
+/// Metadata errors are not absence: falling back could change audit/privacy.
+/// This is admission, not an atomic check-and-open or an init creation lock.
+pub(crate) fn entry_exists(path: &std::path::Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(anyhow::anyhow!(
+            "failed to inspect {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+// Both full loading and pre-selection registry lookup use the same optional
+// global-file rule. An existing unreadable/dangling entry is never absence.
+fn read_optional_file(path: &std::path::Path) -> Result<Option<String>> {
+    if !entry_exists(path)? {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))
+}
+
+pub(crate) enum Located {
     Found(PathBuf),
     /// Not found; carries the message saying where the search stopped.
     Missing(String),
 }
 
-fn locate_config(sel: &Selection) -> Result<Located> {
+pub(crate) fn locate_config(sel: &Selection) -> Result<Located> {
     let mut dir = match sel {
         Selection::Exact(root) => {
             let candidate = root.join(CONFIG_FILENAME);
-            return Ok(if candidate.exists() {
+            return Ok(if entry_exists(&candidate)? {
                 Located::Found(candidate)
             } else {
                 Located::Missing(format!(
@@ -166,10 +156,10 @@ fn locate_config(sel: &Selection) -> Result<Located> {
 
     loop {
         let candidate = dir.join(CONFIG_FILENAME);
-        if candidate.exists() {
+        if entry_exists(&candidate)? {
             return Ok(Located::Found(candidate));
         }
-        if dir.join(".git").exists() {
+        if entry_exists(&dir.join(".git"))? {
             return Ok(Located::Missing(format!(
                 "no {CONFIG_FILENAME} found (searched up to git root: {})\n\n\
                  Run `review init` to create one.",
@@ -193,12 +183,8 @@ pub fn global_projects() -> Result<(BTreeMap<String, String>, Option<PathBuf>)> 
     let Some(path) = global_config_path() else {
         return Ok((BTreeMap::new(), None));
     };
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((BTreeMap::new(), Some(path)));
-        }
-        Err(e) => bail!("failed to read {}: {e}", path.display()),
+    let Some(raw) = read_optional_file(&path)? else {
+        return Ok((BTreeMap::new(), Some(path)));
     };
     let mut file = parse_file(&raw, &path.display().to_string(), Layer::Global)?;
     let host = hostname();
@@ -210,70 +196,52 @@ pub fn global_projects() -> Result<(BTreeMap<String, String>, Option<PathBuf>)> 
     Ok((mine, Some(path)))
 }
 
-const INIT_TEMPLATE_PREFIX: &str = "\
-# Project config for `review`. Everything here is optional except [_audit].
-# Settings resolve command line, then this file, then the operator's global
-# config (~/.config/review/config.toml, same format). Run `review config` to see
-# the effective result and where each value came from.
-#
-# Archetypes are priming prompts: a name mapped to text prepended to stdin.
-# A run without an archetype sends stdin unchanged.
-#
-# [archetypes]
-# security = \"You are a security expert for this project. Read the codebase.\"
-#
-# Providers to fan out to when --provider is omitted:
-# [_defaults]
-# providers = [\"codex\"]
-#
-# Groups fan out to multiple archetypes:
-# [_groups]
-# sweep = [\"security\", \"bugs\"]
-#
-# Named profiles, selected with --profile, as [<provider>.<profile>]. A profile
-# here replaces a global profile of the same name entirely.
-# [codex.deep]
-# model = \"gpt-6-luna\"
-# effort = \"high\"
-# sandbox = \"read-only\"
-";
-
-/// Create a starter config in the selected directory itself - never in an
-/// ancestor, whichever kind of selection it is.
-pub fn init(sel: &Selection) -> Result<()> {
-    let dir = sel.dir();
-    let path = dir.join(CONFIG_FILENAME);
-
-    if path.exists() {
-        bail!("{CONFIG_FILENAME} already exists in {}", dir.display());
-    }
-
-    if let Located::Found(existing) = locate_config(&Selection::Discover(dir.to_path_buf()))? {
-        bail!(
-            "{CONFIG_FILENAME} already exists at {}\n  \
-             Creating another here would shadow it.",
-            existing.display()
-        );
-    }
-
-    let audit_id = try_generate_short_id()?;
-    let mut content = INIT_TEMPLATE_PREFIX.to_string();
-    content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
-    std::fs::write(&path, content)
-        .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
-
-    println!("Created {}", path.display());
-    println!();
-    println!("Next steps:");
-    println!("  1. Run `review config` to see what the global config already provides");
-    println!("  2. Run: echo \"check for issues\" | review --provider codex");
-    Ok(())
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_errors_and_dangling_entries_never_fall_back() {
+        use std::os::unix::fs::symlink;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("config-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("fixture");
+        std::fs::write(root.join(CONFIG_FILENAME), "[_audit]\nid = 'ancestor'\n")
+            .expect("ancestor");
+        symlink("missing", child.join(CONFIG_FILENAME)).expect("dangling config");
+        assert!(read_optional_file(&child.join(CONFIG_FILENAME)).is_err());
+        assert!(
+            read_optional_file(&child.join("absent-global"))
+                .expect("optional absent")
+                .is_none()
+        );
+        for sel in [
+            Selection::Exact(child.clone()),
+            Selection::Discover(child.clone()),
+        ] {
+            assert!(
+                load_optional(&sel).is_err(),
+                "dangling config must be selected, then fail reading"
+            );
+            assert!(crate::config_write::init(&sel).is_err());
+        }
+        std::fs::remove_file(child.join(CONFIG_FILENAME)).expect("remove dangling config");
+        symlink("loop", root.join("loop")).expect("parent loop");
+        let sel = Selection::Discover(root.join("loop/child"));
+        assert!(locate_config(&sel).is_err());
+        assert!(load_optional(&sel).is_err());
+        assert!(!entry_exists(&root.join("absent")).expect("missing is absence"));
+        symlink("missing", child.join(".git")).expect("dangling git boundary");
+        assert!(matches!(
+            locate_config(&Selection::Discover(child)).expect("boundary"),
+            Located::Missing(_)
+        ));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
 
     #[test]
     fn global_config_path_prefers_absolute_xdg() {
