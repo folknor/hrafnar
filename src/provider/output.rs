@@ -41,7 +41,12 @@ pub fn resume_hint(provider: Provider, session_id: &str) -> String {
 }
 
 fn print_digest(outcome: &Outcome, d: &Digest) {
-    print_status(d.exit_code, d.signal.as_deref(), outcome, &d.status_facts());
+    print_status(
+        d.exit.code(),
+        d.exit.signal_name().as_deref(),
+        outcome,
+        &d.status_facts(),
+    );
     print_usage(d.turns, &d.usage);
     if let Some(evidence) = &d.provider {
         match evidence {
@@ -71,10 +76,10 @@ pub(crate) fn print_digest_summary(d: &super::DigestSummary) {
     print_usage(
         d.turns,
         &Usage {
-            input_tokens: d.input_tokens,
-            cached_input_tokens: d.cached_input_tokens,
-            output_tokens: d.output_tokens,
-            reasoning_output_tokens: d.reasoning_output_tokens,
+            total_input: d.input_tokens,
+            cached_input: d.cached_input_tokens,
+            output: d.output_tokens,
+            reasoning_output: d.reasoning_output_tokens,
         },
     );
     if let Some(ref path) = d.incident_path {
@@ -104,9 +109,6 @@ fn print_usage(turns: u32, usage: &Usage) {
     println!("turns: {turns}");
     println!(
         "usage: input={} cached={} output={} reasoning={}",
-        usage.input_tokens,
-        usage.cached_input_tokens,
-        usage.output_tokens,
-        usage.reasoning_output_tokens
+        usage.total_input, usage.cached_input, usage.output, usage.reasoning_output
     );
 }

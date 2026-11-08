@@ -251,7 +251,11 @@ pub fn install_signal_supervisor(lifecycle: Lifecycle) {
             }
         };
         let name = next_signal().await;
-        let exit_code = if name == "SIGINT" { 130 } else { 143 };
+        let exit = crate::exit::CommandExit::Signalled(if name == "SIGINT" {
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        });
         lifecycle.request_stop();
         let unrecorded = || lifecycle.unrecorded();
         if unrecorded() > 0 {
@@ -298,8 +302,8 @@ pub fn install_signal_supervisor(lifecycle: Lifecycle) {
                  and processes it started may still be running"
             );
         }
-        // 128 + signal number, the conventional shell encoding.
-        std::process::exit(exit_code);
+        // The one exit outside `main`; see `CommandExit` for why.
+        std::process::exit(exit.code());
     });
 }
 

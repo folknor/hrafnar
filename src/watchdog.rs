@@ -61,6 +61,20 @@ pub struct Verdict {
     pub last_event: Option<String>,
 }
 
+impl Verdict {
+    /// The cause recorded for the kill. `reason` is the longer operator-facing
+    /// explanation of the same verdict; this is its fixed, persisted name.
+    pub fn termination(&self) -> crate::provider::Termination {
+        use crate::provider::{Termination, WatchdogTermination};
+        Termination::Watchdog(match self.kind {
+            Kind::Stranded => WatchdogTermination::Stranded,
+            Kind::Stalled => WatchdogTermination::Stalled {
+                quiet_secs: self.quiet_secs,
+            },
+        })
+    }
+}
+
 /// Answer and diagnostic evidence from one successful source read. None from
 /// Source::evidence means unreadable, not a successful read with no answer.
 pub(crate) struct Evidence<A> {

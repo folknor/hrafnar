@@ -40,69 +40,6 @@ A future API-only conversion can remove those redundant parses, but must retain
 raw malformed evidence and leave frozen lock handling untouched. Do not claim
 these types establish unique Codex suffix matches or symlink confinement.
 
-## STR-005 - Termination reason as an enum
-
-Reported by: providers, forensics.
-
-`terminated_by_review: Option<String>` holds one of `"review was signalled to
-stop"`, ``"operator interrupt (`review interrupt`)"``, `"watchdog: stranded
-completion"`, or `format!("watchdog: stall timeout ({}s silent)")`. They are
-written in the claude and codex runners separately and as a fallback default
-in `app::digest_summary_note`; readers branch on presence alone, tests match
-substrings, and the kind is lost by the time it reaches the sidecar ("how many
-Stranded kills this week" is a substring grep). `Verdict.reason` (the
-watchdog's own prose) and the short string are two phrasings of one verdict
-built in two modules. Proposed:
-`enum Termination { Signal, OperatorInterrupt, Watchdog(Kind, quiet_secs) }`
-with one `Display`, persisted as a tag.
-
-## STR-006 - Exit status as a typed value
-
-Reported by: providers, lifecycle, forensics, grok-man.
-
-- `Digest.exit_code` plus `signal` split one `ExitStatus`; `signal_name` maps
-  2, 9 and 15 and formats the rest as `"signal N"`.
-- The keeper's `Outcome.status: Option<i32>` is a raw `waitpid` status
-  crossing a process boundary, turned back with `ExitStatus::from_raw` in two
-  places in `finish`.
-- `Incident`'s `exit_code: Option<i32>` sits beside `turns: u32` and can be
-  swapped silently.
-- Grok's `Unread::Finished { exit_code: Option<i64>, signal: Option<String> }`
-  has an illegal both-set state, resolved by exit-code-wins in the wake
-  prompt.
-
-Proposed: `enum Exit { Code(i32), Signal(i32), Unknown }` on the wire and in
-the records, with `Display` replacing `signal_name`. The lifecycle hunter adds
-that opencode (130 on SIGINT) and maki (0 on error) mean runners must not
-classify by exit status, and a plainly secondary typed field helps keep it so.
-
-## STR-007 - Process exit codes as an enum with one exit site
-
-Reported by: orchestration.
-
-`1` and `EXIT_LEFT_RUNNING = 3` in `app::exit_status`, `130`/`143` in the
-signal supervisor, `2` for help, and `man::run`'s return are bare integers in
-four places, and `std::process::exit` is called from three. Proposed: an
-`ExitStatus` enum with `code()`, `app` returning it, and a single `exit` in
-`main`, so tests can assert on a whole run's status and `exit()` cannot skip
-destructors (the `Unrecorded` and lock guards are dropped by then today, but
-nothing guarantees it).
-
-## STR-008 - Usage, served model and turn counts
-
-Reported by: providers.
-
-`Usage` has four `u64` fields with provider-specific mappings (`claude_usage`
-and `grok_usage` each rebuild codex's "input includes cached" convention); the
-grok wake loop adds them by hand and `cost_usd` is summed with a hand-written
-`Option` merge. `Served::model` is a comma-joined `String`. `Digest::turns`
-counts `turn.completed` events for codex but `num_turns` (API round trips) for
-claude and grok, so the column is not comparable across providers. Proposed:
-`AddAssign` for `Usage` and `Served`; the convention named in the type
-(`total_input`, `cached_input`) so a new mapper cannot double-count
-claude-style cache-creation tokens; `Vec<String>` joined only at
-serialisation.
-
 ## STR-010 - In-flight marker fields
 
 Reported by: lifecycle.
@@ -184,7 +121,9 @@ config, so no call site can pair a private project's id with the public log.
 
 ## STR-018 - `ProjectRoot` and the resume target
 
-Reported by: config.
+Reported by: config. Narrowed: the separate resume function and its
+expected-target plumbing were folded into `run_message`; the root type and the
+`load` tuples remain.
 
 Beyond the canonical-identity question in `notes/consolidations.md`:
 `expected: (PathBuf, Option<String>)` in `run_message` is a bare tuple
@@ -212,18 +151,8 @@ Reported by: forensics.
 - `Incident` is 28 loose `&str`/`Option<&str>`/bool/integer fields; `signal`,
   `stdin_write_error`, `turn_error` and `last_rollout_event` are all
   `Option<&str>`.
-- `Incident.codex_version` and `Meta.codex_version` are schema fields named
-  after one provider; rename to `provider_version`.
-
-## STR-022 - Stall timeout without a zero sentinel
-
-Reported by: forensics.
-
-`watchdog::Timings` and `crate::timings` share a name but are different
-things. `stall_grace: Option<Duration>` is converted in `provider.rs` from
-config's "`secs == 0` means off". Proposed: the conversion belongs to the
-config type (`StallTimeout::{Off, After(Duration)}`), so `0` never travels as
-a sentinel.
+- (`Incident` already carries `provider_version`; `Meta.codex_version` is the
+  schema-1 wire key, kept on purpose for existing bundles.)
 
 ## STR-023 - Grok outcome types
 
@@ -255,8 +184,6 @@ adapter control flow a trait would have to expose as a hook per step with
 shared state between them.
 
 What remains:
-- Grok's wake loop merges usage, cost, turns and leftovers by hand;
-  `RunOutput::absorb(next)` on the types.
 - `run_codex_json`, `run_claude`, `RunOutput` and `new_output_file` are `pub`
   only for `tests/provider_runs.rs`; a test seam through `invoke` (or a
   lifecycle-level stub suite) lets them go.
@@ -278,7 +205,9 @@ marker for the verb to read; and the log is parsed once per process.
 
 ## STR-028 - `contained::spawn` should pass exactly what the runner built
 
-Reported by: lifecycle.
+Reported by: lifecycle. Narrowed: `ProcessSpec` already owns env layering and
+sets `PWD` to the cwd for every provider; the exact-bytes argv/env transport
+and the `env_clear` hole below remain.
 
 `spawn` rebuilds the keeper's `Command` from `get_envs()`, which reports
 explicit sets and removes but not `env_clear()`. A runner that clears the
@@ -297,9 +226,13 @@ to match for every provider.
 
 ## STR-030 - Split `writable_roots` into derivation and rendering; consider moving the toolchain facts to config
 
-Reported by: config.
+Reported by: config. Narrowed: derivation, filtering, host and output are now
+separate files under `src/writable_roots/`. The residue of the split is that
+codex's `-c sandbox_workspace_write.writable_roots=` rendering
+(`writable_roots/output.rs`) still lives in the generic module rather than the
+codex adapter; the toolchain-facts-in-config half is a new feature.
 
-`writable_roots` is codex-shaped in name and output (`config_override` emits
+Original claim: `writable_roots` is codex-shaped in name and output (`config_override` emits
 `sandbox_workspace_write.writable_roots=`), while its derivation is generic and
 grok reuses it. Proposed: split derivation ("what a build on this host needs")
 from rendering (codex's `-c`, grok's profile hash), with `invoke`'s `derives`
@@ -335,8 +268,8 @@ Reported by: providers, lifecycle, forensics, grok-man, config.
   argv (`--ignore-rules`, `--ignore-user-config`, `approval_policy`, network
   grants, the `resume` placement of `-o`) is never exercised end to end, and
   bypassing `invoke`, so root derivation, the sandbox translation and the
-  recorded fields are untested where they combine. Grok has no runner-level
-  test. Proposed per adapter: a table test of `argv(Launch) -> Vec<String>`
+  recorded fields are untested where they combine. (Grok does now have
+  runner-level stub tests in `tests/provider_runs.rs`.) Proposed per adapter: a table test of `argv(Launch) -> Vec<String>`
   pinning every safety-critical flag, a fixture test of `classify`, and one
   shared lifecycle suite run against a stub per provider (interrupt, stop,
   marker, death), which maki and opencode get for free.

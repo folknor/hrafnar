@@ -146,7 +146,7 @@ struct SessionEntry<'a> {
     /// Record-only: deliberately absent from `SessionRecord`, so no resume can
     /// inherit it into `-m`, which refuses it. See `provider::Served`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    served_model: Option<&'a str>,
+    served_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     /// The folder a grok run was launched with `--trust` for - a permanent,
@@ -380,7 +380,7 @@ pub(crate) fn record_with_kind(
         sandbox: sandbox.and_then(crate::provider::Permissions::recorded_level),
         provider_sandbox: sandbox.and_then(crate::provider::Permissions::native_to_record),
         writable_roots,
-        served_model: served.model.as_deref(),
+        served_model: served.model_label(),
         cost_usd: served.cost_usd,
         grok_trust,
         operator_prompt,

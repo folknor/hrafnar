@@ -38,7 +38,10 @@ is the lifecycle's stop arm. Still separate sources of the one fact:
 
 ## CON-013 - Is shutdown under way?
 
-Reported by: lifecycle, providers.
+Reported by: lifecycle, providers. Stale in part: the global `STOP` is gone;
+the command-owned `supervisor::Lifecycle` owns stop and spawn admission, and
+`request_stop` changes them under one mutex. Re-adjudicate the residue below
+against that implementation before inventing a `Shutdown` state.
 
 Sites:
 - `provider::STOP` (a watch channel), read through `stop_requested()` and
@@ -164,7 +167,10 @@ unnecessary rather than guarding a copy.
 
 ## CON-022 - What does `bare` mean?
 
-Reported by: config, orchestration.
+Reported by: config, orchestration. Stale in part:
+`ReviewConfig::select_archetypes` now owns `bare`/`all`/group expansion and
+dedup. Recheck the two disagreements below against it before building another
+resolver.
 
 Sites:
 - `config::BARE` (the parse rule forbidding a non-empty `bare`) and the

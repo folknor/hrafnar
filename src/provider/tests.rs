@@ -1,16 +1,9 @@
 //! Unit tests of `invoke`'s pure parts: session-id selection, the writable-roots
 //! override and the root announcement. Provider-specific tests live beside their
-//! runners, and `exited` here is shared with them. The tests that run a real
+//! runners. The tests that run a real
 //! child process are in
 //! `tests/provider_runs.rs`, an integration test, because their keeper is the
 //! built `review` binary (see `keeper`).
-
-/// An exit status with the given code, for digests that must report what was
-/// observed rather than what was assumed.
-pub(super) fn exited(code: i32) -> std::process::ExitStatus {
-    use std::os::unix::process::ExitStatusExt;
-    std::process::ExitStatus::from_raw(code << 8)
-}
 
 #[test]
 fn a_resume_result_retains_the_session_id_known_to_its_caller() {

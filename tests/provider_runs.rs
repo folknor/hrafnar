@@ -813,14 +813,14 @@ exit 0
         summary.terminated_by_review
     );
     assert_eq!(
-        digest.exit_code,
+        digest.exit.code(),
         Some(0),
         "stub must have exited on its own, not been killed"
     );
     assert!(
-        digest.signal.is_none(),
+        digest.exit.signal_name().is_none(),
         "no signal: nothing killed this run, got {:?}",
-        digest.signal
+        digest.exit
     );
     assert!(
         summary.captured,
@@ -868,7 +868,11 @@ exit 0
         "reaping must not wait for pipe EOF; took {elapsed:?}"
     );
     let digest = run.digest.expect("digest");
-    assert_eq!(digest.exit_code, Some(0), "the stub itself exited cleanly");
+    assert_eq!(
+        digest.exit.code(),
+        Some(0),
+        "the stub itself exited cleanly"
+    );
     // The heart of this test: stdout never reached EOF, so the reader was
     // aborted on the grace expiry. What it had already buffered must survive.
     // An earlier version returned an empty buffer here, silently discarding the
@@ -1030,7 +1034,7 @@ exit 1
     );
     // The surrounding failure signature is unchanged - this still *is* a run
     // that produced no answer, and must keep reporting as one.
-    assert_eq!(digest.exit_code, Some(1));
+    assert_eq!(digest.exit.code(), Some(1));
     assert!(!summary.captured, "no -o file was written");
     assert!(
         !summary.recovered_from_transcript,
@@ -1153,7 +1157,7 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
         "got {:?}",
         summary.terminated_by_review
     );
-    assert_eq!(digest.exit_code, Some(1));
+    assert_eq!(digest.exit.code(), Some(1));
     assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
     assert!(
         scratch.incident_dirs().is_empty(),
@@ -1199,7 +1203,7 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
 
     assert!(summary.interrupted, "the digest must record the interrupt");
     assert_eq!(
-        digest.exit_code,
+        digest.exit.code(),
         Some(1),
         "codex answered SIGINT, not a kill"
     );
@@ -1487,7 +1491,7 @@ async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
         summary.turn_error.is_none(),
         "claude's complaint about the abort is not a stated failure"
     );
-    assert_eq!(digest.exit_code, Some(0), "claude answered SIGINT itself");
+    assert_eq!(digest.exit.code(), Some(0), "claude answered SIGINT itself");
     assert!(
         summary
             .terminated_by_review
@@ -1554,7 +1558,7 @@ async fn a_stop_signal_ends_a_started_claude_turn_as_an_interrupt() {
     let summary = summary_of(&run);
     let digest = run.digest.expect("digest");
     assert!(summary.interrupted);
-    assert_eq!(digest.exit_code, Some(0), "SIGINT, not a group kill");
+    assert_eq!(digest.exit.code(), Some(0), "SIGINT, not a group kill");
     assert!(
         summary
             .terminated_by_review
@@ -1614,7 +1618,7 @@ async fn a_claude_that_dies_after_starting_keeps_its_session() {
         summary.turn_error.is_none(),
         "claude stated no reason, so this is a death, not a stated failure"
     );
-    assert_eq!(digest.exit_code, Some(3));
+    assert_eq!(digest.exit.code(), Some(3));
     assert!(run.session_id.is_some(), "the session id is kept");
     assert!(run.text.contains("without a result"), "got {:?}", run.text);
 }
@@ -1884,7 +1888,8 @@ sleep 1
     assert!(run.leftovers.unknown.is_some(), "{:?}", run.leftovers);
     let digest = run.digest.as_ref().expect("digest");
     assert_eq!(
-        digest.exit_code, None,
+        digest.exit.code(),
+        None,
         "an unreported status is not invented"
     );
     assert!(
@@ -1946,13 +1951,13 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
     let summary = summary_of(&run);
     let digest = run.digest.expect("nonzero status is recorded");
     assert!(summary.captured);
-    assert_eq!(digest.exit_code, Some(7));
+    assert_eq!(digest.exit.code(), Some(7));
     assert!(summary.turn_error.is_none());
     assert!(summary.review_error.is_none());
     assert!(!run.outcome.failed());
     assert_eq!(digest.turns, 2);
-    assert_eq!(digest.usage.input_tokens, 28);
-    assert_eq!(digest.usage.output_tokens, 32);
+    assert_eq!(digest.usage.total_input, 28);
+    assert_eq!(digest.usage.output, 32);
 }
 
 #[tokio::test]
@@ -2322,7 +2327,7 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
                 .summary(result.digest.as_ref())
                 .expect("failure summary");
             let digest = result.digest.expect("failure digest");
-            assert_eq!(digest.exit_code, Some(0));
+            assert_eq!(digest.exit.code(), Some(0));
             assert!(turn.outcome.failed());
             assert!(
                 summary

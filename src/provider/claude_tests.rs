@@ -48,12 +48,12 @@ async fn claude_output_past_the_cap_keeps_its_final_result_and_middle_metrics() 
     assert!(matches!(outcome, super::ClaudeOutcome::Answered { .. }));
     let metrics = metrics.lock().expect("metrics").clone();
     assert_eq!(metrics.turns, 5);
-    assert_eq!(metrics.usage.input_tokens, 10 + 20 + 30 + 4 + 25470 + 22520);
-    assert_eq!(metrics.usage.cached_input_tokens, 30 + 22520);
-    assert_eq!(metrics.usage.output_tokens, 40 + 149);
-    assert_eq!(metrics.usage.reasoning_output_tokens, 5);
+    assert_eq!(metrics.usage.total_input, 10 + 20 + 30 + 4 + 25470 + 22520);
+    assert_eq!(metrics.usage.cached_input, 30 + 22520);
+    assert_eq!(metrics.usage.output, 40 + 149);
+    assert_eq!(metrics.usage.reasoning_output, 5);
     assert_eq!(
-        metrics.served().model.as_deref(),
+        metrics.served().model_label().as_deref(),
         Some("claude-opus-5-5,claude-sonnet-4")
     );
     let cost = metrics.served().cost_usd.expect("cost");
@@ -215,15 +215,12 @@ fn claude_usage_and_served_are_read_from_the_result() {
     assert_eq!(turns, 2);
     // Uncached input, cache writes and cache reads together, as codex counts
     // input; the reads are the cached share.
-    assert_eq!(usage.input_tokens, 4 + 25470 + 22520);
-    assert_eq!(usage.cached_input_tokens, 22520);
-    assert_eq!(usage.output_tokens, 149);
+    assert_eq!(usage.total_input, 4 + 25470 + 22520);
+    assert_eq!(usage.cached_input, 22520);
+    assert_eq!(usage.output, 149);
     assert_eq!(
         super::claude_served(CLAUDE_OK),
-        super::Served {
-            model: Some("claude-opus-5-5".to_string()),
-            cost_usd: Some(0.21126),
-        }
+        super::Served::new(["claude-opus-5-5".to_string()], Some(0.21126))
     );
     assert_eq!(super::claude_usage("not json").0, 0);
 }
@@ -234,7 +231,7 @@ fn claude_served_models_and_cost_sum_every_result() {
     let stdout = claude_stream(&[CLAUDE_OK, second]);
     let served = super::claude_served(&stdout);
     assert_eq!(
-        served.model.as_deref(),
+        served.model_label().as_deref(),
         Some("claude-opus-5-5,claude-sonnet-4")
     );
     let cost = served.cost_usd.expect("cost");
@@ -249,12 +246,12 @@ fn claude_usage_counts_every_result_and_ignores_other_events() {
     let stdout = claude_stream(&[CLAUDE_INIT, CLAUDE_OK, assistant, "not json", last]);
     let (turns, usage) = super::claude_usage(&stdout);
     assert_eq!(turns, 3);
-    assert_eq!(usage.input_tokens, 4 + 25470 + 22520 + 2 + 3 + 5);
-    assert_eq!(usage.cached_input_tokens, 22520 + 5);
-    assert_eq!(usage.output_tokens, 149 + 7);
-    assert_eq!(usage.reasoning_output_tokens, 4);
+    assert_eq!(usage.total_input, 4 + 25470 + 22520 + 2 + 3 + 5);
+    assert_eq!(usage.cached_input, 22520 + 5);
+    assert_eq!(usage.output, 149 + 7);
+    assert_eq!(usage.reasoning_output, 4);
     let (turns, usage) = super::claude_usage(r#"{"type":"result"}"#);
-    assert_eq!((turns, usage.input_tokens), (0, 0));
+    assert_eq!((turns, usage.total_input), (0, 0));
 }
 
 #[tokio::test]

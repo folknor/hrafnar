@@ -4,6 +4,7 @@
 use anyhow::{Result, bail};
 
 use crate::cli::{self, Cli};
+use crate::exit::CommandExit;
 use crate::{
     config, config_cmd, config_write, contained, input, interrupt_cmd, lock, man, project, prompt,
     provider,
@@ -70,7 +71,7 @@ fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Opt
     }
 }
 
-pub async fn run() -> Result<()> {
+pub async fn run() -> Result<CommandExit> {
     // Total wall clock, started before anything else runs. This deliberately
     // includes the stdin read and the global-lock wait: it is what the operator
     // waited, not just what the providers spent.
@@ -109,9 +110,15 @@ pub async fn run() -> Result<()> {
     let selector = cli.project.as_deref();
 
     match &cli.command {
-        Some(cli::Command::Man { topic }) => std::process::exit(man::run(topic.as_deref())),
-        Some(cli::Command::Init) => return config_write::init(&project::select(selector)?),
-        Some(cli::Command::Config) => return config_cmd::run(&project::select(selector)?),
+        Some(cli::Command::Man { topic }) => return Ok(man::run(topic.as_deref())),
+        Some(cli::Command::Init) => {
+            config_write::init(&project::select(selector)?)?;
+            return Ok(CommandExit::Success);
+        }
+        Some(cli::Command::Config) => {
+            config_cmd::run(&project::select(selector)?)?;
+            return Ok(CommandExit::Success);
+        }
         Some(cli::Command::Message { id, dry_run }) => {
             return run_message(id, *dry_run, selector, started, &lifecycle).await;
         }
@@ -119,14 +126,21 @@ pub async fn run() -> Result<()> {
             eprintln!("warning: `review resume <ID>` is now `review message <ID>`");
             return run_message(id, *dry_run, selector, started, &lifecycle).await;
         }
-        Some(cli::Command::Interrupt { id }) => return interrupt_cmd::run(id).await,
-        Some(cli::Command::Sessions { id, all, limit }) => {
-            return match id {
-                Some(id) => run_session_show(id, selector),
-                None => run_sessions(*all, *limit, selector),
-            };
+        Some(cli::Command::Interrupt { id }) => {
+            interrupt_cmd::run(id).await?;
+            return Ok(CommandExit::Success);
         }
-        Some(cli::Command::Incidents { limit }) => return run_incidents(*limit),
+        Some(cli::Command::Sessions { id, all, limit }) => {
+            match id {
+                Some(id) => run_session_show(id, selector)?,
+                None => run_sessions(*all, *limit, selector)?,
+            }
+            return Ok(CommandExit::Success);
+        }
+        Some(cli::Command::Incidents { limit }) => {
+            run_incidents(*limit)?;
+            return Ok(CommandExit::Success);
+        }
         None => {}
     }
 
@@ -160,7 +174,7 @@ pub async fn run() -> Result<()> {
             Some(s) => Some(s),
             None => {
                 Cli::print_help();
-                std::process::exit(2);
+                return Ok(CommandExit::Usage);
             }
         }
     } else {
@@ -229,7 +243,7 @@ pub async fn run() -> Result<()> {
                 println!();
             }
         }
-        return Ok(());
+        return Ok(CommandExit::Success);
     }
 
     // Every provider must be installed here, checked before anything launches.
@@ -268,7 +282,7 @@ pub async fn run() -> Result<()> {
     // property rather than a documented contract.
     let provider_runtime = provider::ProviderRuntime::from_config(
         lifecycle.clone(),
-        cfg.stall_timeout_secs(),
+        cfg.stall_timeout(),
         cfg.audit.private,
     );
 
@@ -413,30 +427,8 @@ pub async fn run() -> Result<()> {
     // it: one provider's answer cannot excuse another's processes still
     // running.
     let all_failed = results.iter().flat_map(|g| &g.launches).all(run_failed);
-    if let Some(code) = exit_status(all_failed, left_running) {
-        std::process::exit(code);
-    }
-
-    Ok(())
+    Ok(CommandExit::of_runs(all_failed, left_running))
 }
-
-/// Exit status for a finished run or message: `3` when anything it started was
-/// left running or its teardown could not be confirmed, `1` when no answer was
-/// produced, else none (exit 0). Leftovers win: a failed run is retried or
-/// resumed, but with its processes possibly still changing the tree, the
-/// first thing to do is check them, and `3` says so whatever the answers were.
-fn exit_status(no_answer: bool, left_running: bool) -> Option<i32> {
-    if left_running {
-        Some(EXIT_LEFT_RUNNING)
-    } else if no_answer {
-        Some(1)
-    } else {
-        None
-    }
-}
-
-/// See `exit_status`.
-const EXIT_LEFT_RUNNING: i32 = 3;
 
 /// Print what is still running, or may be, from every invocation this
 /// `review` made (see `contained`), whichever results were reported. Returns
@@ -501,13 +493,5 @@ mod tests {
             .expect_err("ambiguous")
             .to_string();
         assert!(err.contains("twice"), "{err}");
-    }
-
-    #[test]
-    fn leftovers_outrank_a_missing_answer_in_the_exit_status() {
-        assert_eq!(exit_status(false, false), None);
-        assert_eq!(exit_status(true, false), Some(1));
-        assert_eq!(exit_status(false, true), Some(3));
-        assert_eq!(exit_status(true, true), Some(3));
     }
 }

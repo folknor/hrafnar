@@ -459,7 +459,7 @@ model = \"global-host\"
         assert_eq!(cfg.default_providers().unwrap(), &[Provider::Codex]);
         assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Global);
         // 0 means "disabled", which is a setting, not an absence.
-        assert_eq!(cfg.stall_timeout_secs(), Some(0));
+        assert_eq!(cfg.stall_timeout(), Some(crate::config::StallTimeout::Off));
         assert_eq!(cfg.stall_timeout_secs.as_ref().unwrap().layer, Layer::Local);
 
         let cfg = layered(
@@ -469,7 +469,10 @@ model = \"global-host\"
         )
         .unwrap();
         assert_eq!(cfg.default_providers().unwrap(), &[Provider::Claude]);
-        assert_eq!(cfg.stall_timeout_secs(), Some(600));
+        assert_eq!(
+            cfg.stall_timeout(),
+            Some(crate::config::StallTimeout::from(600))
+        );
         let s = cfg.stall_timeout_secs.as_ref().unwrap();
         assert_eq!(s.layer, Layer::Global);
         assert_eq!(s.table, "[_defaults]");

@@ -49,15 +49,16 @@ impl ClaudeMetrics {
             return;
         }
         self.turns += event.num_turns;
-        self.usage.input_tokens += event.usage.input_tokens
-            + event.usage.cache_creation_input_tokens
-            + event.usage.cache_read_input_tokens;
-        self.usage.cached_input_tokens += event.usage.cache_read_input_tokens;
-        self.usage.output_tokens += event.usage.output_tokens;
-        self.usage.reasoning_output_tokens += event
-            .usage
-            .output_tokens_details
-            .map_or(0, |details| details.thinking_tokens);
+        self.usage += &Usage::from_parts(
+            event.usage.input_tokens,
+            event.usage.cache_creation_input_tokens,
+            event.usage.cache_read_input_tokens,
+            event.usage.output_tokens,
+            event
+                .usage
+                .output_tokens_details
+                .map_or(0, |details| details.thinking_tokens),
+        );
         if let Some(model_usage) = event.model_usage {
             self.models
                 .extend(model_usage.into_iter().map(|(name, _)| name));
@@ -68,11 +69,7 @@ impl ClaudeMetrics {
     }
 
     pub(super) fn served(&self) -> Served {
-        let models: Vec<&str> = self.models.iter().map(String::as_str).collect();
-        Served {
-            model: (!models.is_empty()).then(|| models.join(",")),
-            cost_usd: self.cost_usd,
-        }
+        Served::new(self.models.iter().cloned(), self.cost_usd)
     }
 }
 

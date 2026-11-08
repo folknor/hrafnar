@@ -1,6 +1,6 @@
 //! Unit tests of grok provider behavior.
 
-use super::super::tests::exited;
+use crate::process::Exit;
 
 // ---------------------------------------------------------------------------
 // grok output classification
@@ -51,10 +51,7 @@ fn grok_served_model_and_cost_are_read_from_model_usage() {
     }"#;
     assert_eq!(
         super::result_served(out),
-        super::Served {
-            model: Some("grok-4.7-build".to_string()),
-            cost_usd: Some(0.02397),
-        }
+        super::Served::new(["grok-4.7-build".to_string()], Some(0.02397))
     );
     // Absent fields and non-JSON record nothing rather than failing the run.
     assert_eq!(super::result_served(GROK_OK), super::Served::default());
@@ -103,9 +100,9 @@ fn grok_cancelled_turn_is_not_an_answer() {
 
     // It must still read as a failure everywhere that matters: exit code,
     // greppable digest, and no auto-resume (a stated reason is not a wedge).
-    let digest = super::status_digest(Some(&exited(1)));
+    let digest = super::status_digest(Exit::Code(1));
     assert_eq!(
-        digest.exit_code,
+        digest.exit.code(),
         Some(1),
         "the digest reports the status we observed"
     );
@@ -143,15 +140,15 @@ fn grok_turns_and_usage_are_read_from_the_result() {
     let (turns, usage) = super::grok_usage(out);
     assert_eq!(turns, 2);
     assert_eq!(
-        usage.input_tokens,
+        usage.total_input,
         6716 + 30592,
         "codex-shaped: input includes cached"
     );
-    assert_eq!(usage.cached_input_tokens, 30592);
-    assert_eq!(usage.output_tokens, 154);
-    assert_eq!(usage.reasoning_output_tokens, 82);
+    assert_eq!(usage.cached_input, 30592);
+    assert_eq!(usage.output, 154);
+    assert_eq!(usage.reasoning_output, 82);
     let (turns, usage) = super::grok_usage("not json");
-    assert_eq!((turns, usage.input_tokens), (0, 0));
+    assert_eq!((turns, usage.total_input), (0, 0));
 }
 
 #[test]
@@ -266,6 +263,40 @@ fn grok_run(outcome: super::Outcome, digest: Option<super::Digest>) -> super::Ru
 }
 
 #[test]
+fn wake_turns_fold_into_one_run_and_a_final_wake_failure_carries_the_totals() {
+    let usage = |n| super::Usage::from_parts(n, 0, 1, n, 0);
+    let mut first = grok_run(super::Outcome::answered(super::Answer::Captured), None);
+    first.session_id = Some("first".into());
+    first.text = "interim".into();
+    first.served = super::Served::new(["grok-a".to_string()], Some(0.5));
+    let mut run = super::GrokTurn {
+        out: first,
+        turns: 2,
+        usage: usage(10),
+    };
+    let mut wake = grok_run(super::Outcome::answered(super::Answer::Captured), None);
+    wake.session_id = Some("echoed".into());
+    wake.text = "final".into();
+    wake.served = super::Served::new(["grok-b".to_string()], None);
+    run.absorb(super::GrokTurn {
+        out: wake,
+        turns: 3,
+        usage: usage(5),
+    });
+    run.out.digest = Some(super::wake_failure(&mut run.out, "unverifiable".into()));
+    let out = run.finish();
+    assert_eq!(out.text, "final", "the wake's answer is the run's");
+    assert_eq!(out.session_id.as_deref(), Some("first"));
+    assert_eq!(out.served.model_label().as_deref(), Some("grok-a,grok-b"));
+    assert_eq!(out.served.cost_usd, Some(0.5));
+    assert!(out.outcome.failed(), "the wake failure fails the run");
+    let digest = out.digest.expect("the wake failure made a digest");
+    assert_eq!(digest.turns, 5);
+    assert_eq!(digest.usage.total_input, 10 + 1 + 5 + 1);
+    assert_eq!(digest.usage.cached_input, 2);
+}
+
+#[test]
 fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
     let mut run = grok_run(super::Outcome::answered(super::Answer::Captured), None);
     let digest = super::wake_failure(&mut run, "unread background results".to_string());
@@ -274,7 +305,7 @@ fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
         "verification cannot retract an answer"
     );
     assert_eq!(
-        digest.exit_code,
+        digest.exit.code(),
         Some(0),
         "the completed turn exited cleanly"
     );
@@ -293,40 +324,39 @@ fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
 
 #[test]
 fn review_verification_failure_preserves_provider_failure_and_usage() {
-    let mut last = super::status_digest(Some(&exited(7)));
+    let mut last = super::status_digest(Exit::Code(7));
     last.turns = 3;
-    last.usage.output_tokens = 42;
+    last.usage.output = 42;
     let mut run = grok_run(
         super::Outcome::no_answer().stated("cancelled".to_string()),
         Some(last),
     );
     let digest = super::wake_failure(&mut run, "cannot read update log".to_string());
     assert!(!run.outcome.has_answer());
-    assert_eq!(digest.exit_code, Some(7));
+    assert_eq!(digest.exit.code(), Some(7));
     assert_eq!(run.outcome.stated.as_deref(), Some("cancelled"));
     assert_eq!(
         run.outcome.unverified.as_deref(),
         Some("cannot read update log")
     );
     assert_eq!(digest.turns, 3);
-    assert_eq!(digest.usage.output_tokens, 42);
+    assert_eq!(digest.usage.output, 42);
     assert!(run.outcome.failed());
 }
 
 #[test]
 fn review_verification_failure_preserves_a_signal_after_an_answer() {
-    use std::os::unix::process::ExitStatusExt;
-    let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
+    let status = Exit::Signal(libc::SIGTERM);
     let answered = super::Outcome::answered(super::Answer::Captured);
     assert!(
         !answered.failed(),
         "post-answer process status alone is not a failed turn"
     );
-    let mut run = grok_run(answered, Some(super::status_digest(Some(&status))));
+    let mut run = grok_run(answered, Some(super::status_digest(status)));
     let digest = super::wake_failure(&mut run, "cannot verify results".to_string());
     assert!(run.outcome.has_answer());
-    assert_eq!(digest.exit_code, None);
-    assert_eq!(digest.signal.as_deref(), Some("SIGTERM"));
+    assert_eq!(digest.exit.code(), None);
+    assert_eq!(digest.exit.signal_name().as_deref(), Some("SIGTERM"));
     assert!(run.outcome.stated.is_none());
     assert!(run.outcome.failed());
 }

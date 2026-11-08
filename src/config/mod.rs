@@ -91,7 +91,44 @@ pub struct DefaultsConfig {
     /// that it wakes itself every few minutes and cannot stay silent - so it is
     /// deliberately tunable, and switchable off, in case a future codex changes
     /// cadence. codex-only; claude has no rollout to watch.
-    pub stall_timeout_secs: Option<u64>,
+    pub stall_timeout_secs: Option<StallTimeout>,
+}
+
+/// `[_defaults].stall_timeout_secs`, decoded where it is parsed: `0` means
+/// off, any other value a timeout of that many seconds. Absence is not `Off`
+/// (it leaves the codex adapter's own default in place), so the field holding
+/// this stays an `Option`, and a local `0` can still override a global value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(from = "u64")]
+pub enum StallTimeout {
+    Off,
+    After(std::num::NonZeroU64),
+}
+
+impl From<u64> for StallTimeout {
+    fn from(secs: u64) -> Self {
+        std::num::NonZeroU64::new(secs).map_or(Self::Off, Self::After)
+    }
+}
+
+impl StallTimeout {
+    /// The watchdog's form: `None` disables its stall branch.
+    pub fn grace(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Off => None,
+            Self::After(secs) => Some(std::time::Duration::from_secs(secs.get())),
+        }
+    }
+}
+
+/// Shown as the number the operator wrote, `0` for off.
+impl std::fmt::Display for StallTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("0"),
+            Self::After(secs) => write!(f, "{secs}"),
+        }
+    }
 }
 
 /// A named settings profile: optional model, effort, sandbox, and env overrides
@@ -211,7 +248,7 @@ pub struct ReviewConfig {
     /// Always the project's: an audit id identifies a project.
     pub audit: AuditConfig,
     pub providers: Option<Sourced<Vec<Provider>>>,
-    pub stall_timeout_secs: Option<Sourced<u64>>,
+    pub stall_timeout_secs: Option<Sourced<StallTimeout>>,
     /// provider -> profile name -> entry.
     pub profiles: BTreeMap<Provider, BTreeMap<String, ProfileEntry>>,
     pub hostname: String,
@@ -343,7 +380,7 @@ impl ReviewConfig {
         self.providers.as_ref().map(|s| s.value.as_slice())
     }
 
-    pub fn stall_timeout_secs(&self) -> Option<u64> {
+    pub fn stall_timeout(&self) -> Option<StallTimeout> {
         self.stall_timeout_secs.as_ref().map(|s| s.value)
     }
 

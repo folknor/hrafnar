@@ -1,13 +1,46 @@
 pub use super::codex::forensics::CodexForensics;
 use anyhow::Result;
 
-/// Token accounting summed across a run's `turn.completed` events (codex).
-#[derive(Default, Clone)]
+/// Token accounting for a run, in codex's convention: `total_input` counts
+/// every input token, the cached ones included, and `cached_input` is the
+/// cached part of it. Providers that report cache reads (and cache writes)
+/// separately go through `from_parts`, the one place that convention is
+/// rebuilt, so no mapper can double-count or drop a part.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct Usage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_output_tokens: u64,
+    pub total_input: u64,
+    pub cached_input: u64,
+    pub output: u64,
+    pub reasoning_output: u64,
+}
+
+impl Usage {
+    /// Build from separately reported parts: input that hit no cache, input
+    /// written to the cache, and input read from it. A provider that reports
+    /// no cache writes passes zero.
+    pub fn from_parts(
+        uncached_input: u64,
+        cache_creation: u64,
+        cache_read: u64,
+        output: u64,
+        reasoning_output: u64,
+    ) -> Self {
+        Self {
+            total_input: uncached_input + cache_creation + cache_read,
+            cached_input: cache_read,
+            output,
+            reasoning_output,
+        }
+    }
+}
+
+impl std::ops::AddAssign<&Usage> for Usage {
+    fn add_assign(&mut self, other: &Usage) {
+        self.total_input += other.total_input;
+        self.cached_input += other.cached_input;
+        self.output += other.output;
+        self.reasoning_output += other.reasoning_output;
+    }
 }
 
 /// The forensic record of a run: process status, counts, and what codex left
@@ -16,10 +49,12 @@ pub struct Usage {
 /// claude only when the process status is worth keeping.
 #[derive(Default)]
 pub struct Digest {
-    /// Process exit code (`None` if terminated by a signal or unknown).
-    pub exit_code: Option<i32>,
-    /// Signal name when the process was killed by one, else `None`.
-    pub signal: Option<String>,
+    /// How the provider process ended.
+    pub exit: crate::process::Exit,
+    /// The provider's own count, in its own unit: codex counts
+    /// `turn.completed` events, claude and grok report `num_turns` (API round
+    /// trips). Not comparable across providers, and not normalised: no
+    /// provider reports the other's unit.
     pub turns: u32,
     pub usage: Usage,
     /// Directory of the forensic bundle written for a suspicious run (stderr,
@@ -100,8 +135,8 @@ impl Digest {
     pub fn summary(&self, outcome: &super::Outcome) -> DigestSummary {
         use super::outcome::{Answer, EndedBy};
         DigestSummary {
-            exit_code: self.exit_code,
-            signal: self.signal.clone(),
+            exit_code: self.exit.code(),
+            signal: self.exit.signal_name(),
             captured: outcome.answer == Answer::Captured,
             recovered_from_transcript: outcome.answer == Answer::Recovered,
             turns: self.turns,
@@ -113,12 +148,12 @@ impl Digest {
                 .codex()
                 .and_then(|c| c.transcript.as_ref())
                 .map(|t| t.stream_error),
-            input_tokens: self.usage.input_tokens,
-            cached_input_tokens: self.usage.cached_input_tokens,
-            output_tokens: self.usage.output_tokens,
-            reasoning_output_tokens: self.usage.reasoning_output_tokens,
+            input_tokens: self.usage.total_input,
+            cached_input_tokens: self.usage.cached_input,
+            output_tokens: self.usage.output,
+            reasoning_output_tokens: self.usage.reasoning_output,
             incident_path: self.incident_path.clone(),
-            terminated_by_review: outcome.termination().map(str::to_string),
+            terminated_by_review: outcome.termination().map(ToString::to_string),
             quiet_secs: self.codex().and_then(|c| c.quiet_secs),
             last_rollout_event: self.codex().and_then(|c| c.last_rollout_event.clone()),
             turn_error: outcome.stated.clone(),
@@ -130,8 +165,8 @@ impl Digest {
     /// The facts the outcome lines are read against.
     pub fn status_facts(&self) -> super::outcome::StatusFacts<'_> {
         super::outcome::StatusFacts {
-            exit_code: self.exit_code,
-            signal: self.signal.as_deref(),
+            exit_code: self.exit.code(),
+            signaled: self.exit.is_signal(),
             quiet_secs: self.codex().and_then(|c| c.quiet_secs),
             last_event: self.codex().and_then(|c| c.last_rollout_event.as_deref()),
             task_complete: self
@@ -146,7 +181,9 @@ impl DigestSummary {
     pub fn status_facts(&self) -> super::outcome::StatusFacts<'_> {
         super::outcome::StatusFacts {
             exit_code: self.exit_code,
-            signal: self.signal.as_deref(),
+            // A row's recorded signal text, whatever it says, is observed
+            // status: rows are evidence, never re-decoded into a live Exit.
+            signaled: self.signal.is_some(),
             quiet_secs: self.quiet_secs,
             last_event: self.last_rollout_event.as_deref(),
             task_complete: self.task_complete,
@@ -221,10 +258,41 @@ pub struct ProviderResult {
 /// claude report it, from their result objects; empty for codex.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Served {
-    /// Every model that served a call in the run, sorted and comma-joined (one
-    /// in practice; a subagent on another model would add a second).
-    pub model: Option<String>,
+    /// Every model that served a call in the run (one in practice; a subagent
+    /// on another model would add a second). A set, so order and duplicates
+    /// are settled by construction; joined only when recorded (`model_label`).
+    models: std::collections::BTreeSet<String>,
     pub cost_usd: Option<f64>,
+}
+
+impl Served {
+    pub fn new(models: impl IntoIterator<Item = String>, cost_usd: Option<f64>) -> Self {
+        Self {
+            models: models.into_iter().collect(),
+            cost_usd,
+        }
+    }
+
+    /// The recorded form: sorted and comma-joined, `None` when none reported.
+    pub fn model_label(&self) -> Option<String> {
+        (!self.models.is_empty()).then(|| {
+            self.models
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+
+    /// Fold in a later invocation of the same run: models are a union; costs
+    /// sum where known, and an unknown cost does not erase a known one.
+    pub fn merge(&mut self, other: Served) {
+        self.models.extend(other.models);
+        self.cost_usd = match (self.cost_usd, other.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+    }
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -264,42 +332,26 @@ pub(super) fn result_served(stdout: &str) -> Served {
     let Ok(raw) = serde_json::from_str::<Raw>(stdout.trim()) else {
         return Served::default();
     };
-    let names: Vec<&str> = raw.model_usage.keys().map(String::as_str).collect();
-    Served {
-        model: (!names.is_empty()).then(|| names.join(",")),
-        cost_usd: raw.total_cost_usd,
-    }
+    Served::new(raw.model_usage.keys().cloned(), raw.total_cost_usd)
 }
 
 /// The process status of a grok or claude run, when it is worth keeping: a
 /// non-zero or unknown exit after an answer is still an answer (the outcome
 /// says so), but the status is the only sign something went wrong after the
 /// turn, so it is recorded. `None` for a clean exit.
-pub(super) fn answered_status_digest(status: Option<&std::process::ExitStatus>) -> Option<Digest> {
-    (!status.is_some_and(std::process::ExitStatus::success)).then(|| status_digest(status))
+pub(super) fn answered_status_digest(status: crate::process::Exit) -> Option<Digest> {
+    (!status.success()).then(|| status_digest(status))
 }
 
 /// A grok or claude run's observed process status as forensics. The *observed*
 /// status, never an assumed one: the exit code is what an operator reads to
-/// tell "the provider declined" from "the provider was killed", and `None`
+/// tell "the provider declined" from "the provider was killed", and `Unknown`
 /// means the keeper could not report it.
-pub(super) fn status_digest(status: Option<&std::process::ExitStatus>) -> Digest {
+pub(super) fn status_digest(status: crate::process::Exit) -> Digest {
     Digest {
-        exit_code: status.and_then(std::process::ExitStatus::code),
-        signal: status.and_then(signal_name),
+        exit: status,
         ..Digest::default()
     }
-}
-
-/// Signal name when a process was terminated by a signal, else `None`.
-pub(super) fn signal_name(status: &std::process::ExitStatus) -> Option<String> {
-    use std::os::unix::process::ExitStatusExt;
-    status.signal().map(|sig| match sig {
-        2 => "SIGINT".to_string(),
-        9 => "SIGKILL".to_string(),
-        15 => "SIGTERM".to_string(),
-        other => format!("signal {other}"),
-    })
 }
 
 #[cfg(test)]

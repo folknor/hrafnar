@@ -197,7 +197,7 @@ pub async fn run_claude(
     let interrupt_requested = ended.interrupt_requested;
     let stopped_by_signal = ended.stopped_by_signal;
     let leftovers = ended.leftovers;
-    // `None` when the keeper could not report it. The run still goes on to
+    // `Unknown` when the keeper could not report it. The run still goes on to
     // what claude printed - its answer and session survive an unknown
     // teardown, which the ledger already fails the command for.
     let status = ended.status;
@@ -239,9 +239,9 @@ pub async fn run_claude(
     // clean exit records no digest, as for grok.
     let forensics = |outcome: &Outcome| {
         if outcome.is_clean() {
-            answered_status_digest(status.as_ref()).map(with_usage)
+            answered_status_digest(status).map(with_usage)
         } else {
-            Some(with_usage(status_digest(status.as_ref())))
+            Some(with_usage(status_digest(status)))
         }
     };
     // An interrupt explains the missing answer, so claude's own complaint

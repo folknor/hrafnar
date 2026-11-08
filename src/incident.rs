@@ -40,8 +40,7 @@ pub struct Incident<'a> {
     /// The prompt piped on the child's stdin - part of the invocation, so a
     /// replay is impossible without it.
     pub prompt: &'a str,
-    pub exit_code: Option<i32>,
-    pub signal: Option<&'a str>,
+    pub exit: crate::process::Exit,
     /// `Some` if writing the prompt to the child's stdin failed (e.g. a broken
     /// pipe because the child exited before consuming it).
     pub stdin_write_error: Option<&'a str>,
@@ -269,14 +268,14 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         command,
         cwd: inc.process.cwd.to_string_lossy().into_owned(),
         prompt_bytes: inc.prompt.len(),
-        exit_code: inc.exit_code,
-        signal: inc.signal.map(str::to_string),
+        exit_code: inc.exit.code(),
+        signal: inc.exit.signal_name(),
         stdin_write_error: inc.stdin_write_error.map(str::to_string),
         duration_ms: inc.duration_ms,
         captured: inc.outcome.answer == crate::provider::Answer::Captured,
         recovered_from_transcript: inc.outcome.answer == crate::provider::Answer::Recovered,
         turns: inc.turns,
-        terminated_by_review: inc.outcome.termination().map(str::to_string),
+        terminated_by_review: inc.outcome.termination().map(ToString::to_string),
         quiet_secs: codex.and_then(|c| c.quiet_secs),
         last_rollout_event: codex.and_then(|c| c.last_rollout_event).map(str::to_string),
         turn_error: inc.outcome.stated.clone(),
@@ -750,8 +749,7 @@ mod tests {
             provider_version: Some("stub version".into()),
             session_id: Some("session"),
             prompt: "request",
-            exit_code: Some(1),
-            signal: None,
+            exit: crate::process::Exit::Code(1),
             stdin_write_error: None,
             stdout: b"stream",
             stderr: b"error",

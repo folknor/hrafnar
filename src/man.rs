@@ -84,7 +84,7 @@ const TOPICS: &[Topic] = &[
 /// An unknown topic is an error on stderr, index included, with nothing on
 /// stdout: a caller capturing stdout must not mistake the index for the
 /// document it asked for.
-pub fn run(topic: Option<&str>) -> i32 {
+pub fn run(topic: Option<&str>) -> crate::exit::CommandExit {
     let Some(name) = topic else {
         return write_stdout(&index());
     };
@@ -92,7 +92,7 @@ pub fn run(topic: Option<&str>) -> i32 {
         Some(t) => write_stdout(t.content),
         None => {
             eprintln!("error: no man topic '{name}'\n\n{}", index());
-            1
+            crate::exit::CommandExit::Failed
         }
     }
 }
@@ -108,14 +108,14 @@ fn index() -> String {
 
 /// A closed pipe (`| head`) is a clean exit; any other write failure fails the
 /// command, since the reader did not get the document.
-fn write_stdout(text: &str) -> i32 {
+fn write_stdout(text: &str) -> crate::exit::CommandExit {
     let mut out = std::io::stdout().lock();
     match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-        Ok(()) => 0,
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => 0,
+        Ok(()) => crate::exit::CommandExit::Success,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => crate::exit::CommandExit::Success,
         Err(e) => {
             eprintln!("error: writing the topic failed: {e}");
-            1
+            crate::exit::CommandExit::Failed
         }
     }
 }

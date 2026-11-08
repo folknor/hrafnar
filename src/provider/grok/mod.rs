@@ -126,7 +126,7 @@ pub(super) async fn run_grok(
     // through the wakes, each kept current with the turn's keeper. One lease
     // for the whole run, closed when this function returns however it does.
     let lease = Lease::known(session_id, Provider::Grok, project_root, data_root);
-    let (first, first_turns, first_usage) = run_grok_turn(
+    let first = run_grok_turn(
         launch,
         sandbox,
         prepared,
@@ -139,6 +139,7 @@ pub(super) async fn run_grok(
     // A fresh run reports its new id (grok's echo, else the one we minted); a
     // resume was given it. So this is always known.
     let sid = first
+        .out
         .session_id
         .clone()
         .unwrap_or_else(|| session_id.to_string());
@@ -146,10 +147,7 @@ pub(super) async fn run_grok(
         lease.alias(&sid);
     }
     let grok = &prepared.grok;
-    let mut out = first;
-    let mut cost = out.served.cost_usd;
-    let mut turns = first_turns;
-    let mut usage = first_usage;
+    let mut run = first;
     let mut wakes = 0;
     loop {
         // Fail closed: a run whose results cannot be checked is not a run
@@ -163,7 +161,7 @@ pub(super) async fn run_grok(
             Err(e) => {
                 let reason = format!("could not verify grok's background results: {e}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure(&mut out, reason));
+                run.out.digest = Some(wake_failure(&mut run.out, reason));
                 break;
             }
         };
@@ -172,7 +170,7 @@ pub(super) async fn run_grok(
         }
         // A failed turn is not fixed by waking, whether grok stated a reason or
         // review found its stop reason missing. The outcome already fails it.
-        if out.outcome.explained_failure() {
+        if run.out.outcome.explained_failure() {
             break;
         }
         // A signal can arrive after this turn but before we wake it. Do not
@@ -182,7 +180,7 @@ pub(super) async fn run_grok(
         if runtime.lifecycle.stop_requested() {
             let reason = "grok wake-up not launched: review was signalled to stop".to_string();
             eprintln!("grok: {reason}");
-            out.digest = Some(wake_failure(&mut out, reason));
+            run.out.digest = Some(wake_failure(&mut run.out, reason));
             break;
         }
         let names: Vec<String> = pending.iter().map(state::Unread::id).collect();
@@ -192,7 +190,7 @@ pub(super) async fn run_grok(
                 names.join(", ")
             );
             eprintln!("grok: {reason} - giving up on session {sid}");
-            out.digest = Some(wake_failure(&mut out, reason));
+            run.out.digest = Some(wake_failure(&mut run.out, reason));
             break;
         }
         wakes += 1;
@@ -208,8 +206,8 @@ pub(super) async fn run_grok(
         let wake = match SessionId::parse(&sid) {
             Ok(id) => SessionStart::Resume(id),
             Err(e) => {
-                out.digest = Some(wake_failure(
-                    &mut out,
+                run.out.digest = Some(wake_failure(
+                    &mut run.out,
                     format!("invalid wake session id: {e}"),
                 ));
                 break;
@@ -220,7 +218,7 @@ pub(super) async fn run_grok(
             prompt,
             ..launch.clone()
         };
-        let (next, next_turns, next_usage) = match run_grok_turn(
+        let next = match run_grok_turn(
             &wake_launch,
             sandbox,
             prepared,
@@ -237,38 +235,13 @@ pub(super) async fn run_grok(
                 // on `Err`, which would cost the sidecar row and any resume.
                 let reason = format!("wake-up turn for session {sid} failed: {e:#}");
                 eprintln!("grok: {reason}");
-                out.digest = Some(wake_failure(&mut out, reason));
+                run.out.digest = Some(wake_failure(&mut run.out, reason));
                 break;
             }
         };
-        cost = match (cost, next.served.cost_usd) {
-            (Some(a), Some(b)) => Some(a + b),
-            (a, b) => a.or(b),
-        };
-        turns += next_turns;
-        usage.input_tokens += next_usage.input_tokens;
-        usage.cached_input_tokens += next_usage.cached_input_tokens;
-        usage.output_tokens += next_usage.output_tokens;
-        usage.reasoning_output_tokens += next_usage.reasoning_output_tokens;
-        // Every turn's leftovers stay on the run, whichever turn answers.
-        let mut next = next;
-        let mut leftovers = std::mem::take(&mut out.leftovers);
-        leftovers.merge(std::mem::take(&mut next.leftovers));
-        out = RunOutput {
-            // The wake turn's report is the run's answer; the id stays the
-            // first turn's (a wake resumes that same session).
-            session_id: out.session_id,
-            leftovers,
-            ..next
-        };
+        run.absorb(next);
     }
-    out.served.cost_usd = cost;
-    // Whatever digest the run ends with describes the whole run, not its last
-    // grok process.
-    if let Some(d) = out.digest.as_mut() {
-        d.turns = turns;
-        d.usage = usage;
-    }
+    let mut out = run.finish();
     if wakes > 0 {
         out.text = format!(
             "(grok woken {wakes} time(s) to read background results it had not waited for)\n{}",
@@ -286,7 +259,51 @@ fn wake_failure(run: &mut RunOutput, reason: String) -> Digest {
     run.outcome.unverified = Some(reason);
     run.digest
         .take()
-        .unwrap_or_else(|| status_digest(Some(&std::process::ExitStatus::default())))
+        .unwrap_or_else(|| status_digest(crate::process::Exit::Code(0)))
+}
+
+/// One grok turn's output with its counts, which a clean answer carries no
+/// digest for, and the running total over a run's wake turns.
+struct GrokTurn {
+    out: RunOutput,
+    turns: u32,
+    usage: Usage,
+}
+
+impl GrokTurn {
+    /// Fold in the next wake turn of the *same* run. Sequential-continuation
+    /// rules, which is why this is grok's and not a general `RunOutput`
+    /// operation (a fan-out or an automatic recovery has other identity and
+    /// outcome rules): the wake's text, outcome and digest replace the
+    /// earlier turn's whole - an outcome is never assembled from two turns -
+    /// the session id stays the first turn's (a wake resumes that session),
+    /// counts and usage sum, served models union, costs sum where known, and
+    /// every turn's leftovers stay on the run.
+    fn absorb(&mut self, next: GrokTurn) {
+        self.turns += next.turns;
+        self.usage += &next.usage;
+        let mut next_out = next.out;
+        let mut served = std::mem::take(&mut self.out.served);
+        served.merge(std::mem::take(&mut next_out.served));
+        let mut leftovers = std::mem::take(&mut self.out.leftovers);
+        leftovers.merge(std::mem::take(&mut next_out.leftovers));
+        self.out = RunOutput {
+            session_id: self.out.session_id.take(),
+            served,
+            leftovers,
+            ..next_out
+        };
+    }
+
+    /// The run's output. Whatever digest it ends with, including one a wake
+    /// failure created, describes the whole run, not its last grok process.
+    fn finish(mut self) -> RunOutput {
+        if let Some(d) = self.out.digest.as_mut() {
+            d.turns = self.turns;
+            d.usage = self.usage;
+        }
+        self.out
+    }
 }
 
 /// One grok process: a single headless turn.
@@ -300,7 +317,7 @@ async fn run_grok_turn(
     launched: Option<LaunchSignal>,
     runtime: &ProviderRuntime,
     lease: &Lease,
-) -> Result<(RunOutput, u32, Usage)> {
+) -> Result<GrokTurn> {
     let grok = &prepared.grok;
     let session = &launch.start;
     let selection = &launch.settings.selection;
@@ -448,7 +465,7 @@ async fn run_grok_turn(
     run.wait(std::future::pending::<()>()).await;
     let ended = run.finish().await;
     let leftovers = ended.leftovers;
-    // `None` when the keeper could not report it; what grok printed still
+    // `Unknown` when the keeper could not report it; what grok printed still
     // stands, and the ledger fails the command for the unknown teardown.
     let status = ended.status;
     let stdout_buf = collect_reader(
@@ -502,7 +519,7 @@ async fn run_grok_turn(
             // still a real answer, but the status is worth surfacing rather
             // than discarding - it is the only sign that something went wrong
             // after the turn finished.
-            digest: answered_status_digest(status.as_ref()).map(with_usage),
+            digest: answered_status_digest(status).map(with_usage),
         },
         GrokOutcome::NoAnswer {
             reason,
@@ -530,7 +547,7 @@ async fn run_grok_turn(
                 outcome,
                 session_id: keep_id(session_id),
                 codex_home: None,
-                digest: Some(with_usage(status_digest(status.as_ref()))),
+                digest: Some(with_usage(status_digest(status))),
                 served,
                 leftovers,
             }
@@ -538,7 +555,11 @@ async fn run_grok_turn(
     };
     // Turn and token counts go back separately: a clean answer carries no
     // digest, and `run_grok` needs every turn's counts to describe the run.
-    Ok((run, turns, usage))
+    Ok(GrokTurn {
+        out: run,
+        turns,
+        usage,
+    })
 }
 
 /// Extend grok's bare stop reason with what its event log and folder trust
@@ -580,12 +601,14 @@ fn grok_usage(stdout: &str) -> (u32, Usage) {
     let u = raw.usage;
     (
         raw.num_turns,
-        Usage {
-            input_tokens: u.input_tokens + u.cache_read_input_tokens,
-            cached_input_tokens: u.cache_read_input_tokens,
-            output_tokens: u.output_tokens,
-            reasoning_output_tokens: u.reasoning_tokens,
-        },
+        // Grok reports no cache writes; nothing is inferred for them.
+        Usage::from_parts(
+            u.input_tokens,
+            0,
+            u.cache_read_input_tokens,
+            u.output_tokens,
+            u.reasoning_tokens,
+        ),
     )
 }
 

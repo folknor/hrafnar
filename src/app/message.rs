@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 
-use super::{exit_status, format_runtime, print_left_running, run_failed, selected_root};
+use super::{format_runtime, print_left_running, run_failed, selected_root};
 // Interrupt remains a separate verb owner; message composes its signalling
 // and wording without duplicating it or moving storage policy into the app.
 use crate::{
@@ -139,7 +139,7 @@ pub(super) async fn run_message(
     selector: Option<&str>,
     started: std::time::Instant,
     lifecycle: &crate::supervisor::Lifecycle,
-) -> Result<()> {
+) -> Result<crate::exit::CommandExit> {
     // Reject unsafe executable identities before locks or interruption. Rows
     // remain permissive historical evidence and are not changed on disk.
     let validated_id = provider::SessionId::parse(session_id)?;
@@ -178,7 +178,7 @@ pub(super) async fn run_message(
         eprintln!("session: {session_id} (turn in flight, not yet recorded)");
         eprintln!("project: {}", target_root.display());
         println!("{instructions}");
-        return Ok(());
+        return Ok(crate::exit::CommandExit::Success);
     }
     let expected = (target_root, target_cfg.audit.id);
     if let Some(marker) = marker.filter(|_| !dry_run) {
@@ -236,7 +236,7 @@ pub(super) async fn run_message(
         eprintln!("session: {session_id}");
         eprintln!("archetype: {archetype}");
         println!("{stdin_instructions}");
-        return Ok(());
+        return Ok(crate::exit::CommandExit::Success);
     }
 
     if !provider::is_available(provider_name) {
@@ -248,7 +248,7 @@ pub(super) async fn run_message(
     // still honoured.
     let provider_runtime = provider::ProviderRuntime::from_config(
         lifecycle.clone(),
-        cfg.stall_timeout_secs(),
+        cfg.stall_timeout(),
         cfg.audit.private,
     );
 
@@ -419,10 +419,10 @@ pub(super) async fn run_message(
     // incident survive), but it is a failure for exit-code purposes - exiting 0
     // on a wedged run lies to scripts and CI, exactly as it did on the fan-out
     // path before this was fixed there. Anything left running outranks it.
-    if let Some(code) = exit_status(run_failed(&result), left_running) {
-        std::process::exit(code);
-    }
-    Ok(())
+    Ok(crate::exit::CommandExit::of_runs(
+        run_failed(&result),
+        left_running,
+    ))
 }
 
 #[cfg(test)]

@@ -33,21 +33,84 @@ pub enum Answer {
 }
 
 /// Whether `review` ended the provider process rather than letting it exit.
+/// Interrupted versus killed is policy (an answer wins over an interrupt);
+/// the `Termination` is the cause, and is never used to infer which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndedBy {
     Natural,
     /// An interrupt request (`review interrupt`, `review message`, or a signal
-    /// to `review`) ended a turn that had no answer. The reason says which.
-    Interrupted(String),
+    /// to `review`) ended a turn that had no answer. The cause says which.
+    Interrupted(Termination),
     /// `review` killed the process for its own reason (the codex watchdog).
-    Killed(String),
+    Killed(Termination),
 }
 
-/// Why `review` ended a run whose interrupt came from `review interrupt` or
-/// `review message`.
-pub const OPERATOR_INTERRUPT: &str = "operator interrupt (`review interrupt`)";
-/// Why `review` ended a run when `review` itself was signalled.
-pub const SIGNAL_STOP: &str = "review was signalled to stop";
+/// Why `review` ended a provider process. Persisted as its `Display` text in
+/// `terminated_by_review` (the row schema is a flat string, and stays one), so
+/// the text of each cause is fixed: rows and greps depend on it exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Termination {
+    /// `review` itself was signalled to stop.
+    Signal,
+    /// `review interrupt` or `review message`.
+    OperatorInterrupt,
+    Watchdog(WatchdogTermination),
+    /// A persisted reason that is not one of the canonical texts, kept
+    /// verbatim: re-rendering history must not rewrite what it said.
+    Recorded(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogTermination {
+    /// The answer was on disk and the process would not exit.
+    Stranded,
+    /// No answer, and observed progress stayed unchanged this long.
+    Stalled { quiet_secs: u64 },
+}
+
+const SIGNAL_TEXT: &str = "review was signalled to stop";
+const OPERATOR_TEXT: &str = "operator interrupt (`review interrupt`)";
+const STRANDED_TEXT: &str = "watchdog: stranded completion";
+
+impl std::fmt::Display for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Signal => f.write_str(SIGNAL_TEXT),
+            Self::OperatorInterrupt => f.write_str(OPERATOR_TEXT),
+            Self::Watchdog(WatchdogTermination::Stranded) => f.write_str(STRANDED_TEXT),
+            // Named a stall *timeout* on purpose: it is one, and saying so
+            // keeps a future codex cadence change diagnosable.
+            Self::Watchdog(WatchdogTermination::Stalled { quiet_secs }) => {
+                write!(f, "watchdog: stall timeout ({quiet_secs}s silent)")
+            }
+            Self::Recorded(text) => f.write_str(text),
+        }
+    }
+}
+
+impl Termination {
+    /// Decode a persisted reason. Only an exact canonical text maps to a
+    /// cause; anything else is kept as `Recorded`, so a historical string
+    /// that merely resembles a cause is never re-rendered differently.
+    pub fn parse(text: &str) -> Self {
+        let stalled = text
+            .strip_prefix("watchdog: stall timeout (")
+            .and_then(|rest| rest.strip_suffix("s silent)"))
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .map(|quiet_secs| Self::Watchdog(WatchdogTermination::Stalled { quiet_secs }));
+        match text {
+            SIGNAL_TEXT => Self::Signal,
+            OPERATOR_TEXT => Self::OperatorInterrupt,
+            STRANDED_TEXT => Self::Watchdog(WatchdogTermination::Stranded),
+            _ => match stalled {
+                // Exactness: the parsed form must render back to the text.
+                Some(t) if t.to_string() == text => t,
+                _ => Self::Recorded(text.to_string()),
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
@@ -97,16 +160,13 @@ impl Outcome {
         mut self,
         interrupt_requested: bool,
         stopped_by_signal: bool,
-        killed: Option<String>,
+        killed: Option<Termination>,
     ) -> Self {
         self.ended_by = if interrupt_requested && !self.has_answer() {
-            EndedBy::Interrupted(killed.unwrap_or_else(|| {
-                if stopped_by_signal {
-                    SIGNAL_STOP
-                } else {
-                    OPERATOR_INTERRUPT
-                }
-                .to_string()
+            EndedBy::Interrupted(killed.unwrap_or(if stopped_by_signal {
+                Termination::Signal
+            } else {
+                Termination::OperatorInterrupt
             }))
         } else {
             match killed {
@@ -145,7 +205,7 @@ impl Outcome {
     }
 
     /// Why `review` ended the process, if it did.
-    pub fn termination(&self) -> Option<&str> {
+    pub fn termination(&self) -> Option<&Termination> {
         match &self.ended_by {
             EndedBy::Natural => None,
             EndedBy::Interrupted(why) | EndedBy::Killed(why) => Some(why),
@@ -181,8 +241,11 @@ impl Outcome {
             Answer::None
         };
         let ended_by = match (d.interrupted, d.terminated_by_review.clone()) {
-            (true, why) => EndedBy::Interrupted(why.unwrap_or_else(|| OPERATOR_INTERRUPT.into())),
-            (false, Some(why)) => EndedBy::Killed(why),
+            (true, why) => EndedBy::Interrupted(
+                why.as_deref()
+                    .map_or(Termination::OperatorInterrupt, Termination::parse),
+            ),
+            (false, Some(why)) => EndedBy::Killed(Termination::parse(&why)),
             (false, None) => EndedBy::Natural,
         };
         Self {
@@ -223,7 +286,7 @@ impl Outcome {
         if let Some(msg) = &self.unverified {
             out.push(format!("review failed: {msg}"));
         }
-        if self.has_answer() && f.exit_code.is_none() && f.signal.is_none() {
+        if self.has_answer() && f.exit_code.is_none() && !f.signaled {
             out.push("note: answer captured; process exit status could not be confirmed".into());
         }
         // Before the notes below: it reframes the exit code and signal, which
@@ -256,7 +319,7 @@ impl Outcome {
                 } else if self.termination().is_some() {
                     "note: review terminated the run; the text below is whatever it \
                      had produced by then"
-                } else if f.exit_code != Some(0) || f.signal.is_some() {
+                } else if f.exit_code != Some(0) || f.signaled {
                     "note: run died without a final answer; the text below is the last \
                      interim note, not a conclusion"
                 } else if f.task_complete == Some(true) {
@@ -274,7 +337,8 @@ impl Outcome {
 /// The forensic facts the outcome lines are read against.
 pub struct StatusFacts<'a> {
     pub exit_code: Option<i32>,
-    pub signal: Option<&'a str>,
+    /// A signal was observed (live) or recorded (a row, whatever its text).
+    pub signaled: bool,
     pub quiet_secs: Option<u64>,
     pub last_event: Option<&'a str>,
     pub task_complete: Option<bool>,
@@ -307,13 +371,55 @@ mod tests {
 
     #[test]
     fn an_answer_wins_over_an_interrupt_but_keeps_a_kill() {
-        let o = Outcome::answered(Answer::Recovered).ended(true, false, Some("watchdog".into()));
+        let stranded = Termination::Watchdog(WatchdogTermination::Stranded);
+        let o = Outcome::answered(Answer::Recovered).ended(true, false, Some(stranded.clone()));
         assert!(!o.interrupted());
-        assert_eq!(o.ended_by, EndedBy::Killed("watchdog".into()));
-        let o = Outcome::no_answer().ended(true, false, Some("watchdog".into()));
-        assert_eq!(o.ended_by, EndedBy::Interrupted("watchdog".into()));
+        assert_eq!(o.ended_by, EndedBy::Killed(stranded.clone()));
+        let o = Outcome::no_answer().ended(true, false, Some(stranded.clone()));
+        assert_eq!(o.ended_by, EndedBy::Interrupted(stranded));
         let o = Outcome::no_answer().ended(true, true, None);
-        assert_eq!(o.termination(), Some(SIGNAL_STOP));
+        assert_eq!(o.termination(), Some(&Termination::Signal));
+    }
+
+    #[test]
+    fn terminations_render_and_parse_their_canonical_texts_exactly() {
+        for t in [
+            Termination::Signal,
+            Termination::OperatorInterrupt,
+            Termination::Watchdog(WatchdogTermination::Stranded),
+            Termination::Watchdog(WatchdogTermination::Stalled { quiet_secs: 181 }),
+        ] {
+            assert_eq!(Termination::parse(&t.to_string()), t);
+        }
+        assert_eq!(
+            Termination::Watchdog(WatchdogTermination::Stalled { quiet_secs: 5 }).to_string(),
+            "watchdog: stall timeout (5s silent)"
+        );
+        // Near misses stay verbatim rather than being normalised.
+        for text in [
+            "watchdog: stall timeout (05s silent)",
+            "watchdog: stall timeout (+5s silent)",
+            "watchdog",
+            "watchdog: stranded completion ",
+        ] {
+            assert_eq!(Termination::parse(text), Termination::Recorded(text.into()));
+            assert_eq!(Termination::parse(text).to_string(), text);
+        }
+    }
+
+    #[test]
+    fn a_recorded_signal_text_counts_as_observed_status_whatever_it_says() {
+        let row: DigestSummary = serde_json::from_value(serde_json::json!({
+            "exit_code": null, "signal": "SIGWEIRD", "captured": true, "turns": 1,
+            "input_tokens": 0, "cached_input_tokens": 0,
+            "output_tokens": 0, "reasoning_output_tokens": 0
+        }))
+        .expect("row");
+        let lines = Outcome::interpret_summary(&row).lines(&row.status_facts());
+        assert!(
+            !lines.iter().any(|l| l.contains("could not be confirmed")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -348,7 +454,14 @@ mod tests {
     #[test]
     fn summaries_round_trip_their_facts() {
         for o in [
-            Outcome::answered(Answer::Recovered).ended(false, false, Some("watchdog".into())),
+            Outcome::answered(Answer::Recovered).ended(
+                false,
+                false,
+                Some(Termination::Watchdog(WatchdogTermination::Stalled {
+                    quiet_secs: 600,
+                })),
+            ),
+            Outcome::no_answer().ended(true, false, Some(Termination::Recorded("watchdog".into()))),
             Outcome::no_answer().ended(true, true, None),
             Outcome::no_answer()
                 .stated("x".into())

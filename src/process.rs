@@ -3,6 +3,62 @@
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+/// How a reaped process ended, decoded once from its raw wait status. The
+/// keeper's wire keeps the raw `i32` (a keeper can be a different build than
+/// the `review` reading it, when the binary is replaced mid-run, and the raw
+/// status is the most stable encoding); this is what `review` reasons over.
+/// Forensics only: no runner classifies a turn by it, since opencode exits 130
+/// on a clean SIGINT and maki 0 on a failed turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+    /// Never ran, could not be reaped, or the keeper's report did not arrive.
+    #[default]
+    Unknown,
+}
+
+impl Exit {
+    pub fn from_wait_status(raw: i32) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(raw);
+        match (status.code(), status.signal()) {
+            (Some(code), _) => Self::Code(code),
+            (None, Some(sig)) => Self::Signal(sig),
+            (None, None) => Self::Unknown,
+        }
+    }
+
+    pub fn code(self) -> Option<i32> {
+        match self {
+            Self::Code(code) => Some(code),
+            _ => None,
+        }
+    }
+
+    pub fn success(self) -> bool {
+        self == Self::Code(0)
+    }
+
+    pub fn is_signal(self) -> bool {
+        matches!(self, Self::Signal(_))
+    }
+
+    /// The signal's name as the logs have always spelled it (`SIGINT`,
+    /// `SIGKILL`, `SIGTERM`, else `signal N`).
+    pub fn signal_name(self) -> Option<String> {
+        match self {
+            Self::Signal(sig) => Some(match sig {
+                libc::SIGINT => "SIGINT".to_string(),
+                libc::SIGKILL => "SIGKILL".to_string(),
+                libc::SIGTERM => "SIGTERM".to_string(),
+                other => format!("signal {other}"),
+            }),
+            _ => None,
+        }
+    }
+}
+
 fn last_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }
@@ -108,6 +164,21 @@ mod tests {
         assert!(!identity_alive(pid, Some(start + 1)));
         assert!(identity_alive(pid, None));
         assert!(!identity_alive(u32::MAX, None));
+    }
+
+    #[test]
+    fn wait_statuses_decode_into_one_exit() {
+        assert_eq!(Exit::from_wait_status(7 << 8), Exit::Code(7));
+        assert_eq!(
+            Exit::from_wait_status(libc::SIGTERM),
+            Exit::Signal(libc::SIGTERM)
+        );
+        assert_eq!(
+            Exit::Signal(libc::SIGKILL).signal_name().as_deref(),
+            Some("SIGKILL")
+        );
+        assert_eq!(Exit::Signal(6).signal_name().as_deref(), Some("signal 6"));
+        assert!(Exit::Code(0).success() && !Exit::Unknown.success());
     }
 
     #[test]

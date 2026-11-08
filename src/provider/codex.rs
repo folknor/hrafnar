@@ -492,7 +492,7 @@ pub async fn run_codex_json(
     run.launch(launched).await?;
 
     // Records that *we* ended the run, and why. See `Outcome::ended`.
-    let mut terminated_by_review: Option<String> = None;
+    let mut terminated_by_review: Option<crate::provider::Termination> = None;
     // Forensics from the watchdog verdict, carried onto the digest and into the
     // incident bundle.
     let mut watchdog_answer: Option<String> = None;
@@ -532,15 +532,7 @@ pub async fn run_codex_json(
         }
     };
     if let Some(verdict) = run.wait(watchdog).await {
-        terminated_by_review = Some(match verdict.kind {
-            crate::watchdog::Kind::Stranded => "watchdog: stranded completion".to_string(),
-            // Named a stall *timeout* on purpose: it is one, and saying so
-            // keeps a future codex cadence change diagnosable instead of
-            // mysterious.
-            crate::watchdog::Kind::Stalled => {
-                format!("watchdog: stall timeout ({}s silent)", verdict.quiet_secs)
-            }
-        });
+        terminated_by_review = Some(verdict.termination());
         watchdog_answer = verdict.final_answer;
         quiet_secs = Some(verdict.quiet_secs);
         last_rollout_event = verdict.last_event.clone();
@@ -630,15 +622,13 @@ pub async fn run_codex_json(
         .or(parsed_session_id)
         .or(watched_session_id);
 
-    let exit_code = status.and_then(|s| s.code());
-    let signal = status.as_ref().and_then(signal_name);
     // Only pay for transcript forensics when the run looks wrong; a clean
     // captured run needs no post-mortem. Look under the run's effective
     // CODEX_HOME (a profile env override) so a custom codex home is searched.
     // Read before choosing the final message: codex routinely finishes the turn
     // on disk (task_complete) yet exits non-zero and truncates both the `--json`
     // stream and the `-o` file, so the rollout is the authoritative record.
-    let suspicious = !captured || exit_code != Some(0) || signal.is_some();
+    let suspicious = !captured || !status.success();
     // An untrustworthy baseline must not degrade to "scan everything": scope to
     // a point past the end of the file so nothing is attributed to this run.
     // `u64::MAX` is exact for that purpose - `slice_from_offset` yields an empty
@@ -743,8 +733,7 @@ pub async fn run_codex_json(
             process: &spec,
             session_id: session_id.as_deref(),
             prompt,
-            exit_code,
-            signal: signal.as_deref(),
+            exit: status,
             stdin_write_error: stdin_write_error.as_deref(),
             stdout: &stdout_buf,
             stderr: &stderr_buf,
@@ -798,8 +787,7 @@ pub async fn run_codex_json(
     };
 
     let digest = Digest {
-        exit_code,
-        signal,
+        exit: status,
         turns,
         usage,
         incident_path,

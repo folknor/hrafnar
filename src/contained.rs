@@ -6,7 +6,6 @@ use crate::supervisor::{Control, Lifecycle};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -328,11 +327,19 @@ pub fn spawn(
     })
 }
 
+/// The one decode of the keeper's raw wait status, for both report branches.
+fn decode_status(done: Option<&keeper::Outcome>) -> crate::process::Exit {
+    done.and_then(|o| o.status).map_or(
+        crate::process::Exit::Unknown,
+        crate::process::Exit::from_wait_status,
+    )
+}
+
 /// How a contained invocation ended.
 pub struct Finished {
-    /// The provider's own exit status. `None` when it never ran, or its
+    /// The provider's own exit status. `Unknown` when it never ran, or its
     /// keeper's report did not arrive.
-    pub status: Option<std::process::ExitStatus>,
+    pub status: crate::process::Exit,
     pub leftovers: Leftovers,
 }
 
@@ -440,7 +447,7 @@ impl Contained {
         let finished = match (&events.done, &events.malformed, keeper_ok) {
             (Some(outcome), None, true) if outcome.survivors == events.survivors.len() => {
                 Finished {
-                    status: outcome.status.map(std::process::ExitStatus::from_raw),
+                    status: decode_status(Some(outcome)),
                     leftovers: Leftovers {
                         killed: outcome.killed.clone(),
                         killed_dropped: outcome.killed_dropped,
@@ -465,10 +472,7 @@ impl Contained {
                 // Survivors already named are kept beside the unknown: what
                 // the keeper knew is still true, it is just not all of it.
                 Finished {
-                    status: done
-                        .as_ref()
-                        .and_then(|o| o.status)
-                        .map(std::process::ExitStatus::from_raw),
+                    status: decode_status(done.as_ref()),
                     leftovers: Leftovers {
                         killed: done.as_ref().map(|o| o.killed.clone()).unwrap_or_default(),
                         killed_dropped: done.as_ref().map_or(0, |o| o.killed_dropped),

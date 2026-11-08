@@ -13,8 +13,7 @@ pub(in crate::provider::grok) enum Unread {
     Finished {
         id: WorkId,
         command: String,
-        exit_code: Option<i64>,
-        signal: Option<String>,
+        status: TaskStatus,
         /// Grok's captured output (its own snapshot, possibly truncated).
         output: String,
         truncated: bool,
@@ -35,6 +34,37 @@ pub(in crate::provider::grok) enum Unread {
         status: Option<String>,
         error: Option<String>,
     },
+}
+
+/// How a grok background command ended, as grok's task snapshot reports it.
+/// Grok's protocol evidence, not a native wait status: its code is an `i64`
+/// and its signal free text. Decoded once, with the exit code winning when a
+/// snapshot carries both, so no reader meets the both-set state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::provider::grok) enum TaskStatus {
+    Code(i64),
+    Signal(String),
+    Unknown,
+}
+
+impl TaskStatus {
+    fn decode(exit_code: Option<i64>, signal: Option<&str>) -> Self {
+        match (exit_code, signal) {
+            (Some(code), _) => Self::Code(code),
+            (None, Some(sig)) => Self::Signal(sig.to_string()),
+            (None, None) => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(c) => write!(f, "exit code {c}"),
+            Self::Signal(s) => write!(f, "killed by {s}"),
+            Self::Unknown => f.write_str("unknown exit status"),
+        }
+    }
 }
 
 /// Identity of one kind of grok background work. Keeping the kind separate
@@ -152,8 +182,10 @@ pub(in crate::provider::grok) fn unread_background_results(
                     let item = Unread::Finished {
                         id: WorkId::Task(id.to_string()),
                         command: snap["command"].as_str().unwrap_or_default().to_string(),
-                        exit_code: snap["exit_code"].as_i64(),
-                        signal: snap["signal"].as_str().map(str::to_string),
+                        status: TaskStatus::decode(
+                            snap["exit_code"].as_i64(),
+                            snap["signal"].as_str(),
+                        ),
                         output: snap["output"].as_str().unwrap_or_default().to_string(),
                         truncated: snap["truncated"].as_bool().unwrap_or(false),
                         output_file: snap["output_file"].as_str().map(str::to_string),
@@ -260,17 +292,11 @@ pub(in crate::provider::grok) fn wake_prompt(unread: &[Unread]) -> String {
             Unread::Finished {
                 id,
                 command,
-                exit_code,
-                signal,
+                status,
                 output,
                 truncated,
                 output_file,
             } => {
-                let status = match (exit_code, signal) {
-                    (Some(c), _) => format!("exit code {c}"),
-                    (None, Some(s)) => format!("killed by {s}"),
-                    (None, None) => "unknown exit status".to_string(),
-                };
                 out.push_str(&format!(
                     "## `{command}` (task {id}) finished: {status}\n\n"
                 ));
@@ -396,6 +422,19 @@ mod tests {
     }
 
     #[test]
+    fn a_task_status_keeps_the_exit_code_over_a_signal() {
+        assert_eq!(
+            TaskStatus::decode(Some(2), Some("SIGTERM")),
+            TaskStatus::Code(2)
+        );
+        assert_eq!(
+            TaskStatus::decode(None, Some("SIGTERM")).to_string(),
+            "killed by SIGTERM"
+        );
+        assert_eq!(TaskStatus::decode(None, None), TaskStatus::Unknown);
+    }
+
+    #[test]
     fn a_result_completed_after_the_last_turn_is_unread() {
         // The live probe that lost a passing `brokkr test`: the model ended its
         // turn while the task ran, and the completion landed after it.
@@ -484,8 +523,7 @@ mod tests {
         let finished = Unread::Finished {
             id: WorkId::Task("t1".to_string()),
             command: "brokkr test -p piners-vm reg".to_string(),
-            exit_code: Some(0),
-            signal: None,
+            status: TaskStatus::Code(0),
             output: "[test]    PASS piners-vm::reg\n".to_string(),
             truncated: false,
             output_file: Some("/g/t1.log".to_string()),
@@ -509,8 +547,7 @@ mod tests {
         let big = Unread::Finished {
             id: WorkId::Task("t3".to_string()),
             command: "brokkr check".to_string(),
-            exit_code: Some(1),
-            signal: None,
+            status: TaskStatus::Code(1),
             output: format!("{}THE VERDICT", "x".repeat(WAKE_OUTPUT_TAIL_BYTES * 2)),
             truncated: false,
             output_file: Some("/g/t3.log".to_string()),

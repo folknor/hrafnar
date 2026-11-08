@@ -350,9 +350,9 @@ pub struct Run {
 
 /// How a run ended, as far as the lifecycle knows.
 pub struct Ended {
-    /// The provider's own exit status, `None` when the keeper could not
+    /// The provider's own exit status, `Unknown` when the keeper could not
     /// report it. Forensics only: no adapter classifies by it.
-    pub status: Option<std::process::ExitStatus>,
+    pub status: crate::process::Exit,
     pub leftovers: crate::contained::Leftovers,
     /// An operator interrupt request was consumed, or `review` was signalled
     /// and ended the turn. Whether it counts is the outcome's call.

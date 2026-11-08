@@ -11,6 +11,7 @@ pub mod config;
 pub mod config_cmd;
 pub mod config_write;
 pub mod contained;
+pub mod exit;
 mod fsutil;
 pub mod incident;
 pub mod inflight;

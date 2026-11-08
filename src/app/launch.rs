@@ -368,7 +368,7 @@ mod tests {
             session_id: Some(sid.into()),
             codex_home: None,
             digest: Some(provider::Digest {
-                exit_code: Some(i32::from(!answered)),
+                exit: crate::process::Exit::Code(i32::from(!answered)),
                 turns: 1,
                 ..provider::Digest::default()
             }),

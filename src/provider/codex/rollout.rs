@@ -319,10 +319,10 @@ pub(crate) fn stream(content: &str) -> Stream {
                 turns += 1;
                 if let Some(u) = val.get("usage") {
                     let get = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                    usage.input_tokens += get("input_tokens");
-                    usage.cached_input_tokens += get("cached_input_tokens");
-                    usage.output_tokens += get("output_tokens");
-                    usage.reasoning_output_tokens += get("reasoning_output_tokens");
+                    usage.total_input += get("input_tokens");
+                    usage.cached_input += get("cached_input_tokens");
+                    usage.output += get("output_tokens");
+                    usage.reasoning_output += get("reasoning_output_tokens");
                 }
             }
             _ => {}

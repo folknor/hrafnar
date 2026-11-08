@@ -89,18 +89,18 @@ pub struct ProviderRuntime {
 }
 
 impl ProviderRuntime {
-    /// Build from project config. `stall_timeout_secs` comes from
+    /// Build from project config. `stall_timeout` comes from
     /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
-    /// `Some(0)` disables the stall branch, anything else sets it. `private`
-    /// routes the orphan log the way the sidecar is routed.
+    /// otherwise it replaces it (off included). `private` routes the orphan
+    /// log the way the sidecar is routed.
     pub fn from_config(
         lifecycle: crate::supervisor::Lifecycle,
-        stall_timeout_secs: Option<u64>,
+        stall_timeout: Option<crate::config::StallTimeout>,
         private: bool,
     ) -> Self {
         let mut rt = Self::with_lifecycle(lifecycle);
-        if let Some(secs) = stall_timeout_secs {
-            rt.timings.stall_grace = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+        if let Some(timeout) = stall_timeout {
+            rt.timings.stall_grace = timeout.grace();
         }
         rt.orphan_log = orphan_log_path(None, private);
         rt

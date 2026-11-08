@@ -26,7 +26,7 @@ pub fn resolve(
     let mut archetypes: BTreeMap<String, Sourced<String>> = BTreeMap::new();
     let mut groups: BTreeMap<String, Sourced<Vec<String>>> = BTreeMap::new();
     let mut providers: Option<Sourced<Vec<Provider>>> = None;
-    let mut stall_timeout_secs: Option<Sourced<u64>> = None;
+    let mut stall_timeout_secs: Option<Sourced<super::StallTimeout>> = None;
     let mut defs: BTreeMap<Provider, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
 

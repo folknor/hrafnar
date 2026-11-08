@@ -24,7 +24,7 @@ pub use launch::{InheritedSettings, LaunchSpec, ProfileOrigin, RunSettings};
 use lifecycle::{Lease, LeaseUse, Run};
 pub use lifecycle::{ProcessSpec, Stdin};
 pub use model::ModelSpec;
-pub use outcome::{Answer, EndedBy, OPERATOR_INTERRUPT, Outcome, SIGNAL_STOP, StatusFacts, Turn};
+pub use outcome::{Answer, EndedBy, Outcome, StatusFacts, Termination, Turn, WatchdogTermination};
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
 pub use result::{
@@ -35,7 +35,7 @@ pub use runtime::{ProviderCommand, ProviderCommands, ProviderRuntime, orphan_log
 pub use session::{SessionId, SessionStart};
 
 use codex::run_codex;
-use result::{answered_status_digest, result_served, signal_name, status_digest};
+use result::{answered_status_digest, result_served, status_digest};
 
 #[cfg(test)]
 mod tests;
