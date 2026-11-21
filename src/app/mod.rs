@@ -282,6 +282,7 @@ pub async fn run() -> Result<CommandExit> {
     let provider_runtime = provider::ProviderRuntime::from_config(
         lifecycle.clone(),
         cfg.stall_timeout(),
+        cfg.claude_token_command.as_deref(),
         data.clone(),
         &scope,
     );
@@ -373,6 +374,7 @@ pub async fn run() -> Result<CommandExit> {
                 Ok(outcome) => outcome.into_result(),
                 Err(err) => {
                     let result = provider::ProviderResult {
+                        credential: None,
                         run_id: None,
                         _reservation: None,
                         provider: p.provider,

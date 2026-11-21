@@ -61,6 +61,13 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
             .map_err(|e| anyhow::anyhow!("[_defaults] in {origin}: {e}"))?,
         None => DefaultsConfig::default(),
     };
+    if layer == Layer::Local && defaults.claude_token_command.is_some() {
+        bail!(
+            "[_defaults].claude_token_command in {origin}: a command review runs to fetch a \
+             credential belongs in the global config; one named by a project's \
+             {CONFIG_FILENAME} would run code from any checkout"
+        );
+    }
     let projects: BTreeMap<String, BTreeMap<String, String>> = match table.remove("_projects") {
         Some(_) if layer == Layer::Local => bail!(
             "[_projects] in {origin}: the project registry maps names to this machine's \
@@ -214,6 +221,23 @@ mod tests {
             host,
             crate::config::ConfigFiles::default(),
         )?)
+    }
+
+    /// A project file naming a command review would run is code execution
+    /// from any checkout; only the operator's global file may.
+    #[test]
+    fn claude_token_command_is_global_only() {
+        let raw = "[_defaults]\nclaude_token_command = \"echo t\"\n";
+        let err = local_only(raw, "h").unwrap_err().to_string();
+        assert!(err.contains("global config"), "{err}");
+        let cfg = resolve(
+            parse_file("", "local", Layer::Local).unwrap(),
+            Some(parse_file(raw, "global", Layer::Global).unwrap()),
+            "h",
+            crate::config::ConfigFiles::default(),
+        )
+        .unwrap();
+        assert_eq!(cfg.claude_token_command.as_deref(), Some("echo t"));
     }
 
     #[test]

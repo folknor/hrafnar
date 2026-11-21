@@ -126,7 +126,7 @@ pub struct EnvVar {
 /// A name that shouldn't have its value recorded (heuristic, errs toward hiding).
 /// Bundles keep nonsecret values for replay and redact likely secrets. Sidecars
 /// record env names only, so omitting values there is compatible with this rule.
-fn looks_secret(name: &str) -> bool {
+pub(crate) fn looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     [
         "KEY",

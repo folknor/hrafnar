@@ -569,3 +569,125 @@ fn maki_argv_never_carries_a_flag_maki_would_drop() {
     }
     assert!(super::forced_env(Dialect::Maki).is_empty());
 }
+
+/// The events claude 2.1.330 printed for an expired, unrefreshable login,
+/// reduced to the fields the classification reads.
+const AUTH_HOOK: &str = r#"{"type":"system","subtype":"hook_started"}"#;
+const AUTH_INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s"}"#;
+const AUTH_ERROR: &str = r#"{"type":"assistant","error":"authentication_failed","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"Failed to authenticate"}]}}"#;
+const AUTH_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed","session_id":"s"}"#;
+
+fn auth_of(lines: &[&str], eof: bool) -> Option<AuthFailure> {
+    let mut metrics = ClaudeMetrics::new(Dialect::Claude);
+    for line in lines {
+        metrics.record_line(line.as_bytes());
+    }
+    if eof {
+        metrics.eof();
+    }
+    metrics.auth_failure()
+}
+
+#[test]
+fn an_auth_failure_before_any_work_is_replayable() {
+    assert_eq!(
+        auth_of(&[AUTH_HOOK, AUTH_INIT, AUTH_ERROR, AUTH_RESULT], true),
+        Some(AuthFailure::BeforeWork)
+    );
+}
+
+/// Model output or tool activity first means a resend could repeat work.
+#[test]
+fn an_auth_failure_after_work_is_not_replayable() {
+    let text = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+    let tool = r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#;
+    for work in [text, tool] {
+        assert_eq!(
+            auth_of(&[AUTH_INIT, work, AUTH_ERROR, AUTH_RESULT], true),
+            Some(AuthFailure::Unknown),
+            "{work}"
+        );
+        // An early auth error the run got past, then work, is not replayable.
+        assert_eq!(
+            auth_of(&[AUTH_INIT, AUTH_ERROR, work, AUTH_RESULT], true),
+            Some(AuthFailure::Unknown),
+            "{work}"
+        );
+    }
+}
+
+/// The auth error must belong to the result that ended the run: one closed by
+/// some other ending, or by a turn before a later failure, is not the run's.
+#[test]
+fn an_auth_error_not_closed_by_the_last_result_is_not_the_runs() {
+    let other = r#"{"type":"result","is_error":true,"terminal_reason":"max_turns"}"#;
+    let completed = r#"{"type":"result","is_error":false,"terminal_reason":"completed"}"#;
+    assert_eq!(auth_of(&[AUTH_INIT, AUTH_ERROR, other], true), None);
+    assert_eq!(
+        auth_of(&[AUTH_INIT, AUTH_ERROR, completed, AUTH_RESULT], true),
+        None
+    );
+    // An auth error with no result after it at all: reported, not replayed.
+    assert_eq!(
+        auth_of(&[AUTH_INIT, AUTH_ERROR], true),
+        Some(AuthFailure::Unknown)
+    );
+}
+
+/// A partial view of the stream cannot prove nothing ran.
+#[test]
+fn an_incompletely_observed_auth_failure_is_not_replayable() {
+    assert_eq!(
+        auth_of(&[AUTH_INIT, AUTH_ERROR, AUTH_RESULT], false),
+        Some(AuthFailure::Unknown)
+    );
+    assert_eq!(
+        auth_of(&[AUTH_INIT, "not json", AUTH_ERROR, AUTH_RESULT], true),
+        Some(AuthFailure::Unknown)
+    );
+    let mut metrics = ClaudeMetrics::new(Dialect::Claude);
+    metrics.record_line(AUTH_INIT.as_bytes());
+    metrics.skipped();
+    metrics.record_line(AUTH_ERROR.as_bytes());
+    metrics.eof();
+    assert_eq!(metrics.auth_failure(), Some(AuthFailure::Unknown));
+}
+
+/// A subagent's system event, or tool use carried on the auth event itself,
+/// is work a resend would repeat.
+#[test]
+fn subagent_and_tool_activity_beside_the_auth_error_are_work() {
+    let sub_system =
+        r#"{"type":"system","subtype":"task_notification","parent_tool_use_id":"toolu_1"}"#;
+    let acting_error = r#"{"type":"assistant","error":"authentication_failed","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+    // The documented task events carry no parent_tool_use_id at all.
+    let task = r#"{"type":"system","subtype":"task_started","tool_use_id":"toolu_1"}"#;
+    for activity in [sub_system, task] {
+        assert_eq!(
+            auth_of(&[AUTH_INIT, activity, AUTH_ERROR, AUTH_RESULT], true),
+            Some(AuthFailure::Unknown),
+            "{activity}"
+        );
+    }
+    assert_eq!(
+        auth_of(&[AUTH_INIT, acting_error, AUTH_RESULT], true),
+        Some(AuthFailure::Unknown)
+    );
+}
+
+/// A subagent's credential error is not the run's, and is itself work.
+#[test]
+fn a_subagent_auth_error_is_not_the_runs() {
+    let sub =
+        r#"{"type":"assistant","error":"authentication_failed","parent_tool_use_id":"toolu_1"}"#;
+    assert_eq!(auth_of(&[AUTH_INIT, sub, AUTH_RESULT], true), None);
+    assert_eq!(
+        auth_of(&[AUTH_INIT, sub, AUTH_ERROR, AUTH_RESULT], true),
+        Some(AuthFailure::Unknown)
+    );
+}
+
+#[test]
+fn an_ordinary_api_error_is_not_an_auth_failure() {
+    assert_eq!(auth_of(&[AUTH_INIT, AUTH_RESULT], true), None);
+}

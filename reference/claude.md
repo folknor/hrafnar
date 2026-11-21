@@ -123,6 +123,81 @@ actually binds. `run_claude_compat` sets `BASH_DEFAULT_TIMEOUT_MS` and
 allowance too); a 150-second command then ran to completion. All three are set
 before the profile's `env`, so a profile can restate any of them.
 
+## Credentials from a Claude Code session
+
+**A claude launched from inside a Claude Code session can lack the operator's
+credential.** An operator who authenticates claude by exporting
+`CLAUDE_CODE_OAUTH_TOKEN` in a login shell has a claude that works from any
+terminal, but Claude Code does not pass that variable to the shells it runs.
+A `review` started from one - by an orchestrating agent, or the operator's own
+`!` command - starts a claude without it, which falls back to its saved login
+(`~/.claude/.credentials.json`). Observed with that file four months stale
+(`expiresAt: 0`, refresh token long expired): every such run, and a plain
+`claude -p` from the same shell, failed after 30.0s with "OAuth session
+expired and could not be refreshed", while interactive sessions started from
+a terminal authenticated normally (bz review#10). Blanking the Claude Code
+session variables (`CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, the messaging
+socket and token) changed nothing; the missing token was the whole cause.
+
+The stream says so in structure, not just prose. On claude 2.1.330 the failed
+run printed `system` hook and `init` events, one main-agent `assistant` event
+(`parent_tool_use_id: null`) with top-level `error: "authentication_failed"`,
+then a `result` with `is_error: true`, `terminal_reason: "api_error"` and no
+API status. `ClaudeMetrics` reads that from every observed line, independent
+of capture retention, and classifies it as `AuthFailure::BeforeWork` only when
+no model output, tool activity or subagent event appears anywhere in the
+attempt (an early auth error the run got past is still an attempt that did
+work), the last result ended on `api_error`, no line was skipped or
+unreadable, and the stream reached end of file - anything less is `Unknown`,
+reported and never replayed, since a resend could repeat work.
+
+`[_defaults].claude_token_command` (global layer only; a project file naming a
+command would run code from any checkout) is the operator's opt-in fix, run
+lazily so a config synced across hosts that log claude in differently is
+harmless (`provider/claude_token.rs`). Two paths use it:
+
+- **A fresh run** (`app::launch::claude_auth_retry`). On `BeforeWork`, with the
+  command configured, no token already in the child's effective environment
+  (inherited or profile `env`), a clean teardown (a startup hook can leave
+  something running before the model is reached) and no stop requested, the
+  first attempt is
+  settled first: audited, kept out of the sidecar (it advanced no session),
+  and its own handoff published naming itself with no sidecar row. That is the
+  point its id stops being an interrupt target; a handoff that cannot be
+  published stops the retry, because waiters on that id would otherwise hang
+  behind an unrelated launch; it is audited either way and never recorded
+  twice. Then the command runs (once per process, cached) and the prompt is
+  relaunched as a new session with its own marker and handoff, taking the host
+  launch lock across its spawn like any launch. Its `run` row records
+  `credential` only when the token was accepted, so a rejected token never
+  becomes the session's policy. Resending into the same session was rejected: the failed
+  attempt already wrote the prompt to its transcript, so a resume would send
+  it twice. Startup hooks rerun, as on any relaunch; that is accepted.
+- **A message or resume** never replays. A session whose `run` row - found by
+  kind, not by timestamp order, which clock skew and the public/private log
+  merge can reorder - records `credential: "token_command"` continues on that
+  credential source: the command runs before the launch lock, and if it is
+  unconfigured or fails the message is refused before anything is sent. Later
+  rows only report what each attempt used. A host-wide "this host needs the
+  token" marker was rejected: it would let one invocation's failure choose the
+  credential for unrelated later ones, go stale once native login is fixed,
+  and race between concurrent runs.
+
+The token is passed only into that child's environment, after the profile's
+`env`, is redacted by name in incident bundles like any `*TOKEN*` variable,
+and is replaced in claude's stdout and stderr before either is interpreted,
+printed or recorded, so a wrapper echoing its environment cannot carry it into
+a record. The helper's own stderr reaches the terminal unfiltered. The keeper applies
+the same redaction to every process record it emits, from the child's own
+secret-named environment values (`incident::looks_secret`), so its orphan log
+is covered when `review` has died; a command line cut at its length limit
+part-way through a token has the trailing fragment redacted when it is at least
+8 characters, and a shorter fragment of a long token is left as is. Tokens must
+be ASCII, so a byte cut cannot split a character inside one. A resume
+refused before doing anything writes no sidecar row, so it does not refresh
+the session's cache clock. The message-path policy lookup binds the `run` row
+to provider and project as well as session id.
+
 ## No filesystem sandbox
 
 Claude's `--permission-mode` is a tool-approval policy, a different axis from

@@ -86,16 +86,20 @@ pub struct ProviderRuntime {
     /// The keeper binary and teardown pacing (see `contained`). Tests point the
     /// keeper at the built `review` and shorten the graces.
     pub teardown: crate::contained::Settings,
+    /// The global `claude_token_command`, shared by every claude run in this
+    /// process so it is run at most once. `None` when unconfigured.
+    pub claude_token: Option<std::sync::Arc<super::claude_token::TokenSource>>,
 }
 
 impl ProviderRuntime {
-    /// Build from project config. `stall_timeout` comes from
+    /// Build from config. `stall_timeout` comes from
     /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
     /// otherwise it replaces it (off included). Scope routes the orphan log
     /// to the same family as the sidecar.
     pub fn from_config(
         lifecycle: crate::supervisor::Lifecycle,
         stall_timeout: Option<crate::config::StallTimeout>,
+        claude_token_command: Option<&str>,
         data: crate::data::DataDir,
         scope: &crate::data::LogScope,
     ) -> Self {
@@ -103,7 +107,23 @@ impl ProviderRuntime {
         if let Some(timeout) = stall_timeout {
             rt.timings.stall_grace = timeout.grace();
         }
+        rt.claude_token = claude_token_command
+            .map(str::to_string)
+            .map(|command| std::sync::Arc::new(super::claude_token::TokenSource::new(command)));
         rt
+    }
+
+    /// The configured command's token, run off the async workers. `None` when
+    /// no command is configured.
+    pub async fn fetch_claude_token(
+        &self,
+    ) -> Option<Result<super::claude_token::ClaudeToken, String>> {
+        let source = std::sync::Arc::clone(self.claude_token.as_ref()?);
+        Some(
+            tokio::task::spawn_blocking(move || source.fetch())
+                .await
+                .unwrap_or_else(|e| Err(format!("claude_token_command task failed: {e}"))),
+        )
     }
 }
 
@@ -124,6 +144,7 @@ impl ProviderRuntime {
             log_family,
             lifecycle,
             teardown: crate::contained::Settings::default(),
+            claude_token: None,
         }
     }
 }

@@ -49,6 +49,7 @@ fn resolve_inner(
     let mut groups: BTreeMap<String, Sourced<Vec<String>>> = BTreeMap::new();
     let mut providers: Option<Sourced<Vec<Provider>>> = None;
     let mut stall_timeout_secs: Option<Sourced<super::StallTimeout>> = None;
+    let mut claude_token_command: Option<String> = None;
     let mut defs: BTreeMap<Provider, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
 
@@ -82,6 +83,10 @@ fn resolve_inner(
                 layer,
                 table: "[_defaults]".into(),
             });
+        }
+        // `parse_file` refuses it in the local layer.
+        if layer == Layer::Global {
+            claude_token_command = file.defaults.claude_token_command.take();
         }
         if stall_timeout_secs.is_none()
             && let Some(s) = file.defaults.stall_timeout_secs
@@ -202,6 +207,7 @@ fn resolve_inner(
         audit,
         providers,
         stall_timeout_secs,
+        claude_token_command,
         profiles,
         hostname: hostname.to_string(),
         files,

@@ -124,6 +124,21 @@ pub struct Outcome {
     /// answer.
     pub unverified: Option<String>,
     pub ended_by: EndedBy,
+    /// The provider rejected the run's credentials. Claude only, read from
+    /// its stream; never persisted, so a summary decodes it as `None`.
+    pub auth: Option<AuthFailure>,
+}
+
+/// A claude run that failed to authenticate, and whether resending its prompt
+/// under a new session is known to be safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFailure {
+    /// The whole stream was read, and the main agent's credential error came
+    /// before any model output or tool activity: nothing ran but startup.
+    BeforeWork,
+    /// Work may have happened first, or part of the stream was not observed.
+    /// Reported, never replayed.
+    Unknown,
 }
 
 impl Outcome {
@@ -133,7 +148,13 @@ impl Outcome {
             stated: None,
             unverified: None,
             ended_by: EndedBy::Natural,
+            auth: None,
         }
+    }
+
+    pub fn auth(mut self, auth: Option<AuthFailure>) -> Self {
+        self.auth = auth;
+        self
     }
 
     pub fn no_answer() -> Self {
@@ -253,6 +274,7 @@ impl Outcome {
             stated: d.turn_error.clone(),
             unverified: d.review_error.clone(),
             ended_by,
+            auth: None,
         }
     }
 

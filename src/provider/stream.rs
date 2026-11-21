@@ -9,6 +9,12 @@ pub(super) trait Observer {
     /// None disables scanning permanently. The cap excludes the newline.
     fn line_cap(&self) -> Option<usize>;
     fn line(&mut self, line: &[u8]);
+    /// A line longer than the cap was discarded unobserved.
+    fn skipped(&mut self) {}
+    /// The stream reached end of file. Not called after a read error, nor on
+    /// a reader cancelled before the end, so an observer that never sees it
+    /// knows its view of the stream is partial.
+    fn eof(&mut self) {}
 }
 
 pub(super) struct Ignore;
@@ -144,7 +150,9 @@ impl Lines {
             let Some(end) = end else {
                 return;
             };
-            if !self.oversized {
+            if self.oversized {
+                observer.skipped();
+            } else {
                 observer.line(&self.pending);
             }
             self.pending.clear();
@@ -156,7 +164,12 @@ impl Lines {
     }
 
     fn finish(&mut self, observer: &mut impl Observer) {
-        if observer.line_cap().is_some() && !self.oversized && !self.pending.is_empty() {
+        if observer.line_cap().is_none() {
+            return;
+        }
+        if self.oversized {
+            observer.skipped();
+        } else if !self.pending.is_empty() {
             observer.line(&self.pending);
         }
     }
@@ -170,9 +183,14 @@ where
     let mut chunk = [0u8; 16384];
     let mut lines = Lines::default();
     let mut first = true;
+    let mut reached_eof = false;
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                reached_eof = true;
+                break;
+            }
+            Err(_) => break,
             Ok(n) => {
                 if first {
                     observer.first_bytes();
@@ -184,6 +202,9 @@ where
         }
     }
     lines.finish(&mut observer);
+    if reached_eof {
+        observer.eof();
+    }
 }
 
 #[cfg(test)]

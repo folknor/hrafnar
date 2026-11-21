@@ -266,6 +266,7 @@ rollout_started
 /// comfortably shorter than the quiet grace).
 fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
     ProviderRuntime {
+        claude_token: None,
         run_id: review::sessions::handoff::RunId::default(),
         reservation: None,
         predecessor: None,

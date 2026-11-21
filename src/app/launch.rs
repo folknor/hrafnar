@@ -37,8 +37,14 @@ impl RecordCtx {
     ) -> bool {
         // Failed resumes did not warm the cache. This applies to automatic
         // and manual resumes alike; a requested ID is not proof a turn ran.
-        let sidecar = kind != sessions::SessionKind::Resume || result.output.is_ok();
-        self.record_policy(result, kind, prompt, sidecar)
+        // A run claude refused credentials for before doing anything never
+        // reached the model either, though it comes back as a turn: a resume
+        // must not refresh the cache clock, and a fresh session holding only
+        // the refused prompt must not look resumable.
+        let refused =
+            outcome_of(result).is_some_and(|o| o.auth == Some(provider::AuthFailure::BeforeWork));
+        let sidecar = !refused && (kind != sessions::SessionKind::Resume || result.output.is_ok());
+        self.record_policy(result, kind, prompt, sidecar).1
     }
 
     fn record_policy(
@@ -47,7 +53,7 @@ impl RecordCtx {
         kind: sessions::SessionKind,
         prompt: &str,
         sidecar: bool,
-    ) -> bool {
+    ) -> (bool, bool) {
         let row = sessions::SessionRow {
             timestamp: audit::chrono_utc(result.completed_epoch),
             epoch_secs: Some(result.completed_epoch),
@@ -84,30 +90,56 @@ impl RecordCtx {
             digest: summary_of(result),
             leftovers: (!result.leftovers.is_empty()).then(|| result.leftovers.clone()),
             codex_home: result.codex_home.clone(),
+            // Only a token that was accepted: on a `run` row this becomes the
+            // session's credential policy, and a rejected token must not make
+            // later messages require it.
+            credential: result
+                .credential
+                // An answer is the evidence: an interrupted or dead attempt
+                // with no auth error never showed the token worked.
+                .filter(|_| outcome_of(result).is_some_and(|o| o.auth.is_none() && o.has_answer()))
+                .map(str::to_owned),
         };
-        let _audit_written = audit::log_result(&self.data, &self.scope, &row);
+        let audit_written = audit::log_result(&self.data, &self.scope, &row);
         // A manual failed launch did not warm the cache. Automatic recovery is
         // already an established invocation and retains its historical row policy.
-        sidecar && result.session_id.is_some() && sessions::append(&self.data, &self.scope, &row)
+        let sidecar_written = sidecar
+            && result.session_id.is_some()
+            && sessions::append(&self.data, &self.scope, &row);
+        (audit_written, sidecar_written)
     }
 
     fn record_task(&self, outcome: &TaskOutcome) {
+        let pending = &outcome.invocations[outcome.prerecorded..];
+        if pending.is_empty() {
+            return;
+        }
         let mut recorded = false;
-        for invocation in &outcome.invocations {
+        for invocation in pending {
             recorded = self.record_as(
                 &invocation.result,
                 invocation.kind.clone(),
                 &invocation.prompt,
             );
         }
-        let final_run = &outcome
-            .invocations
-            .last()
-            .expect("at least one invocation")
-            .result;
-        for invocation in &outcome.invocations {
-            self.publish(&invocation.result, final_run, recorded);
+        let final_run = &pending.last().expect("nonempty").result;
+        for invocation in pending {
+            let _ = self.publish(&invocation.result, final_run, recorded);
         }
+    }
+
+    /// Record an attempt that is being abandoned for a replacement: audit only,
+    /// never the session sidecar (it advanced no session), and publish its own
+    /// receipt now, naming itself with no sidecar written, so anything waiting
+    /// on its id settles instead of waiting on an unrelated replacement. This
+    /// is where its id stops being a target for `review interrupt`. False when
+    /// its audit row could not be written or its receipt could not be
+    /// published, in which case the replacement must not launch: the
+    /// abandoned attempt would be unaccounted for, or its waiters stuck.
+    fn settle_abandoned(&self, result: &provider::ProviderResult, prompt: &str) -> bool {
+        let (audited, _) = self.record_policy(result, sessions::SessionKind::Run, prompt, false);
+        let published = self.publish(result, result, false);
+        audited && published
     }
 
     pub(super) fn record_message(&self, result: &provider::ProviderResult, prompt: &str) -> bool {
@@ -120,22 +152,28 @@ impl RecordCtx {
         requested: &provider::ProviderResult,
         final_run: &provider::ProviderResult,
         sidecar_written: bool,
-    ) {
-        if let Some(id) = &requested.run_id {
-            let handoff = sessions::handoff::Handoff {
-                schema: sessions::handoff::PROTOCOL,
-                requested: id.clone(),
-                interrupted: outcome_of(requested).is_some_and(provider::Outcome::interrupted),
-                final_session: final_run.session_id.clone(),
-                sidecar_written,
-            };
-            match sessions::handoff::publish(&self.data, &handoff) {
-                Ok(()) => {
-                    if let Some(reservation) = &requested._reservation {
-                        reservation.complete();
-                    }
+    ) -> bool {
+        // No run id: no marker was ever published, so nothing waits on one.
+        let Some(id) = &requested.run_id else {
+            return true;
+        };
+        let handoff = sessions::handoff::Handoff {
+            schema: sessions::handoff::PROTOCOL,
+            requested: id.clone(),
+            interrupted: outcome_of(requested).is_some_and(provider::Outcome::interrupted),
+            final_session: final_run.session_id.clone(),
+            sidecar_written,
+        };
+        match sessions::handoff::publish(&self.data, &handoff) {
+            Ok(()) => {
+                if let Some(reservation) = &requested._reservation {
+                    reservation.complete();
                 }
-                Err(e) => eprintln!("warning: failed to publish run handoff: {e}"),
+                true
+            }
+            Err(e) => {
+                eprintln!("warning: failed to publish run handoff: {e}");
+                false
             }
         }
     }
@@ -176,6 +214,9 @@ struct RecordedInvocation {
 pub(super) struct TaskOutcome {
     invocations: Vec<RecordedInvocation>,
     selected: usize,
+    /// Leading invocations already recorded and published before the task
+    /// went on (an abandoned attempt settled before its replacement launched).
+    prerecorded: usize,
 }
 
 impl TaskOutcome {
@@ -187,6 +228,7 @@ impl TaskOutcome {
                 prompt,
             }],
             selected: 0,
+            prerecorded: 0,
         }
     }
     fn result(&self) -> &provider::ProviderResult {
@@ -286,7 +328,154 @@ fn after_auto_resume(
             },
         ],
         selected,
+        prerecorded: 0,
     }
+}
+
+/// A fresh claude run that failed to authenticate before doing anything is
+/// launched once more as a new session, with a token from the global
+/// `claude_token_command`. `Err` hands the first result back untouched when
+/// that does not apply; otherwise the first attempt is already settled.
+///
+/// Only a failure the stream shows came before any model output or tool
+/// activity, in a fully observed stream, is resent: anything else may have
+/// done work a resend would repeat. Not when the child already had a token
+/// (inherited or from the profile): that is the credential that was refused.
+/// Not after a stop. Startup hooks run again, as on any relaunch. The first
+/// attempt is settled - audited, kept out of the sidecar, its receipt
+/// published - before the command runs, so its id stops being a target for
+/// `review interrupt` there; a receipt that cannot be published stops the
+/// retry, since waiters on that id would otherwise hang behind it.
+async fn claude_auth_retry(
+    launch: &Launch,
+    ctx: &RecordCtx,
+    first: provider::ProviderResult,
+) -> Result<TaskOutcome, Box<provider::ProviderResult>> {
+    let Some(auth) = outcome_of(&first).and_then(|o| o.auth) else {
+        return Err(Box::new(first));
+    };
+    let hint = if launch.runtime.claude_token.is_none() {
+        Some(
+            "claude could not authenticate. If claude is logged in through \
+             CLAUDE_CODE_OAUTH_TOKEN in your login shell: Claude Code does not pass that \
+             variable to the commands it runs, so a review started from inside a Claude Code \
+             session lacks it. Launch from a terminal, or set [_defaults].claude_token_command \
+             in the global review config (`review man config`).",
+        )
+    } else if launch.spec.settings.has_own_claude_token() {
+        Some(
+            "claude refused the CLAUDE_CODE_OAUTH_TOKEN it was given; not retrying with claude_token_command.",
+        )
+    } else if auth != provider::AuthFailure::BeforeWork {
+        Some(
+            "claude failed to authenticate after it may have done work, or its output was not \
+             fully read; not retrying, since a resend could repeat that work.",
+        )
+    } else if !first.leftovers.is_clean() {
+        // A startup hook can leave something running even when the model was
+        // never reached; a replacement must not run beside it.
+        Some(
+            "not retrying: processes the failed attempt started survived teardown, or its \
+             teardown could not be confirmed.",
+        )
+    } else if launch.runtime.lifecycle.stop_requested() {
+        Some("review is stopping; not retrying.")
+    } else {
+        None
+    };
+    if let Some(hint) = hint {
+        eprintln!("{hint}");
+        return Err(Box::new(first));
+    }
+    let settled = |first| TaskOutcome {
+        invocations: vec![RecordedInvocation {
+            result: first,
+            kind: sessions::SessionKind::Run,
+            prompt: launch.spec.prompt.clone(),
+        }],
+        selected: 0,
+        prerecorded: 1,
+    };
+    // Audited either way; only a published receipt lets the retry go on.
+    if !ctx.settle_abandoned(&first, &launch.spec.prompt) {
+        eprintln!(
+            "not retrying: the failed attempt could not be audited, or its handoff could not be published"
+        );
+        return Ok(settled(first));
+    }
+    let token = match launch.runtime.fetch_claude_token().await {
+        Some(Ok(token)) => token,
+        Some(Err(why)) => {
+            eprintln!(
+                "claude could not authenticate, and claude_token_command gave no token: {why}"
+            );
+            return Ok(settled(first));
+        }
+        None => return Ok(settled(first)),
+    };
+    if launch.runtime.lifecycle.stop_requested() {
+        eprintln!("review is stopping; not retrying.");
+        return Ok(settled(first));
+    }
+    eprintln!(
+        "claude could not authenticate; retrying once as a new session with a token from claude_token_command"
+    );
+    let spec = provider::LaunchSpec {
+        start: provider::SessionStart::Fresh { id: None },
+        settings: launch.spec.settings.clone().with_claude_token(token),
+        ..launch.spec.clone()
+    };
+    // A launch of its own, so it takes the host's launch lock like any other
+    // and releases it once spawned (the fan-out's may be long gone).
+    let lock = tokio::task::spawn_blocking(|| {
+        let file = crate::lock::open_lock_file(&std::env::temp_dir().join("review.lock"))?;
+        crate::lock::acquire_blocking(&file)?;
+        Ok::<_, anyhow::Error>(file)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    let lock = match lock {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("not retrying: could not take the launch lock: {e}");
+            return Ok(settled(first));
+        }
+    };
+    let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
+    let invoke = provider::invoke(
+        spec,
+        Some(launched_tx),
+        &launch.runtime,
+        first.run_id.clone(),
+    );
+    tokio::pin!(invoke);
+    let second = tokio::select! {
+        result = &mut invoke => {
+            drop(lock);
+            result
+        }
+        _ = launched_rx => {
+            drop(lock);
+            invoke.await
+        }
+    };
+    Ok(TaskOutcome {
+        invocations: vec![
+            RecordedInvocation {
+                result: first,
+                kind: sessions::SessionKind::Run,
+                prompt: launch.spec.prompt.clone(),
+            },
+            RecordedInvocation {
+                result: second,
+                kind: sessions::SessionKind::Run,
+                prompt: launch.spec.prompt.clone(),
+            },
+        ],
+        selected: 1,
+        prerecorded: 1,
+    })
 }
 
 /// One fan-out task: launch, maybe auto-resume, then record.
@@ -329,8 +518,15 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
         }
         AfterRun::StatedFailure(why) => {
             eprintln!("{prov} ended the turn without a final answer: {why}");
-            eprintln!("not auto-resuming - {prov} stated a reason, so a retry would hit it again");
-            TaskOutcome::single(first, launch.spec.prompt.clone())
+            match claude_auth_retry(&launch, &ctx, first).await {
+                Ok(outcome) => outcome,
+                Err(first) => {
+                    eprintln!(
+                        "not auto-resuming - {prov} stated a reason, so a retry would hit it again"
+                    );
+                    TaskOutcome::single(*first, launch.spec.prompt.clone())
+                }
+            }
         }
         AfterRun::AutoResume {
             session: sid,
@@ -385,6 +581,7 @@ mod tests {
             provider::Answer::None
         };
         provider::ProviderResult {
+            credential: None,
             run_id: None,
             _reservation: None,
             provider: provider::Provider::Codex,
@@ -522,6 +719,7 @@ mod tests {
             assert_eq!(audit.lines().count(), 2);
             let runtime = provider::ProviderRuntime::from_config(
                 crate::supervisor::Lifecycle::default(),
+                None,
                 None,
                 data.clone(),
                 &scope,

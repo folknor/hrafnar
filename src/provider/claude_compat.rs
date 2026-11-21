@@ -36,6 +36,18 @@ impl Observer for ClaudeObserver {
             metrics.record_line(line);
         }
     }
+
+    fn skipped(&mut self) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.skipped();
+        }
+    }
+
+    fn eof(&mut self) {
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.eof();
+        }
+    }
 }
 
 /// How long `review` lets a claude shell command run in the foreground: 20
@@ -169,7 +181,17 @@ pub(super) async fn run_claude_compat(
     let provider = dialect.provider();
     let session = &launch.start;
     let selection = &launch.settings.selection;
-    let env = launch.settings.env.as_ref();
+    // The token goes in last, over the profile's env: it exists only because
+    // the child's own credential was already found wanting.
+    let with_token = launch.settings.claude_token.as_ref().map(|token| {
+        let mut env = launch.settings.env.clone().unwrap_or_default();
+        env.insert(
+            super::claude_token::TOKEN_VAR.to_string(),
+            token.value().to_string(),
+        );
+        env
+    });
+    let env = with_token.as_ref().or(launch.settings.env.as_ref());
     let prompt = launch.prompt.as_str();
     let project_root = launch.root.as_path();
 
@@ -283,8 +305,15 @@ pub(super) async fn run_claude_compat(
     )
     .await;
     let write_res = ended.stdin;
-    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    let mut stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let mut stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+    // Everything below prints or records text derived from these. A claude, or
+    // a wrapper around it, that echoes its environment in an error must not
+    // carry the injected token into the answer, the digest or the audit log.
+    if let Some(token) = &launch.settings.claude_token {
+        stdout = stdout.replace(token.value(), "<redacted claude token>");
+        stderr = stderr.replace(token.value(), "<redacted claude token>");
+    }
 
     // The echoed ID wins on a fresh run in case claude reassigned the requested
     // UUID; on resume, retain the ID the caller asked us to continue.
@@ -294,6 +323,7 @@ pub(super) async fn run_claude_compat(
         .map(|metrics| metrics.clone())
         .unwrap_or_default();
     let served = metrics.served();
+    let auth_failure = metrics.auth_failure();
     let turns = metrics.turns;
     let usage = metrics.usage;
     let with_usage = |digest: Digest| Digest {
@@ -385,11 +415,48 @@ pub(super) async fn run_claude_compat(
             Ok(()) => return Err(e),
         },
     };
-    let outcome = settle(outcome);
+    // A failure claude reported, not a run that ended without saying why.
+    let auth = if outcome.stated.is_some() && !outcome.has_answer() {
+        auth_failure
+    } else {
+        None
+    };
+    let outcome = settle(outcome).auth(auth);
     let text = if outcome.interrupted() && text.trim().is_empty() {
         outcome.placeholder(provider)
     } else {
         text
+    };
+    // And again on what was parsed: the raw replacement above misses a token
+    // that a JSON escape spelled differently, and metrics read the stream
+    // before it was scrubbed (a model name is printed and recorded).
+    const REDACTED: &str = "<redacted claude token>";
+    // Command lines in the teardown evidence too: a hook or wrapper can pass
+    // the token to a process as an argument.
+    let (text, outcome, served, session_id, leftovers) = match &launch.settings.claude_token {
+        Some(token) => {
+            let scrub = |s: String| s.replace(token.value(), REDACTED);
+            let mut leftovers = leftovers;
+            for proc in leftovers
+                .killed
+                .iter_mut()
+                .chain(leftovers.survivors.iter_mut())
+            {
+                proc.cmdline = scrub(std::mem::take(&mut proc.cmdline));
+            }
+            (
+                scrub(text),
+                Outcome {
+                    stated: outcome.stated.map(scrub),
+                    unverified: outcome.unverified.map(scrub),
+                    ..outcome
+                },
+                served.scrubbed(token.value(), REDACTED),
+                session_id.map(scrub),
+                leftovers,
+            )
+        }
+        None => (text, outcome, served, session_id, leftovers),
     };
     Ok(RunOutput {
         text,

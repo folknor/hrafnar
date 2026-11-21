@@ -21,6 +21,9 @@ pub struct RunSettings {
     pub(super) env: Option<BTreeMap<String, String>>,
     pub(super) config: Vec<String>,
     origin: Option<ProfileOrigin>,
+    /// Claude only: a token from `claude_token_command`, passed to the child
+    /// as `CLAUDE_CODE_OAUTH_TOKEN`. Its presence is recorded; never its value.
+    pub(super) claude_token: Option<super::claude_token::ClaudeToken>,
 }
 
 impl RunSettings {
@@ -42,6 +45,7 @@ impl RunSettings {
                 layer: d.layer.as_str().to_owned(),
                 table: d.table.clone(),
             }),
+            claude_token: None,
         }
     }
 
@@ -65,11 +69,27 @@ impl RunSettings {
                 .map(|home| BTreeMap::from([("CODEX_HOME".to_owned(), home)])),
             config: Vec::new(),
             origin: None,
+            claude_token: None,
         }
     }
 
     pub fn origin(&self) -> Option<&ProfileOrigin> {
         self.origin.as_ref()
+    }
+
+    /// Launch claude with this token in place of its own login.
+    pub fn with_claude_token(mut self, token: super::claude_token::ClaudeToken) -> Self {
+        self.claude_token = Some(token);
+        self
+    }
+
+    /// The child already has a token without the command's help.
+    pub fn has_own_claude_token(&self) -> bool {
+        super::claude_token::env_has_token(self.env.as_ref())
+    }
+
+    pub fn uses_claude_token(&self) -> bool {
+        self.claude_token.is_some()
     }
     pub fn env_keys(&self) -> Vec<String> {
         self.env

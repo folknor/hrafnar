@@ -99,6 +99,12 @@ pub struct DefaultsConfig {
     /// deliberately tunable, and switchable off, in case a future codex changes
     /// cadence. codex-only; claude has no rollout to watch.
     pub stall_timeout_secs: Option<StallTimeout>,
+    /// A shell command whose stdout is a Claude OAuth token, for a claude run
+    /// whose own login failed. Global config only (refused in a project file).
+    /// Run lazily: only after a fresh claude run fails to authenticate, or up
+    /// front for a session that was created with it. The token is passed to
+    /// that claude process as `CLAUDE_CODE_OAUTH_TOKEN` and never recorded.
+    pub claude_token_command: Option<String>,
 }
 
 /// `[_defaults].stall_timeout_secs`, decoded where it is parsed: `0` means
@@ -256,6 +262,8 @@ pub struct ReviewConfig {
     pub audit: AuditConfig,
     pub providers: Option<Sourced<Vec<Provider>>>,
     pub stall_timeout_secs: Option<Sourced<StallTimeout>>,
+    /// Global layer only, so never a project's choice.
+    pub claude_token_command: Option<String>,
     /// provider -> profile name -> entry.
     pub profiles: BTreeMap<Provider, BTreeMap<String, ProfileEntry>>,
     pub hostname: String,

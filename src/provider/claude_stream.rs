@@ -44,6 +44,62 @@ pub(super) struct ClaudeMetrics {
     pub(super) usage: Usage,
     models: std::collections::BTreeSet<String>,
     cost_usd: Option<f64>,
+    auth: AuthEvidence,
+}
+
+/// What the stream showed about a credential failure, for deciding whether the
+/// prompt may be resent. Observed on claude 2.1.330 for an expired, unrefreshable
+/// login: `system` hook and `init` events, then one main-agent `assistant`
+/// event with top-level `error: "authentication_failed"`, then a `result`
+/// with `is_error: true`, `terminal_reason: "api_error"`.
+#[derive(Default, Clone)]
+struct AuthEvidence {
+    /// A main-agent assistant event carried `error: "authentication_failed"`
+    /// since the last result.
+    pending: bool,
+    /// The last result closed a turn whose auth error came since the result
+    /// before it, and ended with `terminal_reason: "api_error"`: the failure
+    /// belongs to the result the adapter interprets, the last one.
+    ended_on_auth: bool,
+    /// Anywhere in the attempt: model output, tool activity, or anything from
+    /// a subagent. An auth error that came before work and was followed by it
+    /// is still an attempt that did work.
+    work: bool,
+    /// A line was discarded or unreadable.
+    skipped: bool,
+    /// The stream reached end of file.
+    eof: bool,
+}
+
+/// The fields of an event that say whether work happened, or how a result
+/// ended.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ActivityEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    subtype: Option<String>,
+    error: Option<String>,
+    parent_tool_use_id: Option<serde_json::Value>,
+    terminal_reason: Option<String>,
+    message: Option<ActivityMessage>,
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct ActivityMessage {
+    content: Vec<serde_json::Value>,
+}
+
+impl ActivityEvent {
+    /// Content beyond plain text: a tool call or anything else that acts.
+    fn acts(&self) -> bool {
+        self.message.as_ref().is_some_and(|m| {
+            m.content
+                .iter()
+                .any(|c| c.get("type").and_then(|t| t.as_str()) != Some("text"))
+        })
+    }
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -82,7 +138,76 @@ impl ClaudeMetrics {
         }
     }
 
+    pub(super) fn skipped(&mut self) {
+        self.auth.skipped = true;
+    }
+
+    pub(super) fn eof(&mut self) {
+        self.auth.eof = true;
+    }
+
+    /// The credential failure this stream showed, if any. Replay is offered
+    /// only for a failure seen in a fully observed stream before any work.
+    pub(super) fn auth_failure(&self) -> Option<AuthFailure> {
+        let auth = &self.auth;
+        if !auth.ended_on_auth {
+            // An auth error the last result does not close is not what
+            // ended the run; a partial stream may have hidden that result.
+            return auth.pending.then_some(AuthFailure::Unknown);
+        }
+        Some(if auth.work || auth.skipped || !auth.eof {
+            AuthFailure::Unknown
+        } else {
+            AuthFailure::BeforeWork
+        })
+    }
+
+    fn record_activity(&mut self, line: &[u8]) {
+        let Ok(event) = serde_json::from_slice::<ActivityEvent>(line) else {
+            // An event that could not be read might have been work.
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                self.auth.skipped = true;
+            }
+            return;
+        };
+        let main_agent = event
+            .parent_tool_use_id
+            .as_ref()
+            .is_none_or(serde_json::Value::is_null);
+        match event.kind.as_str() {
+            // Startup, named: the main agent's init and hook events run before
+            // the model is reached. Any other system event - task events
+            // (`task_started`, `task_progress`, `task_notification`, which carry
+            // `tool_use_id` rather than `parent_tool_use_id`), a subagent's, or
+            // one this list does not know - is treated as work.
+            "system"
+                if main_agent
+                    && matches!(
+                        event.subtype.as_deref(),
+                        Some("init" | "hook_started" | "hook_response")
+                    ) => {}
+            "result" => {
+                self.auth.ended_on_auth =
+                    self.auth.pending && event.terminal_reason.as_deref() == Some("api_error");
+                self.auth.pending = false;
+            }
+            "assistant"
+                if main_agent && event.error.as_deref() == Some("authentication_failed") =>
+            {
+                self.auth.pending = true;
+                if event.acts() {
+                    self.auth.work = true;
+                }
+            }
+            // Model output, a tool result, a subagent: anything else is work.
+            _ => self.auth.work = true,
+        }
+    }
+
     pub(super) fn record_line(&mut self, line: &[u8]) {
+        if self.dialect == Dialect::Claude {
+            self.record_activity(line);
+        }
         let Ok(event) = serde_json::from_slice::<ClaudeMetricEvent>(line) else {
             return;
         };

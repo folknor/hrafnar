@@ -211,6 +211,9 @@ impl DigestSummary {
 }
 
 pub struct ProviderResult {
+    /// `claude_token::CREDENTIAL_TOKEN_COMMAND` when this run authenticated
+    /// with a token from the configured command. The fact only.
+    pub credential: Option<&'static str>,
     pub run_id: Option<crate::sessions::handoff::RunId>,
     /// Holds namespace ownership through recovery, durable recording and IPC.
     pub(crate) _reservation: Option<std::sync::Arc<crate::inflight::Reservation>>,
@@ -292,6 +295,19 @@ impl Served {
         Self {
             models: models.into_iter().collect(),
             cost_usd,
+        }
+    }
+
+    /// The same facts with `secret` replaced wherever it appears in a model
+    /// name, for a run whose child held a credential review supplied.
+    pub(super) fn scrubbed(self, secret: &str, with: &str) -> Self {
+        Self {
+            models: self
+                .models
+                .into_iter()
+                .map(|m| m.replace(secret, with))
+                .collect(),
+            cost_usd: self.cost_usd,
         }
     }
 

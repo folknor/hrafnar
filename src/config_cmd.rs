@@ -190,6 +190,13 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         )?,
         None => writeln!(out, "stall_timeout_secs: unset (built-in default)")?,
     }
+    match cfg.claude_token_command {
+        Some(ref command) => writeln!(
+            out,
+            "claude_token_command: {command}  (global [_defaults]; run after a claude run fails to authenticate, and before continuing a session that used it)"
+        )?,
+        None => writeln!(out, "claude_token_command: unset")?,
+    }
 
     // Printed on every call because everyone runs `review config` before using
     // the tool, and an orchestrating agent told to "interrupt the agent" will

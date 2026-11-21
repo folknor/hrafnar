@@ -244,7 +244,8 @@ impl Keeper {
             self.members.values().map(|m| m.proc_.clone()).collect()
         };
         for s in &survivors {
-            self.queue(&Event::Survivor(s.clone()));
+            let event = Event::Survivor(self.scrub_proc(s.clone()));
+            self.queue(&event);
         }
         Outcome {
             status: self.leader_status,

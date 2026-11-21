@@ -137,6 +137,36 @@ fn message_target(
 /// agent", an orchestrating Claude reached for its own task-stop tool instead -
 /// killing `review` rather than the turn, which left a fresh session with no
 /// record to resume. "Message the agent" has no such rival.
+/// Whether the session's own fresh launch (its `run` row) authenticated with
+/// `claude_token_command`. Later rows only report what each attempt used, so
+/// they neither grant nor revoke this; a session whose run row predates the
+/// field carries no such policy.
+fn session_uses_token_command(
+    snapshot: &sessions::query::Snapshot,
+    record: &sessions::SessionRecord,
+    project_root: &std::path::Path,
+) -> bool {
+    // Bound to the session this message was validated against - its audit
+    // id, this host - so a row from another host or audit trail sharing the
+    // data directory cannot opt this continuation into the local command.
+    let host = crate::config::hostname();
+    // An empty historical id identifies nothing, so it cannot bind a policy.
+    if record.audit_id.is_empty() {
+        return false;
+    }
+    snapshot.find(&record.session_id).is_some_and(|session| {
+        session.rows.iter().any(|row| {
+            row.kind == sessions::SessionKind::Run
+                && row.provider == provider::Provider::Claude.as_str()
+                && row.hostname == host
+                && row.audit_id == record.audit_id
+                && crate::project::same_project(&row.project, project_root)
+                && row.credential.as_deref()
+                    == Some(provider::claude_token::CREDENTIAL_TOKEN_COMMAND)
+        })
+    })
+}
+
 pub(super) async fn run_message(
     session_id: &str,
     dry_run: bool,
@@ -297,6 +327,39 @@ pub(super) async fn run_message(
         eprintln!("session last touched {age}");
     }
 
+    // A claude session created with a token from `claude_token_command`
+    // continues on that credential source, read from its `run` row - the one
+    // its fresh launch wrote, found by kind rather than by timestamp. Fetched
+    // here, before the global lock, so a slow helper holds nothing; and a
+    // session that needs it but cannot get it is refused before anything is
+    // sent, since a failed attempt would leave the prompt in its transcript.
+    let claude_token = if provider_name == provider::Provider::Claude
+        && session_uses_token_command(&snapshot, &record, &project_root)
+        && !provider::claude_token::env_has_token(None)
+    {
+        let Some(command) = cfg.claude_token_command.clone() else {
+            bail!(
+                "session {session_id} was created with a token from claude_token_command, which \
+                 the global config no longer sets\n  Nothing was sent."
+            );
+        };
+        let source = provider::claude_token::TokenSource::new(command);
+        let fetched = tokio::task::spawn_blocking(move || source.fetch())
+            .await
+            .map_err(|e| anyhow::anyhow!("claude_token_command task failed: {e}"))?;
+        match fetched {
+            Ok(token) => {
+                eprintln!("credential: claude_token_command (inherited from the session record)");
+                Some(token)
+            }
+            Err(why) => bail!(
+                "session {session_id} needs a token from claude_token_command: {why}\n  Nothing was sent."
+            ),
+        }
+    } else {
+        None
+    };
+
     // Global lock: serialize the *launch* against other `review` invocations,
     // matching what the fan-out path does (it releases the lock once its
     // staggered launches have fired, not when the runs finish).
@@ -328,6 +391,7 @@ pub(super) async fn run_message(
     let provider_runtime = provider::ProviderRuntime::from_config(
         lifecycle.clone(),
         cfg.stall_timeout(),
+        cfg.claude_token_command.as_deref(),
         data.clone(),
         &scope,
     );
@@ -354,10 +418,14 @@ pub(super) async fn run_message(
     // A session created under a profile CODEX_HOME must resume against that
     // same storage directory. Older rows have no saved path and keep using the
     // current process environment/default.
+    let mut settings = provider::RunSettings::from_inherited(provider_name, inherited);
+    if let Some(token) = claude_token {
+        settings = settings.with_claude_token(token);
+    }
     let spec = provider::LaunchSpec {
         provider: provider_name,
         start: provider::SessionStart::Resume(validated_id),
-        settings: provider::RunSettings::from_inherited(provider_name, inherited),
+        settings,
         prompt: stdin_instructions.clone(),
         root: project_root.clone(),
     };
@@ -397,8 +465,20 @@ pub(super) async fn run_message(
         operator_prompt: stdin_instructions.clone(),
     };
     let recorded = ctx.record_message(&result, &stdin_instructions);
-    ctx.publish(&result, &result, recorded);
+    let _ = ctx.publish(&result, &result, recorded);
 
+    if result
+        .output
+        .as_ref()
+        .is_ok_and(|turn| turn.outcome.auth.is_some())
+    {
+        eprintln!(
+            "claude could not authenticate. A message is never resent (the prompt is already in \
+             the session's transcript). If claude is logged in through CLAUDE_CODE_OAUTH_TOKEN, \
+             Claude Code does not pass it to the commands it runs: send this from a terminal; a \
+             session started with [_defaults].claude_token_command gets the token up front."
+        );
+    }
     provider::print_result(&result);
     let left_running = print_left_running(lifecycle);
     println!("\nruntime: {}", format_runtime(started.elapsed()));

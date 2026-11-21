@@ -10,6 +10,7 @@
 mod artifacts;
 mod claude_compat;
 mod claude_stream;
+pub mod claude_token;
 pub(crate) mod codex;
 mod grok;
 mod kind;
@@ -32,7 +33,9 @@ pub use launch::{InheritedSettings, LaunchSpec, ProfileOrigin, RunSettings};
 use lifecycle::{Lease, LeaseUse, Run};
 pub use lifecycle::{ProcessSpec, Stdin};
 pub use model::ModelSpec;
-pub use outcome::{Answer, EndedBy, Outcome, StatusFacts, Termination, Turn, WatchdogTermination};
+pub use outcome::{
+    Answer, AuthFailure, EndedBy, Outcome, StatusFacts, Termination, Turn, WatchdogTermination,
+};
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
 pub use result::{
@@ -245,9 +248,14 @@ pub async fn invoke(
     let project_root = launch.root.as_path();
     let profile_roots = &launch.settings.writable_roots;
     let selection_check = selection.validate(provider);
+    let credential = launch
+        .settings
+        .uses_claude_token()
+        .then_some(claude_token::CREDENTIAL_TOKEN_COMMAND);
     if permissions.provider() != provider || selection_check.is_err() || reservation_error.is_some()
     {
         return ProviderResult {
+            credential,
             run_id: reservation_error.is_none().then(|| runtime.run_id.clone()),
             _reservation: runtime.reservation.clone(),
             provider,
@@ -363,6 +371,7 @@ pub async fn invoke(
     let completed_epoch = now_epoch_secs();
     let mut result = match result {
         Ok(run) => ProviderResult {
+            credential,
             run_id: Some(runtime.run_id.clone()),
             _reservation: runtime.reservation.clone(),
             provider,
@@ -383,6 +392,7 @@ pub async fn invoke(
             leftovers: run.leftovers,
         },
         Err(e) => ProviderResult {
+            credential,
             run_id: Some(runtime.run_id.clone()),
             _reservation: runtime.reservation.clone(),
             provider,

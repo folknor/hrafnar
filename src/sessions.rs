@@ -168,6 +168,13 @@ pub struct SessionRow {
     /// Absent on rows written before Codex home persistence was added.
     #[serde(default)]
     pub codex_home: Option<String>,
+    /// `token_command` when this attempt authenticated claude with the global
+    /// `claude_token_command` (the fact, never the token). On a session's
+    /// `run` row it is also the session's launch policy: messages and resumes
+    /// of that session fetch the token up front. Absent on older rows, which
+    /// therefore carry no such policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 /// Historical call sites use this name; there is only one wire representation.

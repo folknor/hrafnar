@@ -66,7 +66,9 @@ must also omit `effort`, which maki ignores. A codex workspace-write run is by
 default granted the project's own .git directory, so it can git commit (a
 codex config override of sandbox_workspace_write.writable_roots replaces it);
 any run that changes git hooks or config is warned about at exit, by path
-(`review man sandbox`).
+(`review man sandbox`). A claude run started from inside a Claude Code session
+may fail to authenticate, since Claude Code does not pass CLAUDE_CODE_OAUTH_TOKEN
+on; a global [_defaults].claude_token_command fixes that (`review man config`).
 
 Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
 then the response. Codex and grok runs also print a digest between the session
