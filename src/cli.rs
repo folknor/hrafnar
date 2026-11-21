@@ -62,7 +62,11 @@ ask for workspace-write before a codex or grok run may modify files. Claude
 and maki profiles must omit `sandbox`: what a claude run can touch is decided
 by Claude Code's own permission settings, and a maki run's by maki's
 permissions.toml - which by default lets maki edit the project. Maki profiles
-must also omit `effort`, which maki ignores.
+must also omit `effort`, which maki ignores. A codex workspace-write run is by
+default granted the project's own .git directory, so it can git commit (a
+codex config override of sandbox_workspace_write.writable_roots replaces it);
+any run that changes git hooks or config is warned about at exit, by path
+(`review man sandbox`).
 
 Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
 then the response. Codex and grok runs also print a digest between the session

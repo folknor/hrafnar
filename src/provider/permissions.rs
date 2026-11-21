@@ -198,12 +198,75 @@ pub(super) struct PermissionPlan {
     // Provenance of this invocation's roots, retained after preparation
     // replaces a fresh request with its prepared native profile.
     policy: RootPolicy,
+    /// The project's `.git`, when this plan granted it.
+    git_grant: Option<String>,
+    root: std::path::PathBuf,
+}
+
+/// Codex mounts `<workspace>/.git` read-only in `workspace-write` unless an
+/// explicit rule already covers that path, which leaves an agent able to edit
+/// and build but not commit (`.git/index.lock`: read-only file system). Naming
+/// it as a writable root is that explicit rule. Only for a real `.git`
+/// directory in the project root: a pointer file (linked worktree, submodule,
+/// separate gitdir) leads to state other checkouts share, and a project below
+/// the repository's top level has its `.git` outside the workspace, so both
+/// get a note instead of a grant. What a run changes in git's executable
+/// metadata is reported at exit (`crate::git_watch`).
+fn codex_git_grant(root: &Path) -> Option<GrantedRoot> {
+    use crate::git_watch::Layout;
+    let dirs = crate::git_watch::locate(root)?;
+    if dirs.layout != Layout::Direct {
+        let why = match dirs.layout {
+            Layout::Pointer => {
+                "its .git is a pointer file (linked worktree, submodule or separate gitdir)"
+            }
+            Layout::BadPointer => "its .git pointer file could not be read",
+            _ => "the repository's .git is above the project root",
+        };
+        // A profile `config` override can still grant it, so this states the
+        // automatic decision rather than predicting the commit.
+        eprintln!(
+            "note: codex: the project's git metadata was not granted writable, {why}; \
+             git commit needs it"
+        );
+        return None;
+    }
+    let path = std::fs::canonicalize(&dirs.gitdir).unwrap_or(dirs.gitdir);
+    let path = path.to_str()?.to_string();
+    Some(GrantedRoot {
+        path,
+        why: "git commit (the project's .git)",
+    })
 }
 
 impl PermissionPlan {
     pub fn new(permissions: Permissions, root: &Path, profile_roots: &[String]) -> Self {
         let policy = permissions.roots();
-        let granted = match policy {
+        // A resume passes its recorded roots back as profile roots, and a
+        // recorded project `.git` would reach the generic filter, which
+        // resolves symlinks before its inside-the-workspace check: a `.git`
+        // replaced by a symlink to a sibling would be granted there. Drop it
+        // by spelling first, so only `codex_git_grant` decides on `.git`.
+        let project_git = [
+            Some(root.join(".git")),
+            std::fs::canonicalize(root).ok().map(|r| r.join(".git")),
+        ];
+        // Codex only: grok has no automatic `.git` grant, so an explicit or
+        // recorded one there keeps its previous meaning.
+        let is_codex = matches!(permissions.0, NativePermissions::Codex(_));
+        let profile_roots: Vec<String> = profile_roots
+            .iter()
+            .filter(|r| {
+                !is_codex
+                    || !project_git
+                        .iter()
+                        .flatten()
+                        .any(|g| Path::new(r.as_str()) == g)
+            })
+            .cloned()
+            .collect();
+        let profile_roots = profile_roots.as_slice();
+        let mut granted = match policy {
             RootPolicy::Derive => crate::writable_roots::derive_with(
                 root,
                 &crate::writable_roots::RealHost,
@@ -217,8 +280,18 @@ impl PermissionPlan {
             }
             _ => granted.iter().map(|g| g.path.clone()).collect(),
         };
+        let mut git_grant = None;
         match &permissions.0 {
-            NativePermissions::Codex(_) => {}
+            NativePermissions::Codex(_) => {
+                if policy == RootPolicy::Derive
+                    && let Some(grant) = codex_git_grant(root)
+                    && !paths.contains(&grant.path)
+                {
+                    paths.push(grant.path.clone());
+                    git_grant = Some(grant.path.clone());
+                    granted.push(grant);
+                }
+            }
             NativePermissions::Grok(_) => {
                 if policy == RootPolicy::Derive {
                     paths = grok::RootSet::new(&paths).paths().to_vec();
@@ -238,11 +311,23 @@ impl PermissionPlan {
             granted,
             paths,
             policy,
+            git_grant,
+            root: root.to_path_buf(),
         }
     }
 
     pub fn derives(&self) -> bool {
         self.policy == RootPolicy::Derive
+    }
+
+    /// No effective root outside the workspace, not counting the project's
+    /// own `.git`, which says nothing about whether a build's roots were
+    /// found. Checked against the effective paths, which a codex `config`
+    /// override may have replaced with entries inside the workspace.
+    pub fn lacks_build_roots(&self) -> bool {
+        self.paths
+            .iter()
+            .all(|p| self.git_grant.as_ref() == Some(p) || Path::new(p).starts_with(&self.root))
     }
     pub fn uses_recorded_roots(&self) -> bool {
         self.policy == RootPolicy::Recorded

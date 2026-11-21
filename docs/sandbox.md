@@ -48,8 +48,10 @@ page assume a profile that does not.
 The run can write inside the project directory, plus the roots below, plus
 whatever the provider itself always grants: temporary directories on both, and
 on grok its own home. Codex also keeps some paths inside the project read-only
-on its own account, such as `.git`. On codex the run has network access too,
-which is what lets build and test suites use unix sockets.
+on its own account (`.git`, `.agents`, `.codex`, `.aws`); `review` lifts that
+for `.git` only, so a codex write run can commit (see Git metadata below).
+On codex the run has network access too, which is what lets build and test
+suites use unix sockets.
 
 On grok, a write run first marks the project as trusted in grok's folder-trust
 store, because grok cancels every edit in an untrusted folder. That grant is
@@ -70,7 +72,9 @@ or grok is also granted these, when they lie outside the project:
   link such as `target -> ../shared-target` is resolved from the project
   directory first, so it is granted by its real path);
 - the `.git/lfs` store of a sibling checkout that holds a path dependency, when
-  that store exists.
+  that store exists;
+- on codex, the project's own `.git`, when it is a directory in the project
+  root.
 
 The first three are granted whether or not they exist yet, since a build may
 create them.
@@ -94,6 +98,45 @@ The exception: a codex profile whose `config` sets
 roots and `writable_roots` alike - with exactly what it lists, and those paths
 pass through none of the filters above. The run records what it actually got.
 
+## Git metadata
+
+A codex `workspace-write` run can `git add` and `git commit`: by default the
+project's `.git` is granted writable (a codex `config` override of
+`sandbox_workspace_write.writable_roots` replaces this along with the other
+roots). Only a real `.git` directory in the project root is granted
+automatically. When `.git` is a pointer file (a linked worktree, a submodule, a
+separate git directory), or the project sits below the repository's top level,
+nothing is granted automatically and a note at launch says so; a commit then
+needs a deliberate grant (a codex `config` override) or happens outside the
+run.
+
+A writable `.git` lets a run leave behind something git later executes outside
+any sandbox, the next time anyone runs git in that repository: a hook, or a
+config entry naming a program. Claude and maki runs could always do this. So
+every run, on every provider and level, is checked: at launch `review` notes the
+repository's `config`, `config.worktree` and hooks, plus any include file and
+`core.hooksPath` directory that config names, and the files that say where the
+git directory is (a `.git` pointer, `commondir`). At the end of the run it warns
+about each one that changed, and about anything it could not check:
+
+```
+warning: codex: git metadata that git may execute from changed while this run was live, by it or by anything else, or could not be checked - inspect before running git in this repository:
+  /path/to/repo/.git/hooks/pre-commit: added
+```
+
+It names the path and the kind of change - added, removed, content or mode
+changed, now or no longer a symlink, the repository layout changed, or not
+checked - and never the contents, since config can hold credentials. Nothing is undone; what to do is your call.
+Setting a branch's upstream (`git branch -u`, `git push -u`, or creating a
+branch from a remote one) writes `config` too, so a warning is not proof of
+anything malicious.
+
+This is a best-effort comparison of two moments, not a guarantee. No warning
+does not mean the repository is safe. Not covered: nested git directories under
+`modules/` and `worktrees/`, git's global and system config, anything run in
+the repository while the run was still going, and a `review` that was killed
+before the run ended.
+
 ## What a resumed session gets
 
 `review message` keeps the session's own level, from the last run recorded for
@@ -114,8 +157,9 @@ it: a `workspace-write` session stays writable.
 ## When a write fails
 
 A run that reports a read-only filesystem was launched `read-only`, is writing
-outside its roots, or is writing a path the provider protects (such as `.git`
-on codex). `review sessions <ID>` shows the level and roots it
+outside its roots, or is writing a path the provider protects (such as `.codex`
+on codex, or a `.git` the run was not granted - see Git metadata above).
+`review sessions <ID>` shows the level and roots it
 launched with. Then:
 
 - launched `read-only`: use a profile with `workspace-write`;

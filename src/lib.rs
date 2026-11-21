@@ -14,6 +14,7 @@ pub mod contained;
 pub mod data;
 pub mod exit;
 mod fsutil;
+pub mod git_watch;
 pub mod incident;
 pub mod inflight;
 pub mod input;

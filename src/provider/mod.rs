@@ -325,7 +325,7 @@ pub async fn invoke(
     // therefore a policy warning, not a correctness diagnostic - but silence
     // here is what let 40 consecutive runs record no roots unnoticed while every
     // build inside them died at a lock outside the sandbox.
-    if derives && root_paths.is_empty() {
+    if derives && plan.lacks_build_roots() {
         eprintln!(
             "warning: workspace-write run with no writable roots outside the \
              workspace - a build needing one (the build lock, the cargo home, \
@@ -338,7 +338,24 @@ pub async fn invoke(
     let result = match setup {
         Err(e) => Err(e),
         Ok(mut state) => {
+            // Taken here rather than earlier so preparation's own writes are
+            // not attributed to the run. See `crate::git_watch`.
+            // Filesystem reads and a `git config` child: kept off the runtime's
+            // worker threads.
+            let root = project_root.to_path_buf();
+            let git = tokio::task::spawn_blocking(move || crate::git_watch::Snapshot::take(&root))
+                .await
+                .ok();
             let result = state.run(&launch, &plan, launched, runtime).await;
+            match git {
+                Some(git) => {
+                    let changes = tokio::task::spawn_blocking(move || git.changes())
+                        .await
+                        .unwrap_or_else(|_| vec!["git metadata check failed".into()]);
+                    report_git_changes(provider, &changes);
+                }
+                None => report_git_changes(provider, &["git metadata check failed".into()]),
+            }
             prepared = Some(state);
             result
         }
@@ -399,6 +416,22 @@ pub async fn invoke(
         prepared.record(&mut result);
     }
     result
+}
+
+/// Warn about git metadata a run changed. Advisory: names paths and the kind
+/// of change, never contents, and a run with no warning is not thereby safe.
+fn report_git_changes(provider: Provider, changes: &[String]) {
+    if changes.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: {provider}: git metadata that git may execute from changed while \
+         this run was live, by it or by anything else, or could not be checked - \
+         inspect before running git in this repository:"
+    );
+    for line in changes {
+        eprintln!("  {line}");
+    }
 }
 
 /// The `writable root` lines for a launch: one per **effective** root, carrying

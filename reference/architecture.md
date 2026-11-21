@@ -26,7 +26,7 @@ From the operator's command line down to the process a provider runs in:
 | Provider | `provider` (`kind`, `launch`, `prepare`, `permissions`, `model`, `session`, `lifecycle`, `stream`, `outcome`, `result`, `output`), one adapter per wire protocol: `claude_compat` (claude and maki, decoded by `claude_stream`), `codex/`, `grok/` | Turning a launch request into a classified result |
 | Containment | `contained`, `keeper/`, `supervisor`, `process`, `report` | Running each provider under its own keeper and proving its tree empty |
 | State | `data`, `sessions/`, `inflight`, `audit`, `incident`, `transcript`, `lock`, `fsutil` | Everything `review` writes to disk and reads back |
-| Shared policy | `writable_roots/`, `watchdog`, `timings`, `prompt`, `input`, `ids` | Pieces several layers use |
+| Shared policy | `writable_roots/`, `git_watch`, `watchdog`, `timings`, `prompt`, `input`, `ids` | Pieces several layers use |
 
 Dependencies point downward. The command layer picks what to run, the provider
 layer runs it, containment holds it, and state records it. The provider layer
