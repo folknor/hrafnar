@@ -246,13 +246,10 @@ mod tests {
             .var("CARGO_HOME", "/media/disk/cargo-home");
         let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
         assert!(
-            paths.contains(&"/media/disk/cargo-home".to_string()),
+            paths.iter().any(|p| p == "/media/disk/cargo-home"),
             "{paths:?}"
         );
-        assert!(
-            !paths.contains(&"/home/dev/.cargo".to_string()),
-            "{paths:?}"
-        );
+        assert!(!paths.iter().any(|p| p == "/home/dev/.cargo"), "{paths:?}");
     }
 
     /// A sandboxed brokkr that cannot write its history drops the row silently,
@@ -262,15 +259,15 @@ mod tests {
         let host = FakeHost::new().var("HOME", "/home/dev");
         let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
         assert!(
-            paths.contains(&"/home/dev/.local/share/brokkr".to_string()),
+            paths.iter().any(|p| p == "/home/dev/.local/share/brokkr"),
             "{paths:?}"
         );
 
         let host = host.var("XDG_DATA_HOME", "/srv/xdg");
         let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
-        assert!(paths.contains(&"/srv/xdg/brokkr".to_string()), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "/srv/xdg/brokkr"), "{paths:?}");
         assert!(
-            !paths.contains(&"/home/dev/.local/share/brokkr".to_string()),
+            !paths.iter().any(|p| p == "/home/dev/.local/share/brokkr"),
             "{paths:?}"
         );
     }
@@ -285,10 +282,7 @@ mod tests {
             .var("HOME", "/home/dev")
             .var("XDG_RUNTIME_DIR", "/run/user/1000");
         let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
-        assert!(
-            paths.contains(&"/home/dev/.brokkr".to_string()),
-            "{paths:?}"
-        );
+        assert!(paths.iter().any(|p| p == "/home/dev/.brokkr"), "{paths:?}");
         assert!(
             !paths.iter().any(|p| p.starts_with("/run/user")),
             "{paths:?}"

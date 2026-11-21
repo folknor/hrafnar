@@ -1,4 +1,5 @@
 project = "review"
 
 [test]
+debug = true
 default_package = "review"
