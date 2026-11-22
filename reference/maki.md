@@ -5,20 +5,23 @@ What maki was observed to do, which the maki arms of
 coding agent that runs open models (DeepSeek, Qwen, Kimi, GLM and others,
 directly or through OpenRouter) and is driven by claude's runner because
 its headless mode reproduces Claude Code's stream-json format. Source
-findings are from the `research/maki` checkout at `b58c319d`; probes ran
-against maki 0.7.1 (`scripts/maki-probe.sh`,
+findings are from the `research/maki` checkout at `v0.7.3`; probes ran
+against maki 0.7.3 (`scripts/maki-probe.sh`,
 `scripts/maki-probe-signal.py`). Re-run both after a maki upgrade, because
 upstream changes fast.
 
 ## Flags maki ignores
 
 maki accepts 15 Claude Code flags only to ignore them with a warning
-(`Cli::warn_ignored_flags`), and reads `--permission-mode` only in its SDK
-mode, dropping it under `-p` without a word. `MAKI_IGNORED_FLAGS` is a copy
-of that list. `--effort` is among them: the thinking level comes from
-config (`always_thinking`), else from the level last used anywhere on the
-host (`setup::remember_thinking`), and a resumed headless session does not
-take the level stored with it.
+(`Cli::warn_ignored_flags`). `MAKI_IGNORED_FLAGS` is a copy of that list.
+`--effort` is among them: the thinking level comes from config
+(`always_thinking`), else from the level last used anywhere on the host
+(`setup::remember_thinking`), and a resumed headless session does not take
+the level stored with it.
+
+A flag only some run paths read is refused with exit 1 on the others
+(`Cli::check_run_path_flags`): `--permission-mode`, which only SDK mode
+reads, fails a plain `-p` launch (probed).
 
 The model id is maki's own `provider/model-id`: `openrouter/free` names a
 model `free` that OpenRouter doesn't have (probed: a 404 result).

@@ -146,8 +146,8 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
             "--verbose",
         ],
         // maki needs no `--verbose` for stream-json, and takes no permission
-        // mode outside its SDK mode (it would drop `--permission-mode`
-        // silently): an unattended `-p` run denies whatever would prompt,
+        // mode outside its SDK mode (it refuses `--permission-mode` under
+        // `-p`): an unattended `-p` run denies whatever would prompt,
         // which is claude's `dontAsk`. Never `--trust`: `hrafnar` grants no
         // folder trust, so an untrusted project's `.maki` config can tighten
         // maki's permissions but not loosen them (trust the operator gave
