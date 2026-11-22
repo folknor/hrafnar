@@ -1,42 +1,67 @@
 # review
 
-A Rust CLI that sends a prompt to a fresh AI session on one of several harnesses (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
+`review` is a command-line tool that hands a prompt to a fresh, headless AI
+coding session and prints the answer. You pipe in instructions; it starts a
+new session on Claude Code, Codex, Grok or maki, and the agent reads the code
+itself. Use it for code reviews, second opinions, and with a write profile,
+for fixes.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
-## How it works
+## Why fresh sessions
 
-You pipe your instructions via stdin. The tool starts one **fresh session** on one harness and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
+Every run starts a clean session. Reviving a long-lived session on a cold
+prompt cache reprocesses its whole history, which only grows; a fresh session
+costs about one review's worth of tokens. Each run prints its session ID, so
+you can follow up with `review message ID` while the cache is still warm.
 
-Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. Every harness prints the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
+`review` is built to be driven by other agents as much as by people:
+
+- All output is plain text, and the exit status says whether the run
+  produced an answer.
+- When a run ends, everything its agent started is torn down, and anything
+  that survives is named.
+- A running agent is steered with `review message`, never by killing
+  `review`.
+
+## Install
+
+`review` is a Rust crate. From a checkout:
+
+```sh
+cargo install --path .
+```
+
+It drives whichever harnesses are on your `PATH`: `claude`, `codex`, `grok`
+or `maki`. `review list --all` shows which ones this host has.
 
 ## Quick start
 
-### 1. Initialize
+Create the project config in your repository. It holds the project's audit
+id, and can hold its archetypes:
 
-```
+```sh
 cd /path/to/your/project
 review init
 ```
 
-### 2. Configure
-
-Settings shared by every project - the profiles naming which harnesses and
-models serve which tier, and the default one - go once in the global
-`~/.config/review/config.toml`:
+Define profiles once, in the global config at
+`~/.config/review/config.toml`. A profile is a tier of work with one entry
+per harness that can serve it:
 
 ```toml
 [_defaults]
-profile = "deep"
+profile = "review"
 prefer = ["codex", "claude"]
 
-[profiles.deep]
-codex = { model = "gpt-6-luna", effort = "max", sandbox = "read-only" }
+[profiles.review]
+comment = "Standard reviewer."
+codex = { model = "gpt-6.2-sol", effort = "low", sandbox = "read-only" }
 claude = { model = "opus" }
 ```
 
-Project-specific archetypes - a name mapped to a priming prompt - go in the
-project's `.review.toml`:
+Give the project its archetypes, the priming prompts for each kind of
+review, in its `.review.toml`:
 
 ```toml
 [archetypes]
@@ -44,392 +69,34 @@ security = "You are a security expert for this project. Read the codebase."
 bugs = "You hunt for edge cases and correctness bugs."
 ```
 
-`review list` shows the archetypes and profiles you can use; `review list --all` the effective result and which file each value came from.
+Then run it:
 
-### 3. Run
-
-```
-echo "what does the retry loop guarantee?" | review -p deep
+```sh
 echo "look for auth boundary violations" | review -a security
-echo "check for edge cases in the parsing module" | review -a bugs -p deep
-echo "second opinion please" | review -a bugs -p deep --harness claude
+echo "second opinion please" | review -a bugs --harness claude
+echo "what's the worst of those?" | review message SESSION_ID
+review list
 ```
 
-## Usage
-
-```
-echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--harness HARNESS] [--dry-run]
-echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
-review list [--projects | --all]
-review sessions [ID] [--all] [--limit N]
-review incidents [--limit N]
-review init
-```
-
-Instructions are piped via stdin (required, 20KB limit). Without `-a`, stdin is sent unchanged - no priming prompt.
-
-One run is one session. For several perspectives or harnesses, launch several `review` calls side by side; launches on one host are spaced apart automatically (see [Rate limits](#rate-limits)).
-
-All output is plain text, for people and agents alike. There is no JSON mode.
-
-### Archetypes
-
-Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except reserved names, which fail to parse: the subcommand names (`message`, `resume`, `interrupt`, `config`, `sessions`, `incidents`, `init`, `man`, `help`), and `bare` with any non-empty prompt. `bare` is the special no-prime selector: `-a bare` works even without a config entry, and an archetype definition is allowed only as `bare = ""`.
-
-### Options
-
-| Flag | Description |
-|------|-------------|
-| `-a, --archetype <name>` | Archetype to prime with, or `bare` (an unprimed run, even without a config entry). Omit to send stdin unchanged. |
-| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, one entry per harness with its `model`/`effort`/`sandbox`/`env`. Overrides `[_defaults].profile`. |
-| `--harness <name>` | Which of the profile's harnesses to run on. Without it, the first in `[_defaults].prefer` that the profile defines and is installed, else the profile's only installed one. |
-| `--dry-run` | Print what would be sent instead of sending it |
-
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, holds the candidate harnesses; `--harness`, `[_defaults].prefer` and what is installed pick one. A chosen harness that is not installed on this machine fails the run before anything launches - `review list` marks the harness a plain `-p <name>` picks.
-
-What each harness was observed to do is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every harness captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one harness that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
-
-### Upgrading from the positional archetype
-
-The archetype used to be positional (`review security`) and resuming used `--session <ID>`. Both still work, with a warning, so scripts and orchestration procedures keep running until they are updated: `review security` behaves like `review -a security`, `review bare` like plain `review`, and `--session <ID>` like `review resume <ID>` (any `--profile` given with it is ignored).
-
-### Profiles
-
-A profile is a tier of work holding one entry per harness that can serve it, each with that harness's `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
-
-```toml
-[profiles.review]
-comment = "Standard reviewer."
-codex = { model = "gpt-5.6-terra", effort = "low" }
-claude = { model = "Opus 4.8", effort = "medium", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
-
-[profiles.implement.codex]
-model = "gpt-5.6-terra"
-effort = "high"
-sandbox = "workspace-write"
-
-[_defaults]
-prefer = ["codex", "claude"]
-```
-
-```
-echo "audit the auth flow" | review -a security -p review
-echo "audit the auth flow" | review -a security -p review --harness claude
-```
-
-The harness is `--harness` if given (the profile must have an entry for it), else the first in `[_defaults].prefer` that the profile defines and this machine has installed, else the profile's only installed entry; otherwise the run errors asking for `--harness`. A project's `.review.toml` may add profiles but never redefine one the global config defines - the same name in both is a load error naming both files - so a checked-out repository cannot change what `-p review` means. If no file defines the profile, the run errors naming every file it searched.
-
-`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki entries must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
-
-The levels are `review`'s own vocabulary, translated per harness at launch, because the harnesses do not agree on the names and grok *refuses to start* on one it cannot resolve:
-
-| `review` level | codex `--sandbox` | grok `--sandbox` |
-|---|---|---|
-| `read-only` | `read-only` | `read-only` |
-| `workspace-write` | `workspace-write` | `workspace` |
-| `danger-full-access` | `danger-full-access` | `none` |
-
-A value `review` does not recognise is passed through to the harness verbatim, so a custom grok profile defined in `~/.grok/sandbox.toml` still works; the harness validates its own vocabulary and fails before running a turn if the name is wrong.
-
-### Follow-up with `review resume`
-
-`review resume <id>` continues a specific harness session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
-
-```
-echo "what's the worst of those for a single-account user?" | \
-  review resume 019deabc-0def-7000-8000-abcdef012345
-```
-
-There is no `-p`: the sidecar records which harness owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
-
-```
-$ echo "follow up" | review resume 019deabc-...
-Error: no record of session 019deabc-... on this host
-  `review sessions` lists the sessions this host's review runs created.
-```
-
-Other constraints:
-
-- No archetype and no profile - no prime and no profile overrides are applied. The sandbox level, writable roots, model and effort are inherited from the session's own recorded run instead.
-- Validation of the session ID itself is delegated to the harness.
-
-### Sessions sidecar log
-
-Each run that captures a session ID and each `review resume` appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
-
-- `timestamp` (UTC), `epoch_secs`, `project` (root path), `hostname`
-- `audit_id`, `provider`, `archetype`, `session_id`
-- `kind` - `"run"` for fresh-session creation events, `"session"` for resume touches
-- `model`, `env_keys` (env-var *names* only - values are not recorded so secrets don't leak through the sidecar)
-- `operator_prompt` (raw stdin), `assembled_prompt` (what the harness actually saw)
-- `response` or `error`
-- `review_version`
-
-The sidecar drives two things:
-
-**1. Cache-age gate on `review resume`.** When you resume, `review` looks up the last touch and prints how long it's been:
-
-```
-$ echo "follow up" | review resume 019deabc-...
-harness: claude (from the session record)
-session last touched 14m ago
---- claude ---
-<response>
-```
-
-Resuming is the *warm* follow-up path. If the session last ended over 55
-minutes ago - past the longest realistic prompt-cache TTL - the cache is cold,
-and resuming would reprocess the whole session prefix at full cost. So `review`
-**refuses** it and tells you to do a fresh run with restated context instead:
-
-```
-$ echo "follow up" | review resume 019deabc-...
-Error: session last touched 1h17m ago - its prompt cache is cold.
-  Resuming would reprocess the whole session prefix at full cost.
-  Start a fresh run with restated context instead.
-```
-
-**2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
-
-A turn that is running right now appears first, so a long run is
-distinguishable from an idle session:
-
-```
-$ review sessions
-[in flight] codex / turn in flight since 6m
-       session: 019f5f70-b2ca-7590-8a61-be66d9d7cf07
-
-[14m ago] claude / bugs (run) / 3 touches
-       session: 019deabc-0def-7000-8000-abcdef012345
-       opened:  review the new sync code
-
-[1h12m ago] codex / security (run) / 1 touch
-       session: 019d0123-...
-       opened:  check OAuth handling on the IMAP path
-```
-
-Each block shows the age since the last touch, the harness/archetype/touch count, the session ID (copy-paste into `review resume <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
-
-For ad-hoc queries beyond what `review sessions` exposes, the JSONL works directly with `jq` and `grep`.
-
-### Output format
-
-```
---- claude ---
-<review content>
-
---- codex ---
-<review content>
-```
-
-Codex runs (both fresh and resumed) also print a digest above
-the message, distilled from codex's own `--json` event stream plus the
-`-o`/`--output-last-message` backstop:
-
-```
---- codex ---
-session: 019f5f70-b2ca-7590-8a61-be66d9d7cf07
-exit: 0
-captured: true
-turns: 1
-usage: input=12244 cached=10112 output=5 reasoning=0
-<review content>
-```
-
-`captured: true` means the final message came from the authoritative `-o` file
-(which survives a frozen or halted stream); `false` means we fell back to the
-last streamed message. Non-JSON log lines codex interleaves (ERROR/WARN,
-apply_patch dumps) are printed between the digest and the message.
-
-When a run looks wrong (`captured: false`, non-zero exit, or a signal), the
-digest also reads codex's on-disk transcript and appends a post-mortem: whether
-the turn reached `task_complete`, whether a `stream_error` occurred, the last
-event, and the last in-flight tool call (what was running when it stopped).
-Clean runs skip this.
-
-### When codex hangs
-
-Some codex versions can stop making progress without exiting - either after
-finishing the work, or partway through it. `review` watches the rollout
-transcript while a run is in flight and handles the two cases differently.
-
-**Finished but stuck.** The final answer is already on disk and codex simply
-will not exit. `review` recovers the answer from the rollout, terminates codex,
-and reports normally:
-
-```
---- codex ---
-exit: -
-signal: SIGTERM
-captured: false
-terminated by review: watchdog: stranded completion
-  rollout silent for: 183s
-  last rollout event: event_msg/task_complete
-recovered: final answer restored from transcript (stream/-o truncated)
-<the real review content>
-```
-
-This is not a timeout. It cannot fire on a run that has not already produced
-its answer, however long that run takes, and it cannot fire while the rollout
-is still growing.
-
-**Wedged with nothing produced.** No answer was ever written and the rollout
-has gone silent. This *is* a timeout, defaulting to 15 minutes:
-
-```
---- codex ---
-terminated by review: watchdog: stall timeout (900s silent)
-  rollout silent for: 900s
-  last rollout event: response_item/custom_tool_call
-note: review terminated the run; the text below is whatever codex had produced by then
-```
-
-A stalled run writes a forensic bundle (see `review incidents`) and exits
-non-zero, so scripts and CI see a failure rather than a silent success.
-
-(Both digests above are abridged - the usual `turns`, `usage`, `transcript` and
-`incident` lines still print alongside.)
-
-The 15 minutes rests on codex waking itself every few minutes even while
-waiting on a long tool call - not on a documented guarantee. Tune or disable it
-if that ever stops holding:
-
-```toml
-[_defaults]
-stall_timeout_secs = 900   # 0 disables the check entirely
-```
-
-Both are codex-only; claude has no rollout to watch, and legitimately goes
-quiet while waiting on a backgrounded task.
-
-Killing `review` (Ctrl-C or `SIGTERM`) now takes codex and everything it
-spawned with it, rather than leaving it running detached.
-
-### `review incidents`
-
-Any codex run that looks wrong - no capture, non-zero exit, killed by a signal
-- writes a forensic bundle to `~/.local/share/review/incidents/`, holding
-codex's stderr (with backtraces), the raw NDJSON stream, a transcript tail, the
-exact prompt, and a `meta.json` with a copy-pasteable command that replays the
-run verbatim. Clean runs write nothing.
-
-```
-$ review incidents --limit 2
-2026-07-31T10:22:25Z  codex 019fb7b0-cac2-7a02-b121-08af9e2bf626  exit=1  no final answer (died)  [codex-cli 0.146.0]
-       /home/folk/.local/share/review/incidents/2026-07-31T10-22-25Z-codex-019fb7b0-…-f008
-```
-
-Newest first, `--limit <N>` capping the count (default 20). The verdict is one
-of `recovered from transcript`, `no final answer (died)`, `completed (stream/-o
-truncated)`, or `suspicious`, and the codex version is recorded because deaths
-have been version-specific. The bundle path is also printed on the digest of
-the run that produced it.
-
-## Configuration
-
-Settings resolve like a standard command-line tool: the command line, then the project's `.review.toml`, then the global config. Nothing is built in.
-
-| File | Where | Required |
-|---|---|---|
-| Project | `.review.toml` in the project root, discovered by walking up to the git root. `review init` creates a starter. | Yes - it holds `[_audit]`, the project's audit id. A file with only `[_audit]` is enough. |
-| Global | `$XDG_CONFIG_HOME/review/config.toml`, else `~/.config/review/config.toml` | No |
-
-Both files take the same format; `[_audit]` is allowed only in the project file.
-
-```toml
-[archetypes]
-security = "You are a security expert for this project. Read the codebase."
-bugs = "You hunt for edge cases and correctness bugs."
-tilemaker = "You are a tilemaker maintainer weighing tradeoffs."
-tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
-
-[_defaults]
-profile = "high"                   # used when -p is omitted
-prefer = ["codex", "claude"]       # which of a profile's harnesses to run on
-stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
-
-# Named profiles: one entry per harness with its model/effort/sandbox/env,
-# selected with -p/--profile (and --harness).
-[profiles.high]
-comment = "Hard problems."
-codex = { model = "gpt-6-luna", effort = "high" }
-claude = { model = "Opus 4.8", effort = "medium", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
-```
-
-How the layers combine:
-
-- **Archetypes** are the union of both files; the project wins on a name clash.
-- **`[_defaults]` keys** come from the first file that sets them, each whole.
-- **Profiles** are add-only: a project may define new ones, but a name both files define is an error naming both files.
-
-### `review list`
-
-Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles with at least one harness installed on this machine, each with its installed harnesses (the one a plain `-p <name>` picks marked `*`, none when the choice is ambiguous), the default marked, and the comment's first line. A profile with no installed harness is named on a `hidden:` line.
-
-```
-$ review list
-archetypes:
-  (none)
-
-profiles:
-  review        codex*, claude   (default)
-                # Standard reviewer.
-  gpt-write-l1  codex*
-                # Small/medium tasks, shallow, mechanical, and very cheap.
-  hidden: qwen (maki not installed)
-```
-
-`review list --all` prints the whole effective configuration: the files consulted, whether each harness is installed, every archetype with its source, `[_defaults].prefer`, and every profile with the table it came from and each harness entry's settings. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
-
-Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer on its own.
-
-### Upgrading existing files
-
-These now fail to parse, each with an error saying what replaced it:
-
-- `[<harness>.<name>]` profile tables, and legacy `[<host>.<harness>.<name>]` ones: move each to `[profiles.<name>.<harness>]`.
-- A profile with `provider = "<harness>"`: move its settings under `[profiles.<name>.<harness>]`; only `comment` stays at the profile level.
-- `[_defaults].providers` or `[_defaults].provider`: write `profile = "<name>"`, and `prefer = [...]` to order harnesses.
-- `[_groups]`: remove it. Launch one `review -a <name>` per member.
-- A profile or entry containing a key `review` does not know - usually a typo, which would otherwise parse as an empty entry and silently run the harness's defaults.
-- A project profile with the same name as a global one: rename it. Projects may add profiles, not redefine them.
-
-### Harnesses
-
-| Harness | Binary | Non-interactive | Resume | Model flag |
-|----------|--------|----------------|--------|------------|
-| claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
-| codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
-| grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
-| maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
-
-To run another harness, pick it from the profile's entries:
-
-```
-echo "ask claude" | review -a bugs -p high --harness claude
-```
-
-## Rate limits
-
-Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple harness sessions simultaneously (e.g. 5 claude sessions) will trigger RPM limits.
-
-A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once - enough to blow past most RPM budgets.
-
-To avoid this, `review` calls fired together on one host are spaced apart automatically: each fresh run holds the host launch lock for a fixed spacing after launching (or until it ends, if sooner), so the next queued call launches that much later. All run concurrently once launched.
-
-## Concurrency
-
-A global file lock (`/tmp/review.lock`) serializes harness **launches**, not
-whole runs. A fresh run holds it for its launch spacing, a `review message`
-until its single spawn, then releases it and lets the runs proceed
-concurrently. Additional invocations queue and wait for the launch window only.
-
-That distinction is deliberate. Holding the lock for a run's full duration
-meant one wedged harness froze every other `review` on the machine
-indefinitely - a hung run should cost you that run, not the tool.
-
-Note: the lock is shared across all users on the machine. On shared dev
-machines, one user's launch will briefly block another's.
+`review list` shows the archetypes and profiles you can use here, with the
+harness each profile would pick.
+
+## Documentation
+
+`review --help` is the complete short form. `review man` lists the longer
+topics, which are the same pages as this repository's [docs](docs/):
+
+- **`run`**: a fresh run, from stdin to exit status
+- **`profiles`**: profile fields and how a run picks its harness
+- **`config`**: the config files, how they combine, and their errors
+- **`message`**: steering and continuing a session
+- **`sandbox`**: what a run can touch on each harness
+- **`sessions`**: what is recorded and how to query it
+- **`failures`**: what a failed run tells you, and what to do
+- **`projects`**: acting on another project with `-C`
+
+Changes that affect how you use `review` are in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
