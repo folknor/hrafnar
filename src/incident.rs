@@ -200,7 +200,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     }
     let mut failures = Vec::new();
 
-    // Full stderr - the highest-value channel we used to discard. With
+    // Full stderr, the highest-value channel in the bundle. With
     // RUST_BACKTRACE set on the child, a panic lands here with its trace.
     if let Err(error) = write_file(&dir, "stderr.txt", inc.stderr) {
         failures.push(error);

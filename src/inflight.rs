@@ -62,7 +62,7 @@ pub enum Phase {
 #[serde(try_from = "MarkerWire")]
 pub struct Marker {
     pub session_id: String,
-    /// On disk as `provider`, so live markers from older builds still read.
+    /// On disk as `provider`: the marker file format keeps that key name.
     #[serde(rename = "provider")]
     pub harness: String,
     pub project: String,

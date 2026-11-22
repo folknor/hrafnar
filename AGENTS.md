@@ -113,7 +113,7 @@ bz close 12 -m "fixed by ..."
 
 | Folder | Contents | Rule |
 |---|---|---|
-| `reference/` | How the thing is built and why: architecture, design decisions, per-harness mechanism and evidence, invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `reference/` | Only what code can't say: behaviour you'd need three modules open to get right, and harness facts and evidence that shape the code | Citable from source as a source of truth. What it says must be true. |
 | `docs/` | How the thing is used: the `review man` topics, one file each, flat | Same must-be-true rule. |
 | `notes/` | Transient: plans, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
 | `plans/` | Retired | Plan documents go in `notes/`. |
@@ -128,16 +128,28 @@ bz close 12 -m "fixed by ..."
 - `scripts/` holds maintained diagnostics that keep a claim in `reference/`
   re-testable against a harness that upgrades underneath us. They cost real
   turns, so they are run deliberately after a harness upgrade, never from
-  `brokkr check`. A one-off probe belongs in `notes/`.
+  `brokkr check`. A one-off probe belongs in `notes/`. The exception is
+  `scripts/check_docs.py`, which costs no turns: `brokkr check` runs it to
+  enforce the document rules here and in the prose guide; its docstring
+  lists them, and `doc-ok` on a line exempts it.
 - `research/` holds gitignored checkouts of harness source (`research/codex`,
   `research/grok-build`): not ours, not guaranteed present, but the authority on
   harness behaviour when they are.
 - Root-level convention files (`AGENTS.md`, `CLAUDE.md`, `README.md`,
   `CHANGELOG.md`, `LICENSE`, ...) stay at the root.
-- Docs, reference pages and code comments state the current contract only.
-  A user-visible change (flag, command, config format, output) gets a
-  `CHANGELOG.md` entry saying what to do if you relied on the old behaviour;
-  other history stays in git. Write docs to
-  `../piners/reference/how-to-write-docs.md` where it isn't piners-specific.
+
+### Editing docs
+
+- A rule and its reason go on the code that enforces it. Reach for
+  `reference/` only when the comment can't hold it. Rule of thumb: if you
+  didn't need `reference/` to implement or fix something, what you did
+  doesn't belong there either.
+- `docs/` is the user's contract: what happens and what to do, never how.
+- One fact, one place. Elsewhere, point at it; don't restate it.
+- Current contract only. No "used to", no incident stories, no changelogs
+  in prose. User-visible changes go in `CHANGELOG.md`; the rest is git.
+- Add to a page by rewriting the section, not by appending a paragraph.
+- Write to `../piners/reference/how-to-write-docs.md` where it isn't
+  piners-specific. `scripts/check_docs.py` enforces the mechanical rules.
 - Avoid citing source line numbers in `notes/`, `docs/` and `reference/` - they
   drift fast.

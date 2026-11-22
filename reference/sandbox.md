@@ -27,12 +27,12 @@ is what the next resume launches with:
    `writable_roots` only when non-empty. A row with the field is a row that
    widened something.
 
-A profile `config` entry that restates `sandbox_workspace_write.writable_roots`
-wins, because codex takes the last `-c`. `codex::config_writable_roots_override`
-parses it back so the record follows the run. An explicit `[]` records as
-empty, not as "no override". A failed launch records what it asked for; a
-panicked task records no permission facts, because its effective grants are
-unavailable.
+A profile `config` entry that restates
+`sandbox_workspace_write.writable_roots` wins, because codex takes the last
+`-c`. `codex::config_writable_roots_override` parses it back so the record
+follows the run. An explicit `[]` records as empty, not as "no override". A
+failed launch records what it asked for; a panicked task records no
+permission facts, because its effective grants are unavailable.
 
 ## What a resume inherits
 
@@ -58,10 +58,10 @@ line up across modules:
   inherit them.
 
 Model and effort are inherited because codex resolves the model again on
-every invocation. Without `-m`, every resume ran on codex's built-in default
-at its default effort, and since `--ignore-user-config` that isn't even the
-operator's configured model. A field session's rollout `turn_context` showed
-one turn on the profile's model and five resumed turns on another. Grok
+every invocation. A resume without `-m` runs on codex's built-in default at
+its default effort, and under `--ignore-user-config` that isn't the
+operator's configured model either. A field session's rollout `turn_context`
+showed one turn on the profile's model and five resumed turns on another. Grok
 stores the model with the session: measured on grok 1.0.40, a session
 created with `-m grok-4.6` and resumed without `-m` was still served by
 `grok-4.6-build`. The inherited `-m` is redundant there, and harmless.
@@ -69,7 +69,7 @@ created with `-m grok-4.6` and resumed without `-m` was still served by
 ## What a sandboxed build needs
 
 Codex `workspace-write` grants the cwd and `/tmp`. With `--ignore-rules`
-(see [codex.md](codex.md#the-sandbox-guarantee)) build commands really run
+(see [codex.md](codex.md#the-sandbox-guarantee)) build commands run
 sandboxed, and a `brokkr check` fails in this order:
 
 1. The build lock: fatal, before the compiler starts.

@@ -2038,8 +2038,8 @@ async fn a_codex_resume_is_marked_in_flight_before_it_launches() {
 
 /// The ticket's case: the agent started a hung script in a session of its own
 /// (codex's sandbox runs bwrap with `--new-session`), and codex finished. The
-/// script escaped every process group `review` knew about and used to run for
-/// hours after `review` reported the run over. The keeper adopts it as a
+/// script escaped every process group `review` knew about, so without the
+/// keeper it would run for hours after `review` reported the run over. The keeper adopts it as a
 /// subreaper and ends it - SIGKILL, since it ignores SIGTERM - before the run
 /// returns, and the record names it.
 #[tokio::test]

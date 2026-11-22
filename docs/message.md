@@ -139,8 +139,8 @@ in flight:
 - if the first turn has already finished, it continues the session
 
 While a message waits behind the host-wide launch lock, `review sessions`
-shows it as `[queued]`. A message that arrives just after the first launched,
-before the harness has reported its process, waits briefly rather than
+shows it as `[queued]`. A message that arrives after the first launched but
+before the harness has reported its process waits briefly rather than
 failing.
 
 ## Exit status

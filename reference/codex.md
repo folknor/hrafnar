@@ -68,10 +68,11 @@ against sessions that worked on 0.146.0:
 The leading upstream explanation for the stranded case is the resume-only
 `exclude_turns: true` that `thread_resume_params_from_config` sends from
 0.147.0 (openai/codex#35621). After `TurnCompleted`, exec issues an unbounded
-`thread/read` with `include_turns: true` (`maybe_backfill_turn_completed_items`)
-while its single `select!` loop isn't draining notifications. With turns
-excluded at resume, that read rebuilds the whole thread from the rollout,
-which fits "resumes hang, fresh runs don't, small sessions are fine". A
+`thread/read` with `include_turns: true`
+(`maybe_backfill_turn_completed_items`) while its single `select!` loop
+isn't draining notifications. With turns excluded at resume, that read
+rebuilds the whole thread from the rollout, which fits "resumes hang, fresh
+runs don't, small sessions are fine". A
 secondary candidate is the synchronous `Drop` of `OtelProvider`, bounded
 only for the TUI by openai/codex#37109, with a Statsig metrics exporter on by
 default in release builds. Neither is proven. `review` catches the hang with
@@ -160,10 +161,10 @@ Codex resolves model and effort as `review` mirrors them in
 present it's the authority on codex behaviour. The sandbox findings above
 came from `protocol/src/protocol.rs` (`SandboxPolicy`),
 `config/src/config_toml.rs` and `core/src/config/` (how `sandbox_mode` or
-`default_permissions` compiles into a policy) and `linux-sandbox/src/landlock.rs`
-(what the seccomp filter denies). Compare `git log -1` and the newest tag
-there with `codex --version` before trusting it: a key in the checkout may
-not exist in the installed binary.
+`default_permissions` compiles into a policy) and
+`linux-sandbox/src/landlock.rs` (what the seccomp filter denies). Compare
+`git log -1` and the newest tag there with `codex --version` before trusting
+it: a key in the checkout may not exist in the installed binary.
 
 The source says what should happen; the scripts in `scripts/` measure what
 does, against whatever codex is installed:

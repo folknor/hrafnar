@@ -53,7 +53,7 @@ Upstream facts the trust code models, from grok's source:
   (`folder_trust::report_cli_trust_grant`).
 
 The grant spans three steps in `mod.rs`: `prepare` announces a grant only
-for an undecided key, `run_grok_turn` re-checks that key just before spawn,
+for an undecided key, `run_grok_turn` re-checks that key right before spawn,
 and `Prepared::verify_trust` re-reads the store after the run. Only a
 trusted entry on the announced key reaches the sidecar as `grok_trust`, so
 `jq 'select(.grok_trust)'` lists every grant `review` made.

@@ -1,5 +1,5 @@
 //! The run lifecycle every harness adapter drives: one place owning the
-//! ordering that each runner used to restate by hand.
+//! ordering, so no runner restates it by hand.
 //!
 //! An adapter keeps its own control flow - argv, its stream readers, codex's
 //! rollout baseline and recovery, grok's wake loop, classification - and calls

@@ -59,8 +59,8 @@ codex runs get a second chance, in two steps:
    reporting it, `review` restores the answer and the digest says
    `recovered`.
 2. If there was no answer, `review` files an incident bundle (see
-   `review man sessions`) and resumes the session once with a nudge to finish (see
-   `review man run`).
+   `review man sessions`) and resumes the session once with a nudge to
+   finish (see `review man run`).
 
 `review` doesn't resume a codex death that was interrupted, or one that left
 processes running.

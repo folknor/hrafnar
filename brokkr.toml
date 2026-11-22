@@ -3,3 +3,43 @@ project = "review"
 [test]
 debug = true
 default_package = "review"
+
+# The documentation rules from AGENTS.md ("Document folders") and the prose
+# guide `docs/` and `reference/` follow: no history outside CHANGELOG.md, no
+# hyphen as punctuation, no internal paths in `docs/`, every relative link
+# and anchor resolving, terminal-safe headings, tagged fences, the banned
+# words, the 78-column wrap, and nothing durable citing `notes/`. The script's
+# docstring lists each rule and what it exempts. It self-tests every rule on
+# in-memory cases before reading the tree and refuses to report on the tree
+# if one fails, so a rotted regex cannot pass silently. It reads text only and
+# writes nothing.
+[[script_check]]
+name = "doc-conventions"
+command = "python3 -B scripts/check_docs.py"
+expect = "doc conventions ok"
+match = "last-line"
+stage = "pre-clippy"
+
+# The code-comment half of the no-history rule: a comment describes what the
+# code does now, and the story of how it got there belongs in git history and
+# CHANGELOG.md. `region = "comment"` reads comments only, so a user-facing
+# error string naming a retired form ("`provider` was removed") stays legal.
+#
+# The vocabulary is narrower than the docs rule's on purpose. Comments here
+# describe runtime events ("a file was removed", "no longer talking to its
+# harness"), name past session rows "historical", and use codex's own name for
+# its "legacy" sandbox pipeline; matching those would bury the signal. Only
+# phrases that can mean nothing but the code's own past are read. `except`
+# exempts the passive "is used to check", which is a purpose, not a habit;
+# lowercase `used` only, so a sentence-initial "Used to assert ..." never
+# matches.
+[[textlint]]
+name = "history-in-code-comments"
+pattern = '\bused to\b|(?i:\bpreviously\b|\bformerly\b|\bolder builds?\b)'
+paths = ["src/**/*.rs", "tests/**/*.rs"]
+except = ['\b(?:is|are|be|been|being|never|only|also|not) used to\b']
+region = "comment"
+allow_marker = "doc-ok"
+require_live_paths = true
+must_scan = ["src/harness/lifecycle.rs", "tests/provider_runs.rs"]
+message = "describe what the code does now; history goes in git and CHANGELOG.md (doc-ok to allow)"

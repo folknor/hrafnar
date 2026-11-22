@@ -86,8 +86,9 @@ only, as Git metadata below describes.
 ### Grok write runs
 
 Grok's built-in `workspace` profile can't add writable paths, so a grok
-write run uses a profile `review` creates in grok's global `sandbox.toml`. Each profile is named `review-ws-` plus a hash of its root
-set, so a run gets exactly its own roots. `review` creates a profile once
+write run uses a profile `review` creates in grok's global `sandbox.toml`.
+Each profile is named `review-ws-` plus a hash of its root set, so a run
+gets exactly its own roots. `review` creates a profile once
 and never modifies it.
 
 A grok write run first marks the project as trusted in grok's folder trust

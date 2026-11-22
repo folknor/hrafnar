@@ -120,10 +120,10 @@ If `review` dies, the control pipe's EOF (or EPIPE on events) tells the
 keeper to tear down. It appends its outcome to `teardowns.jsonl`
 (`teardowns-private.jsonl` for a private project) beside the sidecar logs,
 best-effort; nothing reads that log back. An outcome that reached the events
-pipe just before `review` died is in neither place. While such a keeper is
-still tearing down, the marker reads as cleanup pending and `review message`
-and `review interrupt` refuse the session; once the keeper is gone that
-protection ends.
+pipe in the moment before `review` died is in neither place. While such a
+keeper is still tearing down, the marker reads as cleanup pending and
+`review message` and `review interrupt` refuse the session; once the keeper
+is gone that protection ends.
 
 ## What stays outside every tree
 
