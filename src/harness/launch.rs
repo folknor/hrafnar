@@ -27,7 +27,9 @@ pub struct RunSettings {
 }
 
 impl RunSettings {
-    pub fn from_profile(harness: Harness, definition: Option<&config::ProfileDef>) -> Self {
+    /// `definition` is the chosen harness's entry of the run's profile; its
+    /// table (`[profiles.<name>.<harness>]`) is what the session row records.
+    pub fn from_profile(harness: Harness, definition: Option<&config::HarnessEntry>) -> Self {
         let default = config::Profile::default();
         let profile = definition.map(|d| &d.profile).unwrap_or(&default);
         Self {
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn profile_settings_keep_winning_origin_and_selector_precedence() {
-        let definition = config::ProfileDef {
+        let definition = config::HarnessEntry {
             harness: Harness::Codex,
             profile: config::Profile {
                 model: Some("dedicated".into()),
@@ -211,10 +213,9 @@ mod tests {
                 env: Some(BTreeMap::from([("SECRET".into(), "secret value".into())])),
                 writable_roots: vec!["/requested".into()],
                 sandbox: Some(config::SandboxLevel::WorkspaceWrite),
-                ..Default::default()
             },
             layer: config::Layer::Global,
-            table: "[profiles.deep]".into(),
+            table: "[profiles.deep.codex]".into(),
         };
         let settings = RunSettings::from_profile(Harness::Codex, Some(&definition));
         assert_eq!(settings.selection.model(), Some("dedicated"));
@@ -223,7 +224,10 @@ mod tests {
         assert_eq!(settings.writable_roots, ["/requested"]);
         assert_eq!(settings.permissions.selector(), Some("workspace-write"));
         assert_eq!(settings.origin().expect("origin").layer, "global");
-        assert_eq!(settings.origin().expect("origin").table, "[profiles.deep]");
+        assert_eq!(
+            settings.origin().expect("origin").table,
+            "[profiles.deep.codex]"
+        );
         let encoded = serde_json::to_string(&settings.origin()).expect("origin json");
         assert!(!encoded.contains("secret value"));
     }

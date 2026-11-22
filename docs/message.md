@@ -32,11 +32,11 @@ session cannot be continued at all. Grok turns are not ended gracefully.
 Stdin as-is: no archetype prime, no profile. The session keeps the harness,
 sandbox level, model and effort recorded for it, and each is announced
 (`sandbox: workspace-write (inherited from the session record)`). There is no
-`-a` or `-p`. A maki session records no effort, and maki itself
+`-a`, `-p` or `--harness`. A maki session records no effort, and maki itself
 resumes at the thinking level its own config sets, else the one it last used
 anywhere on the host, not the one the session ran at.
 
-It does **not** keep the profile's `env` or codex `config` overrides: the
+It does **not** keep the profile entry's `env` or codex `config` overrides: the
 session record holds env names only and no overrides, so there is nothing to
 restore them from. A session that relied on one - a custom endpoint,
 `CODEX_HOME`, `GROK_HOME`, a model-provider override - runs its follow-up

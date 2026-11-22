@@ -1,6 +1,6 @@
 # A fresh run
 
-`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE]`
+`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--harness HARNESS]`
 
 Every run starts one **fresh session** on one harness. Nothing
 carries over from an earlier run: if the new session needs context, the
@@ -37,11 +37,17 @@ still works with a warning.
 
 ## Profile
 
-The profile names the harness and its settings: `-p deep`, else
-`[_defaults].profile` in the config (see `review man profiles`). A run with
-neither, or naming a profile no file defines, errors before launching. So does
-a profile whose harness is not installed on this host; `review list --all` shows
-which are installed. `--provider` was removed and is refused with that advice.
+The profile is `-p deep`, else `[_defaults].profile` in the config (see
+`review man profiles`). A run with neither, or naming a profile no file
+defines, errors before launching. A profile holds one entry per harness; the
+run uses `--harness <name>` if given (an error if the profile has no entry for
+it), else the first harness in `[_defaults].prefer` that the profile defines
+and this host has installed, else the profile's only installed entry. When
+several are installed and nothing picks one, the run errors asking for
+`--harness` or `[_defaults].prefer`. A chosen harness that is not installed
+errors before launching; `review list` shows which a plain `-p <name>` would
+pick. `--provider` was removed and is refused, pointing at `-p` and
+`--harness`.
 
 ## Several sessions
 
@@ -54,8 +60,9 @@ other `review` calls beyond that spacing.
 
 ## Dry run
 
-`--dry-run` prints the assembled prompt and launches nothing. It warns, rather
-than fails, when the harness is not installed.
+`--dry-run` prints the assembled prompt and launches nothing. It names the
+chosen harness entry on stderr, and warns, rather than fails, when that
+harness is not installed.
 
 ## Output
 

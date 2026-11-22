@@ -6,7 +6,8 @@
 //! Hidden migration aliases warn when used: the old positional archetype
 //! (`review security`, with `review bare` meaning none), `review resume <ID>`
 //! and `--session <ID>`, both now `review message <ID>`, and `review config`,
-//! now `review list --all`. A retired `--provider` is refused by the run. Run flags beside a
+//! now `review list --all`. A retired `--provider` is refused by the run, pointing at
+//! `-p` and `--harness`. Run flags beside a
 //! subcommand are refused by hand (`Cli::parse_checked`), because clap would
 //! accept them in front of one and silently drop them. Which commands accept
 //! `-C` is one exhaustive policy here (`Cli::project_scope`).
@@ -55,18 +56,25 @@ never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
 {PROJECT_REFUSALS} refuse -C.
 
-Profiles (-p): a profile is a [profiles.<name>] table naming the harness it
-runs on ({HARNESSES}) and that harness's model, effort, sandbox and env. Without
--p the run uses [_defaults].profile. A harness that is not installed fails the
-run before anything launches. A profile resolves to its first definition,
-looking in the project file before the global one, and that definition wins
-whole. Fields are never merged, so a project profile that leaves out `model`
-does not inherit the global profile's `model`, and a project profile may not
-name a different harness than the global one of the same name. `sandbox` defaults to read-only, so a profile has to
+Profiles (-p): a profile is a tier of work, a [profiles.<name>] table holding
+an optional `comment` and one entry per harness that can serve it
+({HARNESSES}), each with that harness's model, effort, sandbox and env:
+  [profiles.review.codex]
+  model = \"gpt-5.6-terra\"
+  [profiles.review.claude]
+  model = \"opus\"
+Without -p the run uses [_defaults].profile. The harness is --harness if given
+(the profile must have an entry for it); else the first harness in
+[_defaults].prefer that the profile defines and this host has installed; else
+the profile's only installed entry. Otherwise the run fails asking for
+--harness. A chosen harness that is not installed fails the run before
+anything launches. A project's .review.toml may add profiles but never
+redefine a global one: the same name in both files is an error. `sandbox`
+defaults to read-only, so an entry has to
 ask for workspace-write before a codex or grok run may modify files. Claude
-and maki profiles must omit `sandbox`: what a claude run can touch is decided
+and maki entries must omit `sandbox`: what a claude run can touch is decided
 by Claude Code's own permission settings, and a maki run's by maki's
-permissions.toml - which by default lets maki edit the project. Maki profiles
+permissions.toml - which by default lets maki edit the project. Maki entries
 must also omit `effort`, which maki ignores. A codex workspace-write run is by
 default granted the project's own .git directory, so it can git commit (a
 codex config override of sandbox_workspace_write.writable_roots replaces it);
@@ -105,7 +113,7 @@ more work there.
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
-  echo \"ask claude\" | review -p opus                   A profile on another harness
+  echo \"ask claude\" | review -p deep --harness claude  The profile on another harness
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
@@ -160,7 +168,7 @@ must finish before continuation.
 The session must come from a run on this host: its harness is read from the
 record that run left (`review sessions` lists them), and an ID with no record
 is refused. The run continues in the project the session was started in,
-whatever the current directory; -C only asserts it. There is no -a or -p. Stdin is sent as-is, with no
+whatever the current directory; -C only asserts it. There is no -a, -p or --harness. Stdin is sent as-is, with no
 archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
@@ -194,11 +202,12 @@ merges the project's .review.toml with the global config, so reading
 .review.toml alone gives an incomplete and often wrong answer: profiles and
 archetypes may live in the global file.
 
-By default it lists the archetypes, and the profiles whose harness is
-installed on this host with the default marked; profiles hidden for a missing
-harness are named. --all adds everything: the files consulted, harness
-availability, each value's source and any definition it shadows, and the
-remaining settings. Env vars are listed by name only, never by value. Outside
+By default it lists the archetypes, and the profiles with at least one
+harness installed on this host: each with its installed harnesses, the one a
+plain `-p <name>` would pick marked `*` (none when the choice is ambiguous),
+and the default profile marked; profiles with no installed harness are named.
+--all adds everything: the files consulted, harness availability,
+[_defaults].prefer, each value's source, and every harness entry's settings. Env vars are listed by name only, never by value. Outside
 a project it shows the global layer alone.";
 
 #[derive(Parser)]
@@ -232,14 +241,20 @@ pub struct RunArgs {
     #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 
-    /// Profile to run: [profiles.<name>], naming the harness and its
-    /// model/effort/sandbox/env. Overrides [_defaults].profile. The first
-    /// definition found wins whole; sandbox defaults to read-only
+    /// Profile to run: [profiles.<name>], one entry per harness with its
+    /// model/effort/sandbox/env. Overrides [_defaults].profile; sandbox
+    /// defaults to read-only
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Retired: the harness is part of the profile. Still accepted so the
-    /// run can refuse it with the replacement rather than clap's diagnostic.
+    /// Which of the profile's harnesses to run on. Without it: the first in
+    /// [_defaults].prefer that the profile defines and is installed, else its
+    /// only installed one
+    #[arg(long, value_name = "HARNESS")]
+    pub harness: Option<crate::harness::Harness>,
+
+    /// Retired: replaced by -p and --harness. Still accepted so the run can
+    /// refuse it with the replacement rather than clap's diagnostic.
     #[arg(long = "provider", hide = true, value_name = "NAME")]
     pub retired_provider: Option<String>,
 
@@ -574,11 +589,21 @@ mod tests {
             &["-a", "bugs", "resume", "abc"],
             &["--provider", "claude", "resume", "abc"],
             &["--provider", "codex", "message", "abc"],
+            &["--harness", "codex", "message", "abc"],
+            &["--harness", "claude", "list"],
             &["-p", "deep", "config"],
             &["--session", "abc", "sessions"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should be refused");
         }
+    }
+
+    #[test]
+    fn a_run_takes_a_harness_by_name() {
+        let cli = parsed(&["-p", "review", "--harness", "claude"]);
+        assert_eq!(cli.harness, Some(crate::harness::Harness::Claude));
+        assert!(parsed(&[]).harness.is_none());
+        assert!(parse(&["--harness", "gpt"]).is_err());
     }
 
     #[test]

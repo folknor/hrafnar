@@ -71,13 +71,16 @@ mod tests {
                 ),
             ] {
                 let error = parse_file(
-                    &format!("[profiles.test]\nprovider = '{harness}'\n{field}"),
+                    &format!("[profiles.test.{harness}]\n{field}"),
                     "source.toml",
                     layer,
                 )
                 .expect_err("ignored field must fail")
                 .to_string();
-                assert!(error.contains("[profiles.test]"), "{error}");
+                assert!(
+                    error.contains(&format!("[profiles.test.{harness}]")),
+                    "{error}"
+                );
                 assert!(error.contains("source.toml"), "{error}");
                 assert!(error.contains("remove"), "{error}");
             }
@@ -94,7 +97,7 @@ mod tests {
             };
             parse_file(
                 &format!(
-                    "[profiles.test]\nprovider='{harness}'\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"
+                    "[profiles.test.{harness}]\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"
                 ),
                 "source",
                 Layer::Local,
@@ -108,7 +111,7 @@ mod tests {
         ] {
             parse_file(
                 &format!(
-                    "[profiles.test]\nprovider='{harness}'\nsandbox='{level}'\nwritable_roots=['/srv/cache']"
+                    "[profiles.test.{harness}]\nsandbox='{level}'\nwritable_roots=['/srv/cache']"
                 ),
                 "source",
                 Layer::Local,
@@ -120,7 +123,7 @@ mod tests {
     #[test]
     fn invalid_selector_types_fail_with_repair_instructions() {
         let error = parse_file(
-            "[profiles.test]\nprovider='codex'\nconfig=['model_reasoning_effort=123']",
+            "[profiles.test.codex]\nconfig=['model_reasoning_effort=123']",
             "source",
             Layer::Local,
         )

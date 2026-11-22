@@ -3,14 +3,14 @@
 //! and anything left over is an error: a retired harness-scoped
 //! `[<harness>.<profile>]` table gets a message saying where it moved, and any
 //! other table (a retired legacy host table, a typo) is an unknown section.
-//! Each `[profiles.<name>]` names its harness with a required `harness` key,
-//! which is taken off before the rest is read as a `Profile`, so a misspelled
-//! field is still an error. `[_audit]` in the global file is an error. The
-//! format itself is documented in `docs/config.md`.
+//! Each `[profiles.<name>]` holds an optional `comment` and one entry per
+//! harness, each read strictly as a `Profile`, so a misspelled field is still
+//! an error. `[_audit]` in the global file is an error. The format itself is
+//! documented in `docs/config.md` and `docs/profiles.md`.
 
 use super::{
     AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Harness, Layer, Profile,
-    reserved_names, toml_key,
+    ProfileDef, reserved_names, toml_key,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -44,8 +44,10 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
         for retired in ["providers", "provider"] {
             if d.contains_key(retired) {
                 bail!(
-                    "[_defaults].{retired} in {origin}: the provider is part of the profile \
-                     now - write `profile = \"<name>\"` naming a [profiles.<name>] table"
+                    "[_defaults].{retired} in {origin}: the harness is chosen from the \
+                     profile now - write `profile = \"<name>\"` naming a [profiles.<name>] \
+                     table, and `prefer = [\"<harness>\", ...]` to order the harnesses a \
+                     profile may run on"
                 );
             }
         }
@@ -90,7 +92,7 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
         None => BTreeMap::new(),
     };
     let profiles = match table.remove("profiles") {
-        Some(toml::Value::Table(t)) => parse_profiles(t, origin)?,
+        Some(toml::Value::Table(t)) => parse_profiles(t, origin, layer)?,
         Some(_) => bail!("[profiles] in {origin}: expected a table of [profiles.<name>] tables"),
         None => BTreeMap::new(),
     };
@@ -100,15 +102,15 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     if let Some(key) = table.keys().next() {
         if let Ok(harness) = key.parse::<Harness>() {
             bail!(
-                "[{key}.*] in {origin}: provider-scoped profile tables were removed - \
-                 move each [{key}.<name>] to [profiles.<name>] with provider = \"{harness}\""
+                "[{key}.*] in {origin}: harness-scoped profile tables were removed - \
+                 move each [{key}.<name>] to [profiles.<name>.{harness}]"
             );
         }
         bail!(
             "unknown section '{key}' in {origin}\n  \
              Sections are [archetypes], [profiles.<name>], [_defaults], [_audit] and \
-             [_projects]. Legacy host tables ([<host>.<provider>.<profile>]) were \
-             removed: move a host's profiles to [profiles.<name>] with a provider key."
+             [_projects]. Legacy host tables ([<host>.<harness>.<profile>]) were \
+             removed: move a host's profiles to [profiles.<name>.<harness>]."
         );
     }
 
@@ -134,30 +136,101 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     })
 }
 
-/// `[profiles.<name>]` tables: each takes its required `harness` off, reads
-/// the rest strictly as a `Profile`, and is validated against that harness.
-fn parse_profiles(t: toml::Table, origin: &str) -> Result<BTreeMap<String, (Harness, Profile)>> {
+/// Keys of a harness entry, so a profile that writes one at the top level
+/// (the format before profiles held one entry per harness) is told where it
+/// goes rather than only that the key is unknown.
+const ENTRY_KEYS: &[&str] = &[
+    "model",
+    "effort",
+    "sandbox",
+    "env",
+    "config",
+    "writable_roots",
+];
+
+/// `[profiles.<name>]` tables: an optional `comment` and one entry per
+/// harness, `[profiles.<name>.<harness>]`, each read strictly as a `Profile`
+/// and validated against its harness. Any other key is an error, and so is a
+/// profile with no harness entry.
+fn parse_profiles(
+    t: toml::Table,
+    origin: &str,
+    layer: Layer,
+) -> Result<BTreeMap<String, ProfileDef>> {
     let mut out = BTreeMap::new();
     for (name, v) in t {
-        let at = format!("[profiles.{}] in {origin}", toml_key(&name));
-        let toml::Value::Table(mut fields) = v else {
+        let table = format!("[profiles.{}]", toml_key(&name));
+        let at = format!("{table} in {origin}");
+        let entry_table = |harness: &str| format!("[profiles.{}.{harness}]", toml_key(&name));
+        let toml::Value::Table(fields) = v else {
             bail!("{at}: expected a table");
         };
-        let harness: Harness = match fields.remove("provider") {
-            Some(p) => p.try_into().map_err(|e| anyhow::anyhow!("{at}: {e}"))?,
-            None => bail!(
-                "{at}: missing `provider` - every profile names the provider it runs on \
-                 (supported: {})",
-                Harness::supported()
-            ),
-        };
-        let profile: Profile = toml::Value::Table(fields)
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
-        profile
-            .validate(harness)
-            .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
-        out.insert(name, (harness, profile));
+        // Checked before the other keys, so an old-format profile gets this
+        // advice rather than an unknown-key error for its `model`.
+        if fields.contains_key("provider") {
+            bail!(
+                "{at}: `provider` was removed - a profile now holds one entry per \
+                 harness. Move the settings under {}, naming the harness that \
+                 `provider` named.",
+                entry_table("<harness>")
+            );
+        }
+        let mut comment = None;
+        let mut entries = BTreeMap::new();
+        for (key, value) in fields {
+            if key == "comment" {
+                let toml::Value::String(c) = value else {
+                    bail!("{at}: `comment` must be a string");
+                };
+                comment = Some(c);
+                continue;
+            }
+            let Ok(harness) = key.parse::<Harness>() else {
+                let hint = if ENTRY_KEYS.contains(&key.as_str()) {
+                    format!(
+                        "\n  `{key}` belongs to one harness: move it under {}.",
+                        entry_table("<harness>")
+                    )
+                } else {
+                    String::new()
+                };
+                bail!(
+                    "{at}: unknown key '{key}'; a profile takes `comment` and one entry \
+                     per harness ({}){hint}",
+                    Harness::supported()
+                );
+            };
+            let at = format!("{} in {origin}", entry_table(harness.as_str()));
+            let profile: Profile = match value {
+                toml::Value::Table(_) => {
+                    value.try_into().map_err(|e| anyhow::anyhow!("{at}: {e}"))?
+                }
+                _ => bail!(
+                    "{at}: expected a table of settings (`{harness} = {{}}` for its defaults)"
+                ),
+            };
+            profile
+                .validate(harness)
+                .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
+            entries.insert(harness, profile);
+        }
+        if entries.is_empty() {
+            bail!(
+                "{at}: no harness entry - a profile names at least one harness it runs on \
+                 ({}), as {} (`{{}}` for that harness's defaults)",
+                Harness::supported(),
+                entry_table("<harness>")
+            );
+        }
+        out.insert(
+            name,
+            ProfileDef {
+                comment,
+                entries,
+                layer,
+                table,
+            },
+        );
     }
     Ok(out)
 }
@@ -210,67 +283,139 @@ bugs = \"find edge cases\"
     }
 
     #[test]
-    fn parses_profiles_with_their_harness() {
+    fn parses_profiles_with_one_entry_per_harness() {
         let raw = "\
-[profiles.opus]
-provider = \"claude\"
-model = \"Opus 4.8\"
-effort = \"medium\"
-env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
-
-[profiles.implement]
-provider = \"codex\"
-model = \"gpt-5.6-terra\"
-sandbox = \"workspace-write\"
+[profiles.review]
+comment = \"Standard reviewer.\"
+codex = { model = \"gpt-5.6-terra\", effort = \"low\", sandbox = \"workspace-write\" }
+claude = { model = \"Opus 4.8\", env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" } }
 
 [profiles.plain]
-provider = \"grok\"
+grok = {}
 ";
         let cfg = local_only(raw).unwrap();
-        let opus = cfg.resolve_profile("opus").unwrap();
-        assert_eq!(opus.harness, Harness::Claude);
-        assert_eq!(opus.table, "[profiles.opus]");
-        assert_eq!(opus.profile.model.as_deref(), Some("Opus 4.8"));
+        let review = cfg.resolve_profile("review").unwrap();
+        assert_eq!(review.table, "[profiles.review]");
+        assert_eq!(review.layer, Layer::Local);
+        assert_eq!(review.comment.as_deref(), Some("Standard reviewer."));
         assert_eq!(
-            opus.profile.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+            review.harnesses().collect::<Vec<_>>(),
+            [Harness::Claude, Harness::Codex]
+        );
+        let claude = review.entry(Harness::Claude).unwrap();
+        assert_eq!(claude.table, "[profiles.review.claude]");
+        assert_eq!(claude.profile.model.as_deref(), Some("Opus 4.8"));
+        assert_eq!(
+            claude.profile.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
             "http://localhost:8787"
         );
-        let implement = cfg.resolve_profile("implement").unwrap();
-        assert_eq!(implement.harness, Harness::Codex);
+        let codex = review.entry(Harness::Codex).unwrap();
         assert_eq!(
-            implement
+            codex
                 .profile
                 .sandbox
                 .as_ref()
                 .map(crate::config::SandboxLevel::as_str),
             Some("workspace-write")
         );
-        // A harness alone is a profile: that harness on its own defaults.
+        assert!(review.entry(Harness::Grok).is_none());
+        // An empty entry is that harness on its own defaults.
         let plain = cfg.resolve_profile("plain").unwrap();
-        assert_eq!(plain.harness, Harness::Grok);
-        assert!(plain.profile.model.is_none());
+        assert!(plain.comment.is_none());
+        assert!(plain.entries[&Harness::Grok].model.is_none());
         assert!(cfg.resolve_profile("nope").is_none());
     }
 
     #[test]
-    fn a_profile_must_name_a_known_harness() {
-        let err = local_only("[profiles.x]\nmodel = \"m\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("missing `provider`"), "{err}");
-        let err = local_only("[profiles.x]\nprovider = \"gpt\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown harness 'gpt'"), "{err}");
-        assert!(err.contains("[profiles.x]"), "{err}");
+    fn a_dotted_profile_name_is_quoted_in_entry_tables() {
+        let cfg = local_only("[profiles.\"a.b\".codex]\n").unwrap();
+        let def = cfg.resolve_profile("a.b").unwrap();
+        assert_eq!(def.table, "[profiles.\"a.b\"]");
+        assert_eq!(
+            def.entry(Harness::Codex).unwrap().table,
+            "[profiles.\"a.b\".codex]"
+        );
     }
 
     #[test]
-    fn a_misspelled_profile_key_is_still_an_error() {
-        let err = local_only("[profiles.x]\nprovider = \"codex\"\nmodle = \"m\"\n")
+    fn a_profile_needs_a_harness_entry() {
+        for raw in ["[profiles.x]\n", "[profiles.x]\ncomment = \"c\"\n"] {
+            let err = local_only(raw).unwrap_err().to_string();
+            assert!(err.contains("no harness entry"), "{err}");
+            assert!(err.contains("[profiles.x]"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_retired_provider_key_says_where_settings_moved() {
+        let err = local_only("[profiles.x]\nprovider = \"codex\"\nmodel = \"m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`provider` was removed"), "{err}");
+        assert!(err.contains("[profiles.x.<harness>]"), "{err}");
+    }
+
+    #[test]
+    fn unknown_profile_keys_name_the_allowed_ones() {
+        let err = local_only("[profiles.x]\ngpt = {}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown key 'gpt'"), "{err}");
+        assert!(err.contains("`comment`"), "{err}");
+        assert!(err.contains("claude, codex, grok, maki"), "{err}");
+        // An entry setting written at the profile level is pointed at its home.
+        let err = local_only("[profiles.x]\nmodel = \"m\"\ncodex = {}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown key 'model'"), "{err}");
+        assert!(
+            err.contains("move it under [profiles.x.<harness>]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn entries_and_comments_must_have_the_right_shape() {
+        let err = local_only("[profiles.x]\ncodex = \"gpt\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[profiles.x.codex]"), "{err}");
+        assert!(err.contains("expected a table"), "{err}");
+        let err = local_only("[profiles.x]\ncomment = 1\ncodex = {}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`comment` must be a string"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_entry_key_is_still_an_error() {
+        let err = local_only("[profiles.x.codex]\nmodle = \"m\"\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("modle"), "{err}");
+        assert!(err.contains("[profiles.x.codex]"), "{err}");
+    }
+
+    #[test]
+    fn each_entry_is_validated_against_its_own_harness() {
+        // sandbox is fine for codex, refused for claude, in the same profile.
+        let err = local_only(
+            "[profiles.x]\ncodex = { sandbox = \"read-only\" }\nclaude = { sandbox = \"read-only\" }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("[profiles.x.claude]"), "{err}");
+        assert!(err.contains("claude does not honour 'sandbox'"), "{err}");
+    }
+
+    #[test]
+    fn parses_defaults_prefer() {
+        let cfg = local_only("[_defaults]\nprefer = [\"codex\", \"claude\"]\n").unwrap();
+        assert_eq!(cfg.prefer(), [Harness::Codex, Harness::Claude]);
+        let err = local_only("[_defaults]\nprefer = [\"gpt\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gpt"), "{err}");
     }
 
     #[test]
@@ -284,8 +429,7 @@ provider = \"grok\"
     #[test]
     fn parses_defaults_profile() {
         let cfg =
-            local_only("[_defaults]\nprofile = \"deep\"\n[profiles.deep]\nprovider = \"codex\"\n")
-                .unwrap();
+            local_only("[_defaults]\nprofile = \"deep\"\n[profiles.deep]\ncodex = {}\n").unwrap();
         assert_eq!(cfg.default_profile(), Some("deep"));
     }
 
@@ -297,6 +441,7 @@ provider = \"grok\"
         ] {
             let err = local_only(raw).unwrap_err().to_string();
             assert!(err.contains("profile = "), "{err}");
+            assert!(err.contains("prefer = "), "{err}");
         }
         let err = local_only("[archetypes]\na = \"a\"\n[_groups]\ng = [\"a\"]\n")
             .unwrap_err()
@@ -310,7 +455,7 @@ provider = \"grok\"
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("[profiles.<name>] with provider = \"codex\""),
+            err.contains("move each [codex.<name>] to [profiles.<name>.codex]"),
             "{err}"
         );
         let err = local_only("[myhost.codex.deep]\nmodel = \"m\"\n")
@@ -318,6 +463,7 @@ provider = \"grok\"
             .to_string();
         assert!(err.contains("unknown section 'myhost'"), "{err}");
         assert!(err.contains("Legacy host tables"), "{err}");
+        assert!(err.contains("[profiles.<name>.<harness>]"), "{err}");
         let err = local_only("stray = 1\n").unwrap_err().to_string();
         assert!(err.contains("unknown section 'stray'"), "{err}");
     }

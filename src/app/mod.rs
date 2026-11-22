@@ -155,21 +155,21 @@ pub async fn run() -> Result<CommandExit> {
     // procedure written against the old form keeps working until it is updated.
     if let Some(ref session_id) = cli.session {
         eprintln!("warning: `--session <ID>` is now `review message <ID>`");
-        if cli.profile.is_some() || cli.retired_provider.is_some() {
+        if cli.profile.is_some() || cli.harness.is_some() || cli.retired_provider.is_some() {
             eprintln!(
-                "warning: --profile/--provider are ignored on a resume - the session \
-                 keeps its own harness and settings"
+                "warning: --profile/--harness/--provider are ignored on a resume - the \
+                 session keeps its own harness and settings"
             );
         }
         return run_message(session_id, cli.dry_run, selector, started, &lifecycle).await;
     }
 
-    // Retired: the harness is part of the profile. Still parsed, so the
-    // refusal can say what replaced it rather than clap's "unexpected argument".
+    // Retired: replaced by -p and --harness. Still parsed, so the refusal can
+    // say what replaced it rather than clap's "unexpected argument".
     if let Some(ref p) = cli.retired_provider {
         bail!(
-            "--provider was removed: the harness is part of the profile\n  \
-             Pick a profile whose harness is {p} with -p <name> (`review list` lists them)."
+            "--provider was removed: pick the profile with -p <name> and its harness \
+             with --harness {p}\n  `review list` lists each profile's harnesses."
         );
     }
 
@@ -209,9 +209,10 @@ pub async fn run() -> Result<CommandExit> {
 
     let (arch_name, prime) = cfg.select_archetype(archetype_arg)?;
 
-    // The profile names the harness and its settings: -p wins, otherwise
+    // The profile holds one entry per harness: -p wins, otherwise
     // [_defaults].profile from the first layer that sets it. It must exist
-    // before anything is spawned.
+    // before anything is spawned. Then --harness, [_defaults].prefer and what
+    // is installed pick the entry (`config::choose_harness`).
     let Some(profile_name) = cli.profile.as_deref().or_else(|| cfg.default_profile()) else {
         bail!(
             "no profile to run: pass -p <name> or set [_defaults].profile \
@@ -219,8 +220,17 @@ pub async fn run() -> Result<CommandExit> {
             cfg.searched()
         );
     };
-    let definition = cfg.require_profile(profile_name)?.clone();
-    let prov_name = definition.harness;
+    let profile_def = cfg.require_profile(profile_name)?;
+    let prov_name = config::choose_harness(
+        profile_name,
+        profile_def,
+        cli.harness,
+        cfg.prefer(),
+        &harness::is_available,
+    )?;
+    let definition = profile_def
+        .entry(prov_name)
+        .expect("choose_harness returns a harness the profile defines");
 
     let installed = harness::is_available(prov_name);
     let assembled = prompt::assemble(&prime, &stdin_instructions);
@@ -228,6 +238,7 @@ pub async fn run() -> Result<CommandExit> {
     // Dry run: print what would be sent and exit. It launches nothing, so a
     // missing harness only warns.
     if cli.dry_run {
+        eprintln!("harness: {prov_name} ({})", definition.table);
         if !installed {
             eprintln!("warning: {prov_name} is not installed on this host - a real run would fail");
         }
@@ -240,7 +251,8 @@ pub async fn run() -> Result<CommandExit> {
     if !installed {
         bail!(
             "{prov_name} is not installed on this host (not found on PATH)\n  \
-             Nothing was launched. Install it, or pick a profile for another harness with -p."
+             Nothing was launched. Install it, or pick another of the profile's \
+             harnesses with --harness, or another profile with -p."
         );
     }
 

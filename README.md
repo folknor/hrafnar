@@ -21,19 +21,18 @@ review init
 
 ### 2. Configure
 
-Settings shared by every project - the profiles naming which harness and
-model serve which tier, and the default one - go once in the global
+Settings shared by every project - the profiles naming which harnesses and
+models serve which tier, and the default one - go once in the global
 `~/.config/review/config.toml`:
 
 ```toml
 [_defaults]
 profile = "deep"
+prefer = ["codex", "claude"]
 
 [profiles.deep]
-provider = "codex"
-model = "gpt-6-luna"
-effort = "max"
-sandbox = "read-only"
+codex = { model = "gpt-6-luna", effort = "max", sandbox = "read-only" }
+claude = { model = "opus" }
 ```
 
 Project-specific archetypes - a name mapped to a priming prompt - go in the
@@ -53,13 +52,13 @@ bugs = "You hunt for edge cases and correctness bugs."
 echo "what does the retry loop guarantee?" | review -p deep
 echo "look for auth boundary violations" | review -a security
 echo "check for edge cases in the parsing module" | review -a bugs -p deep
-echo "second opinion please" | review -a bugs -p opus
+echo "second opinion please" | review -a bugs -p deep --harness claude
 ```
 
 ## Usage
 
 ```
-echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--dry-run]
+echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--harness HARNESS] [--dry-run]
 echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
 review list [--projects | --all]
 review sessions [ID] [--all] [--limit N]
@@ -82,10 +81,11 @@ Archetypes are optional named priming prompts defined under `[archetypes]` (name
 | Flag | Description |
 |------|-------------|
 | `-a, --archetype <name>` | Archetype to prime with, or `bare` (an unprimed run, even without a config entry). Omit to send stdin unchanged. |
-| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, naming the harness and its `model`/`effort`/`sandbox`/`env`. Project config first, then global. Overrides `[_defaults].profile`. |
+| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, one entry per harness with its `model`/`effort`/`sandbox`/`env`. Overrides `[_defaults].profile`. |
+| `--harness <name>` | Which of the profile's harnesses to run on. Without it, the first in `[_defaults].prefer` that the profile defines and is installed, else the profile's only installed one. |
 | `--dry-run` | Print what would be sent instead of sending it |
 
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the harness. A profile whose harness is not installed on this machine fails the run before anything launches - `review list --all` shows which are installed.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, holds the candidate harnesses; `--harness`, `[_defaults].prefer` and what is installed pick one. A chosen harness that is not installed on this machine fails the run before anything launches - `review list` marks the harness a plain `-p <name>` picks.
 
 How each harness is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every harness captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one harness that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
@@ -95,29 +95,31 @@ The archetype used to be positional (`review security`) and resuming used `--ses
 
 ### Profiles
 
-A profile is a harness plus its `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
+A profile is a tier of work holding one entry per harness that can serve it, each with that harness's `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
 
 ```toml
-[profiles.opus]
-provider = "claude"
-model = "Opus 4.8"
-effort = "medium"
-env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
+[profiles.review]
+comment = "Standard reviewer."
+codex = { model = "gpt-5.6-terra", effort = "low" }
+claude = { model = "Opus 4.8", effort = "medium", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
 
-[profiles.implement]
-provider = "codex"
+[profiles.implement.codex]
 model = "gpt-5.6-terra"
 effort = "high"
 sandbox = "workspace-write"
+
+[_defaults]
+prefer = ["codex", "claude"]
 ```
 
 ```
-echo "audit the auth flow" | review -a security -p opus
+echo "audit the auth flow" | review -a security -p review
+echo "audit the auth flow" | review -a security -p review --harness claude
 ```
 
-`-p opus` resolves `[profiles.opus]`: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox` - but it may not name a different harness. If no file defines the profile, the run errors naming every file it searched.
+The harness is `--harness` if given (the profile must have an entry for it), else the first in `[_defaults].prefer` that the profile defines and this machine has installed, else the profile's only installed entry; otherwise the run errors asking for `--harness`. A project's `.review.toml` may add profiles but never redefine one the global config defines - the same name in both is a load error naming both files - so a checked-out repository cannot change what `-p review` means. If no file defines the profile, the run errors naming every file it searched.
 
-`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki profiles must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
+`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki entries must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
 
 The levels are `review`'s own vocabulary, translated per harness at launch, because the harnesses do not agree on the names and grok *refuses to start* on one it cannot resolve:
 
@@ -343,31 +345,26 @@ tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 
 [_defaults]
 profile = "high"                   # used when -p is omitted
+prefer = ["codex", "claude"]       # which of a profile's harnesses to run on
 stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
 
-# Named profiles: a harness and its model/effort/sandbox/env, selected with
-# -p/--profile.
-[profiles.opus]
-provider = "claude"
-model = "Opus 4.8"
-effort = "medium"
-env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
-
+# Named profiles: one entry per harness with its model/effort/sandbox/env,
+# selected with -p/--profile (and --harness).
 [profiles.high]
-provider = "codex"
-model = "gpt-6-luna"
-effort = "high"
+comment = "Hard problems."
+codex = { model = "gpt-6-luna", effort = "high" }
+claude = { model = "Opus 4.8", effort = "medium", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
 ```
 
 How the layers combine:
 
 - **Archetypes** are the union of both files; the project wins on a name clash.
-- **`[_defaults]` keys** come from the first file that sets them.
-- **Profiles** come from the first definition found, project file first, and win whole. A project profile may not name a different harness than the global one of the same name.
+- **`[_defaults]` keys** come from the first file that sets them, each whole.
+- **Profiles** are add-only: a project may define new ones, but a name both files define is an error naming both files.
 
 ### `review list`
 
-Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles whose harness is installed on this machine with their model, effort and sandbox, the default marked. A profile hidden because its harness is not installed is named.
+Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles with at least one harness installed on this machine, each with its installed harnesses (the one a plain `-p <name>` picks marked `*`, none when the choice is ambiguous), the default marked, and the comment's first line. A profile with no installed harness is named on a `hidden:` line.
 
 ```
 $ review list
@@ -375,11 +372,14 @@ archetypes:
   (none)
 
 profiles:
-  read            gpt-6.2-sol, effort low, read-only  (default)
-  write           gpt-6-luna, effort max, workspace-write
+  review        codex*, claude   (default)
+                # Standard reviewer.
+  gpt-write-l1  codex*
+                # Small/medium tasks, shallow, mechanical, and very cheap.
+  hidden: qwen (maki not installed)
 ```
 
-`review list --all` prints the whole effective configuration: the files consulted, whether each harness is installed, every archetype with its source, and every profile with its harness, the table it came from and any definitions it shadows. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
+`review list --all` prints the whole effective configuration: the files consulted, whether each harness is installed, every archetype with its source, `[_defaults].prefer`, and every profile with the table it came from and each harness entry's settings. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
 
 Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer on its own.
 
@@ -387,10 +387,12 @@ Anything that used to read `.review.toml` to find out what is available should c
 
 These now fail to parse, each with an error saying what replaced it:
 
-- `[<provider>.<name>]` profile tables, and legacy `[<host>.<provider>.<name>]` ones: move each to `[profiles.<name>]` with `provider = "<harness>"`.
-- `[_defaults].providers` or `[_defaults].provider`: write `profile = "<name>"` instead.
+- `[<harness>.<name>]` profile tables, and legacy `[<host>.<harness>.<name>]` ones: move each to `[profiles.<name>.<harness>]`.
+- A profile with `provider = "<harness>"`: move its settings under `[profiles.<name>.<harness>]`; only `comment` stays at the profile level.
+- `[_defaults].providers` or `[_defaults].provider`: write `profile = "<name>"`, and `prefer = [...]` to order harnesses.
 - `[_groups]`: remove it. Launch one `review -a <name>` per member.
-- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
+- A profile or entry containing a key `review` does not know - usually a typo, which would otherwise parse as an empty entry and silently run the harness's defaults.
+- A project profile with the same name as a global one: rename it. Projects may add profiles, not redefine them.
 
 ### Harnesses
 
@@ -401,10 +403,10 @@ These now fail to parse, each with an error saying what replaced it:
 | grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
 | maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
 
-To run another harness, pick a profile that names it:
+To run another harness, pick it from the profile's entries:
 
 ```
-echo "ask claude" | review -a bugs -p opus
+echo "ask claude" | review -a bugs -p high --harness claude
 ```
 
 ## Rate limits

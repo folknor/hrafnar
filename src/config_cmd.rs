@@ -1,11 +1,12 @@
 //! `review list`: what a run here can use. By default only the archetypes and
-//! the profiles whose harness is installed; `--projects` the `-C` registry;
+//! the profiles with an installed harness; `--projects` the `-C` registry;
 //! `--all` the effective configuration and where each value came from.
 //!
 //! Orchestrators used to parse `.review.toml` directly to learn which
 //! archetypes, harnesses and profiles exist. With the global layer that file no
 //! longer tells the whole story - a profile may come from
-//! `~/.config/review/config.toml`, and a stale local one may be hiding it - so
+//! `~/.config/review/config.toml`, and which harness it runs on depends on
+//! `[_defaults].prefer` and what this host has installed - so
 //! this command is the single source of truth. It renders what the resolver
 //! produced, i.e. exactly what a run would use; it never re-parses TOML, because
 //! a second reader is a second opinion that can disagree with the one that
@@ -19,7 +20,7 @@
 //! availability map), so it is testable without `PATH` or files; `run` only
 //! loads, probes and prints.
 
-use crate::config::{self, Harness, Profile, ProfileDef, ProfileEntry, ReviewConfig};
+use crate::config::{self, Harness, Profile, ProfileDef, ReviewConfig};
 use anyhow::Result;
 use std::fmt::Write as _;
 
@@ -57,11 +58,11 @@ pub fn run(sel: &config::Selection, view: View) -> Result<()> {
     Ok(())
 }
 
-/// The default view: what a run here can be primed with and run as. Which
-/// harness serves a profile is left out - it is plumbing, and a harness can
-/// serve another vendor's models. Profiles whose harness is not installed are
-/// hidden but counted by name, so one an agent was told to use does not just
-/// vanish.
+/// The default view: what a run here can be primed with and run as. Each
+/// profile shows its installed harnesses, the one a plain `-p <name>` picks
+/// marked `*`, and the first line of its comment; settings are left to
+/// `--all`. Profiles with no installed harness are hidden but named, so one an
+/// agent was told to use does not just vanish.
 pub fn render_list(cfg: &ReviewConfig, avail: Availability) -> String {
     let mut out = String::new();
     let _ = write_list(&mut out, cfg, avail);
@@ -81,39 +82,56 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     writeln!(out)?;
     writeln!(out, "profiles:")?;
     let default = cfg.default_profile();
+    // Installed entries, in `prefer` order and then `Harness` order, so the
+    // line reads in the order a run would try them.
+    let prefer = cfg.prefer();
+    let installed = |def: &ProfileDef| -> Vec<Harness> {
+        let mut hs: Vec<Harness> = def.harnesses().filter(|h| avail(*h)).collect();
+        hs.sort_by_key(|h| prefer.iter().position(|p| p == h).unwrap_or(usize::MAX));
+        hs
+    };
     let (shown, hidden): (Vec<_>, Vec<_>) = cfg
         .profiles
         .iter()
-        .partition(|(_, e)| avail(e.effective.harness));
+        .partition(|&(_, def)| !installed(def).is_empty());
     if shown.is_empty() {
         writeln!(out, "  (none)")?;
     }
-    let pw = shown.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-    for (name, entry) in &shown {
-        let def = &entry.effective;
-        let mark = if default == Some(name.as_str()) {
-            "  (default)"
+    // Harness column first, so the default marks line up.
+    let rows: Vec<(&String, &ProfileDef, String)> = shown
+        .iter()
+        .map(|&(name, def)| {
+            let pick = plain_pick(cfg, name, def, avail);
+            let harnesses: Vec<String> = installed(def)
+                .into_iter()
+                .map(|h| {
+                    if pick == Some(h) {
+                        format!("{h}*")
+                    } else {
+                        h.to_string()
+                    }
+                })
+                .collect();
+            (name, def, harnesses.join(", "))
+        })
+        .collect();
+    let pw = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let hw = rows.iter().map(|(_, _, h)| h.len()).max().unwrap_or(0);
+    for (name, def, harnesses) in &rows {
+        let line = if default == Some(name.as_str()) {
+            format!("  {name:<pw$}  {harnesses:<hw$}   (default)")
         } else {
-            ""
+            format!("  {name:<pw$}  {harnesses}")
         };
-        writeln!(
-            out,
-            "  {name:<pw$}  {}{mark}",
-            terse_settings(def.harness, &def.profile)
-        )?;
-        if let Some(line) = def
-            .profile
-            .comment
-            .as_deref()
-            .and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()))
-        {
+        writeln!(out, "{line}")?;
+        if let Some(line) = first_line(def.comment.as_deref()) {
             writeln!(out, "  {:pw$}  # {line}", "")?;
         }
     }
     if !hidden.is_empty() {
         let names: Vec<String> = hidden
             .iter()
-            .map(|(n, e)| format!("{n} ({} not installed)", e.effective.harness))
+            .map(|(n, def)| format!("{n} ({} not installed)", harness_names(def.harnesses())))
             .collect();
         writeln!(out, "  hidden: {}", names.join(", "))?;
     }
@@ -124,11 +142,16 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
                 out,
                 "  warning: default profile '{name}' is not defined - a run without -p will fail"
             )?,
-            Some(def) if !avail(def.harness) => writeln!(
+            Some(def) if installed(def).is_empty() => writeln!(
                 out,
-                "  warning: default profile '{name}' needs {}, which is not installed - \
+                "  warning: default profile '{name}' needs {}, none of which is installed - \
                  a run without -p will fail",
-                def.harness
+                harness_names(def.harnesses())
+            )?,
+            Some(def) if plain_pick(cfg, name, def, avail).is_none() => writeln!(
+                out,
+                "  warning: default profile '{name}' has several installed harnesses and \
+                 [_defaults].prefer picks none - a run without -p needs --harness"
             )?,
             Some(_) => {}
         },
@@ -144,22 +167,31 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     Ok(())
 }
 
-/// `model m, effort e, sandbox`, saying what an unset value means rather
-/// than "unset". A harness with its own permission system shows that.
-fn terse_settings(harness: Harness, p: &Profile) -> String {
-    let sandbox = match (
-        crate::harness::Permissions::profile(harness, None).selector(),
-        p.sandbox.as_ref().map(crate::config::SandboxLevel::as_str),
-    ) {
-        (None, _) => "own permissions".to_string(),
-        (Some(_), Some(s)) => s.to_string(),
-        (Some(default), None) => default.to_string(),
-    };
-    format!(
-        "{}, effort {}, {sandbox}",
-        p.model.as_deref().unwrap_or("default model"),
-        p.effort.as_deref().unwrap_or("default")
-    )
+/// The installed harness a plain `-p <name>` (no `--harness`) would run on,
+/// from the same function the run uses; `None` when that choice is ambiguous
+/// or nothing it could pick is installed.
+fn plain_pick(
+    cfg: &ReviewConfig,
+    name: &str,
+    def: &ProfileDef,
+    avail: Availability,
+) -> Option<Harness> {
+    config::choose_harness(name, def, None, cfg.prefer(), avail)
+        .ok()
+        .filter(|h| avail(*h))
+}
+
+/// The first non-blank line of a comment.
+fn first_line(comment: Option<&str>) -> Option<&str> {
+    comment.and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()))
+}
+
+/// `codex, claude`.
+fn harness_names(harnesses: impl Iterator<Item = Harness>) -> String {
+    harnesses
+        .map(Harness::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `review list --projects`: this host's `-C` registry.
@@ -233,11 +265,12 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 
     writeln!(out)?;
     writeln!(out, "harnesses:")?;
-    // The default harness is the default profile's, when it resolves.
-    let default = cfg
-        .default_profile()
-        .and_then(|name| cfg.resolve_profile(name))
-        .map(|def| def.harness);
+    // The default harness is the one a run with neither -p nor --harness
+    // would launch on, when that choice resolves.
+    let default = cfg.default_profile().and_then(|name| {
+        cfg.resolve_profile(name)
+            .and_then(|def| config::choose_harness(name, def, None, cfg.prefer(), avail).ok())
+    });
     let pw = Harness::all()
         .iter()
         .map(|p| p.as_str().len())
@@ -298,11 +331,27 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         }
         None => writeln!(out, "  default: none set (a run needs -p)")?,
     }
+    match cfg.prefer {
+        Some(ref s) => writeln!(
+            out,
+            "  prefer: {}  ({})",
+            if s.value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                harness_names(s.value.iter().copied())
+            },
+            source(s.layer.as_str(), &s.table)
+        )?,
+        None => writeln!(
+            out,
+            "  prefer: none set (a profile with several installed harnesses needs --harness)"
+        )?,
+    }
     if cfg.profiles.is_empty() {
         writeln!(out, "  (none)")?;
     }
-    for (name, entry) in &cfg.profiles {
-        write_profile(out, name, entry)?;
+    for (name, def) in &cfg.profiles {
+        write_profile(out, name, def, avail)?;
     }
 
     writeln!(out)?;
@@ -343,43 +392,52 @@ fn steering() -> String {
     )
 }
 
-fn write_profile(out: &mut String, name: &str, entry: &ProfileEntry) -> std::fmt::Result {
-    let def = &entry.effective;
-    let harness = def.harness;
-    let p = &def.profile;
-    writeln!(out, "  {name}  {harness}  ({})", def_source(def))?;
+/// One profile: its source, comment, then one block per harness entry.
+fn write_profile(
+    out: &mut String,
+    name: &str,
+    def: &ProfileDef,
+    avail: Availability,
+) -> std::fmt::Result {
+    writeln!(
+        out,
+        "  {name}  ({})",
+        source(def.layer.as_str(), &def.table)
+    )?;
     // Each line of a multi-line comment keeps the block's indent, so it cannot
     // be mistaken for the next profile.
-    if let Some(ref c) = p.comment {
+    if let Some(ref c) = def.comment {
         for line in c.lines().map(str::trim).filter(|l| !l.is_empty()) {
             writeln!(out, "    # {line}")?;
         }
     }
-    writeln!(out, "    {}", settings(harness, p))?;
-    if !p.writable_roots.is_empty() {
-        writeln!(out, "    writable_roots: {}", p.writable_roots.join(", "))?;
-    }
-    let keys = env_keys(p);
-    if !keys.is_empty() {
-        writeln!(out, "    env: {}", keys.join(", "))?;
-    }
-    for c in &p.config {
-        writeln!(out, "    config: {c}")?;
-    }
-    for s in &entry.shadowed {
+    let hw = def.harnesses().map(|h| h.as_str().len()).max().unwrap_or(0);
+    for (&harness, p) in &def.entries {
+        let missing = if avail(harness) {
+            ""
+        } else {
+            "  (not installed)"
+        };
         writeln!(
             out,
-            "    shadows {}: {}",
-            def_source(s),
-            settings(harness, &s.profile)
+            "    {:<hw$}  {}{missing}",
+            harness.as_str(),
+            settings(harness, p)
         )?;
+        // Details sit under the settings, past the harness column.
+        let pad = " ".repeat(4 + hw + 2);
+        if !p.writable_roots.is_empty() {
+            writeln!(out, "{pad}writable_roots: {}", p.writable_roots.join(", "))?;
+        }
+        let keys = env_keys(p);
+        if !keys.is_empty() {
+            writeln!(out, "{pad}env: {}", keys.join(", "))?;
+        }
+        for c in &p.config {
+            writeln!(out, "{pad}config: {c}")?;
+        }
     }
     Ok(())
-}
-
-/// `local [profiles.deep]`.
-fn def_source(def: &ProfileDef) -> String {
-    source(def.layer.as_str(), &def.table)
 }
 
 fn source(layer: &str, table: &str) -> String {
@@ -444,11 +502,9 @@ goal = \"\"
 [_defaults]
 profile = \"deep\"
 
-[profiles.deep]
-provider = \"codex\"
-model = \"stale-model\"
-effort = \"low\"
-env = { SECRET_TOKEN = \"hunter2\" }
+[profiles.local-tier]
+comment = \"Project-only tier.\"
+grok = {}
 ";
 
     const GLOBAL: &str = "\
@@ -459,23 +515,29 @@ security = \"global security prime\"
 [_defaults]
 profile = \"opus\"
 stall_timeout_secs = 600
+prefer = [\"codex\", \"claude\"]
 
 [profiles.deep]
-provider = \"codex\"
-comment = \"global deep comment\"
+comment = \"Deep work.\"
+claude = { model = \"opus-deep\" }
+
+[profiles.deep.codex]
 model = \"fresh-model\"
 effort = \"high\"
 sandbox = \"workspace-write\"
 writable_roots = [\"/srv/data\"]
 config = ['model_provider=\"x\"']
+env = { SECRET_TOKEN = \"hunter2\" }
 
 [profiles.opus]
-provider = \"claude\"
 comment = \"\"\"
 Heavy reasoning.
   Use for design questions.
 \"\"\"
-model = \"opus\"
+claude = { model = \"opus\" }
+
+[profiles.qwen]
+maki = { model = \"openrouter/qwen\" }
 ";
 
     fn cfg() -> ReviewConfig {
@@ -522,21 +584,34 @@ model = \"opus\"
     }
 
     #[test]
-    fn a_stale_local_profile_is_shown_next_to_what_it_shadows() {
+    fn every_harness_entry_is_shown_with_its_settings() {
         let t = text(true);
-        assert!(t.contains("deep  codex  (local [profiles.deep])"), "{t}");
-        assert!(t.contains("model stale-model, effort low"), "{t}");
         assert!(
             t.contains(
-                "shadows global [profiles.deep]: model fresh-model, effort high, \
-                 sandbox workspace-write"
+                "  deep  (global [profiles.deep])\n    # Deep work.\n    \
+                 claude  model opus-deep, effort unset, sandbox n/a (claude ignores sandbox)\n    \
+                 codex   model fresh-model, effort high, sandbox workspace-write\n            \
+                 writable_roots: /srv/data\n            env: SECRET_TOKEN\n            \
+                 config: model_provider=\"x\"\n"
             ),
             "{t}"
         );
-        // The winner replaces the shadowed profile whole: none of its roots or
-        // overrides leak into the effective view.
-        assert!(!t.contains("/srv/data"), "{t}");
-        assert!(t.contains("opus  claude  (global [profiles.opus])"), "{t}");
+        assert!(
+            t.contains("  local-tier  (local [profiles.local-tier])"),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "    grok  model unset, effort unset, sandbox unset (runner default: read-only)  \
+                 (not installed)"
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("  prefer: codex, claude  (global [_defaults])"),
+            "{t}"
+        );
+        assert!(!t.contains("shadows"), "{t}");
     }
 
     #[test]
@@ -544,14 +619,24 @@ model = \"opus\"
         let t = text(true);
         assert!(
             t.contains(
-                "opus  claude  (global [profiles.opus])\n    # Heavy reasoning.\n    \
-                 # Use for design questions.\n    model opus"
+                "opus  (global [profiles.opus])\n    # Heavy reasoning.\n    \
+                 # Use for design questions.\n    claude  model opus"
             ),
             "{t}"
         );
-        // A shadowed definition's comment describes a profile that will not
-        // run, so it stays out of the effective view.
-        assert!(!t.contains("global deep comment"), "{t}");
+    }
+
+    #[test]
+    fn an_unset_prefer_says_what_that_means() {
+        let c = resolve(
+            parse_file(LOCAL, "local", Layer::Local).unwrap(),
+            None,
+            "host",
+            config::ConfigFiles::default(),
+        )
+        .unwrap();
+        let t = render_text(&c, &avail(true));
+        assert!(t.contains("prefer: none set"), "{t}");
     }
 
     #[test]
@@ -562,21 +647,35 @@ model = \"opus\"
     }
 
     #[test]
-    fn availability_is_reported_and_a_missing_default_stands_out() {
+    fn the_default_harness_follows_prefer_and_availability() {
         let c = cfg();
-        let text = render_text(&c, &avail(false));
-        assert!(text.contains("claude  installed"), "{text}");
+        // codex is preferred and installed: it is the default.
+        let text = render_text(&c, &avail(true));
+        assert!(text.contains("codex   installed      default"), "{text}");
         assert!(text.contains("grok    NOT INSTALLED"), "{text}");
+        assert!(!text.contains("warning"), "{text}");
+        // Without codex, prefer falls through to claude.
+        let text = render_text(&c, &avail(false));
+        assert!(text.contains("claude  installed      default"), "{text}");
+        assert!(text.contains("codex   NOT INSTALLED\n"), "{text}");
+        assert!(!text.contains("warning"), "{text}");
+    }
+
+    #[test]
+    fn a_default_profile_whose_only_harness_is_missing_stands_out() {
+        let local = parse_file(
+            "[_defaults]\nprofile = \"q\"\n[profiles.q.maki]\n",
+            "l",
+            Layer::Local,
+        )
+        .unwrap();
+        let c = resolve(local, None, "host", config::ConfigFiles::default()).unwrap();
+        let text = render_text(&c, &avail(true));
         assert!(text.contains("NOT INSTALLED  default"), "{text}");
         assert!(
-            text.contains("default harness 'codex' is not installed"),
+            text.contains("default harness 'maki' is not installed"),
             "{text}"
         );
-
-        // Installed default: no warning. grok is not installed but is not a
-        // default, so it is listed without alarm.
-        let text = render_text(&c, &avail(true));
-        assert!(!text.contains("warning"), "{text}");
     }
 
     #[test]
@@ -588,10 +687,6 @@ model = \"opus\"
         assert!(text.contains("(empty)"), "{text}");
         assert!(
             text.contains("sandbox unset (runner default: read-only)"),
-            "{text}"
-        );
-        assert!(
-            text.contains("shadows global [profiles.deep]: model fresh-model"),
             "{text}"
         );
         assert!(text.contains("n/a (claude ignores sandbox)"), "{text}");
@@ -616,11 +711,9 @@ model = \"opus\"
         let text = render_text(&c, &avail(true));
         assert!(text.contains("not in a project"), "{text}");
         assert!(text.contains("project:   none"), "{text}");
-        assert!(
-            text.contains("deep  codex  (global [profiles.deep])"),
-            "{text}"
-        );
+        assert!(text.contains("deep  (global [profiles.deep])"), "{text}");
         assert!(text.contains("model fresh-model"), "{text}");
+        assert!(!text.contains("local-tier"), "{text}");
         // The global default profile's harness is the default.
         assert!(
             text.contains("default: opus  (global [_defaults])"),
@@ -641,42 +734,81 @@ model = \"opus\"
     }
 
     #[test]
-    fn the_list_shows_runnable_profiles_without_their_harness() {
+    fn the_list_shows_installed_harnesses_with_the_plain_pick_marked() {
         let t = render_list(&cfg(), &avail(true));
+        // In prefer order; codex is what `-p deep` alone launches.
         assert!(
-            t.contains("deep  stale-model, effort low, read-only  (default)"),
+            t.contains(
+                "profiles:\n  deep  codex*, claude   (default)\n        # Deep work.\n  \
+                 opus  claude*\n        # Heavy reasoning.\n"
+            ),
             "{t}"
         );
-        // Claude has its own permission system rather than a sandbox level.
         assert!(
-            t.contains("opus  opus, effort default, own permissions"),
+            t.contains("  hidden: local-tier (grok not installed), qwen (maki not installed)"),
             "{t}"
         );
-        assert!(t.contains("        # Heavy reasoning."), "{t}");
         assert!(t.contains("security  You are a security expert...."), "{t}");
-        // None of the provenance or plumbing the full view carries.
+        // None of the provenance or settings the full view carries.
         for absent in [
-            "codex",
-            "claude",
             "[profiles.",
-            "shadows",
+            "fresh-model",
             "SECRET_TOKEN",
-            "stall",
+            "stall_timeout",
+            "warning",
         ] {
             assert!(!t.contains(absent), "{absent}: {t}");
         }
         assert!(t.contains("review message <ID>"), "{t}");
+        assert!(t.contains("review list --all"), "{t}");
     }
 
     #[test]
-    fn the_list_names_profiles_hidden_for_a_missing_harness() {
+    fn the_list_drops_uninstalled_harnesses_from_a_profile() {
         let t = render_list(&cfg(), &avail(false));
-        assert!(!t.contains("stale-model"), "{t}");
-        assert!(t.contains("hidden: deep (codex not installed)"), "{t}");
+        assert!(t.contains("  deep  claude*   (default)"), "{t}");
+        assert!(!t.contains("codex"), "{t}");
+    }
+
+    #[test]
+    fn an_ambiguous_choice_marks_nothing_and_a_default_warns() {
+        let local = parse_file(
+            "[_defaults]\nprofile = \"r\"\n[profiles.r]\nclaude = {}\ncodex = {}\n",
+            "l",
+            Layer::Local,
+        )
+        .unwrap();
+        let c = resolve(local, None, "host", config::ConfigFiles::default()).unwrap();
+        let t = render_list(&c, &avail(true));
+        assert!(t.contains("  r  claude, codex   (default)"), "{t}");
+        assert!(!t.contains('*'), "{t}");
         assert!(
-            t.contains("default profile 'deep' needs codex, which is not installed"),
+            t.contains("default profile 'r' has several installed harnesses"),
             "{t}"
         );
+        assert!(t.contains("--harness"), "{t}");
+    }
+
+    #[test]
+    fn the_list_warns_when_the_default_cannot_run() {
+        let local = parse_file(
+            "[_defaults]\nprofile = \"q\"\n[profiles.q.maki]\n",
+            "l",
+            Layer::Local,
+        )
+        .unwrap();
+        let c = resolve(local, None, "host", config::ConfigFiles::default()).unwrap();
+        let t = render_list(&c, &avail(true));
+        assert!(t.contains("hidden: q (maki not installed)"), "{t}");
+        assert!(
+            t.contains("default profile 'q' needs maki, none of which is installed"),
+            "{t}"
+        );
+        let local = parse_file("[_defaults]\nprofile = \"ghost\"\n", "l", Layer::Local).unwrap();
+        let c = resolve(local, None, "host", config::ConfigFiles::default()).unwrap();
+        let t = render_list(&c, &avail(true));
+        assert!(t.contains("default profile 'ghost' is not defined"), "{t}");
+        assert!(t.contains("  (none)"), "{t}");
     }
 
     #[test]

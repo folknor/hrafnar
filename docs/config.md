@@ -7,10 +7,11 @@ in.
 
 **`review list` is the authoritative view.** It runs the same resolver a run
 uses. By default it shows what a run here can use: the archetypes, and the
-profiles whose harness is installed, with the default marked and any profile
-hidden for a missing harness named. `review list --all` shows every effective
-value with the file and table it came from, and what each one shadows;
-`review list --projects` the `-C` registry. Reading `.review.toml` alone gives
+profiles with an installed harness, each with its installed harnesses and the
+one a plain `-p <name>` picks marked `*`, the default profile marked, and any
+profile hidden for having no installed harness named. `review list --all`
+shows every effective value with the file and table it came from, and every
+harness entry's settings; `review list --projects` the `-C` registry. Reading `.review.toml` alone gives
 an incomplete and often wrong answer, because profiles and archetypes may live
 in the global file. Outside a project it shows the global layer alone.
 `review config` is a hidden alias of `review list --all` that warns.
@@ -36,6 +37,8 @@ bugs = "You hunt for edge cases and correctness bugs."
 
 [_defaults]
 profile = "deep"
+# Which of a profile's harnesses to run on, first installed match wins.
+prefer = ["codex", "claude"]
 # Seconds of silence after which a codex run counts as stalled. 0 disables;
 # omitted uses the built-in default. Codex only.
 stall_timeout_secs = 900
@@ -45,10 +48,9 @@ claude_token_command = "bw get notes claude-oauth-token"
 
 # Profiles: see `review man profiles`.
 [profiles.deep]
-provider = "codex"
-model = "gpt-5.6-terra"
-effort = "high"
-sandbox = "read-only"
+comment = "Deep review."
+codex = { model = "gpt-5.6-terra", effort = "high", sandbox = "read-only" }
+claude = { model = "Opus 4.8" }
 
 # Project file only.
 [_audit]
@@ -62,10 +64,11 @@ bz = "~/Programs/bz"
 
 - `[archetypes]`: name to priming prompt. The prompt owns the session's role
   and whether it should modify files; `review` adds nothing of its own.
-- `[profiles.<name>]`: a harness and its launch settings (see
-  `review man profiles`).
-- `[_defaults]`: `profile` (the one used without `-p`), `stall_timeout_secs`,
-  and, in the global file only, `claude_token_command`.
+- `[profiles.<name>]`: a `comment` and one entry per harness, each with that
+  harness's launch settings (see `review man profiles`).
+- `[_defaults]`: `profile` (the one used without `-p`), `prefer` (harnesses in
+  order of preference, for a profile with several; `--harness` overrides it),
+  `stall_timeout_secs`, and, in the global file only, `claude_token_command`.
 - `[_audit]`: `id` names the project's audit trail. `review init` creates a
   32-character hex id; a missing or empty id gets one before the first launch.
   Existing nonempty ids remain opaque strings, unchanged.
@@ -73,20 +76,24 @@ bz = "~/Programs/bz"
   `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
 - Any other top-level table is an error. Retired forms say what replaced them:
-  `[<provider>.<name>]` and legacy `[<host>.<provider>.<name>]` profile tables
-  move to `[profiles.<name>]` with a `provider` key; `[_defaults].providers`
-  and `[_defaults].provider` become `[_defaults].profile`; `[_groups]` goes,
+  `[<harness>.<name>]` and legacy `[<host>.<harness>.<name>]` profile tables
+  move to `[profiles.<name>.<harness>]`; a profile's `provider` key goes, its
+  settings moving under `[profiles.<name>.<harness>]`; `[_defaults].providers`
+  and `[_defaults].provider` become `[_defaults].profile` and
+  `[_defaults].prefer`; `[_groups]` goes,
   since a run takes one archetype and several opinions are several `review`
   calls.
 
 ## How the two files combine
 
 - **Archetypes** are a union; for a name both define, the project wins.
-- **`profile` and `stall_timeout_secs`** come from the first layer that sets
-  them, each on its own.
-- **Profiles** resolve to their first definition and win whole, never merged
-  field by field, and a project profile may not change a global profile's
-  harness (see `review man profiles`).
+- **`profile`, `prefer` and `stall_timeout_secs`** come from the first layer
+  that sets them, each on its own and whole: a project's `prefer` replaces the
+  global list rather than extending it.
+- **Profiles** are add-only: a project may define new ones, but defining a
+  profile the global file also defines is an error naming both files, so a
+  checked-out repository cannot change what `-p <name>` means (see
+  `review man profiles`).
 - **`[_audit]`** is the project's alone and is an error in the global file.
   **`[_projects]`** and **`claude_token_command`** are the global file's alone
   and are errors in a project: a command named by a project file would run

@@ -1,18 +1,31 @@
 //! Combining the local and global layers into one `ReviewConfig`. Every
-//! resolved value is `Sourced` (layer and table), and each profile keeps the
-//! definitions it shadows, so `review list --all` can show both. The precedence
-//! rules and their reasons are in `reference/design.md`; the tests are in
-//! `resolve/tests.rs`.
+//! resolved value is `Sourced` (layer and table), and each profile records
+//! its layer and table, so `review list --all` can show where it came from.
+//! The precedence rules and their reasons are in `reference/design.md`; the
+//! tests are in `resolve/tests.rs`.
 
-use super::{ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, ReviewConfig, Sourced};
+use super::{ConfigFile, ConfigFiles, Layer, ProfileDef, ReviewConfig, Sourced};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
+
+/// The file a layer was read from, for errors that name both files.
+fn layer_file(files: &ConfigFiles, layer: Layer) -> String {
+    let path = match layer {
+        Layer::Local => files.local.as_deref(),
+        Layer::Global => files.global.as_deref(),
+    };
+    match path {
+        Some(p) => p.display().to_string(),
+        None => format!("the {} config", layer.as_str()),
+    }
+}
 
 /// Resolve the local and (optional) global layers for `hostname`, which
 /// selects this host's `[_projects.<host>]` registry.
 ///
-/// Everything is first-definition-wins over the precedence order local, then
-/// global. Profiles win whole - nothing is merged field by field.
+/// Archetypes and each `[_defaults]` key are first-definition-wins over the
+/// precedence order local, then global. Profiles are add-only: a name both
+/// layers define is an error.
 pub fn resolve(
     local: ConfigFile,
     global: Option<ConfigFile>,
@@ -45,7 +58,8 @@ fn resolve_inner(
     let mut profile: Option<Sourced<String>> = None;
     let mut stall_timeout_secs: Option<Sourced<super::StallTimeout>> = None;
     let mut claude_token_command: Option<String> = None;
-    let mut defs: BTreeMap<String, Vec<ProfileDef>> = BTreeMap::new();
+    let mut prefer: Option<Sourced<Vec<super::Harness>>> = None;
+    let mut profiles: BTreeMap<String, ProfileDef> = BTreeMap::new();
     let mut projects = BTreeMap::new();
 
     for (layer, mut file) in layers {
@@ -85,46 +99,34 @@ fn resolve_inner(
                 table: "[_defaults]".into(),
             });
         }
-        // Pushing in precedence order makes the first definition of each
-        // profile the effective one.
-        for (name, (harness, p)) in file.profiles {
-            let table = format!("[profiles.{}]", super::toml_key(&name));
-            defs.entry(name).or_default().push(ProfileDef {
-                harness,
-                profile: p,
+        if prefer.is_none()
+            && let Some(p) = file.defaults.prefer
+        {
+            prefer = Some(Sourced {
+                value: p,
                 layer,
-                table,
+                table: "[_defaults]".into(),
             });
         }
-    }
-
-    let mut profiles = BTreeMap::new();
-    for (name, list) in defs {
-        let mut list = list.into_iter();
-        let Some(effective) = list.next() else {
-            continue;
-        };
-        let shadowed: Vec<ProfileDef> = list.collect();
-        // A project profile may replace a global one of the same name, but not
-        // with another harness: `-p <name>` would then launch a different
-        // harness in this project than everywhere else, with no sign of it.
-        if let Some(other) = shadowed.iter().find(|d| d.harness != effective.harness) {
-            bail!(
-                "profile '{name}' runs on {} in the {} config but on {} in the {} config\n  \
-                 A profile names one harness everywhere: rename one of them.",
-                effective.harness,
-                effective.layer.as_str(),
-                other.harness,
-                other.layer.as_str()
-            );
+        // Profiles are add-only across layers. A project may define new ones,
+        // but redefining a global profile is refused: a checked-out repo's
+        // config must not be able to change what `-p <name>` means everywhere
+        // else - swap its model, widen its sandbox, add env - for the same
+        // reason `claude_token_command` is global-only.
+        for (name, mut def) in file.profiles {
+            // The layer is the slot the file was resolved in.
+            def.layer = layer;
+            if let Some(earlier) = profiles.get(&name) {
+                bail!(
+                    "profile '{name}' is defined in both {} and {}\n  \
+                     A project may add profiles but not redefine a global one: pick \
+                     another name for the project's profile.",
+                    layer_file(&files, earlier.layer),
+                    layer_file(&files, def.layer)
+                );
+            }
+            profiles.insert(name, def);
         }
-        profiles.insert(
-            name,
-            ProfileEntry {
-                effective,
-                shadowed,
-            },
-        );
     }
 
     Ok(ReviewConfig {
@@ -133,6 +135,7 @@ fn resolve_inner(
         profile,
         stall_timeout_secs,
         claude_token_command,
+        prefer,
         profiles,
         hostname: hostname.to_string(),
         files,

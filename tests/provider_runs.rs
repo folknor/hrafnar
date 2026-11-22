@@ -2680,7 +2680,7 @@ fn fixture_settings(
 ) -> review::harness::RunSettings {
     review::harness::RunSettings::from_profile(
         harness,
-        Some(&review::config::ProfileDef {
+        Some(&review::config::HarnessEntry {
             harness,
             profile,
             layer: review::config::Layer::Local,
@@ -2969,7 +2969,6 @@ fi
                 env: Some(env),
                 config,
                 writable_roots: vec![external.to_string_lossy().into_owned()],
-                ..Default::default()
             },
         ),
         prompt: "prompt with spaces\nand a second line".into(),

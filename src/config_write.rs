@@ -97,17 +97,19 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # [archetypes]
 # security = \"You are a security expert for this project. Read the codebase.\"
 #
-# Named profiles, selected with -p: a provider and its settings. A profile here
-# replaces a global profile of the same name entirely.
+# Named profiles, selected with -p: a tier of work with one entry per harness
+# that can serve it. This file may add profiles but not redefine one the
+# global config already defines - pick a name of the project's own.
 # [profiles.deep]
-# provider = \"codex\"
-# model = \"gpt-6-luna\"
-# effort = \"high\"
-# sandbox = \"read-only\"
+# comment = \"Deep review of this project.\"
+# codex = { model = \"gpt-6-luna\", effort = \"high\", sandbox = \"read-only\" }
+# claude = { model = \"opus\" }
 #
-# The profile a run uses when -p is omitted:
+# The profile a run uses when -p is omitted, and which harness to run a
+# profile on when several are installed (--harness overrides it):
 # [_defaults]
 # profile = \"deep\"
+# prefer = [\"codex\", \"claude\"]
 ";
 
 /// Create a starter config in the selected directory itself - never in an

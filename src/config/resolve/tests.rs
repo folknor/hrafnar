@@ -27,7 +27,7 @@ mod layering {
         )?)
     }
 
-    fn entry<'a>(cfg: &'a ReviewConfig, profile: &str) -> &'a ProfileEntry {
+    fn entry<'a>(cfg: &'a ReviewConfig, profile: &str) -> &'a ProfileDef {
         &cfg.profiles[profile]
     }
 
@@ -37,97 +37,58 @@ mod layering {
     fn a_global_profile_applies_when_the_project_defines_none() {
         // The whole point of the global layer: which model serves a tier is
         // stated once per operator, not restated in every project.
-        let cfg = layered("", "[profiles.deep]\nprovider = \"codex\"\nmodel = \"g\"\n").unwrap();
+        let cfg = layered("", "[profiles.deep.codex]\nmodel = \"g\"\n").unwrap();
         let e = entry(&cfg, "deep");
-        assert_eq!(e.effective.harness, Harness::Codex);
-        assert_eq!(e.effective.profile.model.as_deref(), Some("g"));
-        assert_eq!(e.effective.layer, Layer::Global);
-        assert_eq!(e.effective.table, "[profiles.deep]");
-        assert!(e.shadowed.is_empty());
+        assert_eq!(e.entries[&Harness::Codex].model.as_deref(), Some("g"));
+        assert_eq!(e.layer, Layer::Global);
+        assert_eq!(e.table, "[profiles.deep]");
+        let codex = e.entry(Harness::Codex).unwrap();
+        assert_eq!(codex.layer, Layer::Global);
+        assert_eq!(codex.table, "[profiles.deep.codex]");
     }
 
     #[test]
-    fn a_local_profile_replaces_the_global_one_whole() {
-        // No field-level merge: the global profile opts up to workspace-write,
-        // the local one only names a model. If fields merged, the project's
-        // profile would silently inherit write access it never asked for.
+    fn a_project_may_add_profiles_beside_the_global_ones() {
         let cfg = layered(
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"local-model\"\n",
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"global-model\"\n\
-             effort = \"high\"\nsandbox = \"workspace-write\"\n\
-             writable_roots = [\"/srv\"]\nconfig = ['a=\"b\"']\nenv = { K = \"v\" }\n",
+            "[profiles.local-only.claude]\nmodel = \"l\"\n",
+            "[profiles.deep.codex]\nmodel = \"g\"\n",
         )
         .unwrap();
-        let p = &cfg.resolve_profile("deep").unwrap().profile;
-        assert_eq!(p.model.as_deref(), Some("local-model"));
-        assert_eq!(p.effort, None);
-        assert_eq!(p.sandbox, None);
-        assert!(p.writable_roots.is_empty());
-        assert!(p.config.is_empty());
-        assert!(p.env.is_none());
+        assert_eq!(entry(&cfg, "local-only").layer, Layer::Local);
+        assert_eq!(entry(&cfg, "deep").layer, Layer::Global);
     }
 
     #[test]
-    fn the_shadowed_global_profile_is_retained_for_display() {
-        // `review list --all` shows what a stale local override is hiding; that
-        // only works if the loser survives resolution intact.
-        let cfg = layered(
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"l\"\n",
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"g\"\n",
-        )
-        .unwrap();
-        let e = entry(&cfg, "deep");
-        assert_eq!(e.effective.layer, Layer::Local);
-        assert_eq!(e.shadowed.len(), 1);
-        assert_eq!(e.shadowed[0].layer, Layer::Global);
-        assert_eq!(e.shadowed[0].table, "[profiles.deep]");
-        assert_eq!(e.shadowed[0].profile.model.as_deref(), Some("g"));
-    }
-
-    #[test]
-    fn a_project_profile_may_not_switch_the_harness() {
-        // `-p deep` must launch the same harness in every project; a project
-        // that redefined it on another harness would change that silently.
-        let err = layered(
-            "[profiles.deep]\nprovider = \"claude\"\n",
-            "[profiles.deep]\nprovider = \"codex\"\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("runs on claude in the local config"), "{err}");
-        assert!(err.contains("codex in the global config"), "{err}");
-    }
-
-    #[test]
-    fn profiles_resolve_independently_per_name() {
-        // A local override of one profile must not hide the global's others.
-        let cfg = layered(
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"l\"\n",
-            "[profiles.deep]\nprovider = \"codex\"\nmodel = \"g\"\n\
-             [profiles.fast]\nprovider = \"claude\"\nmodel = \"gf\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.resolve_profile("deep")
-                .unwrap()
-                .profile
-                .model
-                .as_deref(),
-            Some("l")
-        );
-        let fast = entry(&cfg, "fast");
-        assert_eq!(fast.effective.harness, Harness::Claude);
-        assert_eq!(fast.effective.profile.model.as_deref(), Some("gf"));
-        assert!(fast.shadowed.is_empty());
-    }
-
-    #[test]
-    fn a_dotted_profile_name_is_quoted_in_the_recorded_table() {
-        // The table string is shown to the operator as where to go and edit;
-        // unquoted, `[profiles.a.b]` names a different table.
-        let raw = "[profiles.\"a.b\"]\nprovider = \"grok\"\n";
-        let cfg = layered(raw, "").unwrap();
-        assert_eq!(entry(&cfg, "a.b").effective.table, "[profiles.\"a.b\"]");
+    fn a_project_may_not_redefine_a_global_profile() {
+        // A checked-out repo must not change what `-p deep` means - not its
+        // model, and above all not its sandbox - whatever the harnesses.
+        for local_raw in [
+            "[profiles.deep.codex]\nsandbox = \"danger-full-access\"\n",
+            "[profiles.deep.claude]\n",
+        ] {
+            let err = resolve(
+                local(local_raw),
+                Some(global("[profiles.deep.codex]\nmodel = \"g\"\n")),
+                "h",
+                ConfigFiles {
+                    local: Some("/p/.review.toml".into()),
+                    global: Some("/home/u/.config/review/config.toml".into()),
+                    global_loaded: true,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("profile 'deep' is defined in both"), "{err}");
+            assert!(err.contains("/p/.review.toml"), "{err}");
+            assert!(err.contains("/home/u/.config/review/config.toml"), "{err}");
+            assert!(err.contains("pick another name"), "{err}");
+        }
+        // Without known paths the layers are still named.
+        let err = layered("[profiles.deep.codex]\n", "[profiles.deep.codex]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the local config"), "{err}");
+        assert!(err.contains("the global config"), "{err}");
     }
 
     // ---- archetypes -----------------------------------------------------
@@ -212,6 +173,37 @@ mod layering {
         let cfg = layered("[_defaults]\n", "[_defaults]\n").unwrap();
         assert!(cfg.profile.is_none());
         assert!(cfg.stall_timeout_secs.is_none());
+        assert!(cfg.prefer.is_none());
+        assert!(cfg.prefer().is_empty());
+    }
+
+    #[test]
+    fn prefer_comes_whole_from_the_first_layer_that_sets_it() {
+        // Whole, not merged: a project that prefers claude alone must not
+        // inherit the global list's tail.
+        let cfg = layered(
+            "[_defaults]\nprefer = [\"claude\"]\n",
+            "[_defaults]\nprefer = [\"codex\", \"grok\"]\nprofile = \"deep\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.prefer(), [Harness::Claude]);
+        let p = cfg.prefer.as_ref().unwrap();
+        assert_eq!(p.layer, Layer::Local);
+        assert_eq!(p.table, "[_defaults]");
+        assert_eq!(cfg.default_profile(), Some("deep"));
+
+        let cfg = layered("", "[_defaults]\nprefer = [\"codex\", \"grok\"]\n").unwrap();
+        assert_eq!(cfg.prefer(), [Harness::Codex, Harness::Grok]);
+        assert_eq!(cfg.prefer.as_ref().unwrap().layer, Layer::Global);
+
+        // An empty list is a setting: it overrides the global one.
+        let cfg = layered(
+            "[_defaults]\nprefer = []\n",
+            "[_defaults]\nprefer = [\"codex\"]\n",
+        )
+        .unwrap();
+        assert!(cfg.prefer().is_empty());
+        assert_eq!(cfg.prefer.as_ref().unwrap().layer, Layer::Local);
     }
 
     // ---- audit ----------------------------------------------------------
@@ -286,8 +278,7 @@ mod layering {
 bugs = \"b\"
 [_defaults]
 profile = \"deep\"
-[profiles.deep]
-provider = \"codex\"
+[profiles.deep.codex]
 model = \"m\"
 ";
         let without = resolve(local(raw), None, "h", ConfigFiles::default()).unwrap();
@@ -296,9 +287,7 @@ model = \"m\"
         for cfg in [&without, &with_empty] {
             assert_eq!(cfg.archetypes["bugs"].layer, Layer::Local);
             assert_eq!(cfg.profile.as_ref().unwrap().layer, Layer::Local);
-            let e = entry(cfg, "deep");
-            assert_eq!(e.effective.layer, Layer::Local);
-            assert!(e.shadowed.is_empty());
+            assert_eq!(entry(cfg, "deep").layer, Layer::Local);
         }
     }
 

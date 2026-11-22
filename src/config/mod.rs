@@ -9,12 +9,14 @@ mod parse;
 mod profile;
 mod resolve;
 mod sandbox;
+mod select;
 
 pub use crate::ids::{generate_uuid, try_generate_short_id};
 pub use load::{global_config_path, global_projects, load, load_optional, project_root};
 pub use parse::parse_file;
 pub use resolve::resolve;
 pub use sandbox::SandboxLevel;
+pub use select::choose_harness;
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -104,6 +106,10 @@ pub struct DefaultsConfig {
     /// front for a session that was created with it. The token is passed to
     /// that claude process as `CLAUDE_CODE_OAUTH_TOKEN` and never recorded.
     pub claude_token_command: Option<String>,
+    /// Harnesses in order of preference, for a profile that defines several:
+    /// a run without `--harness` takes the first one listed here that the
+    /// profile defines and this host has installed.
+    pub prefer: Option<Vec<Harness>>,
 }
 
 /// `[_defaults].stall_timeout_secs`, decoded where it is parsed: `0` means
@@ -143,22 +149,16 @@ impl std::fmt::Display for StallTimeout {
     }
 }
 
-/// A named settings profile: optional model, effort, sandbox, and env overrides
-/// applied to a harness invocation when selected via `--profile`. The
-/// harness it runs on is the table's required `harness` key, peeled off
-/// before this is deserialized and kept beside it (`ProfileDef::harness`).
+/// One harness's entry in a profile, `[profiles.<name>.<harness>]`: optional
+/// model, effort, sandbox, and env overrides applied to that harness's
+/// invocation when the profile is selected via `--profile` and the run lands
+/// on that harness. An empty entry is that harness on its own defaults.
 ///
-/// Unknown keys are an error. A profile wins whole, so a project profile with a
-/// misspelled key (`modle = ...`) would otherwise parse as an empty profile and
-/// silently discard the global definition it replaces - model, sandbox and all.
+/// Unknown keys are an error: a misspelled key (`modle = ...`) would otherwise
+/// parse as an empty entry and silently run the harness's default model.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
-    /// Free text for whoever picks a profile - what it is for, when to reach
-    /// for it. Never sent to a harness; `review list` shows it. A field
-    /// rather than a TOML comment because the parser discards comments, and
-    /// `review list` renders only what the resolver produced.
-    pub comment: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// Review's sandbox vocabulary, resolved into native permissions before
@@ -195,8 +195,8 @@ pub struct ConfigFile {
     pub archetypes: BTreeMap<String, String>,
     pub audit: AuditConfig,
     pub defaults: DefaultsConfig,
-    /// `[profiles.<name>]`: name -> (harness, profile).
-    pub profiles: BTreeMap<String, (Harness, Profile)>,
+    /// `[profiles.<name>]`: name -> definition.
+    pub profiles: BTreeMap<String, ProfileDef>,
     /// `[_projects.<host>]`: host -> project name -> path as written. Global
     /// file only, for `-C <name>` (see `project.rs`).
     pub projects: BTreeMap<String, BTreeMap<String, String>>,
@@ -212,25 +212,49 @@ pub struct Sourced<T> {
     pub table: String,
 }
 
-/// One definition of a profile.
+/// One profile, `[profiles.<name>]`: a tier of work with one entry per
+/// harness that can serve it. Which entry a run uses is chosen per run
+/// (`select::choose_harness`). A profile is defined in exactly one layer: a
+/// project may add profiles but never redefine a global one (see `resolve`).
 #[derive(Debug, Clone)]
 pub struct ProfileDef {
+    /// Free text for whoever picks a profile - what it is for, when to reach
+    /// for it. Never sent to a harness; `review list` shows it. A field
+    /// rather than a TOML comment because the parser discards comments, and
+    /// `review list` renders only what the resolver produced.
+    pub comment: Option<String>,
+    /// Never empty: parsing refuses a profile with no harness entry.
+    pub entries: BTreeMap<Harness, Profile>,
+    pub layer: Layer,
+    /// `[profiles.<name>]`, the name quoted as TOML needs it.
+    pub table: String,
+}
+
+impl ProfileDef {
+    /// The entry for `harness` with its provenance, if the profile has one.
+    pub fn entry(&self, harness: Harness) -> Option<HarnessEntry> {
+        self.entries.get(&harness).map(|profile| HarnessEntry {
+            harness,
+            profile: profile.clone(),
+            layer: self.layer,
+            table: format!("{}.{}]", self.table.trim_end_matches(']'), harness.as_str()),
+        })
+    }
+
+    /// The harnesses this profile has entries for, in `Harness` order.
+    pub fn harnesses(&self) -> impl Iterator<Item = Harness> + '_ {
+        self.entries.keys().copied()
+    }
+}
+
+/// The one harness entry a run launches with, and where it was written
+/// (`[profiles.<name>.<harness>]`), which the session row records.
+#[derive(Debug, Clone)]
+pub struct HarnessEntry {
     pub harness: Harness,
     pub profile: Profile,
     pub layer: Layer,
     pub table: String,
-}
-
-/// Every definition of one profile name, in precedence order. All of them
-/// name the same harness: resolution refuses a project profile that would
-/// silently switch which harness `-p <name>` launches. The first wins **whole** - a winning profile replaces the
-/// others outright rather than merging field by field, so no field of a run can
-/// come from a table that did not mention it. The rest are kept so `review
-/// config` can show what a stale override is hiding.
-#[derive(Debug, Clone)]
-pub struct ProfileEntry {
-    pub effective: ProfileDef,
-    pub shadowed: Vec<ProfileDef>,
 }
 
 /// The files that were read to build a `ReviewConfig`.
@@ -257,8 +281,10 @@ pub struct ReviewConfig {
     pub stall_timeout_secs: Option<Sourced<StallTimeout>>,
     /// Global layer only, so never a project's choice.
     pub claude_token_command: Option<String>,
-    /// profile name -> entry.
-    pub profiles: BTreeMap<String, ProfileEntry>,
+    /// `[_defaults].prefer`, whole from the first layer that sets it.
+    pub prefer: Option<Sourced<Vec<Harness>>>,
+    /// profile name -> its one definition.
+    pub profiles: BTreeMap<String, ProfileDef>,
     pub hostname: String,
     // Both are constructed together by resolve; callers cannot replace one
     // independently and create a config paired with a different root.
@@ -313,9 +339,14 @@ impl ReviewConfig {
         )
     }
 
-    /// The effective definition of `profile`, if any layer defines it.
+    /// The definition of `profile`, if any layer defines it.
     pub fn resolve_profile(&self, profile: &str) -> Option<&ProfileDef> {
-        self.profiles.get(profile).map(|e| &e.effective)
+        self.profiles.get(profile)
+    }
+
+    /// `[_defaults].prefer`, empty when no layer sets it.
+    pub fn prefer(&self) -> &[Harness] {
+        self.prefer.as_ref().map_or(&[], |s| s.value.as_slice())
     }
 
     /// The effective definition, or an error naming the files searched and
