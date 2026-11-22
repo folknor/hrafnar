@@ -12,8 +12,10 @@ output. Each entry says what to do if you relied on the old behaviour.
   (`~/.config/review/` to `~/.config/hrafnar/`), the data directory
   (`~/.local/share/review/` to `~/.local/share/hrafnar/`), the host launch
   lock and the generated `review-ws-*` and `review-read-only` harness
-  profiles all take the new name. Rename the files and directories you
-  have. Old values are not read. Record fields `review_version`,
+  profiles all take the new name. A project's `.review.toml` is still read
+  in place of `.hrafnar.toml`. A directory holding both is an error. Move
+  the global config and data directories yourself: the old paths are not
+  read. Record fields `review_version`,
   `terminated_by_review` and `review_error` are now `hrafnar_version`,
   `terminated_by_hrafnar` and `hrafnar_error`. Rows written under the old
   names still parse, but update any `jq` queries that use them.

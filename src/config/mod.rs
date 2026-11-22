@@ -25,6 +25,12 @@ use std::path::PathBuf;
 pub use crate::harness::Harness;
 
 pub(crate) const CONFIG_FILENAME: &str = ".hrafnar.toml";
+/// The project file's name from before the tool was called hrafnar. It is
+/// read exactly like `CONFIG_FILENAME`, so existing checkouts keep working
+/// without a rename; `init` never writes it, and a directory holding both is
+/// an error rather than a silent pick, since the two could differ in
+/// `[_audit]` and file a project's rows under the wrong id.
+pub(crate) const LEGACY_CONFIG_FILENAME: &str = ".review.toml";
 
 /// Reserved CLI vocabulary is derived from Clap (including hidden commands
 /// and aliases). Keep the dependency one way: CLI construction must not consult

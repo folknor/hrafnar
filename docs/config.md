@@ -10,7 +10,9 @@ Settings resolve from the command line first, then the project's
 `$XDG_CONFIG_HOME/hrafnar/config.toml`, or
 `~/.config/hrafnar/config.toml` when that variable is unset or relative.
 Both files share one format, and nothing is built in: a setting no layer
-gives has no value.
+gives has no value. A project file named `.review.toml` is read the same
+way as `.hrafnar.toml`. A directory holding both is an error, and
+`hrafnar init` only ever writes `.hrafnar.toml`.
 
 ## Seeing the effective config
 

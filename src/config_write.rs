@@ -124,7 +124,7 @@ pub fn init(sel: &Selection) -> Result<()> {
 
     if let Located::Found(existing) = locate_config(&Selection::Discover(dir.to_path_buf()))? {
         bail!(
-            "{CONFIG_FILENAME} already exists at {}\n  \
+            "a project config already exists at {}\n  \
              Creating another here would shadow it.",
             existing.display()
         );

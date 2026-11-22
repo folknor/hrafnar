@@ -53,6 +53,10 @@ pub enum ConfigError {
         path: PathBuf,
     },
     ProjectRequired,
+    /// `.hrafnar.toml` and the legacy `.review.toml` side by side.
+    BothConfigs {
+        dir: PathBuf,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -81,6 +85,12 @@ impl fmt::Display for ConfigError {
             Self::ProjectRequired => {
                 f.write_str("project configuration required; only the global layer was loaded")
             }
+            Self::BothConfigs { dir } => write!(
+                f,
+                "both .hrafnar.toml and .review.toml are in {}\n  \
+                 Merge them into .hrafnar.toml and delete .review.toml.",
+                dir.display()
+            ),
         }
     }
 }

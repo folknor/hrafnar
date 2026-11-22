@@ -385,7 +385,12 @@ pub(super) async fn run_message(
     // Persist an id before launching so every concurrent resume records the
     // same project identity, and a write failure cannot leave an unidentifiable
     // session behind.
-    let audit_id = config_write::ensure_audit_id(&project_root.join(".hrafnar.toml"))?;
+    let local_config_path = cfg
+        .files()
+        .local
+        .clone()
+        .unwrap_or_else(|| project_root.join(crate::config::CONFIG_FILENAME));
+    let audit_id = config_write::ensure_audit_id(&local_config_path)?;
     let scope = crate::data::LogScope::new(audit_id, cfg.audit.private);
     let data = crate::data::DataDir::process().clone();
     // Prompt/profile settings are inherited; the current stall safety setting is honoured.

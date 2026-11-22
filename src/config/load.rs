@@ -9,8 +9,8 @@
 //! fallback would file a private project's rows in the public log.
 
 use super::{
-    CONFIG_FILENAME, ConfigFile, ConfigFiles, HrafnarConfig, Layer, Selection, hostname,
-    parse_file, resolve,
+    CONFIG_FILENAME, ConfigFile, ConfigFiles, HrafnarConfig, LEGACY_CONFIG_FILENAME, Layer,
+    Selection, hostname, parse_file, resolve,
 };
 use super::{ConfigError, Result, SearchBoundary};
 use crate::project::ProjectRoot;
@@ -141,23 +141,35 @@ pub(crate) enum Located {
     Missing(SearchBoundary),
 }
 
+/// The project file directly in `dir`: `.hrafnar.toml`, else the legacy
+/// `.review.toml`. Both present is an error (see `LEGACY_CONFIG_FILENAME`).
+fn config_in(dir: &std::path::Path) -> Result<Option<PathBuf>> {
+    let current = dir.join(CONFIG_FILENAME);
+    let legacy = dir.join(LEGACY_CONFIG_FILENAME);
+    match (entry_exists(&current)?, entry_exists(&legacy)?) {
+        (true, true) => Err(ConfigError::BothConfigs {
+            dir: dir.to_path_buf(),
+        }),
+        (true, false) => Ok(Some(current)),
+        (false, true) => Ok(Some(legacy)),
+        (false, false) => Ok(None),
+    }
+}
+
 pub(crate) fn locate_config(sel: &Selection) -> Result<Located> {
     let mut dir = match sel {
         Selection::Exact(root) => {
-            let candidate = root.join(CONFIG_FILENAME);
-            return Ok(if entry_exists(&candidate)? {
-                Located::Found(candidate)
-            } else {
-                Located::Missing(SearchBoundary::Exact(root.clone()))
+            return Ok(match config_in(root)? {
+                Some(path) => Located::Found(path),
+                None => Located::Missing(SearchBoundary::Exact(root.clone())),
             });
         }
         Selection::Discover(start) => start.clone(),
     };
 
     loop {
-        let candidate = dir.join(CONFIG_FILENAME);
-        if entry_exists(&candidate)? {
-            return Ok(Located::Found(candidate));
+        if let Some(path) = config_in(&dir)? {
+            return Ok(Located::Found(path));
         }
         if entry_exists(&dir.join(".git"))? {
             return Ok(Located::Missing(SearchBoundary::GitRoot(dir)));
@@ -236,6 +248,42 @@ mod tests {
             locate_config(&Selection::Discover(child)).expect("boundary"),
             Located::Missing(_)
         ));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_legacy_review_toml_is_the_project_file_unless_both_exist() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/test-scratch")
+            .join(format!("config-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("fixture");
+        let legacy = root.join(LEGACY_CONFIG_FILENAME);
+        std::fs::write(&legacy, "[_audit]\nid = 'legacy'\n").expect("legacy config");
+
+        for sel in [
+            Selection::Exact(root.clone()),
+            Selection::Discover(child.clone()),
+        ] {
+            assert!(matches!(locate_config(&sel).unwrap(), Located::Found(p) if p == legacy));
+        }
+        let cfg = load(&Selection::Exact(root.clone())).unwrap();
+        assert_eq!(cfg.files().local.as_deref(), Some(legacy.as_path()));
+        assert_eq!(
+            cfg.audit.id.as_ref().map(crate::data::AuditId::as_str),
+            Some("legacy")
+        );
+        // init must not add a .hrafnar.toml beside or below a legacy file.
+        assert!(crate::config_write::init(&Selection::Exact(root.clone())).is_err());
+        assert!(crate::config_write::init(&Selection::Exact(child.clone())).is_err());
+
+        std::fs::write(root.join(CONFIG_FILENAME), "[_audit]\nid = 'new'\n").expect("config");
+        let error = match locate_config(&Selection::Discover(child)) {
+            Err(error) => error,
+            Ok(_) => panic!("both files must be refused"),
+        };
+        assert!(matches!(&error, ConfigError::BothConfigs { dir } if *dir == root));
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
