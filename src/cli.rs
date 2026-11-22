@@ -84,13 +84,13 @@ may fail to authenticate, since Claude Code does not pass CLAUDE_CODE_OAUTH_TOKE
 on; a global [_defaults].claude_token_command fixes that (`review man config`).
 
 Output: a `--- <harness> ---` header, then `session: <ID>`, then the
-response. Codex and grok runs also print a digest between the session
-line and the response:
+response. Codex and grok runs, and any run that did not end cleanly, also
+print a digest between the session line and the response:
   exit / signal     the harness process's exit status
   captured          true if a final answer was captured; false means the text
                     below is an interim note, not a conclusion
   turn failed       the reason the harness gave for ending the turn
-  review failed     review could not verify the run (grok background work);
+  review failed     review could not verify the result (`review man failures`);
                     the run fails even if an answer was captured
   terminated by review
                     the stall watchdog killed a codex run that went silent
@@ -162,8 +162,8 @@ If a {INTERRUPTIBLE} turn is in flight, it is interrupted first (as `review
 interrupt` does) - the turn is cut off and whatever it had not finished is lost -
 and the message then continues the session. A {UNINTERRUPTIBLE} turn in flight cannot be
 interrupted; the message is refused until it ends. A run already recording
-waits for its handoff. Active runs from older builds without handoff support
-must finish before continuation.
+waits for its handoff. A run started by a review build that cannot hand off
+its result must finish first.
 
 The session must come from a run on this host: its harness is read from the
 record that run left (`review sessions` lists them), and an ID with no record
@@ -186,8 +186,8 @@ const INTERRUPT_AFTER_HELP_TEMPLATE: &str = "\
 Works on {INTERRUPTIBLE} runs, not {UNINTERRUPTIBLE}. This ends the turn, waits for the run
 to record its session, and prints the `review message` command that continues
 it. A run already recording waits for its exact handoff without signalling.
-Active runs from older builds without handoff support must finish before
-continuation. The interrupted run exits 1, like any run that produced no answer. To stop a
+A run started by a review build that cannot hand off its result must finish
+first. The interrupted run exits 1, like any run that produced no answer. To stop a
 turn and send new information in one step, use `review message` instead.
 
 Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
@@ -416,7 +416,7 @@ pub enum Command {
         limit: usize,
     },
 
-    /// Create a starter .review.toml in the current directory
+    /// Create a starter .review.toml in the current directory, or the -C one
     Init,
 
     /// Print a bundled topic with more depth than this help; no topic lists them

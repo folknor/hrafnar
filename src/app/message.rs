@@ -341,7 +341,7 @@ pub(super) async fn run_message(
         let Some(command) = cfg.claude_token_command.clone() else {
             bail!(
                 "session {session_id} was created with a token from claude_token_command, which \
-                 the global config no longer sets\n  Nothing was sent."
+                 the global config does not set\n  Nothing was sent."
             );
         };
         let source = harness::claude_token::TokenSource::new(command);

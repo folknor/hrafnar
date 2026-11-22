@@ -1,13 +1,9 @@
 //! Every production timing default, in one place.
 //!
-//! These were previously spread across four files in three different forms:
-//! two named constants (one of them function-scoped), several inline
-//! `Duration::from_secs` literals inside `Default` impls, one bare
-//! `from_millis(250)` mid-function, and a clap `default_value = "30"` string.
-//! Nothing related them to each other, so the only way to see the shape of the
-//! system's patience was to grep for `Duration`.
+//! They live together so the shape of the system's patience can be read in one
+//! place, and so no default hides as an inline literal or a clap string.
 //!
-//! Collecting them does not change how they are *used*: `watchdog::Timings` and
+//! This module does not decide how they are *used*: `watchdog::Timings` and
 //! `harness::HarnessRuntime` are still the injection points, and tests still
 //! override them freely (see `tests/provider_runs.rs`, which drives 3-minute and
 //! 10-second behaviours in milliseconds). What lives here is only the default

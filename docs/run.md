@@ -1,109 +1,153 @@
-# A fresh run
+# Starting a fresh run
 
-`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--harness HARNESS]`
+This page covers a run: `review` with no subcommand, which sends your
+instructions to one new session on one harness. It explains the input, the
+archetype and profile flags, how concurrent runs are spaced, the dry run,
+the output, auto-resume and the exit status. `review --help` has the short
+form of each rule.
 
-Every run starts one **fresh session** on one harness. Nothing
-carries over from an earlier run: if the new session needs context, the
-instructions have to state it. To continue a session instead, use
-`review message <ID>` while its cache is warm (see `review man message`).
-
-## Input
-
-Instructions come on stdin and are required, up to 20 KB. A pipe and a heredoc
-are the same thing to `review`:
-
+```sh
+echo "instructions" | review -a ARCHETYPE -p PROFILE --harness HARNESS
 ```
+
+Every run starts a fresh session, and nothing from an earlier run is
+carried over. If the new session needs context, state it in the
+instructions. To continue an existing session while its cache is warm, use
+`review message ID` instead (see `review man message`).
+
+## Instructions on stdin
+
+Your instructions come on stdin, and a run needs them. The limit is 20000
+bytes; a longer input is refused before anything launches. A pipe and a
+heredoc are the same to `review`:
+
+```sh
 review -a security <<'EOF'
 Audit the session handling in src/auth.
 EOF
 ```
 
-Quote the heredoc delimiter (`'EOF'`) so the shell leaves `$`, backticks and
-backslashes in the text alone. With no arguments and nothing on stdin, `review`
-prints its help and exits 2.
+Quote the heredoc delimiter (`'EOF'`), so the shell leaves `$`, backticks
+and backslashes in the text alone. Bare `review`, with no arguments and
+nothing on stdin, prints its help and exits 2. With any argument given,
+empty stdin is an error instead, exiting 1.
 
-## Archetypes
+## Priming with an archetype
 
-`-a` names what to prime the session with. An archetype is a name mapped to a
-prompt in the config, prepended to stdin with a blank line between.
+An archetype is a named prompt from the config that primes the session. With
+`-a NAME`, `review` sends the archetype's prompt, a blank line, then your
+stdin. The flag takes these forms:
 
-- no `-a`: stdin is sent unchanged, recorded under the archetype label `bare`.
-- `-a bare`: an unprimed run, whether or not `bare` is in the config.
-- `-a security`: the `security` archetype.
+- **No `-a`**: stdin is sent unchanged, and the run is recorded under the
+  archetype name `bare`.
+- **`-a bare`**: the same unprimed run, whether or not the config defines
+  `bare`.
+- **`-a security`**: the `security` archetype's prompt, then stdin.
 
-`-a` takes one name; a comma-separated list is refused. An unknown name is an
-error listing what is configured. The old positional form (`review security`)
-still works with a warning.
+An archetype whose prompt is empty or whitespace sends stdin unchanged, with
+no blank line in front. `-a` takes one name: a comma-separated list is
+refused, because one run is one session. An unknown name is an error that
+lists the configured archetypes. A positional archetype (`review security`)
+is a hidden alias for `-a security` and prints a warning; a positional
+`bare` means no archetype.
 
-## Profile
+## Choosing the profile and harness
 
-The profile is `-p deep`, else `[_defaults].profile` in the config (see
-`review man profiles`). A run with neither, or naming a profile no file
-defines, errors before launching. A profile holds one entry per harness; the
-run uses `--harness <name>` if given (an error if the profile has no entry for
-it), else the first harness in `[_defaults].prefer` that the profile defines
-and this host has installed, else the profile's only installed entry. When
-several are installed and nothing picks one, the run errors asking for
-`--harness` or `[_defaults].prefer`. A chosen harness that is not installed
-errors before launching; `review list` shows which a plain `-p <name>` would
-pick. `--provider` was removed and is refused, pointing at `-p` and
-`--harness`.
+The profile decides the model and settings, and it holds one entry per
+harness (see `review man profiles` for its fields). The run takes `-p NAME`,
+else `[_defaults].profile` from the config. With neither, or with a profile
+no config file defines, the run errors before launching.
 
-## Several sessions
+The run then picks one of the profile's harness entries: `--harness NAME`
+when given, otherwise the order `review man profiles` sets out. A chosen
+harness that isn't installed fails the run before anything launches.
+`review list` marks the harness a plain `-p NAME` would pick on this host.
 
-One run is one session. For several archetypes or profiles, launch
-several `review` calls side by side, each with the same stdin. Runs on one host
-queue behind a host-wide launch lock, which each holds for a fixed spacing
-after launching (or until it ends, if sooner), so calls fired together reach
-their harnesses spaced apart rather than all at once. A long run never blocks
-other `review` calls beyond that spacing.
+`--provider` is refused, with an error naming `-p` and `--harness`.
 
-## Dry run
+## Running several sessions at once
 
-`--dry-run` prints the assembled prompt and launches nothing. It names the
-chosen harness entry on stderr, and warns, rather than fails, when that
-harness is not installed.
+One run is one session. For several archetypes or profiles, start several
+`review` calls side by side, each with the same stdin.
 
-## Output
+Runs on one host share a launch lock, so calls you start together reach
+their harnesses 30s apart. Each run holds the lock for 30s after it
+launches, or until it ends if that comes sooner. A long run delays no other
+`review` call by more than that spacing.
 
-A `--- <harness> ---` header, the `session: <ID>` line, any digest, then the
-response. `review --help` lists the digest fields. The output ends with a
-`runtime:` line, which is wall clock including the wait for stdin and the
-launch lock.
+## Previewing with a dry run
 
-## Auto-resume
+`--dry-run` prints the assembled prompt on stdout and launches nothing. It
+still reads stdin and resolves the archetype, profile and harness, so it
+fails on the same configuration errors a real run would. On stderr it
+names:
+
+- the config files searched
+- this host's name
+- the chosen harness and its profile table
+
+A chosen harness that isn't installed gets a warning, not an error. A dry
+run exits 0.
+
+## Reading the output
+
+A run prints these, in order:
+
+1. A `--- HARNESS ---` header.
+2. `session: ID`, when the harness created a session.
+3. A digest, for codex and grok runs and for any run that didn't end
+   cleanly. `review --help` lists its fields.
+4. The response.
+5. For an interrupted run, the `review message` command that continues it.
+6. Anything the run left running (see `review man failures`).
+7. A `runtime:` line.
+
+The runtime is wall clock from the moment `review` started, so it includes
+the wait for stdin and for the launch lock. A run that fails before its
+harness produces a turn prints the header and the error on stderr instead.
+
+## Auto-resume after a codex death
 
 A codex run that dies mid-turn without a final answer is resumed once,
-immediately, on the same profile and session, with a short nudge to finish. If
-that produces an answer it is reported, prefixed
-`(auto-resumed after the initial run died without a final answer)`; if not,
-the original death is reported - unless the resume was itself interrupted, in
-which case the resume is reported, so its continue command is shown. A run whose harness stated why it failed, and
-a run that was interrupted, are never auto-resumed (see `review man failures`).
+straight away, in the same session with the same profile. The resume
+prompt is a short nudge to finish.
+
+`review` then reports one attempt, chosen like this:
+
+- **The resume answered**: its answer is reported, prefixed with
+  `(auto-resumed after the initial run died without a final answer)`.
+- **The resume was interrupted**: the resume is reported, so its continue
+  command is shown.
+- **Otherwise**: the original death is reported.
+
+A run is never auto-resumed when it was interrupted, when its harness stated
+why it failed, or when its teardown left processes running.
+`review man failures` explains each of those outcomes.
 
 ## Exit status
 
-`0` when the run produced an answer and nothing it started is still running,
-and for a `--dry-run`. `1` when it produced no answer - including a run that
-died, stalled, stated a failure or was interrupted - and on any error before
-launch. `3` when anything a run started was left running,
-or its teardown could not be confirmed, whatever the answers were (see
-`review man failures`): it outranks `1`, because those processes may still be
-changing the tree and need checking first. `2` for invalid arguments, and
-for bare `review` with nothing on stdin. A run that failed still prints its session ID when the
-harness created one, so it can be inspected (`review sessions <ID>`) or
-continued.
+The exit status is the run's contract with the script or agent that started
+it:
+
+- **0**: the run produced an answer, and nothing it started is still
+  running. A dry run also exits 0.
+- **1**: the run produced no answer, or `review` could not verify the
+  answer. This covers a run that died, stalled, stated a failure or was
+  interrupted, and any error before launch.
+- **2**: invalid arguments, or bare `review` with nothing on stdin.
+- **3**: something the run started was left running, or its teardown could
+  not be confirmed. This outranks 1, because those processes may still be
+  changing the tree, so check them before retrying.
+- **128 plus the signal number**: `review` was stopped by a signal.
+
+A failed run still prints its session ID when the harness created one, so
+you can inspect it with `review sessions ID` or continue it with
+`review message ID`.
 
 ## Long runs
 
-Runs can take hours. A harness that stops background commands after a timeout
-signals `review`, which tries to end its codex and claude turns gracefully and
-record them within a bounded wait, so the sessions can be continued with
-`review message`. A second signal, SIGKILL, or a turn that does not stop in
-time loses the record. Launch with the largest
-timeout the harness allows, and never stop or kill `review` to steer an agent:
-use `review message` (see `review man message`).
-
-When no response text was produced, the placeholder describes the settled
-outcome: a stated failure, interruption, termination, verification failure, or
-no final answer. Process status and diagnostic stderr remain in the output.
+A run can take hours. Start `review` with the largest timeout your harness
+allows for background commands. When a harness stops a command at its
+timeout, it signals `review`, which ends the turn and records the session
+so you can continue it. `review man message` covers what a signal does and
+how to steer a running agent without stopping `review`.

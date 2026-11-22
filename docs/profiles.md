@@ -1,9 +1,18 @@
 # Profiles
 
-A profile is a tier of work - "standard review", "implement", "cheap
-mechanical edit" - written as a `[profiles.<name>]` table and selected with
-`-p <name>`. It holds an optional `comment` and one entry per harness that can
-serve that tier, each with that harness's launch settings:
+A profile is a named tier of work, such as a standard review, an
+implementation that must build, or a cheap mechanical edit. You select one
+with `-p NAME`, and `review` launches one of its harness entries. This page
+explains how a run picks the profile and the entry, how profiles layer across
+config files, and every field an entry takes, under "Profile fields". The
+table of refusals is at the end.
+
+## What a profile holds
+
+A profile is a `[profiles.NAME]` table with an optional `comment` and one
+entry per harness that can serve the tier. Each entry is that harness's launch
+settings. The example below defines three profiles and the defaults that pick
+among them:
 
 ```toml
 [profiles.review]
@@ -20,10 +29,8 @@ model = "gpt-5.6-terra"
 effort = "high"
 sandbox = "workspace-write"
 writable_roots = ["/srv/fixtures", "$XDG_CACHE_HOME/assets", "~/corpora"]
-config = ['model_reasoning_summary="concise"']
 env = { RUST_LOG = "info" }
 
-# An empty entry is that harness on its own defaults.
 [profiles.plain]
 grok = {}
 
@@ -32,120 +39,127 @@ profile = "review"
 prefer  = ["codex", "claude", "maki"]
 ```
 
-`review list` lists the profiles a run here can use, each with its installed
-harnesses and the one a plain `-p <name>` would pick marked `*`, and names any
-profile hidden because none of its harnesses is installed; ask it before
-choosing a profile for a role. `review list --all` adds where each profile
-comes from and every entry's settings.
+An empty entry, like `grok = {}` above, runs that harness on its own
+defaults.
 
-Session rows record the selected entry as `profile_origin` (layer and table,
-`[profiles.<name>.<harness>]`), including automatic retries. This describes
-the requested launch source, not proof of successful execution or that the
-profile still exists. Only runs with a session ID get a session row. Manual
-messages have no profile origin.
+## Finding the profiles you can use
 
-## Selecting one
+Run `review list` before choosing a profile for a role. It lists the profiles
+a run here can use, each with its installed harnesses, and marks with `*` the
+harness a plain `-p NAME` picks. It also names each profile it hides because
+none of that profile's harnesses is installed. `review list --all` adds the
+file each profile comes from and every entry's settings.
 
-Every run runs one entry of one profile. The profile is `-p implement`, or
-without `-p`, `[_defaults].profile`. A run with neither, or naming a profile no
-file defines, fails before anything launches, naming every file searched and
-the profiles that exist.
+## How a run picks the profile and harness
 
-The harness is then:
+Every run launches one entry of one profile. The profile is the one `-p`
+names, or without `-p`, `[_defaults].profile`. A run with neither fails before
+anything launches, and so does a run naming a profile no file defines. The
+error names every file searched and the profiles that exist.
 
-1. `--harness <name>` if given. The profile must have an entry for it;
-   otherwise the run fails listing the harnesses it has.
-2. Otherwise the first harness in `[_defaults].prefer` that the profile
-   defines and this host has installed.
-3. Otherwise, if exactly one of the profile's entries is installed, that one.
-   A profile with a single entry resolves to it even when it is not
-   installed, so the run can say which harness is missing.
-4. Otherwise the run fails, asking for `--harness` or `[_defaults].prefer`.
+`review` then picks the harness, in this order:
 
-A chosen harness that is not installed fails the run before anything launches;
-`--dry-run` only warns.
+1. `--harness NAME`, if given. The profile must have an entry for that
+   harness, or the run fails listing the harnesses the profile has.
+2. The first harness in `[_defaults].prefer` that the profile defines and
+   this host has installed.
+3. The profile's one installed entry, if exactly one is installed.
+4. A profile with a single entry and nothing installed resolves to that
+   entry, so the run can name the missing harness.
 
-A resume (`review message`) takes no profile. The session keeps the sandbox,
-model and effort recorded for it, but **not** the entry's `env` or `config`,
-which are not stored in the session record and so are not restored on a
-message (see `review man message`).
+Anything else fails: several installed entries with no preference asks for
+`--harness` or `[_defaults].prefer`, and several entries with none installed
+asks you to install one or pick another profile. A chosen harness that isn't
+installed fails the run before anything launches; `--dry-run` only warns.
 
-## Layers: add-only
+`review message` takes no profile. To learn what a resumed session keeps from
+its entry, see `review man message`.
 
-A profile is defined in exactly one file. A project's `.review.toml` may add
-profiles of its own, but a profile name the global config already defines may
-not be defined again in the project: that is a load error naming both files.
-Pick another name for the project's profile.
+## Profiles across config files
 
-The reason is the same one that keeps `claude_token_command` global-only: a
-checked-out repository's config must not be able to change what `-p review`
-means - swap its model, widen its sandbox, add env - for whoever runs `review`
-in it. Since nothing is overridden, nothing is merged either: every field of a
-run comes from the one entry `review list --all` shows.
+Each profile is defined in exactly one file. A project's `.review.toml` can
+add profiles of its own, but it can't define a profile name the global config
+already defines: loading fails, naming both files. Give the project's profile
+another name.
 
-## Fields
+We refuse the redefinition so that a checked-out repository can't change what
+`-p review` means for whoever runs `review` in it, for example by swapping the
+model, widening the sandbox or adding env. Nothing is overridden, so nothing
+is merged: every field of a run comes from the one entry `review list --all`
+shows.
 
-In `[profiles.<name>]` the only keys are `comment` and harness names. An
-unknown key is an error, and so is a profile with no harness entry. The old
-`provider = "..."` key is refused: move the settings under
-`[profiles.<name>.<harness>]`.
+## Profile fields
 
-- `comment`: free text for whoever picks the profile, never sent to a
+A `[profiles.NAME]` table takes only `comment` and harness names (`claude`,
+`codex`, `grok`, `maki`). Any other key is an error, and so is a profile with
+no harness entry:
+
+- **`comment`**: free text for whoever picks the profile, never sent to a
   harness. `review list` shows its first line, `review list --all` all of it.
 
-Every entry field is optional. An unknown key in an entry is an error, because
-a misspelled key would otherwise parse as an empty entry and silently run the
-harness's defaults. Fields the entry's harness does not honour are errors too.
-Empty `config` and `writable_roots` lists are accepted everywhere.
+### Entry fields
 
-- `model`: the model to request. For maki, `provider/model-id`; without one,
-  maki picks its last used model, then its configured default.
-- `effort`: the reasoning effort to request. Maki entries must omit it: maki
-  accepts an effort flag and ignores it, so set its thinking level in maki's
-  own config instead. A custom OpenAI-compatible model in maki only receives a
-  thinking level if its maki config declares the model's thinking fields.
-- `sandbox`: what the run may modify; defaults to `read-only` for codex and
-  grok. Claude and maki entries must omit it; configure the harness's own
-  permissions instead. See `review man sandbox` for what each level means per
-  harness, and why a maki run can write unless its permissions deny it.
-- `writable_roots`: extra paths a `workspace-write` run may write, added to the
-  ones `review` derives for builds, never replacing them. `~`, `$VAR` and
-  `${VAR}` expand; an entry naming an unset variable is dropped with a warning.
-  A non-empty list requires `workspace-write` on codex or grok (grok
-  also accepts its native `workspace` alias); otherwise parsing fails.
-  Remove the field or select that level. Claude and maki entries must omit it.
-  A codex `config` override of the writable roots replaces all of them,
-  these included. See `review man sandbox`.
-- `config`: codex only; remove a non-empty list from other harnesses. Each
-  string is passed to codex verbatim as a `-c`
-  override, after `review`'s own, so it can restate one deliberately - which
-  includes the settings behind the sandbox guarantees. Codex runs ignore the
-  operator's own codex `config.toml`, so anything an override refers to, such
-  as a custom `model_provider`, must be defined by overrides here too.
-- `env`: environment variables set for the harness process. They override
-  the defaults `review` sets for a harness, but not `PWD`, which is always
-  the project root the harness runs in. The session log
-  and `review list --all` show only their names, since values can carry secrets.
-  A codex incident bundle keeps values too, except for names that look
-  secret, so it can replay the run.
+Every field of a harness entry is optional. An unknown key is an error,
+because a misspelled key would otherwise leave an empty entry that silently
+runs the harness's defaults. A field the entry's harness doesn't honour is an
+error too, though empty `config` and `writable_roots` lists are accepted on
+every harness:
 
-## What a run records
+- **`model`**: the model to request. For maki, write `provider/model-id`;
+  without one, maki picks its last used model, then its configured default.
+- **`effort`**: the reasoning effort to request. Maki entries must omit it,
+  because maki accepts an effort flag and ignores it. Set maki's thinking
+  level in maki's own config instead. A custom OpenAI-compatible model in maki
+  receives a thinking level only if its maki config declares the model's
+  thinking fields.
+- **`sandbox`**: what the run may modify, `read-only` when omitted. Codex and
+  grok entries take it; claude and maki entries must omit it, so configure
+  those harnesses' own permissions instead. See `review man sandbox` for what
+  each level means per harness.
+- **`writable_roots`**: extra paths a `workspace-write` run may write, added
+  to the roots `review` derives for builds. `~`, `$VAR` and `${VAR}` expand.
+  A non-empty list needs `sandbox = "workspace-write"` on codex or grok (grok
+  also accepts its native `workspace`). Claude and maki entries must omit it.
+  See `review man sandbox` for which entries are dropped at launch.
+- **`config`**: codex only. Each string goes to codex verbatim as a `-c`
+  override, after `review`'s own, so an entry can restate one of them on
+  purpose, including the settings behind the sandbox guarantees. Codex runs
+  ignore your own codex `config.toml`, so anything an override refers to,
+  such as a custom `model_provider`, must be defined by overrides here too.
+- **`env`**: environment variables set for the harness process. They override
+  the defaults `review` sets, except `PWD`, which is always the project root
+  the harness runs in. `review list --all` shows only their names, since
+  values can be secrets.
 
-Each run records its prepared permissions, effective writable roots, and model
-and effort selectors. Claude and maki record no sandbox level; an old grok
-session with no known selector keeps it unknown. A level is not a certificate
-of filesystem enforcement: raw codex config can change permissions.
+### Codex model and effort precedence
 
-Model and effort are launch selections, separate from the harness-reported
-served model. maki reports no served model, so none is recorded for it. Its
-reported cost is recorded as maki gives it, which leaves out any turn maki has
-no price for, subagents included; a cost of zero is recorded as unknown, since
-maki reports zero for an unpriced model. If neither a dedicated field nor raw config sets a selector,
-it stays unset and the harness chooses. Codex precedence is explicit: an
-entry's `model` beats raw `config` entries for `model`; otherwise the last
-raw `model` entry is recorded. The last raw `model_reasoning_effort` entry
-beats `effort`. Those effective selectors are inherited on a message even
-though raw config is not stored or replayed. Final non-string TOML values for
-these two raw overrides are errors: change them to strings or remove them.
-Other raw config is still validated by codex. Existing session rows remain
-readable; historical rows retain the selectors originally recorded.
+A codex entry can set the model and effort both through `model` and `effort`
+and through raw `config` entries. `review` records the selector codex uses:
+
+- **Model**: `model` wins over any raw `model` override; without it, the last
+  raw `model` override is used.
+- **Effort**: the last raw `model_reasoning_effort` override wins over
+  `effort`.
+
+The final raw override for either key must be a TOML string. If neither a
+field nor a raw override sets a selector, the harness chooses. What each
+session records is covered in `review man sessions`.
+
+## Refusals and the fix
+
+Each row below is an error a profile can produce at load or launch:
+
+| What you see | Why | Fix |
+|---|---|---|
+| `no harness entry` | The profile has only a `comment`, or nothing | Add an entry, `HARNESS = {}` for defaults |
+| `unknown key 'KEY'` in `[profiles.NAME]` | A key that is neither `comment` nor a harness | Move an entry field under `[profiles.NAME.HARNESS]`; fix a typo |
+| `` `provider` was removed `` | The profile names its harness in a `provider` key | Move the settings under `[profiles.NAME.HARNESS]` for that harness |
+| `[HARNESS.*] ... move each` | A `[HARNESS.NAME]` table defines the profile | Move it to `[profiles.NAME.HARNESS]` |
+| `unknown section` naming a host | A `[HOST.HARNESS.NAME]` table | Move the profiles to `[profiles.NAME.HARNESS]` |
+| `does not honour 'FIELD'` | The entry's harness ignores that field | Remove the field and configure the harness itself |
+| `writable_roots are not honoured at this sandbox level` | Roots on a level other than `workspace-write` | Remove the roots or set that level |
+| `config override 'KEY' must be a string` | The last raw `model` or `model_reasoning_effort` isn't a string | Quote its value or remove it |
+| `defined in both` | The project redefines a global profile | Rename the project's profile |
+| `has no HARNESS entry` | `--harness` names a harness the profile lacks | Pick one of the listed harnesses |
+| `several installed harnesses` | Nothing orders the installed entries | Pass `--harness` or set `[_defaults].prefer` |
+| `none of its harnesses ... is installed` | No entry's harness is on this host | Install one, or pick another profile with `-p` |

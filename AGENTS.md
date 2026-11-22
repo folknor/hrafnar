@@ -133,6 +133,11 @@ bz close 12 -m "fixed by ..."
   `research/grok-build`): not ours, not guaranteed present, but the authority on
   harness behaviour when they are.
 - Root-level convention files (`AGENTS.md`, `CLAUDE.md`, `README.md`,
-  `LICENSE`, ...) stay at the root.
+  `CHANGELOG.md`, `LICENSE`, ...) stay at the root.
+- Docs, reference pages and code comments state the current contract only.
+  A user-visible change (flag, command, config format, output) gets a
+  `CHANGELOG.md` entry saying what to do if you relied on the old behaviour;
+  other history stays in git. Write docs to
+  `../piners/reference/how-to-write-docs.md` where it isn't piners-specific.
 - Avoid citing source line numbers in `notes/`, `docs/` and `reference/` - they
   drift fast.

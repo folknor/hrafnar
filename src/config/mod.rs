@@ -56,8 +56,8 @@ const BARE: &str = "bare";
 /// `.review.toml`, which beats the operator's global config. Nothing is built
 /// in. The split exists because the two files answer different questions: a
 /// project owns its domain archetypes, while *which model serves a tier* is the
-/// operator's current opinion, which changes with every model release and used
-/// to be restated per project, per host, per tier until nobody could keep up.
+/// operator's current opinion, which changes with every model release, so it
+/// is stated once for every project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     Local,
@@ -163,8 +163,8 @@ pub struct Profile {
     pub effort: Option<String>,
     /// Review's sandbox vocabulary, resolved into native permissions before
     /// launch. Custom names reach the harness unchanged. Defaults to read-only
-    /// when unset. Claude profiles must omit this field: it has no filesystem
-    /// sandbox on this axis.
+    /// when unset. Claude and maki entries must omit this field: neither has a
+    /// filesystem sandbox on this axis.
     pub sandbox: Option<SandboxLevel>,
     pub env: Option<BTreeMap<String, String>>,
     /// Extra codex `-c key=value` overrides, each passed verbatim as its own

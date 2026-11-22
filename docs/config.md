@@ -1,151 +1,184 @@
-# Configuration
+# Configuration files
 
-Settings resolve from the command line, then the project's `.review.toml`,
-then the operator's global config: `$XDG_CONFIG_HOME/review/config.toml`, else
-`~/.config/review/config.toml`. Both files share one format. Nothing is built
-in.
+This page covers the two config files `review` reads, how `review` finds
+them, what each section holds and how the files combine. The per-section
+reference is under "Sections", and the errors a config can produce are in
+the last table. Profile fields have their own topic, `review man profiles`.
 
-**`review list` is the authoritative view.** It runs the same resolver a run
-uses. By default it shows what a run here can use: the archetypes, and the
-profiles with an installed harness, each with its installed harnesses and the
-one a plain `-p <name>` picks marked `*`, the default profile marked, and any
-profile hidden for having no installed harness named. `review list --all`
-shows every effective value with the file and table it came from, and every
-harness entry's settings; `review list --projects` the `-C` registry. Reading `.review.toml` alone gives
-an incomplete and often wrong answer, because profiles and archetypes may live
-in the global file. Outside a project it shows the global layer alone.
-`review config` is a hidden alias of `review list --all` that warns.
+Settings resolve from the command line first, then the project's
+`.review.toml`, then your global config. The global config is
+`$XDG_CONFIG_HOME/review/config.toml`, or `~/.config/review/config.toml` when
+that variable is unset or relative. Both files share one format, and nothing
+is built in: a setting no layer gives has no value.
+
+## Seeing the effective config
+
+`review list` shows what a run in the current directory can use. It merges
+both files with the same rules a run uses, so it is the authoritative answer;
+reading `.review.toml` alone misses profiles and archetypes defined in the
+global file.
+
+The command has three views:
+
+- **`review list`**: the archetypes, and the profiles with at least one
+  harness installed on this host. Each profile lists its installed harnesses
+  and marks with `*` the one a plain `-p NAME` picks (no mark when the choice
+  is ambiguous). The default profile is marked, and profiles with no
+  installed harness are named.
+- **`review list --all`**: every effective value with the file and table it
+  came from, the files consulted, harness availability, and every harness
+  entry's settings. Environment variables appear by name only.
+- **`review list --projects`**: the `-C` registry for this host (see
+  `review man projects`).
+
+`review ls` is the same command. Outside a project, `review list` shows the
+global layer alone.
 
 ## Finding the project file
 
 `review` walks up from the current directory to the first `.review.toml`,
-stopping at the git root. A run requires one, because its `[_audit]` block
-identifies the project; a file holding only `[_audit]` is a complete config.
-`review init` creates a starter file in the current directory (or in the
-selected one with `-C`), refusing if one already exists there or above it.
-`-C` picks another project (see `review man projects`).
+stopping at the directory that holds `.git`. A run needs that file, because
+its `[_audit]` block identifies the project. A file holding only `[_audit]` is
+a complete config. `-C` picks another project instead (see
+`review man projects`).
 
-A config that exists but does not parse is always an error, never treated as
-absent.
+`review init` creates a starter `.review.toml` with a fresh audit id in the
+current directory, or in the directory `-C` selects. It refuses when a
+`.review.toml` already exists there or in a directory above it up to the git
+root, because a new file would shadow the existing one.
+
+Discovery never guesses past a problem. A config that exists but doesn't
+parse is an error, not an absent file. A directory entry `review` can't
+inspect is an error too, not a reason to fall back to another project or the
+global layer. A dangling `.review.toml` symlink is selected and fails to read,
+and a dangling `.git` entry still stops the walk.
 
 ## Sections
+
+This example uses every section. Each file accepts only these five tables:
 
 ```toml
 [archetypes]
 security = "You are a security expert. Read the codebase."
-bugs = "You hunt for edge cases and correctness bugs."
 
 [_defaults]
 profile = "deep"
-# Which of a profile's harnesses to run on, first installed match wins.
 prefer = ["codex", "claude"]
-# Seconds of silence after which a codex run counts as stalled. 0 disables;
-# omitted uses the built-in default. Codex only.
 stall_timeout_secs = 900
-# Global file only. Prints a Claude OAuth token on stdout; run only when a
-# claude run fails to authenticate. See "Claude credentials" below.
 claude_token_command = "bw get notes claude-oauth-token"
 
-# Profiles: see `review man profiles`.
 [profiles.deep]
 comment = "Deep review."
-codex = { model = "gpt-5.6-terra", effort = "high", sandbox = "read-only" }
-claude = { model = "Opus 4.8" }
+codex = { model = "gpt-5.6-terra", effort = "high" }
+claude = { model = "opus" }
 
-# Project file only.
 [_audit]
 id = "0123456789abcdef0123456789abcdef"
 private = false
 
-# Global file only: see `review man projects`.
 [_projects.myhostname]
 bz = "~/Programs/bz"
 ```
 
-- `[archetypes]`: name to priming prompt. The prompt owns the session's role
-  and whether it should modify files; `review` adds nothing of its own.
-- `[profiles.<name>]`: a `comment` and one entry per harness, each with that
-  harness's launch settings (see `review man profiles`).
-- `[_defaults]`: `profile` (the one used without `-p`), `prefer` (harnesses in
-  order of preference, for a profile with several; `--harness` overrides it),
-  `stall_timeout_secs`, and, in the global file only, `claude_token_command`.
-- `[_audit]`: `id` names the project's audit trail. `review init` creates a
-  32-character hex id; a missing or empty id gets one before the first launch.
-  Existing nonempty ids remain opaque strings, unchanged.
-  The id is saved before launch, and the run fails if it cannot be saved.
-  `private = true` files the project's sessions in a separate private log.
-- `[_projects.<host>]`: the `-C` registry.
-- Any other top-level table is an error. Retired forms say what replaced them:
-  `[<harness>.<name>]` and legacy `[<host>.<harness>.<name>]` profile tables
-  move to `[profiles.<name>.<harness>]`; a profile's `provider` key goes, its
-  settings moving under `[profiles.<name>.<harness>]`; `[_defaults].providers`
-  and `[_defaults].provider` become `[_defaults].profile` and
-  `[_defaults].prefer`; `[_groups]` goes,
-  since a run takes one archetype and several opinions are several `review`
-  calls.
+The sections hold:
 
-## How the two files combine
+- **`[archetypes]`**: a name mapped to a priming prompt, prepended to stdin
+  by `-a NAME`. The prompt decides the session's role and whether it may
+  modify files; `review` adds nothing of its own.
+- **`[profiles.NAME]`**: an optional `comment` and one entry per harness,
+  each with that harness's launch settings (see `review man profiles`).
+- **`[_defaults]`**: the keys listed under "Defaults".
+- **`[_audit]`**: project file only. `id` names the project's audit trail,
+  and `private = true` files the project's sessions in a separate private
+  log.
+- **`[_projects.HOST]`**: global file only. The `-C` registry for the host of
+  that name (see `review man projects`).
 
-- **Archetypes** are a union; for a name both define, the project wins.
-- **`profile`, `prefer` and `stall_timeout_secs`** come from the first layer
-  that sets them, each on its own and whole: a project's `prefer` replaces the
-  global list rather than extending it.
-- **Profiles** are add-only: a project may define new ones, but defining a
-  profile the global file also defines is an error naming both files, so a
-  checked-out repository cannot change what `-p <name>` means (see
-  `review man profiles`).
-- **`[_audit]`** is the project's alone and is an error in the global file.
-  **`[_projects]`** and **`claude_token_command`** are the global file's alone
-  and are errors in a project: a command named by a project file would run
-  code from any checkout.
+### Defaults
+
+The `[_defaults]` table takes four keys:
+
+- **`profile`**: the profile a run uses without `-p`.
+- **`prefer`**: harnesses in order of preference. A run without `--harness`
+  takes the first one listed that the profile defines and this host has
+  installed (see `review man profiles`).
+- **`stall_timeout_secs`**: seconds of silence after which a codex run counts
+  as stalled (see `review man failures`). `0` disables the check; omitting it
+  keeps the built-in default. Only codex runs use it.
+- **`claude_token_command`**: global file only. A shell command that prints
+  a Claude OAuth token, described under "Claude credentials".
+
+### Audit id
+
+`review init` writes a 32-character hex `id`. When `id` is missing or empty,
+`review` generates one and saves it to `.review.toml` before the first launch;
+the run fails if the file can't be written. Any other nonempty `id` is kept
+as written and treated as an opaque string.
+
+## How the project and global files combine
+
+Each section combines by its own rule:
+
+- **Archetypes** are a union. For a name both files define, the project's
+  prompt wins.
+- **`profile`, `prefer` and `stall_timeout_secs`** each come whole from the
+  first layer that sets them. A project's `prefer` replaces the global list;
+  it doesn't extend it.
+- **Profiles** are add only: a project may define new ones but not redefine
+  a global one (see `review man profiles`).
+- **`[_audit]`** belongs to the project file alone.
+- **`[_projects]` and `claude_token_command`** belong to the global file
+  alone. A command named in a project file would run code from any checkout.
 
 ## Claude credentials
 
-A claude logged in through `CLAUDE_CODE_OAUTH_TOKEN` exported from a login
-shell works from a terminal, but Claude Code does not pass that variable to the
-commands it runs. A `review` started from inside a Claude Code session then
-launches a claude without it, which falls back to its own saved login and, if
-that has expired, fails after about 30 seconds with "OAuth session expired and
-could not be refreshed". `review` says so when it happens.
+Claude Code doesn't pass `CLAUDE_CODE_OAUTH_TOKEN` to the commands it runs.
+If you export that token from a login shell, a `review` started inside a
+Claude Code session launches claude without it. That claude falls back to its
+own saved login and, if the login has expired, fails after about 30s with
+"OAuth session expired and could not be refreshed". `review` says when this
+happens.
 
-`claude_token_command` is a shell command whose stdout is a token. It runs
-through `/bin/sh -c`, from `$HOME`, with stdin closed and at most 60 seconds to
-finish, at most once per `review` process. A fresh run tries claude's own login
-first, so one synced global file serves hosts that log claude in other ways.
-It runs:
+`claude_token_command` fixes this. `review` runs it through `/bin/sh -c`,
+from `$HOME`, with stdin closed and 60s to finish, at most once per `review`
+process, and reads the token from its stdout. A fresh run tries claude's own
+login first, so one synced global file serves hosts that log claude in other
+ways.
 
-- after a fresh claude run fails to authenticate, if nothing but startup ran:
-  the model produced nothing and no tool ran anywhere in the attempt, the whole
-  output was read, the run ended on that failure, processes it started were
-  all torn down, and it had no token of its own (inherited or set in the
-  profile's `env`). The retry takes the host's launch lock like any launch.
-  The run is then launched once more, as a new session, with the token as
-  `CLAUDE_CODE_OAUTH_TOKEN`. The failed attempt is kept in the audit log but
-  not in `review sessions`. Startup hooks run again for the second launch;
-- before `review message` or `review resume` of a session whose first run
-  authenticated with it: that session goes on with the same credential source,
-  without trying claude's own login first. A `CLAUDE_CODE_OAUTH_TOKEN` already
-  in `review`'s own environment is used instead, since claude would read that
-  one anyway. If the command is no longer
-  configured, or gives no token, the message is refused before anything is
-  sent. A message that fails to authenticate is never resent, since its prompt
-  is already in the session.
+`review` runs the command in two cases:
 
-A failed attempt stops being a target for `review interrupt` once the retry is
-decided; stopping `review` itself still prevents the retry. The token is passed
-only to that claude process. `review` removes it from everything it reads back
-from that run - claude's output, and the command lines of processes left at
-teardown - before printing or recording any of it; the session records only
-that the command was used, and only when the token was accepted. The keeper
-that tears the run down scrubs it from leftover command lines too, including
-in the log it writes if `review` itself has died. The command's own stderr goes
-to your terminal unfiltered.
+- **A fresh claude run fails to authenticate** before doing anything else:
+  the model produced nothing, no tool ran, the whole output was read, the run
+  ended on that failure, every process it started was torn down, and it had
+  no token of its own (inherited, or set in the profile's `env`). `review`
+  then launches the run once more as a new session, with the token as
+  `CLAUDE_CODE_OAUTH_TOKEN`. The retry takes the host's launch lock like any
+  launch, and startup hooks run again. The failed attempt stays in the audit
+  log but not in `review sessions`.
+- **`review message` continues a session whose first run used the token**:
+  the command runs up front, without trying claude's own login. A
+  `CLAUDE_CODE_OAUTH_TOKEN` in `review`'s own environment is used instead,
+  since claude reads that one anyway. If the command isn't configured or
+  gives no token, `review` refuses the message before sending anything. A
+  message that fails to authenticate is never resent, because its prompt is
+  already in the session.
 
-## Reserved words
+Once `review` decides to retry, `review interrupt` no longer targets the
+failed attempt; stopping `review` itself still prevents the retry.
 
-An archetype may not use the names below. Reserved command names come
-from the CLI itself, including hidden migration commands and aliases; this table
-is checked against that vocabulary.
+`review` passes the token only to that claude process. It removes the token
+from everything it reads back from the run before printing or recording it:
+claude's output, and the command lines of processes left at teardown. The
+teardown keeper scrubs those command lines too, including in the log it
+writes if `review` itself has died. The session records only that the
+command was used, and only when claude accepted the token. The command's own
+stderr goes to your terminal unfiltered.
+
+## Names an archetype can't use
+
+An archetype can't take the name of a subcommand, because the positional
+form `review NAME` runs the subcommand instead, silently. The reserved names
+come from the command line itself, hidden commands and aliases included:
 
 | Reserved word | Why |
 |---|---|
@@ -159,17 +192,30 @@ is checked against that vocabulary.
 | `incidents` | a subcommand |
 | `init` | a subcommand |
 | `man` | a subcommand |
-| `help` | clap's generated subcommand |
+| `help` | the generated help subcommand |
 
-Subcommand names are reserved because the legacy positional archetype form
-(`review sessions`) would run the subcommand instead, silently.
+`bare` is a selector, not a reserved word: `-a bare` and `review bare` mean no
+archetype, whether or not `[archetypes]` defines `bare`. `bare = ""` is
+valid; a nonempty prompt under that name is an error, since the selector
+never sends it.
 
-`bare` is a special selector: `-a bare` and the legacy `review bare` mean "no
-archetype", whether or not `[archetypes].bare` exists. Existing `bare = ""`
-definitions remain valid, but a non-empty prompt is refused because the
-selector cannot prime.
+## Config errors and the fix
 
-Config discovery propagates filesystem inspection errors; it never treats them
-as a missing file and falls back to another project or the global layer. A
-dangling .review.toml symlink is selected and fails to read. A dangling .git
-entry still stops upward discovery. Init refuses any existing config entry.
+These errors stop every command that loads the config:
+
+| You see | Why | Fix |
+|---|---|---|
+| `unknown section 'NAME'` | Only the five sections above exist; host tables like `[HOST.HARNESS.PROFILE]` aren't one | Move a host's profiles to `[profiles.NAME.HARNESS]` |
+| `[codex.*] ... harness-scoped profile tables` | A profile table is keyed by harness first | Move each `[HARNESS.NAME]` to `[profiles.NAME.HARNESS]` |
+| `` `provider` was removed `` | A profile holds one entry per harness, not a `provider` key | Move the settings under `[profiles.NAME.HARNESS]` for the harness `provider` named |
+| `[_defaults].provider` or `.providers` | The harness comes from the profile | Set `profile = "NAME"` and order harnesses with `prefer` |
+| `[_groups]` | A run takes one archetype | Launch one `review -a NAME` per member |
+| `profile 'NAME' is defined in both` | Profiles are add only across files | Rename the project's profile |
+| `[_audit] in` the global file | The audit block identifies one project | Move it to that project's `.review.toml` |
+| `[_projects]` or `claude_token_command` in a project | Both are global only | Move them to the global config |
+| `'NAME' is a reserved name` | The archetype shadows a subcommand | Rename the archetype |
+| `archetype 'bare' ... has a prompt` | `bare` never sends a prompt | Use `bare = ""` or rename it |
+| `.review.toml already exists` from `review init` | A config is already in force there | Edit the existing file |
+
+`review config` prints `review list --all` with a warning; use
+`review list --all`.
