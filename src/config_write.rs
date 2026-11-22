@@ -97,16 +97,17 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # [archetypes]
 # security = \"You are a security expert for this project. Read the codebase.\"
 #
-# The provider a run uses when --provider is omitted:
-# [_defaults]
+# Named profiles, selected with -p: a provider and its settings. A profile here
+# replaces a global profile of the same name entirely.
+# [profiles.deep]
 # provider = \"codex\"
-#
-# Named profiles, selected with --profile, as [<provider>.<profile>]. A profile
-# here replaces a global profile of the same name entirely.
-# [codex.deep]
 # model = \"gpt-6-luna\"
 # effort = \"high\"
 # sandbox = \"read-only\"
+#
+# The profile a run uses when -p is omitted:
+# [_defaults]
+# profile = \"deep\"
 ";
 
 /// Create a starter config in the selected directory itself - never in an
@@ -137,7 +138,7 @@ pub fn init(sel: &Selection) -> Result<()> {
     println!();
     println!("Next steps:");
     println!("  1. Run `review config` to see what the global config already provides");
-    println!("  2. Run: echo \"check for issues\" | review --provider codex");
+    println!("  2. Run: echo \"check for issues\" | review -p <profile>");
     Ok(())
 }
 

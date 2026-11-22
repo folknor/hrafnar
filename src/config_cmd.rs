@@ -19,7 +19,6 @@
 
 use crate::config::{self, Profile, ProfileDef, ProfileEntry, Provider, ReviewConfig};
 use anyhow::Result;
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Whether a provider's binary is on `PATH` on this host. A function rather
@@ -91,16 +90,11 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 
     writeln!(out)?;
     writeln!(out, "providers:")?;
-    let default = cfg.default_provider();
-    match cfg.provider {
-        Some(ref s) => writeln!(
-            out,
-            "  default: {}  ({})",
-            s.value,
-            source(s.layer.as_str(), &s.table, None)
-        )?,
-        None => writeln!(out, "  default: none set (a run needs --provider)")?,
-    }
+    // The default provider is the default profile's, when it resolves.
+    let default = cfg
+        .default_profile()
+        .and_then(|name| cfg.resolve_profile(name))
+        .map(|def| def.provider);
     let pw = Provider::all()
         .iter()
         .map(|p| p.as_str().len())
@@ -123,7 +117,7 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         writeln!(
             out,
             "  warning: default provider '{provider}' is not installed on this host - \
-             a run without --provider will fail"
+             a run without -p will fail"
         )?;
     }
 
@@ -144,17 +138,28 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 
     writeln!(out)?;
     writeln!(out, "profiles:")?;
-    if cfg.profiles.values().all(BTreeMap::is_empty) {
+    match cfg.profile {
+        Some(ref s) => {
+            let state = if cfg.resolve_profile(&s.value).is_some() {
+                ""
+            } else {
+                ", NOT DEFINED"
+            };
+            writeln!(
+                out,
+                "  default: {}  ({} {}{state})",
+                s.value,
+                s.layer.as_str(),
+                s.table
+            )?;
+        }
+        None => writeln!(out, "  default: none set (a run needs -p)")?,
+    }
+    if cfg.profiles.is_empty() {
         writeln!(out, "  (none)")?;
     }
-    for (provider, by_name) in &cfg.profiles {
-        if by_name.is_empty() {
-            continue;
-        }
-        writeln!(out, "  {provider}:")?;
-        for (name, entry) in by_name {
-            write_profile(out, *provider, name, entry)?;
-        }
+    for (name, entry) in &cfg.profiles {
+        write_profile(out, name, entry)?;
     }
 
     writeln!(out)?;
@@ -163,7 +168,7 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
             out,
             "stall_timeout_secs: {}  ({})",
             s.value,
-            source(s.layer.as_str(), &s.table, None)
+            source(s.layer.as_str(), &s.table)
         )?,
         None => writeln!(out, "stall_timeout_secs: unset (built-in default)")?,
     }
@@ -195,37 +200,33 @@ fn steering() -> String {
     )
 }
 
-fn write_profile(
-    out: &mut String,
-    provider: Provider,
-    name: &str,
-    entry: &ProfileEntry,
-) -> std::fmt::Result {
+fn write_profile(out: &mut String, name: &str, entry: &ProfileEntry) -> std::fmt::Result {
     let def = &entry.effective;
+    let provider = def.provider;
     let p = &def.profile;
-    writeln!(out, "    {name}  ({})", def_source(def))?;
+    writeln!(out, "  {name}  {provider}  ({})", def_source(def))?;
     // Each line of a multi-line comment keeps the block's indent, so it cannot
     // be mistaken for the next profile.
     if let Some(ref c) = p.comment {
         for line in c.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            writeln!(out, "      # {line}")?;
+            writeln!(out, "    # {line}")?;
         }
     }
-    writeln!(out, "      {}", settings(provider, p))?;
+    writeln!(out, "    {}", settings(provider, p))?;
     if !p.writable_roots.is_empty() {
-        writeln!(out, "      writable_roots: {}", p.writable_roots.join(", "))?;
+        writeln!(out, "    writable_roots: {}", p.writable_roots.join(", "))?;
     }
     let keys = env_keys(p);
     if !keys.is_empty() {
-        writeln!(out, "      env: {}", keys.join(", "))?;
+        writeln!(out, "    env: {}", keys.join(", "))?;
     }
     for c in &p.config {
-        writeln!(out, "      config: {c}")?;
+        writeln!(out, "    config: {c}")?;
     }
     for s in &entry.shadowed {
         writeln!(
             out,
-            "      shadows {}: {}",
+            "    shadows {}: {}",
             def_source(s),
             settings(provider, &s.profile)
         )?;
@@ -233,18 +234,13 @@ fn write_profile(
     Ok(())
 }
 
+/// `local [profiles.deep]`.
 fn def_source(def: &ProfileDef) -> String {
-    source(def.layer.as_str(), &def.table, def.host.as_deref())
+    source(def.layer.as_str(), &def.table)
 }
 
-/// `local [codex.deep]`, flagging a legacy host table so an operator migrating
-/// to hostless profiles can see which ones are left.
-fn source(layer: &str, table: &str, host: Option<&str>) -> String {
-    if host.is_some() {
-        format!("{layer} {table}, legacy host table")
-    } else {
-        format!("{layer} {table}")
-    }
+fn source(layer: &str, table: &str) -> String {
+    format!("{layer} {table}")
 }
 
 fn settings(provider: Provider, p: &Profile) -> String {
@@ -303,9 +299,10 @@ security = \"You are a security expert.\\nRead the codebase.\"
 goal = \"\"
 
 [_defaults]
-provider = \"codex\"
+profile = \"deep\"
 
-[host.codex.deep]
+[profiles.deep]
+provider = \"codex\"
 model = \"stale-model\"
 effort = \"low\"
 env = { SECRET_TOKEN = \"hunter2\" }
@@ -317,10 +314,11 @@ bugs = \"You hunt for edge cases.\"
 security = \"global security prime\"
 
 [_defaults]
-provider = \"claude\"
+profile = \"opus\"
 stall_timeout_secs = 600
 
-[codex.deep]
+[profiles.deep]
+provider = \"codex\"
 comment = \"global deep comment\"
 model = \"fresh-model\"
 effort = \"high\"
@@ -328,7 +326,8 @@ sandbox = \"workspace-write\"
 writable_roots = [\"/srv/data\"]
 config = ['model_provider=\"x\"']
 
-[claude.opus]
+[profiles.opus]
+provider = \"claude\"
 comment = \"\"\"
 Heavy reasoning.
   Use for design questions.
@@ -372,7 +371,7 @@ model = \"opus\"
         assert!(t.contains("security  local"), "{t}");
         assert!(t.contains("bugs      global"), "{t}");
         assert!(!t.contains("global security prime"), "{t}");
-        assert!(t.contains("default: codex  (local [_defaults])"), "{t}");
+        assert!(t.contains("default: deep  (local [_defaults])"), "{t}");
         assert!(
             t.contains("stall_timeout_secs: 600  (global [_defaults])"),
             "{t}"
@@ -382,14 +381,11 @@ model = \"opus\"
     #[test]
     fn a_stale_local_profile_is_shown_next_to_what_it_shadows() {
         let t = text(true);
-        assert!(
-            t.contains("deep  (local [host.codex.deep], legacy host table)"),
-            "{t}"
-        );
+        assert!(t.contains("deep  codex  (local [profiles.deep])"), "{t}");
         assert!(t.contains("model stale-model, effort low"), "{t}");
         assert!(
             t.contains(
-                "shadows global [codex.deep]: model fresh-model, effort high, \
+                "shadows global [profiles.deep]: model fresh-model, effort high, \
                  sandbox workspace-write"
             ),
             "{t}"
@@ -397,7 +393,7 @@ model = \"opus\"
         // The winner replaces the shadowed profile whole: none of its roots or
         // overrides leak into the effective view.
         assert!(!t.contains("/srv/data"), "{t}");
-        assert!(t.contains("opus  (global [claude.opus])"), "{t}");
+        assert!(t.contains("opus  claude  (global [profiles.opus])"), "{t}");
     }
 
     #[test]
@@ -405,8 +401,8 @@ model = \"opus\"
         let t = text(true);
         assert!(
             t.contains(
-                "opus  (global [claude.opus])\n      # Heavy reasoning.\n      \
-                 # Use for design questions.\n      model opus"
+                "opus  claude  (global [profiles.opus])\n    # Heavy reasoning.\n    \
+                 # Use for design questions.\n    model opus"
             ),
             "{t}"
         );
@@ -448,15 +444,11 @@ model = \"opus\"
         assert!(!text.contains("Read the codebase"), "{text}");
         assert!(text.contains("(empty)"), "{text}");
         assert!(
-            text.contains("[host.codex.deep], legacy host table"),
-            "{text}"
-        );
-        assert!(
             text.contains("sandbox unset (runner default: read-only)"),
             "{text}"
         );
         assert!(
-            text.contains("shadows global [codex.deep]: model fresh-model"),
+            text.contains("shadows global [profiles.deep]: model fresh-model"),
             "{text}"
         );
         assert!(text.contains("n/a (claude ignores sandbox)"), "{text}");
@@ -481,8 +473,28 @@ model = \"opus\"
         let text = render_text(&c, &avail(true));
         assert!(text.contains("not in a project"), "{text}");
         assert!(text.contains("project:   none"), "{text}");
-        assert!(text.contains("deep  (global [codex.deep])"), "{text}");
+        assert!(
+            text.contains("deep  codex  (global [profiles.deep])"),
+            "{text}"
+        );
         assert!(text.contains("model fresh-model"), "{text}");
+        // The global default profile's provider is the default.
+        assert!(
+            text.contains("default: opus  (global [_defaults])"),
+            "{text}"
+        );
+        assert!(text.contains("claude  installed      default"), "{text}");
+    }
+
+    #[test]
+    fn a_default_profile_no_layer_defines_stands_out() {
+        let local = parse_file("[_defaults]\nprofile = \"ghost\"\n", "l", Layer::Local).unwrap();
+        let c = resolve(local, None, "host", config::ConfigFiles::default()).unwrap();
+        let text = render_text(&c, &avail(true));
+        assert!(
+            text.contains("default: ghost  (local [_defaults], NOT DEFINED)"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -1,7 +1,6 @@
 //! Errors classify failed config operations, retaining rich schema diagnostics as
 //! sources. Individual TOML keys are not actionable error variants; absence,
 //! unreadable storage, invalid files, resolution and undefined profiles are.
-use crate::provider::Provider;
 use std::{fmt, path::PathBuf};
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -45,9 +44,10 @@ pub enum ConfigError {
         source: anyhow::Error,
     },
     ProfileUndefined {
-        provider: Provider,
         profile: String,
         searched: String,
+        /// Every profile some layer does define, for the error to list.
+        defined: Vec<String>,
     },
     InvalidPath {
         path: PathBuf,
@@ -65,12 +65,17 @@ impl fmt::Display for ConfigError {
             Self::Read { path, source } => write!(f, "failed to read {}: {source}", path.display()),
             Self::InvalidFile { source, .. } | Self::Resolve { source } => source.fmt(f),
             Self::ProfileUndefined {
-                provider,
                 profile,
                 searched,
+                defined,
             } => write!(
                 f,
-                "profile '{profile}' not defined for provider '{provider}'\n  looked for {searched}"
+                "profile '{profile}' is not defined\n  looked for {searched}\n  defined: {}",
+                if defined.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    defined.join(", ")
+                }
             ),
             Self::InvalidPath { path } => write!(f, "{} has no parent directory", path.display()),
             Self::ProjectRequired => {

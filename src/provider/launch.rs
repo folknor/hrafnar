@@ -200,6 +200,7 @@ mod tests {
     #[test]
     fn profile_settings_keep_winning_origin_and_selector_precedence() {
         let definition = config::ProfileDef {
+            provider: Provider::Codex,
             profile: config::Profile {
                 model: Some("dedicated".into()),
                 effort: Some("low".into()),
@@ -213,8 +214,7 @@ mod tests {
                 ..Default::default()
             },
             layer: config::Layer::Global,
-            table: "[host.codex.deep]".into(),
-            host: Some("host".into()),
+            table: "[profiles.deep]".into(),
         };
         let settings = RunSettings::from_profile(Provider::Codex, Some(&definition));
         assert_eq!(settings.selection.model(), Some("dedicated"));
@@ -223,10 +223,7 @@ mod tests {
         assert_eq!(settings.writable_roots, ["/requested"]);
         assert_eq!(settings.permissions.selector(), Some("workspace-write"));
         assert_eq!(settings.origin().expect("origin").layer, "global");
-        assert_eq!(
-            settings.origin().expect("origin").table,
-            "[host.codex.deep]"
-        );
+        assert_eq!(settings.origin().expect("origin").table, "[profiles.deep]");
         let encoded = serde_json::to_string(&settings.origin()).expect("origin json");
         assert!(!encoded.contains("secret value"));
     }

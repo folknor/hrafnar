@@ -31,7 +31,7 @@ security = "You are a security expert. Read the codebase."
 bugs = "You hunt for edge cases and correctness bugs."
 
 [_defaults]
-provider = "codex"
+profile = "deep"
 # Seconds of silence after which a codex run counts as stalled. 0 disables;
 # omitted uses the built-in default. Codex only.
 stall_timeout_secs = 900
@@ -40,7 +40,8 @@ stall_timeout_secs = 900
 claude_token_command = "bw get notes claude-oauth-token"
 
 # Profiles: see `review man profiles`.
-[codex.deep]
+[profiles.deep]
+provider = "codex"
 model = "gpt-5.6-terra"
 effort = "high"
 sandbox = "read-only"
@@ -57,30 +58,31 @@ bz = "~/Programs/bz"
 
 - `[archetypes]`: name to priming prompt. The prompt owns the session's role
   and whether it should modify files; `review` adds nothing of its own.
-- `[_defaults]`: `provider` (the one used without `--provider`),
-  `stall_timeout_secs`, and, in the global file only, `claude_token_command`.
-  The retired `providers` list and `[_groups]` table are errors that say what
-  replaced them: a run launches one session, so several opinions are several
-  `review` calls.
+- `[profiles.<name>]`: a provider and its launch settings (see
+  `review man profiles`).
+- `[_defaults]`: `profile` (the one used without `-p`), `stall_timeout_secs`,
+  and, in the global file only, `claude_token_command`.
 - `[_audit]`: `id` names the project's audit trail. `review init` creates a
   32-character hex id; a missing or empty id gets one before the first launch.
   Existing nonempty ids remain opaque strings, unchanged.
   The id is saved before launch, and the run fails if it cannot be saved.
   `private = true` files the project's sessions in a separate private log.
 - `[_projects.<host>]`: the `-C` registry.
-- Any other top-level table is a profile table, `[<provider>.<profile>]`, or a
-  legacy host-scoped one, `[<host>.<provider>.<profile>]`. A table named after
-  a provider that would also be a valid legacy host table (a host named like a
-  provider, or a profile named like one) is an error rather than a guess:
-  rename the profile, or move that host's profiles to hostless tables.
+- Any other top-level table is an error. Retired forms say what replaced them:
+  `[<provider>.<name>]` and legacy `[<host>.<provider>.<name>]` profile tables
+  move to `[profiles.<name>]` with a `provider` key; `[_defaults].providers`
+  and `[_defaults].provider` become `[_defaults].profile`; `[_groups]` goes,
+  since a run takes one archetype and several opinions are several `review`
+  calls.
 
 ## How the two files combine
 
 - **Archetypes** are a union; for a name both define, the project wins.
-- **`provider` and `stall_timeout_secs`** come from the first layer that sets
+- **`profile` and `stall_timeout_secs`** come from the first layer that sets
   them, each on its own.
 - **Profiles** resolve to their first definition and win whole, never merged
-  field by field (see `review man profiles`).
+  field by field, and a project profile may not change a global profile's
+  provider (see `review man profiles`).
 - **`[_audit]`** is the project's alone and is an error in the global file.
   **`[_projects]`** and **`claude_token_command`** are the global file's alone
   and are errors in a project: a command named by a project file would run

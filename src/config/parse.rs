@@ -1,23 +1,19 @@
-//! Parsing one config file. The reserved sections (`[archetypes]`,
-//! `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a
-//! `toml::Table`; what remains is profiles. A top-level table named after a
-//! known provider is a hostless `[<provider>.<profile>]` table, and any other
-//! is a legacy `[<host>.<provider>.<profile>]` host table, still parsed so old
-//! files need no edit. A provider-named table that also parses as a valid host
-//! table is refused as ambiguous, since a host named like a provider would
-//! otherwise silently change meaning. `[_audit]` in the global file is an
-//! error. The format itself is documented in `docs/config.md`.
+//! Parsing one config file. The sections (`[archetypes]`, `[profiles]`,
+//! `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a `toml::Table`,
+//! and anything left over is an error: a retired provider-scoped
+//! `[<provider>.<profile>]` table gets a message saying where it moved, and any
+//! other table (a retired legacy host table, a typo) is an unknown section.
+//! Each `[profiles.<name>]` names its provider with a required `provider` key,
+//! which is taken off before the rest is read as a `Profile`, so a misspelled
+//! field is still an error. `[_audit]` in the global file is an error. The
+//! format itself is documented in `docs/config.md`.
 
 use super::{
-    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, ProfileTables,
-    Provider, reserved_names, toml_key,
+    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, Provider,
+    reserved_names, toml_key,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
-
-fn unknown_provider_hint() -> String {
-    format!("supported: {}", Provider::supported())
-}
 
 /// Parse one config file. `origin` names it in errors. Checks everything that
 /// can be checked within the file alone. Host-scoped `[_projects]` names are checked
@@ -30,28 +26,29 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> super::Result<Config
 }
 
 fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
-    // Parse to a table first, then peel off the reserved sections by name.
-    // Everything left over is a provider table or a legacy host table. This
-    // avoids serde `flatten`, which does not coexist with a sibling named field
+    // Parse to a table first, then peel off the sections by name. This avoids
+    // serde `flatten`, which does not coexist with a sibling named field
     // (`archetypes`).
     let mut table: toml::Table =
         toml::from_str(raw).map_err(|e| anyhow::anyhow!("failed to parse {origin}: {e}"))?;
 
-    // Retired with fan-out. Refused rather than ignored, so a config written
-    // for the old behaviour says why it no longer does what it says.
+    // Retired keys are refused rather than ignored, so a config written for
+    // the old behaviour says why it no longer does what it says.
     if table.contains_key("_groups") {
         bail!(
             "[_groups] in {origin}: archetype groups were removed - a run takes one \
              archetype, so launch one `review -a <name>` per member instead"
         );
     }
-    if let Some(toml::Value::Table(d)) = table.get("_defaults")
-        && d.contains_key("providers")
-    {
-        bail!(
-            "[_defaults].providers in {origin}: a run launches one provider now - \
-             write `provider = \"<name>\"` instead"
-        );
+    if let Some(toml::Value::Table(d)) = table.get("_defaults") {
+        for retired in ["providers", "provider"] {
+            if d.contains_key(retired) {
+                bail!(
+                    "[_defaults].{retired} in {origin}: the provider is part of the profile \
+                     now - write `profile = \"<name>\"` naming a [profiles.<name>] table"
+                );
+            }
+        }
     }
     let audit: AuditConfig = match table.remove("_audit") {
         Some(_) if layer == Layer::Global => bail!(
@@ -92,34 +89,27 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
             .map_err(|e| anyhow::anyhow!("[archetypes] in {origin}: {e}"))?,
         None => BTreeMap::new(),
     };
+    let profiles = match table.remove("profiles") {
+        Some(toml::Value::Table(t)) => parse_profiles(t, origin)?,
+        Some(_) => bail!("[profiles] in {origin}: expected a table of [profiles.<name>] tables"),
+        None => BTreeMap::new(),
+    };
 
-    // Remaining top-level tables: a known provider name is a hostless
-    // `[<provider>.<profile>]` table; anything else is a legacy host.
-    let mut profiles: ProfileTables = BTreeMap::new();
-    let mut hosts: BTreeMap<String, ProfileTables> = BTreeMap::new();
-    for (key, val) in table {
-        let toml::Value::Table(inner) = val else {
-            bail!("unexpected top-level key '{key}' in {origin}: expected a table");
-        };
-        let Ok(provider) = key.parse::<Provider>() else {
-            hosts.insert(key.clone(), parse_host(inner, &key, origin)?);
-            continue;
-        };
-        // Provider names and legacy host names share the top-level namespace,
-        // so a host named after a provider - one that exists now, or one added
-        // later - would silently change meaning. Both readings are therefore
-        // checked against the full schema: a table that is also a valid legacy
-        // host table is refused rather than guessed at. (A non-empty one only:
-        // an empty `[<provider>]` table cannot be meant as a host.)
-        if !inner.is_empty() && parse_host(inner.clone(), &key, origin).is_ok() {
+    // Nothing else is a section. Both retired profile forms are named, since
+    // an existing file is the likeliest source of one.
+    if let Some(key) = table.keys().next() {
+        if let Ok(provider) = key.parse::<Provider>() {
             bail!(
-                "[{key}.*] in {origin} reads both as {key} profiles ([{key}.<profile>]) and as \
-                 a legacy host table for a host named '{key}' ([{key}.<provider>.<profile>])\n  \
-                 Rename the profile if you meant {key} profiles, or move the host's profiles \
-                 to hostless [<provider>.<profile>] tables if you meant the host."
+                "[{key}.*] in {origin}: provider-scoped profile tables were removed - \
+                 move each [{key}.<name>] to [profiles.<name>] with provider = \"{provider}\""
             );
         }
-        profiles.insert(provider, parse_profiles(inner, provider, &key, origin)?);
+        bail!(
+            "unknown section '{key}' in {origin}\n  \
+             Sections are [archetypes], [profiles.<name>], [_defaults], [_audit] and \
+             [_projects]. Legacy host tables ([<host>.<provider>.<profile>]) were \
+             removed: move a host's profiles to [profiles.<name>] with a provider key."
+        );
     }
 
     for (name, prime) in &archetypes {
@@ -134,57 +124,40 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
             );
         }
     }
-    // `[_defaults].provider` was validated as it was deserialized: it is a
-    // `Provider`, whose parse error names the supported list.
 
     Ok(ConfigFile {
         archetypes,
         audit,
         defaults,
         profiles,
-        hosts,
         projects,
     })
 }
 
-/// A legacy `[<host>.<provider>.<profile>]` table's contents, strictly: every
-/// child must be a known provider's table of valid profiles.
-fn parse_host(inner: toml::Table, key: &str, origin: &str) -> Result<ProfileTables> {
-    let mut host_profiles: ProfileTables = BTreeMap::new();
-    for (prov, pv) in inner {
-        let Ok(provider) = prov.parse::<Provider>() else {
-            bail!(
-                "unknown provider '{prov}' in [{key}.{prov}.*] in {origin}\n  \
-                 {}\n  \
-                 A top-level table is either a provider ([<provider>.<profile>]) \
-                 or a legacy host ([<host>.<provider>.<profile>]).",
-                unknown_provider_hint()
-            );
-        };
-        let toml::Value::Table(pt) = pv else {
-            bail!("[{key}.{prov}] in {origin}: expected a table of profiles");
-        };
-        let prefix = format!("{}.{prov}", toml_key(key));
-        host_profiles.insert(provider, parse_profiles(pt, provider, &prefix, origin)?);
-    }
-    Ok(host_profiles)
-}
-
-fn parse_profiles(
-    t: toml::Table,
-    provider: Provider,
-    prefix: &str,
-    origin: &str,
-) -> Result<BTreeMap<String, Profile>> {
+/// `[profiles.<name>]` tables: each takes its required `provider` off, reads
+/// the rest strictly as a `Profile`, and is validated against that provider.
+fn parse_profiles(t: toml::Table, origin: &str) -> Result<BTreeMap<String, (Provider, Profile)>> {
     let mut out = BTreeMap::new();
     for (name, v) in t {
-        let profile: Profile = v
+        let at = format!("[profiles.{}] in {origin}", toml_key(&name));
+        let toml::Value::Table(mut fields) = v else {
+            bail!("{at}: expected a table");
+        };
+        let provider: Provider = match fields.remove("provider") {
+            Some(p) => p.try_into().map_err(|e| anyhow::anyhow!("{at}: {e}"))?,
+            None => bail!(
+                "{at}: missing `provider` - every profile names the provider it runs on \
+                 (supported: {})",
+                Provider::supported()
+            ),
+        };
+        let profile: Profile = toml::Value::Table(fields)
             .try_into()
-            .map_err(|e| anyhow::anyhow!("[{prefix}.{name}] in {origin}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
         profile
             .validate(provider)
-            .map_err(|e| anyhow::anyhow!("[{prefix}.{name}] in {origin}: {e}"))?;
-        out.insert(name, profile);
+            .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
+        out.insert(name, (provider, profile));
     }
     Ok(out)
 }
@@ -197,11 +170,11 @@ mod tests {
 
     /// Parse a single local file and resolve it alone, as a project with no
     /// global config would be.
-    fn local_only(raw: &str, host: &str) -> Result<ReviewConfig> {
+    fn local_only(raw: &str) -> Result<ReviewConfig> {
         Ok(resolve(
             parse_file(raw, "local", Layer::Local)?,
             None,
-            host,
+            "h",
             crate::config::ConfigFiles::default(),
         )?)
     }
@@ -211,7 +184,7 @@ mod tests {
     #[test]
     fn claude_token_command_is_global_only() {
         let raw = "[_defaults]\nclaude_token_command = \"echo t\"\n";
-        let err = local_only(raw, "h").unwrap_err().to_string();
+        let err = local_only(raw).unwrap_err().to_string();
         assert!(err.contains("global config"), "{err}");
         let cfg = resolve(
             parse_file("", "local", Layer::Local).unwrap(),
@@ -230,137 +203,128 @@ mod tests {
 security = \"be a security expert\"
 bugs = \"find edge cases\"
 ";
-        let cfg = local_only(raw, "h").unwrap();
+        let cfg = local_only(raw).unwrap();
         assert_eq!(cfg.archetypes.len(), 2);
         assert_eq!(cfg.archetype("security"), Some("be a security expert"));
         assert_eq!(cfg.archetype("bugs"), Some("find edge cases"));
     }
 
     #[test]
-    fn parses_legacy_host_profiles() {
+    fn parses_profiles_with_their_provider() {
         let raw = "\
-[archetypes]
-bugs = \"find edge cases\"
-
-[myhost.claude.opus]
+[profiles.opus]
+provider = \"claude\"
 model = \"Opus 4.8\"
 effort = \"medium\"
 env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
 
-[myhost.codex.implement]
+[profiles.implement]
+provider = \"codex\"
 model = \"gpt-5.6-terra\"
-effort = \"high\"
 sandbox = \"workspace-write\"
-";
-        let cfg = local_only(raw, "myhost").unwrap();
 
-        let opus = cfg.resolve_profile(Provider::Claude, "opus").unwrap();
-        assert_eq!(opus.model.as_deref(), Some("Opus 4.8"));
-        assert_eq!(opus.effort.as_deref(), Some("medium"));
-        assert_eq!(opus.sandbox, None);
+[profiles.plain]
+provider = \"grok\"
+";
+        let cfg = local_only(raw).unwrap();
+        let opus = cfg.resolve_profile("opus").unwrap();
+        assert_eq!(opus.provider, Provider::Claude);
+        assert_eq!(opus.table, "[profiles.opus]");
+        assert_eq!(opus.profile.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(
-            opus.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+            opus.profile.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
             "http://localhost:8787"
         );
-
-        let implement = cfg.resolve_profile(Provider::Codex, "implement").unwrap();
-        assert_eq!(implement.model.as_deref(), Some("gpt-5.6-terra"));
-        assert_eq!(implement.effort.as_deref(), Some("high"));
+        let implement = cfg.resolve_profile("implement").unwrap();
+        assert_eq!(implement.provider, Provider::Codex);
         assert_eq!(
             implement
+                .profile
                 .sandbox
                 .as_ref()
                 .map(crate::config::SandboxLevel::as_str),
             Some("workspace-write")
         );
-
-        assert!(cfg.resolve_profile(Provider::Claude, "nope").is_none());
-
-        // Another host's tables do not apply here.
-        let other = local_only(raw, "otherhost").unwrap();
-        assert!(other.resolve_profile(Provider::Claude, "opus").is_none());
+        // A provider alone is a profile: that provider on its own defaults.
+        let plain = cfg.resolve_profile("plain").unwrap();
+        assert_eq!(plain.provider, Provider::Grok);
+        assert!(plain.profile.model.is_none());
+        assert!(cfg.resolve_profile("nope").is_none());
     }
 
     #[test]
-    fn parses_hostless_profiles() {
-        let raw = "\
-[codex.deep]
-model = \"gpt-6-luna\"
-sandbox = \"read-only\"
-";
-        for host in ["a", "b"] {
-            let cfg = local_only(raw, host).unwrap();
-            let deep = cfg.resolve_profile(Provider::Codex, "deep").unwrap();
-            assert_eq!(deep.model.as_deref(), Some("gpt-6-luna"));
-        }
+    fn a_profile_must_name_a_known_provider() {
+        let err = local_only("[profiles.x]\nmodel = \"m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing `provider`"), "{err}");
+        let err = local_only("[profiles.x]\nprovider = \"gpt\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown provider 'gpt'"), "{err}");
+        assert!(err.contains("[profiles.x]"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelled_profile_key_is_still_an_error() {
+        let err = local_only("[profiles.x]\nprovider = \"codex\"\nmodle = \"m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("modle"), "{err}");
     }
 
     #[test]
     fn empty_config_parses() {
-        let cfg = local_only("", "h").unwrap();
+        let cfg = local_only("").unwrap();
         assert!(cfg.archetypes.is_empty());
         assert!(cfg.profiles.is_empty());
-        assert!(cfg.provider.is_none());
+        assert!(cfg.profile.is_none());
     }
 
     #[test]
-    fn unknown_provider_in_profile_errors() {
-        let raw = "\
-[archetypes]
-bugs = \"x\"
-
-[myhost.gpt.fast]
-model = \"whatever\"
-";
-        let err = local_only(raw, "myhost").unwrap_err().to_string();
-        assert!(err.contains("unknown provider 'gpt'"), "{err}");
+    fn parses_defaults_profile() {
+        let cfg =
+            local_only("[_defaults]\nprofile = \"deep\"\n[profiles.deep]\nprovider = \"codex\"\n")
+                .unwrap();
+        assert_eq!(cfg.default_profile(), Some("deep"));
     }
 
     #[test]
-    fn parses_defaults_provider() {
-        let cfg = local_only("[_defaults]\nprovider = \"claude\"\n", "h").unwrap();
-        assert_eq!(cfg.default_provider(), Some(Provider::Claude));
-    }
-
-    #[test]
-    fn retired_fan_out_keys_are_refused_by_name() {
-        let err = local_only("[_defaults]\nproviders = [\"claude\"]\n", "h")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("provider = "), "{err}");
-        let err = local_only("[archetypes]\na = \"a\"\n[_groups]\ng = [\"a\"]\n", "h")
+    fn retired_keys_are_refused_by_name() {
+        for raw in [
+            "[_defaults]\nproviders = [\"claude\"]\n",
+            "[_defaults]\nprovider = \"claude\"\n",
+        ] {
+            let err = local_only(raw).unwrap_err().to_string();
+            assert!(err.contains("profile = "), "{err}");
+        }
+        let err = local_only("[archetypes]\na = \"a\"\n[_groups]\ng = [\"a\"]\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("groups were removed"), "{err}");
     }
 
     #[test]
-    fn a_provider_table_that_is_also_a_valid_host_table_is_refused() {
-        // A legacy host named after a provider: `[claude.codex.deep]` is codex's
-        // `deep` profile on host `claude`, and also claude's `codex` profile
-        // with a `deep` key. Neither reading may win silently.
-        let raw = "[claude.codex.deep]\nmodel = \"m\"\n";
-        let err = local_only(raw, "h").unwrap_err().to_string();
-        assert!(err.contains("reads both as claude profiles"), "{err}");
-        // An empty profile named after a provider satisfies both readings too.
-        assert!(local_only("[claude.codex]\n", "h").is_err());
-    }
-
-    #[test]
-    fn a_provider_table_that_is_not_a_host_table_is_a_provider_table() {
-        // `env` is a table, so this is host-shaped, but as a host table its
-        // `env` "profile" holds an unknown key: only the provider reading is
-        // valid.
-        let raw = "[claude.codex]\nenv = { TOKEN = \"v\" }\n";
-        let cfg = local_only(raw, "h").unwrap();
-        assert!(cfg.resolve_profile(Provider::Claude, "codex").is_some());
-        // An empty provider table is never a host.
-        assert!(local_only("[claude]\n", "h").is_ok());
+    fn retired_profile_tables_say_where_they_moved() {
+        let err = local_only("[codex.deep]\nmodel = \"m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("[profiles.<name>] with provider = \"codex\""),
+            "{err}"
+        );
+        let err = local_only("[myhost.codex.deep]\nmodel = \"m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown section 'myhost'"), "{err}");
+        assert!(err.contains("Legacy host tables"), "{err}");
+        let err = local_only("stray = 1\n").unwrap_err().to_string();
+        assert!(err.contains("unknown section 'stray'"), "{err}");
     }
 
     #[test]
     fn reserved_archetype_name_errors() {
-        let err = local_only("[archetypes]\nhelp = \"a\"\n", "h")
+        let err = local_only("[archetypes]\nhelp = \"a\"\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("reserved"), "{err}");
@@ -373,7 +337,7 @@ model = \"whatever\"
         // archetype.
         for name in ["sessions", "help", "init", "incidents", "config", "resume"] {
             let as_archetype = format!("[archetypes]\n{name} = \"x\"\n");
-            let err = local_only(&as_archetype, "h").unwrap_err().to_string();
+            let err = local_only(&as_archetype).unwrap_err().to_string();
             assert!(err.contains("reserved"), "{name} as archetype: {err}");
         }
     }
@@ -382,8 +346,8 @@ model = \"whatever\"
     fn bare_may_only_be_an_empty_archetype() {
         // `bare = ""` is in most existing configs and means what `review bare`
         // means. A prompt under that name would be silently ignored by it.
-        assert!(local_only("[archetypes]\nbare = \"\"\n", "h").is_ok());
-        let err = local_only("[archetypes]\nbare = \"be terse\"\n", "h")
+        assert!(local_only("[archetypes]\nbare = \"\"\n").is_ok());
+        let err = local_only("[archetypes]\nbare = \"be terse\"\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("bare"), "{err}");

@@ -1,6 +1,6 @@
 # A fresh run
 
-`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--provider NAME]`
+`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE]`
 
 Every run starts one **fresh session** on one provider. Nothing
 carries over from an earlier run: if the new session needs context, the
@@ -35,17 +35,17 @@ prompt in the config, prepended to stdin with a blank line between.
 error listing what is configured. The old positional form (`review security`)
 still works with a warning.
 
-## Provider
+## Profile
 
-The provider comes from `--provider codex`, else from `[_defaults].provider`
-in the config. One that is not installed on this host fails the run before
-anything launches; `review config` shows which are installed. A profile (`-p`)
-must be defined for that provider, or the run errors before launching (see
-`review man profiles`).
+The profile names the provider and its settings: `-p deep`, else
+`[_defaults].profile` in the config (see `review man profiles`). A run with
+neither, or naming a profile no file defines, errors before launching. So does
+a profile whose provider is not installed on this host; `review config` shows
+which are installed. `--provider` was removed and is refused with that advice.
 
 ## Several sessions
 
-One run is one session. For several archetypes, providers or profiles, launch
+One run is one session. For several archetypes or profiles, launch
 several `review` calls side by side, each with the same stdin. Runs on one host
 queue behind a host-wide launch lock, which each holds for a fixed spacing
 after launching (or until it ends, if sooner), so calls fired together reach

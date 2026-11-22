@@ -213,8 +213,8 @@ mod tests {
     fn every_provider_round_trips_through_its_name() {
         for p in Provider::all() {
             assert_eq!(p.as_str().parse::<Provider>(), Ok(*p));
-            // clap's own spelling must be the canonical one, or `--provider`
-            // and the config would accept different names.
+            // clap's own spelling must be the canonical one, or a flag taking
+            // a provider and the config would accept different names.
             let pv = clap::ValueEnum::to_possible_value(p).expect("no variant is skipped");
             assert_eq!(pv.get_name(), p.as_str());
         }

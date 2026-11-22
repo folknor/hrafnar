@@ -2690,10 +2690,10 @@ fn fixture_settings(
     review::provider::RunSettings::from_profile(
         provider,
         Some(&review::config::ProfileDef {
+            provider,
             profile,
             layer: review::config::Layer::Local,
             table: "[fixture]".into(),
-            host: None,
         }),
     )
 }

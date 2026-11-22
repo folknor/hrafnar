@@ -21,15 +21,16 @@ review init
 
 ### 2. Configure
 
-Settings shared by every project - the default provider, and the profiles
-naming which model serves which tier - go once in the global
+Settings shared by every project - the profiles naming which provider and
+model serve which tier, and the default one - go once in the global
 `~/.config/review/config.toml`:
 
 ```toml
 [_defaults]
-provider = "codex"
+profile = "deep"
 
-[codex.deep]
+[profiles.deep]
+provider = "codex"
 model = "gpt-6-luna"
 effort = "max"
 sandbox = "read-only"
@@ -52,13 +53,13 @@ bugs = "You hunt for edge cases and correctness bugs."
 echo "what does the retry loop guarantee?" | review -p deep
 echo "look for auth boundary violations" | review -a security
 echo "check for edge cases in the parsing module" | review -a bugs -p deep
-echo "second opinion please" | review -a bugs --provider claude
+echo "second opinion please" | review -a bugs -p opus
 ```
 
 ## Usage
 
 ```
-echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--provider NAME] [--dry-run]
+echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--dry-run]
 echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
 review config
 review sessions [ID] [--all] [--limit N]
@@ -81,29 +82,30 @@ Archetypes are optional named priming prompts defined under `[archetypes]` (name
 | Flag | Description |
 |------|-------------|
 | `-a, --archetype <name>` | Archetype to prime with, or `bare` (an unprimed run, even without a config entry). Omit to send stdin unchanged. |
-| `-p, --profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved for the provider from `[<provider>.<profile>]`, project config first, then global. |
-| `--provider <name>` | The provider to run, overriding `[_defaults].provider` |
+| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, naming the provider and its `model`/`effort`/`sandbox`/`env`. Project config first, then global. Overrides `[_defaults].profile`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The provider comes from `--provider`, or `[_defaults].provider` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the provider. A profile whose provider is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
 
 How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every provider captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
 ### Upgrading from the positional archetype
 
-The archetype used to be positional (`review security`) and resuming used `--session <ID>`. Both still work, with a warning, so scripts and orchestration procedures keep running until they are updated: `review security` behaves like `review -a security`, `review bare` like plain `review`, and `--session <ID>` like `review resume <ID>` (any `--profile`/`--provider` given with it is ignored).
+The archetype used to be positional (`review security`) and resuming used `--session <ID>`. Both still work, with a warning, so scripts and orchestration procedures keep running until they are updated: `review security` behaves like `review -a security`, `review bare` like plain `review`, and `--session <ID>` like `review resume <ID>` (any `--profile` given with it is ignored).
 
 ### Profiles
 
-Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `-p`/`--profile`. They are `[<provider>.<profile>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
+A profile is a provider plus its `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
 
 ```toml
-[claude.opus]
+[profiles.opus]
+provider = "claude"
 model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 
-[codex.implement]
+[profiles.implement]
+provider = "codex"
 model = "gpt-5.6-terra"
 effort = "high"
 sandbox = "workspace-write"
@@ -113,9 +115,7 @@ sandbox = "workspace-write"
 echo "audit the auth flow" | review -a security -p opus
 ```
 
-`-p opus` resolves `[<provider>.opus]` for each launched provider: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox`. If no file defines the profile for a launched provider, the run errors naming every file it searched.
-
-The older host-scoped form `[<host>.<provider>.<profile>]` still parses. It applies only on the host it names, and there it beats a hostless table in the same file - which means such a table keeps overriding the global config on that host until you delete it. `review config` shows it alongside the global profile it hides.
+`-p opus` resolves `[profiles.opus]`: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox` - but it may not name a different provider. If no file defines the profile, the run errors naming every file it searched.
 
 `sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki profiles must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
 
@@ -138,7 +138,7 @@ echo "what's the worst of those for a single-account user?" | \
   review resume 019deabc-0def-7000-8000-abcdef012345
 ```
 
-There is no `--provider`: the sidecar records which provider owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
+There is no `-p`: the sidecar records which provider owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
 
 ```
 $ echo "follow up" | review resume 019deabc-...
@@ -342,17 +342,19 @@ tilemaker = "You are a tilemaker maintainer weighing tradeoffs."
 tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 
 [_defaults]
-provider = "codex"                 # used when --provider is omitted
+profile = "high"                   # used when -p is omitted
 stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
 
-# Named profiles: per-provider model/effort/sandbox/env overrides, applied via
-# -p/--profile. Scoped by provider . profile.
-[claude.opus]
+# Named profiles: a provider and its model/effort/sandbox/env, selected with
+# -p/--profile.
+[profiles.opus]
+provider = "claude"
 model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 
-[codex.high]
+[profiles.high]
+provider = "codex"
 model = "gpt-6-luna"
 effort = "high"
 ```
@@ -361,21 +363,22 @@ How the layers combine:
 
 - **Archetypes** are the union of both files; the project wins on a name clash.
 - **`[_defaults]` keys** come from the first file that sets them.
-- **Profiles** come from the first definition found, and win whole. Lookup order: the project's host-scoped table, its hostless table, then the same two in the global file.
+- **Profiles** come from the first definition found, project file first, and win whole. A project profile may not name a different provider than the global one of the same name.
 
 ### `review config`
 
-Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, the default provider and whether each provider is installed on this machine, every archetype with its source, and every profile with the table it came from and any definitions it shadows. Env vars show by name only.
+Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, whether each provider is installed on this machine, every archetype with its source, the default profile, and every profile with its provider, the table it came from and any definitions it shadows. Env vars show by name only.
 
 Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer and provider availability on their own.
 
 ### Upgrading existing files
 
-Existing `.review.toml` files keep working, including legacy host tables, with these exceptions that now fail to parse:
+These now fail to parse, each with an error saying what replaced it:
 
-- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
-- `[_defaults].providers = [...]`: write `provider = "<name>"` instead.
+- `[<provider>.<name>]` profile tables, and legacy `[<host>.<provider>.<name>]` ones: move each to `[profiles.<name>]` with `provider = "<provider>"`.
+- `[_defaults].providers` or `[_defaults].provider`: write `profile = "<name>"` instead.
 - `[_groups]`: remove it. Launch one `review -a <name>` per member.
+- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
 
 ### Providers
 
@@ -386,10 +389,10 @@ Existing `.review.toml` files keep working, including legacy host tables, with t
 | grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
 | maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
 
-Use `--provider` to pick a provider other than the default:
+To run another provider, pick a profile that names it:
 
 ```
-echo "ask claude" | review -a bugs --provider claude
+echo "ask claude" | review -a bugs -p opus
 ```
 
 ## Rate limits

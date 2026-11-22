@@ -53,32 +53,33 @@ mod tests {
     use crate::config::{Layer, parse_file};
 
     #[test]
-    fn unsupported_profile_fields_fail_in_every_table_and_layer() {
+    fn unsupported_profile_fields_fail_in_every_layer() {
         for layer in [Layer::Local, Layer::Global] {
-            for host in ["", "inactive."] {
-                for (provider, field) in [
-                    ("claude", "sandbox = 'read-only'"),
-                    ("claude", "writable_roots = ['/srv/cache']"),
-                    ("claude", "config = ['a=b']"),
-                    ("grok", "config = ['a=b']"),
-                    ("maki", "sandbox = 'read-only'"),
-                    ("maki", "writable_roots = ['/srv/cache']"),
-                    ("maki", "config = ['a=b']"),
-                    ("maki", "effort = 'high'"),
-                    ("codex", "writable_roots = ['/srv/cache']"),
-                    (
-                        "grok",
-                        "sandbox = 'custom'\nwritable_roots = ['/srv/cache']",
-                    ),
-                ] {
-                    let table = format!("{host}{provider}.test");
-                    let error = parse_file(&format!("[{table}]\n{field}"), "source.toml", layer)
-                        .expect_err("ignored field must fail")
-                        .to_string();
-                    assert!(error.contains(&format!("[{table}]")), "{error}");
-                    assert!(error.contains("source.toml"), "{error}");
-                    assert!(error.contains("remove"), "{error}");
-                }
+            for (provider, field) in [
+                ("claude", "sandbox = 'read-only'"),
+                ("claude", "writable_roots = ['/srv/cache']"),
+                ("claude", "config = ['a=b']"),
+                ("grok", "config = ['a=b']"),
+                ("maki", "sandbox = 'read-only'"),
+                ("maki", "writable_roots = ['/srv/cache']"),
+                ("maki", "config = ['a=b']"),
+                ("maki", "effort = 'high'"),
+                ("codex", "writable_roots = ['/srv/cache']"),
+                (
+                    "grok",
+                    "sandbox = 'custom'\nwritable_roots = ['/srv/cache']",
+                ),
+            ] {
+                let error = parse_file(
+                    &format!("[profiles.test]\nprovider = '{provider}'\n{field}"),
+                    "source.toml",
+                    layer,
+                )
+                .expect_err("ignored field must fail")
+                .to_string();
+                assert!(error.contains("[profiles.test]"), "{error}");
+                assert!(error.contains("source.toml"), "{error}");
+                assert!(error.contains("remove"), "{error}");
             }
         }
     }
@@ -92,7 +93,9 @@ mod tests {
                 Provider::Claude | Provider::Codex | Provider::Grok => "\neffort='high'",
             };
             parse_file(
-                &format!("[{provider}.test]\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"),
+                &format!(
+                    "[profiles.test]\nprovider='{provider}'\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"
+                ),
                 "source",
                 Layer::Local,
             )
@@ -104,7 +107,9 @@ mod tests {
             ("grok", "workspace"),
         ] {
             parse_file(
-                &format!("[{provider}.test]\nsandbox='{level}'\nwritable_roots=['/srv/cache']"),
+                &format!(
+                    "[profiles.test]\nprovider='{provider}'\nsandbox='{level}'\nwritable_roots=['/srv/cache']"
+                ),
                 "source",
                 Layer::Local,
             )
@@ -115,7 +120,7 @@ mod tests {
     #[test]
     fn invalid_selector_types_fail_with_repair_instructions() {
         let error = parse_file(
-            "[codex.test]\nconfig=['model_reasoning_effort=123']",
+            "[profiles.test]\nprovider='codex'\nconfig=['model_reasoning_effort=123']",
             "source",
             Layer::Local,
         )

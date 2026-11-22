@@ -53,13 +53,14 @@ never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
 {PROJECT_REFUSALS} refuse -C.
 
-Providers: {PROVIDERS}, from --provider or [_defaults].provider. A
-provider that is not installed fails the run before anything launches.
-
-Profiles (-p): a profile resolves to its first definition, looking in the
-project file before the global one, and that definition wins whole. Fields are
-never merged, so a project profile that leaves out `model` does not inherit the
-global profile's `model`. `sandbox` defaults to read-only, so a profile has to
+Profiles (-p): a profile is a [profiles.<name>] table naming its provider
+({PROVIDERS}) and that provider's model, effort, sandbox and env. Without -p
+the run uses [_defaults].profile. A provider that is not installed fails the
+run before anything launches. A profile resolves to its first definition,
+looking in the project file before the global one, and that definition wins
+whole. Fields are never merged, so a project profile that leaves out `model`
+does not inherit the global profile's `model`, and a project profile may not
+name a different provider than the global one of the same name. `sandbox` defaults to read-only, so a profile has to
 ask for workspace-write before a codex or grok run may modify files. Claude
 and maki profiles must omit `sandbox`: what a claude run can touch is decided
 by Claude Code's own permission settings, and a maki run's by maki's
@@ -102,7 +103,7 @@ more work there.
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
-  echo \"ask claude\" | review --provider claude         A provider other than the default
+  echo \"ask claude\" | review -p opus                   A profile on another provider
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
@@ -157,8 +158,7 @@ must finish before continuation.
 The session must come from a run on this host: its provider is read from the
 record that run left (`review sessions` lists them), and an ID with no record
 is refused. The run continues in the project the session was started in,
-whatever the current directory; -C only asserts it. There is no --provider, -a
-or -p. Stdin is sent as-is, with no
+whatever the current directory; -C only asserts it. There is no -a or -p. Stdin is sent as-is, with no
 archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
@@ -190,9 +190,9 @@ const CONFIG_AFTER_HELP: &str = "\
 This is the authoritative view of what a run in this directory will use. It
 merges the project's .review.toml with the global config, so reading
 .review.toml alone gives an incomplete and often wrong answer: profiles and
-archetypes may live in the global file, and legacy host tables may shadow them.
-Lists the files consulted, the default provider and whether each is installed
-on this host, archetypes, and profiles, each with its source and any
+archetypes may live in the global file.
+Lists the files consulted, provider availability on this host, archetypes,
+and profiles with the default profile, each with its source and any
 definition it shadows. Env vars are listed by name only, never by value.
 Outside a project it shows the global layer alone.";
 
@@ -227,15 +227,16 @@ pub struct RunArgs {
     #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 
-    /// Named profile (model/effort/sandbox/env), resolved for the provider
-    /// from [<provider>.<profile>]. The first definition found wins whole;
-    /// sandbox defaults to read-only; claude profiles must omit it (see below)
+    /// Profile to run: [profiles.<name>], naming the provider and its
+    /// model/effort/sandbox/env. Overrides [_defaults].profile. The first
+    /// definition found wins whole; sandbox defaults to read-only
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// The provider to run, overriding [_defaults].provider
-    #[arg(long, value_name = "NAME")]
-    pub provider: Option<crate::provider::Provider>,
+    /// Retired: the provider is part of the profile. Still accepted so the
+    /// run can refuse it with the replacement rather than clap's diagnostic.
+    #[arg(long, hide = true, value_name = "NAME")]
+    pub provider: Option<String>,
 
     /// Print the assembled prompt instead of sending it
     #[arg(long)]
@@ -563,12 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_takes_one_name() {
+    fn retired_run_flags() {
+        // --provider still parses, so the run can refuse it by name.
         assert_eq!(
-            parsed(&["--provider", "codex"]).provider,
-            Some(crate::provider::Provider::Codex)
+            parsed(&["--provider", "codex"]).provider.as_deref(),
+            Some("codex")
         );
-        assert!(parse(&["--provider", "claude,codex"]).is_err());
         assert!(parse(&["--stagger", "0"]).is_err(), "retired with fan-out");
     }
 

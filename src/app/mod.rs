@@ -154,6 +154,15 @@ pub async fn run() -> Result<CommandExit> {
         return run_message(session_id, cli.dry_run, selector, started, &lifecycle).await;
     }
 
+    // Retired: the provider is part of the profile. Still parsed, so the
+    // refusal can say what replaced it rather than clap's "unexpected argument".
+    if let Some(ref p) = cli.provider {
+        bail!(
+            "--provider was removed: the provider is part of the profile\n  \
+             Pick a profile whose provider is {p} with -p <name> (`review config` lists them)."
+        );
+    }
+
     let archetype_arg =
         resolve_archetype_arg(cli.archetype.as_deref(), cli.legacy_archetype.as_deref())?;
     let archetype_arg = archetype_arg.as_deref();
@@ -190,21 +199,18 @@ pub async fn run() -> Result<CommandExit> {
 
     let (arch_name, prime) = cfg.select_archetype(archetype_arg)?;
 
-    // --provider wins, otherwise [_defaults].provider from the first layer
-    // that sets it. Both are typed where they were parsed (clap, the config
-    // files), so there is no unknown name left to reject here.
-    let Some(prov_name) = cli.provider.or_else(|| cfg.default_provider()) else {
+    // The profile names the provider and its settings: -p wins, otherwise
+    // [_defaults].profile from the first layer that sets it. It must exist
+    // before anything is spawned.
+    let Some(profile_name) = cli.profile.as_deref().or_else(|| cfg.default_profile()) else {
         bail!(
-            "no provider to run: pass --provider <name> or set [_defaults].provider \
+            "no profile to run: pass -p <name> or set [_defaults].profile \
              (looked in {})",
             cfg.searched()
         );
     };
-
-    // A requested profile must exist for the provider; fail before spawning.
-    if let Some(ref profile) = cli.profile {
-        cfg.require_profile(prov_name, profile)?;
-    }
+    let definition = cfg.require_profile(profile_name)?.clone();
+    let prov_name = definition.provider;
 
     let installed = provider::is_available(prov_name);
     let assembled = prompt::assemble(&prime, &stdin_instructions);
@@ -224,7 +230,7 @@ pub async fn run() -> Result<CommandExit> {
     if !installed {
         bail!(
             "{prov_name} is not installed on this host (not found on PATH)\n  \
-             Nothing was launched. Install it, or choose another with --provider."
+             Nothing was launched. Install it, or pick a profile for another provider with -p."
         );
     }
 
@@ -257,13 +263,7 @@ pub async fn run() -> Result<CommandExit> {
         &scope,
     );
 
-    // Profile overrides (validated above to exist when --profile is set).
-    let definition = cli
-        .profile
-        .as_ref()
-        .and_then(|name| cfg.profiles.get(&prov_name)?.get(name))
-        .map(|entry| &entry.effective);
-    let settings = provider::RunSettings::from_profile(prov_name, definition);
+    let settings = provider::RunSettings::from_profile(prov_name, Some(&definition));
     let ctx = std::sync::Arc::new(RecordCtx {
         project_root: project_root.clone(),
         data: data.clone(),

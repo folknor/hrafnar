@@ -4,19 +4,15 @@
 //! rules and their reasons are in `reference/design.md`; the tests are in
 //! `resolve/tests.rs`.
 
-use super::{
-    ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, Provider, ReviewConfig, Sourced,
-    toml_key,
-};
-use anyhow::Result;
+use super::{ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, ReviewConfig, Sourced};
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
-/// Resolve the local and (optional) global layers for `hostname`.
+/// Resolve the local and (optional) global layers for `hostname`, which
+/// selects this host's `[_projects.<host>]` registry.
 ///
 /// Everything is first-definition-wins over the precedence order local, then
-/// global; within one file a legacy host table for this host beats a hostless
-/// table. Profiles and lists win whole - nothing is merged field by field or
-/// element by element.
+/// global. Profiles win whole - nothing is merged field by field.
 pub fn resolve(
     local: ConfigFile,
     global: Option<ConfigFile>,
@@ -46,10 +42,10 @@ fn resolve_inner(
     }
 
     let mut archetypes: BTreeMap<String, Sourced<String>> = BTreeMap::new();
-    let mut provider: Option<Sourced<Provider>> = None;
+    let mut profile: Option<Sourced<String>> = None;
     let mut stall_timeout_secs: Option<Sourced<super::StallTimeout>> = None;
     let mut claude_token_command: Option<String> = None;
-    let mut defs: BTreeMap<Provider, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
+    let mut defs: BTreeMap<String, Vec<ProfileDef>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
 
     for (layer, mut file) in layers {
@@ -67,10 +63,10 @@ fn resolve_inner(
                 table: "[archetypes]".into(),
             });
         }
-        if provider.is_none()
-            && let Some(p) = file.defaults.provider
+        if profile.is_none()
+            && let Some(p) = file.defaults.profile
         {
-            provider = Some(Sourced {
+            profile = Some(Sourced {
                 value: p,
                 layer,
                 table: "[_defaults]".into(),
@@ -89,69 +85,52 @@ fn resolve_inner(
                 table: "[_defaults]".into(),
             });
         }
-
-        // Host tables first: pushing in precedence order makes the first
-        // definition of each profile the effective one.
-        let mut hosts = file.hosts;
-        if let Some(host_tables) = hosts.remove(hostname) {
-            for (prov, profiles) in host_tables {
-                for (name, profile) in profiles {
-                    let table = format!("[{}.{prov}.{name}]", toml_key(hostname));
-                    defs.entry(prov)
-                        .or_default()
-                        .entry(name)
-                        .or_default()
-                        .push(ProfileDef {
-                            profile,
-                            layer,
-                            table,
-                            host: Some(hostname.to_string()),
-                        });
-                }
-            }
-        }
-        for (prov, profiles) in file.profiles {
-            for (name, profile) in profiles {
-                let table = format!("[{prov}.{name}]");
-                defs.entry(prov)
-                    .or_default()
-                    .entry(name)
-                    .or_default()
-                    .push(ProfileDef {
-                        profile,
-                        layer,
-                        table,
-                        host: None,
-                    });
-            }
+        // Pushing in precedence order makes the first definition of each
+        // profile the effective one.
+        for (name, (provider, p)) in file.profiles {
+            let table = format!("[profiles.{}]", super::toml_key(&name));
+            defs.entry(name).or_default().push(ProfileDef {
+                provider,
+                profile: p,
+                layer,
+                table,
+            });
         }
     }
 
-    let profiles = defs
-        .into_iter()
-        .map(|(prov, by_name)| {
-            let entries = by_name
-                .into_iter()
-                .filter_map(|(name, list)| {
-                    let mut defs = list.into_iter();
-                    let effective = defs.next()?;
-                    Some((
-                        name,
-                        ProfileEntry {
-                            effective,
-                            shadowed: defs.collect(),
-                        },
-                    ))
-                })
-                .collect();
-            (prov, entries)
-        })
-        .collect();
+    let mut profiles = BTreeMap::new();
+    for (name, list) in defs {
+        let mut list = list.into_iter();
+        let Some(effective) = list.next() else {
+            continue;
+        };
+        let shadowed: Vec<ProfileDef> = list.collect();
+        // A project profile may replace a global one of the same name, but not
+        // with another provider: `-p <name>` would then launch a different
+        // provider in this project than everywhere else, with no sign of it.
+        if let Some(other) = shadowed.iter().find(|d| d.provider != effective.provider) {
+            bail!(
+                "profile '{name}' runs on {} in the {} config but on {} in the {} config\n  \
+                 A profile names one provider everywhere: rename one of them.",
+                effective.provider,
+                effective.layer.as_str(),
+                other.provider,
+                other.layer.as_str()
+            );
+        }
+        profiles.insert(
+            name,
+            ProfileEntry {
+                effective,
+                shadowed,
+            },
+        );
+    }
 
     Ok(ReviewConfig {
         archetypes,
         audit,
-        provider,
+        profile,
         stall_timeout_secs,
         claude_token_command,
         profiles,

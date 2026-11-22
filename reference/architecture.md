@@ -35,13 +35,13 @@ the same way: no provider's behaviour reaches them, only a `ProcessSpec`.
 
 ## A fresh run
 
-`echo ... | review [-a archetype] [-p profile] [--provider p]`:
+`echo ... | review [-a archetype] [-p profile]`:
 
 1. `app::run` parses (`Cli::parse_checked`, which also refuses run flags beside
    a subcommand), installs the process-wide signal supervisor around one
    `supervisor::Lifecycle`, and resolves the project (`project::select`) and
-   config (`config::load`). The archetype, provider and profile are validated
-   and the provider must be installed before anything launches.
+   config (`config::load`). The archetype and profile are validated, and the
+   profile's provider must be installed, before anything launches.
 2. Under the host launch lock (`lock`), `config_write::ensure_audit_id` fixes
    the project's audit id, which selects the log family (`data::LogScope`).
 3. `prompt::assemble` builds the prompt and `app::launch::run_launch` is

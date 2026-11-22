@@ -43,7 +43,7 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "profiles",
-        summary: "[<provider>.<profile>] and -p: every field, whole-profile precedence",
+        summary: "[profiles.<name>] and -p: every field, whole-profile precedence",
         path: "docs/profiles.md",
         content: include_str!("../docs/profiles.md"),
     },

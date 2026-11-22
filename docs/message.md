@@ -32,7 +32,7 @@ session cannot be continued at all. Grok turns are not ended gracefully.
 Stdin as-is: no archetype prime, no profile. The session keeps the provider,
 sandbox level, model and effort recorded for it, and each is announced
 (`sandbox: workspace-write (inherited from the session record)`). There is no
-`--provider`, `-a` or `-p`. A maki session records no effort, and maki itself
+`-a` or `-p`. A maki session records no effort, and maki itself
 resumes at the thinking level its own config sets, else the one it last used
 anywhere on the host, not the one the session ran at.
 

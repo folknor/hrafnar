@@ -1,10 +1,11 @@
 # Profiles
 
-A profile is a named set of launch settings for one provider, written as a
-`[<provider>.<profile>]` table and selected with `-p <profile>`:
+A profile is a named provider and its launch settings, written as a
+`[profiles.<name>]` table and selected with `-p <name>`:
 
 ```toml
-[codex.implement]
+[profiles.implement]
+provider = "codex"
 comment = "Implementation work that must build and test."
 model = "gpt-5.6-terra"
 effort = "high"
@@ -13,12 +14,18 @@ writable_roots = ["/srv/fixtures", "$XDG_CACHE_HOME/assets", "~/corpora"]
 config = ['model_reasoning_summary="concise"']
 env = { RUST_LOG = "info" }
 
-[claude.opus]
+[profiles.opus]
+provider = "claude"
 model = "Opus 4.8"
 effort = "medium"
 
-[maki.qwen]
+[profiles.qwen]
+provider = "maki"
 model = "openrouter/qwen/qwen3-coder"
+
+# A provider alone is a profile: that provider on its own defaults.
+[profiles.grok]
+provider = "grok"
 ```
 
 `review config` lists every profile visible here, where each one comes from,
@@ -26,15 +33,15 @@ and any definition it hides. Ask it before choosing a profile for a role.
 Session rows record the selected definition as `profile_origin` (layer and
 table), including automatic retries. This describes the requested launch
 source, not proof of successful execution or that the profile still exists.
-Only runs with a session ID get a session row. Unprofiled runs and manual
-messages have no profile origin.
+Only runs with a session ID get a session row. Manual messages have no
+profile origin.
 
 ## Selecting one
 
-`-p implement` looks the name up for the run's provider. The provider must
-have it, or the run fails before anything launches, naming every file
-searched. Without `-p`, the provider runs on its own defaults with the
-`read-only` sandbox.
+Every run runs a profile, and the profile decides the provider. `-p implement`
+selects one; without `-p`, the run uses `[_defaults].profile`. A run with
+neither, or naming a profile no file defines, fails before anything launches,
+naming every file searched and the profiles that exist.
 
 A resume (`review message`) takes no profile. The session keeps the sandbox,
 model and effort recorded for it, but **not** the profile's `env` or `config`,
@@ -43,32 +50,27 @@ message (see `review man message`).
 
 ## Precedence: the first definition wins whole
 
-A profile resolves to its **first** definition in this order:
+A profile in the project file beats one of the same name in the global file,
+and the winner replaces it **entirely**. Fields are never merged, so a project
+profile that leaves out `model` does not inherit the global profile's `model`:
+it runs on the provider's default. Every field of a run therefore comes from
+one table you can point at; `review config` shows each profile next to what it
+hides.
 
-1. a legacy `[<host>.<provider>.<profile>]` table for this host, in the project
-   file;
-2. `[<provider>.<profile>]` in the project file;
-3. a legacy host table for this host, in the global file;
-4. `[<provider>.<profile>]` in the global file.
-
-The winner replaces the others **entirely**. Fields are never merged, so a
-project profile that leaves out `model` does not inherit the global profile's
-`model`: it runs on the provider's default. Every field of a run therefore
-comes from one table you can point at.
-
-Legacy host tables apply only on the host they name, and still beat a hostless
-table in the same file there. An old project file's host tables can therefore
-keep hiding the global profiles on those hosts; `review config` shows each one
-next to what it hides.
+The one thing a project profile may not change is the provider: naming a
+different one than the global profile of the same name is an error, since
+`-p <name>` would otherwise launch a different provider in that project than
+everywhere else. Rename one of them.
 
 ## Fields
 
-Every field is optional. An unknown key is an error, because a misspelled key
-would otherwise parse as an empty profile and silently replace the global one.
-Fields the selected provider does not honour are errors too, in every table
-(including inactive legacy hosts). Empty `config` and `writable_roots` lists
-are accepted everywhere.
+`provider` is required. Every other field is optional. An unknown key is an
+error, because a misspelled key would otherwise parse as an empty profile and
+silently replace the global one. Fields the profile's provider does not honour
+are errors too. Empty `config` and `writable_roots` lists are accepted
+everywhere.
 
+- `provider`: the provider the profile runs on.
 - `comment`: free text shown by `review config`, never sent to a provider.
 - `model`: the model to request. For maki, `provider/model-id`; without one,
   maki picks its last used model, then its configured default.

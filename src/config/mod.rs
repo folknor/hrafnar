@@ -86,8 +86,8 @@ pub struct AuditConfig {
 /// through to the next layer while a present one - even an empty list - wins.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultsConfig {
-    /// The provider used when `--provider` is omitted.
-    pub provider: Option<Provider>,
+    /// The profile used when `-p` is omitted.
+    pub profile: Option<String>,
     /// Seconds of rollout silence, with no final answer written, after which a
     /// codex run is treated as stalled: killed, bundled, and reported as a
     /// failure. `0` disables the check; omitted uses the built-in default
@@ -144,7 +144,9 @@ impl std::fmt::Display for StallTimeout {
 }
 
 /// A named settings profile: optional model, effort, sandbox, and env overrides
-/// applied to a provider invocation when selected via `--profile`.
+/// applied to a provider invocation when selected via `--profile`. The
+/// provider it runs on is the table's required `provider` key, peeled off
+/// before this is deserialized and kept beside it (`ProfileDef::provider`).
 ///
 /// Unknown keys are an error. A profile wins whole, so a project profile with a
 /// misspelled key (`modle = ...`) would otherwise parse as an empty profile and
@@ -181,13 +183,10 @@ pub struct Profile {
     /// Rejected in config for other levels and providers, because
     /// widening a `read-only` profile would contradict the only thing that
     /// profile promises. `~`, `$VAR` and `${VAR}` expand, which is what lets one
-    /// hostless profile serve hosts with different layouts.
+    /// profile serve hosts with different layouts.
     #[serde(default)]
     pub writable_roots: Vec<String>,
 }
-
-/// provider -> profile name -> profile.
-type ProfileTables = BTreeMap<Provider, BTreeMap<String, Profile>>;
 
 /// One config file, parsed and checked on its own but not yet resolved against
 /// the other layer.
@@ -196,12 +195,8 @@ pub struct ConfigFile {
     pub archetypes: BTreeMap<String, String>,
     pub audit: AuditConfig,
     pub defaults: DefaultsConfig,
-    /// `[<provider>.<profile>]`.
-    pub profiles: ProfileTables,
-    /// Legacy `[<host>.<provider>.<profile>]`, keyed by host. Still parsed so
-    /// existing files need no edit; for the host it names, it beats a hostless
-    /// profile of the same name in the same file.
-    pub hosts: BTreeMap<String, ProfileTables>,
+    /// `[profiles.<name>]`: name -> (provider, profile).
+    pub profiles: BTreeMap<String, (Provider, Profile)>,
     /// `[_projects.<host>]`: host -> project name -> path as written. Global
     /// file only, for `-C <name>` (see `project.rs`).
     pub projects: BTreeMap<String, BTreeMap<String, String>>,
@@ -213,21 +208,22 @@ pub struct Sourced<T> {
     pub value: T,
     pub layer: Layer,
     /// The table that supplied it, as written in the file (`[_defaults]`,
-    /// `[codex.deep]`, `[plantasjen.codex.deep]`).
+    /// `[profiles.deep]`).
     pub table: String,
 }
 
-/// One definition of a profile. A legacy host-scoped one carries its host.
+/// One definition of a profile.
 #[derive(Debug, Clone)]
 pub struct ProfileDef {
+    pub provider: Provider,
     pub profile: Profile,
     pub layer: Layer,
     pub table: String,
-    pub host: Option<String>,
 }
 
-/// Every definition of one `(provider, profile)` visible from this host, in
-/// precedence order. The first wins **whole** - a winning profile replaces the
+/// Every definition of one profile name, in precedence order. All of them
+/// name the same provider: resolution refuses a project profile that would
+/// silently switch which provider `-p <name>` launches. The first wins **whole** - a winning profile replaces the
 /// others outright rather than merging field by field, so no field of a run can
 /// come from a table that did not mention it. The rest are kept so `review
 /// config` can show what a stale override is hiding.
@@ -257,12 +253,12 @@ pub struct ReviewConfig {
     pub archetypes: BTreeMap<String, Sourced<String>>,
     /// Always the project's: an audit id identifies a project.
     pub audit: AuditConfig,
-    pub provider: Option<Sourced<Provider>>,
+    pub profile: Option<Sourced<String>>,
     pub stall_timeout_secs: Option<Sourced<StallTimeout>>,
     /// Global layer only, so never a project's choice.
     pub claude_token_command: Option<String>,
-    /// provider -> profile name -> entry.
-    pub profiles: BTreeMap<Provider, BTreeMap<String, ProfileEntry>>,
+    /// profile name -> entry.
+    pub profiles: BTreeMap<String, ProfileEntry>,
     pub hostname: String,
     // Both are constructed together by resolve; callers cannot replace one
     // independently and create a config paired with a different root.
@@ -317,26 +313,20 @@ impl ReviewConfig {
         )
     }
 
-    /// The effective profile for `provider`, if any layer defines it.
-    pub fn resolve_profile(&self, provider: Provider, profile: &str) -> Option<&Profile> {
-        self.profiles
-            .get(&provider)?
-            .get(profile)
-            .map(|e| &e.effective.profile)
+    /// The effective definition of `profile`, if any layer defines it.
+    pub fn resolve_profile(&self, profile: &str) -> Option<&ProfileDef> {
+        self.profiles.get(profile).map(|e| &e.effective)
     }
 
-    /// The effective profile, or an error describing the tables searched in
-    /// precedence order. Keep the lookup and its explanation together so the
-    /// app does not need to restate the config resolver's search rules.
-    pub(crate) fn require_profile(&self, provider: Provider, profile: &str) -> Result<&Profile> {
-        self.resolve_profile(provider, profile).ok_or_else(|| {
-            let host_table = format!("[{}.{provider}.{profile}]", toml_key(&self.hostname));
-            let common_table = format!("[{provider}.{profile}]");
+    /// The effective definition, or an error naming the files searched and
+    /// the profiles that do exist. Keep the lookup and its explanation together
+    /// so the app does not need to restate the resolver's search rules.
+    pub(crate) fn require_profile(&self, profile: &str) -> Result<&ProfileDef> {
+        self.resolve_profile(profile).ok_or_else(|| {
+            let table = format!("[profiles.{}]", toml_key(profile));
             let mut searched = Vec::new();
-
             if let Some(local) = &self.files.local {
-                searched.push(format!("{host_table} in {}", local.display()));
-                searched.push(format!("{common_table} in {}", local.display()));
+                searched.push(format!("{table} in {}", local.display()));
             }
             if let Some(global) = &self.files.global {
                 let absent = if self.files.global_loaded {
@@ -344,19 +334,17 @@ impl ReviewConfig {
                 } else {
                     " (absent)"
                 };
-                searched.push(format!("{host_table} in {}{absent}", global.display()));
-                searched.push(format!("{common_table} in {}{absent}", global.display()));
+                searched.push(format!("{table} in {}{absent}", global.display()));
             }
-
             let searched = if searched.is_empty() {
                 "no config file paths were available".to_string()
             } else {
                 searched.join(", ")
             };
             ConfigError::ProfileUndefined {
-                provider,
                 profile: profile.to_string(),
                 searched,
+                defined: self.profiles.keys().cloned().collect(),
             }
         })
     }
@@ -365,8 +353,8 @@ impl ReviewConfig {
         self.archetypes.get(name).map(|s| s.value.as_str())
     }
 
-    pub fn default_provider(&self) -> Option<Provider> {
-        self.provider.as_ref().map(|s| s.value)
+    pub fn default_profile(&self) -> Option<&str> {
+        self.profile.as_ref().map(|s| s.value.as_str())
     }
 
     pub fn stall_timeout(&self) -> Option<StallTimeout> {
@@ -420,11 +408,9 @@ mod selection_tests {
             cfg.require_project_root().expect("root").as_path(),
             std::path::Path::new("/missing/project")
         );
-        let error = cfg
-            .require_profile(Provider::Codex, "missing")
-            .expect_err("profile");
+        let error = cfg.require_profile("missing").expect_err("profile");
         assert!(
-            matches!(&error, ConfigError::ProfileUndefined { provider: Provider::Codex, profile, .. } if profile == "missing")
+            matches!(&error, ConfigError::ProfileUndefined { profile, .. } if profile == "missing")
         );
         let error = anyhow::Error::new(error).context("launch settings");
         assert!(matches!(
