@@ -4,7 +4,10 @@ use crate::supervisor::Unresolved;
 
 /// The closing report: what is still running, or may be. Empty when every
 /// teardown was clean. Plain lines: printed to stdout above the `runtime:`
-/// line, or to stderr by the signal supervisor on its way out.
+/// line, or to stderr by the signal supervisor on its way out. Survivors and
+/// unknown outcomes are printed, every survivor named, because they are what
+/// the operator must check before retrying; leftovers the keeper killed
+/// cleanly are recorded, never printed.
 pub fn report_lines(entries: &[Unresolved]) -> Vec<String> {
     let mut out = Vec::new();
     for e in entries {

@@ -4,6 +4,12 @@ use std::sync::LazyLock;
 
 /// An immutable XDG data base (before `review/`), including unavailable storage.
 /// Resolution preserves historical empty/relative and Unicode-env semantics.
+///
+/// The process base is resolved once from `XDG_DATA_HOME`, falling back to
+/// HOME's `.local/share`. Unavailable storage stays unavailable for the
+/// process; nothing retries it. The orphan-log path is derived from the
+/// scope's `LogFamily` before the keeper spawns, since the keeper writes it.
+/// The host launch lock is not here: it stays at `temp_dir()/review.lock`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataDir(Option<PathBuf>);
 

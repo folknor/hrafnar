@@ -280,7 +280,8 @@ pub struct HarnessResult {
 /// is served as `grok-4.7-build`, and `-m grok-4.7-build` is refused as an
 /// unknown model id. So this is recorded but **never** inherited by a
 /// `review resume` - feeding it back to `-m` would fail the launch. Grok and
-/// claude report it, from their result objects; empty for codex.
+/// claude report it, from their result objects; empty for codex. It and
+/// `cost_usd` are record-only: the row stores them and nothing reads them back.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Served {
     /// Every model that served a call in the run (one in practice; a subagent

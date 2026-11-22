@@ -1,4 +1,23 @@
 //! Codex rollout progress source and its measured silence/answer policy.
+//!
+//! Two verdicts. `Stranded` is an answer in this run's scope plus quiet
+//! grace: codex finished its turn and will not exit (observed on 0.147.0).
+//! `Stalled` is no answer plus stall grace: a mid-turn wedge. An answer
+//! always prevents a stall. The scope comes from the runner; an unknown
+//! baseline (`Scope::Untrusted`) disables the watchdog, because an earlier
+//! turn's answer must never license killing this one.
+//!
+//! The stall branch is a timeout and is named one, because it rests on an
+//! observed property of codex, not a documented contract: codex cannot stay
+//! silent. It wakes itself every 2 to 5 minutes even while waiting on a
+//! long tool call (rollouts show `wait` calls with `yield_time_ms: 30000` and
+//! events every 5 to 15s while working), whereas the observed wedge was
+//! silent for hours. That gap is what makes the 15-minute default safe, and
+//! why liveness is rollout length rather than `/proc` CPU time (healthy API
+//! waits are CPU-idle and broken processes can spin). The budget is
+//! tunable and disableable (`stall_timeout_secs`, `0` is off), and every
+//! verdict records `quiet_secs` and the last event so a misfire after a
+//! codex cadence change shows how close the call was.
 use crate::transcript::{EventKind, RolloutOffset, Scope};
 use crate::watchdog::{Evidence, Kind, Source, Timings, Verdict, monitor};
 use std::path::PathBuf;
@@ -69,7 +88,8 @@ pub async fn wait_for_stranded_completion(
 }
 
 /// Codex's append-only rollout length is progress. Any length change, including
-/// truncation, resets patience. Equal-length replacement is not detected.
+/// truncation, resets patience. Equal-length replacement is not detected, and
+/// stat and read are separate observations, not an atomic snapshot.
 /// Partial/malformed bytes count as progress but never as answer evidence.
 struct CodexRollout {
     session_rx: tokio::sync::watch::Receiver<Option<String>>,

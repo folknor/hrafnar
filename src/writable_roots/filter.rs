@@ -179,8 +179,7 @@ mod tests {
     }
 
     /// `..` defeats every lexical filter: `/..` is absolute, is not a prefix of
-    /// cwd and is not empty, so before this was refused it was emitted verbatim
-    /// and codex resolved it to `/`.
+    /// cwd and is not empty, so emitted verbatim codex would resolve it to `/`.
     #[test]
     fn a_parent_dir_component_cannot_smuggle_a_wider_grant() {
         let host = FakeHost::new();

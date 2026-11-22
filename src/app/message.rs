@@ -19,14 +19,14 @@ use crate::{
 /// created - another host's (whose harness store is not here either), one made
 /// outside `review`, or a lost log - and that is an error, not a guess.
 ///
-/// A recorded harness is still parsed, so a row naming a removed harness
-/// (kilo/opencode) cannot turn into an unrunnable invocation.
+/// A recorded harness is still parsed, so a row naming a harness this build
+/// does not drive cannot turn into an unrunnable invocation.
 ///
 /// Recognising the name is not the same as the current runner understanding
-/// the session. Today every recognised name has only ever had one integration,
-/// so the two coincide. They stop coinciding the moment a removed harness's
-/// name is driven again (opencode is the expected case): rows the old
-/// integration wrote would parse as the new one. The stale-session gate does
+/// the session. Every recognised name has had one integration, so the two
+/// coincide. They stop coinciding if a name that rows already record is ever
+/// given a new integration: rows the earlier one wrote would parse as the new
+/// one. The stale-session gate does
 /// not cover that - rows with no usable epoch bypass it - so re-adding a name
 /// must come with a compatibility check here, a minimum `review_version` per
 /// harness below which rows are refused, with the crate version bumped past
@@ -51,11 +51,11 @@ fn resume_record(
 /// The project a message to `session_id` runs in, with its config: the one
 /// the session was started in, never the caller's directory.
 ///
-/// The cwd used to decide it, so a message sent from another checkout ran the
-/// session there, under that checkout's audit id and privacy setting, and filed
-/// the row under it - after which the next resume inherited the misfiled row.
-/// Now the project comes from the session's record (or, for a fresh run still
-/// in flight, its marker) and `-C` can only confirm it.
+/// Deciding it from the cwd would run a message sent from another checkout
+/// there, under that checkout's audit id and privacy setting, and file the row
+/// under it, after which the next resume would inherit the misfiled row. So
+/// the project comes from the session's record (or, for a fresh run still in
+/// flight, its marker) and `-C` can only confirm it.
 ///
 /// Everything is checked before anything is interrupted: the recorded root
 /// must still exist and hold its `.review.toml` directly - every recorded run
@@ -128,15 +128,6 @@ fn message_target(
     Ok(MessageTarget { config: cfg })
 }
 
-/// `review message <id>`: deliver stdin to a session whatever it is doing. A
-/// turn in flight on an interruptible harness is ended first, exactly as `review interrupt`
-/// ends it, and the message then continues the session as a resume.
-///
-/// The verb exists for its name. Steering a running agent used to be
-/// `review interrupt` followed by `review resume`, and told to "interrupt the
-/// agent", an orchestrating Claude reached for its own task-stop tool instead -
-/// killing `review` rather than the turn, which left a fresh session with no
-/// record to resume. "Message the agent" has no such rival.
 /// Whether the session's own fresh launch (its `run` row) authenticated with
 /// `claude_token_command`. Later rows only report what each attempt used, so
 /// they neither grant nor revoke this; a session whose run row predates the
@@ -167,6 +158,16 @@ fn session_uses_token_command(
     })
 }
 
+/// `review message <id>`: deliver stdin to a session whatever it is doing. A
+/// turn in flight on an interruptible harness is ended first, exactly as
+/// `review interrupt` ends it, and the message then continues the session as a
+/// resume. How the launch lock, marker, interrupt request and handoff keep two
+/// messages from running beside each other is in `reference/steering.md`.
+///
+/// The verb exists for its name. Told to "interrupt the agent", an
+/// orchestrating Claude reached for its own task-stop tool instead, killing
+/// `review` rather than the turn, which left a fresh session with no record to
+/// resume. "Message the agent" has no such rival.
 pub(super) async fn run_message(
     session_id: &str,
     dry_run: bool,
@@ -696,7 +697,7 @@ mod tests {
 
     #[test]
     fn a_recorded_harness_review_no_longer_supports_is_refused() {
-        // A row naming a removed harness (kilo/opencode) must not turn into
+        // A row naming a harness this build does not drive must not turn into
         // an unrunnable invocation.
         let err = resume_error(Some(minimal_row("opencode")));
         assert!(err.contains("supported"), "{err}");

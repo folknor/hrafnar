@@ -2,10 +2,28 @@
 //! stream-json output decoded by `claude_stream`. maki's headless mode
 //! reproduces Claude Code's wire format, so one runner drives both and the
 //! `Dialect` owns what differs: the argv, the forced environment, and (in
-//! `claude_stream`) how the result and its cost are read. Neither has a
-//! filesystem sandbox `review` controls; each runs on its own permission
-//! configuration. A first SIGINT ends the turn and keeps the session, which is
-//! what `review interrupt` relies on. Flags and failure modes are in
+//! `claude_stream`) how the result and its cost are read. Wire compatibility
+//! is not equal semantics, which is why the result reading is not shared.
+//!
+//! The rules both dialects run under:
+//!
+//! - The session id is minted by the invocation owner before dispatch, so the
+//!   in-flight marker goes up before the spawn. The prompt goes on stdin.
+//! - Neither has a filesystem sandbox `review` controls: claude's
+//!   `--permission-mode` is a tool-approval policy, and maki has only its own
+//!   permission files. Profiles for both must omit `sandbox`, non-empty
+//!   `writable_roots` and non-empty `config` (config parsing refuses them),
+//!   and a run records no sandbox level.
+//! - The result object states the outcome, so `review` reads nothing from
+//!   either harness's transcript and runs no stall watchdog: codex's watchdog
+//!   rests on codex writing its rollout every few minutes, which nothing has
+//!   established for these harnesses. There is no auto-resume either, because
+//!   a failed turn says why.
+//! - A first SIGINT ends the turn with a result and keeps the session, which
+//!   `review interrupt`, `review message` and a signalled `review` rely on.
+//!   Before the first event the group is killed instead.
+//!
+//! The measured harness behaviour behind these choices is in
 //! `reference/claude.md` and `reference/maki.md`.
 
 pub(super) use super::claude_stream::Dialect;
@@ -15,7 +33,12 @@ use super::*;
 
 type SharedClaudeMetrics = std::sync::Arc<std::sync::Mutex<ClaudeMetrics>>;
 
+/// The longest line checked for the `init` event; a longer one is not it.
 const CLAUDE_INIT_SCAN_MAX: usize = 1 << 20;
+/// Past the `STDOUT_CAPTURE_CAP` head, at least this much of the stream's end
+/// is kept, because the result is the last line: keeping only the head would
+/// lose the answer of any run that outgrew the cap. Metrics are read from
+/// every line as it arrives, so the cut never drops a result event's usage.
 const CLAUDE_TAIL_KEEP: usize = 8 << 20;
 
 struct ClaudeObserver {
@@ -91,6 +114,9 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
         .to_string();
     // A fresh run writes the session under the id `review` minted; a resume
     // names the one it continues. Both harnesses spell these the same way.
+    // maki parses a hyphenated UUID or its own base58 and echoes the caller's
+    // string verbatim, so the minted UUID serves it too; a resume id stays
+    // opaque, so a session maki named itself can be resumed.
     let mut args: Vec<String> = if session.is_fresh() {
         vec!["--session-id".to_string(), id]
     } else {
@@ -98,17 +124,19 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
     };
     // The stream ends in one result object per run, whatever the outcome,
     // carrying `is_error` - so the turn classifies itself, as grok's does, and a
-    // failed run still names its session. Text output gave neither: a non-zero
-    // exit was all `review` saw, and it discarded the session id with it.
+    // failed run still names its session. Text output gives neither: only a
+    // non-zero exit, and no session id to keep.
     //
-    // `stream-json` rather than `json` (which prints only that object) for its
-    // first event: an `init` that makes the harness safe to signal (see the
-    // wait below).
+    // `stream-json` rather than `json` (which prints only that object at the
+    // end) for its first event: an `init`, within half a second of launch,
+    // that makes the harness safe to signal (see the wait below).
     let flags: &[&str] = match dialect {
         // `--verbose` is required with stream-json under `--print`. When claude
         // wakes the model for a background subagent's result, the stream
         // carries a result per turn and the last is the answer - moot while
-        // background tasks are disabled (`forced_env`).
+        // background tasks are disabled (`forced_env`). `dontAsk` uses the
+        // pre-approved permissions and rejects any interactive prompt, which a
+        // headless run could never answer.
         Dialect::Claude => &[
             "--print",
             "--permission-mode",
@@ -123,11 +151,20 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
         // which is claude's `dontAsk`. Never `--trust`: `review` grants no
         // folder trust, so an untrusted project's `.maki` config can tighten
         // maki's permissions but not loosen them (trust the operator gave
-        // maki itself still applies).
-        // Background tasks are already off under `-p`.
+        // maki itself still applies: a saved trust answer, the operator's
+        // `trust.paths`, and then a trusted project's allow rules). maki's
+        // built-in rules allow file edits inside the working directory, so a
+        // maki with no permissions file can edit the project.
+        // Background tasks are already off under `-p`. maki reads the prompt
+        // from stdin in full when no prompt argument is given.
         Dialect::Maki => &["-p", "--output-format", "stream-json"],
     };
     args.extend(flags.iter().map(ToString::to_string));
+    // The profile's `model` and `effort`. For maki the model is its own
+    // `provider/model-id`, provider meaning the model vendor (OpenRouter's
+    // `openrouter/free` router is `openrouter/openrouter/free`), and effort
+    // is refused at config parsing because maki ignores `--effort`. Without a
+    // model maki takes the last one it used, then its configured default.
     args.extend_from_slice(selection.args());
     args
 }
@@ -145,9 +182,9 @@ fn forced_env(dialect: Dialect) -> Vec<(&'static str, String)> {
         // seconds later - a clean-looking run with no report, the loss grok's
         // wake loop exists for. Claude's switch removes the `run_in_background`
         // parameter altogether, so the same prompt ran the command in the
-        // foreground and reported its output. (A background *subagent* was
-        // already waited for and its result handed back in a second turn; it
-        // now just runs in the foreground too.)
+        // foreground and reported its output, and no wake loop is needed. A
+        // background *subagent* is waited for even without the switch, its
+        // result handed back in a second turn.
         //
         // The cost of the switch is Bash's 2-minute default timeout, which
         // kills a longer foreground command outright. The model can pass its
@@ -167,7 +204,10 @@ fn forced_env(dialect: Dialect) -> Vec<(&'static str, String)> {
         }
         // maki runs on the operator's own config, as claude does on its
         // settings: its bash timeout is a config option (`[plugins.bash]`),
-        // not an environment variable, and is the operator's to set.
+        // not an environment variable, and is the operator's to set. Its XDG
+        // directories are not isolated per run, because sessions live under
+        // the state directory (isolation breaks resume) and isolating only
+        // the config would hide the operator's providers and permissions.
         Dialect::Maki => Vec::new(),
     }
 }
@@ -361,8 +401,9 @@ pub(super) async fn run_claude_compat(
     // costs one resume that fails cleanly, while a dropped id loses the turn
     // most worth resuming. For claude the transcript is on disk by then. maki
     // saves only once the session holds a message, which is after it connects
-    // to the model harness, so a maki killed in between leaves an id with no
-    // session behind it; no stream event tells the two apart.
+    // to the model provider, so a maki killed in between leaves an id with no
+    // session behind it; no stream event tells the two apart, and maki
+    // refuses a resume of such an id cleanly ("not found", exit 1).
     let started = lease.is_ready();
 
     let (text, outcome, session_id) = match interpret_claude_output(dialect, &stdout, &stderr) {

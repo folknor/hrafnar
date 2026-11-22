@@ -17,17 +17,17 @@ pub(crate) struct Rollout {
 /// `phase: "commentary"`, which never count. Shared with `watchdog` so the two
 /// readers cannot disagree about what an answer looks like.
 ///
-/// Two shapes, because codex changed which one carries the phase:
-/// - an `event_msg` payload of type `agent_message`, text in `message` (the
-///   shape written up to at least codex 0.147.0);
+/// Two shapes, because codex versions differ in which one carries the phase:
+/// - an `event_msg` payload of type `agent_message`, text in `message` (codex
+///   0.147.0 and earlier);
 /// - a `response_item` payload of type `message` with `role: "assistant"`,
-///   text in the `output_text` items of `content` (codex 0.157.0, which no
-///   longer writes an `agent_message` event at all).
+///   text in the `output_text` items of `content` (codex 0.157.0, which
+///   writes no `agent_message` event at all).
 ///
-/// Empty text is not a report for either representation.
-///
-/// Missing the second made every clean 0.157.0 turn look like a death to
-/// `review sessions <id>` and left the stall watchdog blind to the answer.
+/// Both count, or a clean turn on one version reads as a death and the stall
+/// watchdog is blind to its answer. Empty text is not a report for either.
+/// `task_complete.last_agent_message` often echoes the answer but never counts
+/// alone: `task_complete` fires on aborted turns too.
 fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
     if payload.get("phase").and_then(|p| p.as_str()) != Some("final_answer") {
         return None;
@@ -120,7 +120,7 @@ pub(crate) fn fold(content: &str) -> Rollout {
                 turn_produced_content = false;
             }
             // A turn that aborts without ever carrying a user request or model
-            // output is codex's shutdown-time phantom, not a real turn: as of
+            // output is codex's shutdown-time phantom, not a real turn: on
             // codex-cli 0.147.0, `codex exec` opens a turn during teardown and
             // aborts it within milliseconds. Observed shape, in order:
             // `task_started`, a `turn_context`, a synthetic `role: "developer"`
@@ -134,10 +134,9 @@ pub(crate) fn fold(content: &str) -> Rollout {
             // list of real-content events rather than on "any event at all";
             // see the arms below for what counts.
             //
-            // Attributing this phantom as the session's final state made clean,
-            // fully-completed sessions report `task_complete=false` - which is
-            // how the "resume never completes" investigation was sent chasing a
-            // non-existent truncated-turn condition. Roll back to the real turn
+            // Attributing this phantom as the session's final state would make
+            // clean, fully-completed sessions report `task_complete=false`, a
+            // truncated turn that never happened. Roll back to the real turn
             // instead. A turn that *did* carry content and then aborted is a
             // genuine interruption and is kept as-is.
             Some("turn_aborted") if !turn_produced_content => {
@@ -294,11 +293,11 @@ pub(crate) fn stream(content: &str) -> Stream {
                 }
             }
             // Codex stating why the turn ended: an upstream refusal (content
-            // flagged, rate limit, auth) or a harness error. Dropping these was
-            // what made a policy refusal - fully explained, at the end of the
-            // stream - surface as an unexplained death with a bare interim note,
-            // then get pointlessly auto-resumed into the identical refusal.
-            // `turn.failed` nests the message; the bare `error` event carries it
+            // flagged, rate limit, auth) or a harness error. Kept, because
+            // without it a fully explained refusal reads as an unexplained
+            // death with a bare interim note, and auto-resume replays it into
+            // the identical refusal (observed on 0.146.0; the process exited
+            // promptly on its own). `turn.failed` nests the message; the bare `error` event carries it
             // at the top level. They arrive as a pair saying the same thing, so
             // last-writer-wins is fine; a genuine second failure is more
             // informative than the first anyway.

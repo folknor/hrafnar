@@ -16,8 +16,8 @@
 //! `invoke` against a shell script that reproduces each hang shape
 //! deterministically.
 //!
-//! This matters because the watchdog *kills a live codex*. Before this file the
-//! kill path had never run outside hand-written parse fixtures.
+//! This matters because the watchdog *kills a live codex*; this file is where
+//! the kill path runs against a real process.
 //!
 //! # How it stays fast
 //!
@@ -32,11 +32,10 @@
 //! that data lives in the repo rather than `/tmp`) and are removed on success.
 //!
 //! `HarnessRuntime::data` is also redirected there, and that is load-bearing
-//! rather than tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s
-//! own data paths still resolved from the test process's real
-//! `HOME`/`XDG_DATA_HOME`. Before the override existed, running this suite
-//! deposited stub incident bundles in the operator's real
-//! `~/.local/share/review/incidents`.
+//! rather than tidiness: `CODEX_HOME` only redirects the *child*, so without
+//! it `review`'s own data paths resolve from the test process's real
+//! `HOME`/`XDG_DATA_HOME` and stub incident bundles land in the operator's
+//! real incident directory.
 //!
 //! Any process a stub deliberately leaves running records its pid to
 //! `$LINGER_PID`, so the test can assert on it and clean it up rather than

@@ -35,7 +35,7 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
 /// Expand a configured root with the same grammar as project paths. Expansion
 /// errors are local to this optional grant, so report and drop the entry.
 ///
-/// One `.review.toml` is read on five machines whose layouts differ, so a
+/// One `.review.toml` is read on machines whose layouts differ, so a
 /// literal path is often unwritable somewhere. Expansion is the deliberate,
 /// visible-in-config kind of environment use - unlike the derivation above, the
 /// operator wrote the variable name down.

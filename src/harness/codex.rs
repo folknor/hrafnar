@@ -1,10 +1,31 @@
-//! The codex adapter: `codex exec --json`, with the final message also taken
-//! from `-o` and, failing both, from the session's rollout transcript (the
-//! three-tier pick). `rollout` decodes rollouts and the exec stream, `watch`
-//! is the progress watchdog's codex source, `roots` renders writable roots as
-//! a config override, and `forensics` renders codex evidence into digests and
-//! incident bundles. Why each flag is passed and how a run fails are in
-//! `reference/codex.md`.
+//! The codex adapter. A fresh run is `codex exec --json -o FILE` (the stream
+//! carries `thread_id`); a resume is `codex exec resume ID --json -o FILE`.
+//! The prompt goes on stdin. `rollout` decodes rollouts and the exec stream,
+//! `watch` is the progress watchdog's codex source, `roots` renders writable
+//! roots as a config override, and `forensics` renders codex evidence into
+//! digests and incident bundles.
+//!
+//! Argv order is a rule: the fixed overrides (`--skip-git-repo-check`,
+//! `approval_policy`, `--ignore-rules`, `--ignore-user-config`, the reasoning
+//! summary, the sandbox selection, derived writable roots, workspace network)
+//! come before the profile's raw `config` entries. Codex takes the last `-c`,
+//! so a profile can restate any fixed override and win. The reason for each
+//! flag is on the line that passes it.
+//!
+//! The final message is picked in priority order:
+//!
+//! 1. The `-o` file, which codex writes only for a real final message.
+//! 2. An answer recovered from the rollout: the exact answer the watchdog
+//!    killed on, else the current turn's phase-tagged `final_answer`.
+//! 3. The last unphased stream message, as interim text only.
+//!
+//! With none of them, `Outcome::placeholder` supplies the wording and stderr
+//! is appended as detail. The runner never fails on a non-zero exit once a
+//! turn started, so the session ID and digest survive a dead run.
+//!
+//! Rollout reads (watchdog, recovery, incident tail) all use the one `Scope`
+//! computed here from the rollout's length before spawn, so none of them can
+//! attribute an earlier turn's bytes to this run.
 
 pub(crate) mod forensics;
 pub(crate) mod rollout;
@@ -18,11 +39,14 @@ use crate::transcript::{RolloutOffset, Scope};
 const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
 Continue from exactly where you left off and produce your complete final response now.";
 
-/// Codex's recovery from its mid-turn wedge: a run that ended with no real
-/// final answer - no `-o` capture and nothing recovered from the rollout - is
-/// resumed once with a nudge, cache still warm. A manual resume is what rescued
-/// the original death of this kind; a run that captured or recovered an answer
-/// is not retried. See `harness::recovery` for the vetoes applied before this.
+/// Codex's recovery from its mid-turn death: a run that ended with no real
+/// final answer (no `-o` capture and nothing recovered from the rollout) is
+/// resumed once with a nudge, cache still warm, because the work was real and
+/// a warm resume can finish it. A run that captured or recovered an answer is
+/// not retried. `harness::recovery` applies the vetoes before this: a stated
+/// failure (codex's `error` + `turn.failed` pair) is a verdict on the request,
+/// so resending it costs a second run to hear the same refusal, and an
+/// operator interrupt is a decision, not a death.
 pub(super) fn recovery(r: &HarnessResult) -> Option<&'static str> {
     r.output
         .as_ref()
@@ -167,16 +191,19 @@ pub(super) async fn run_codex(
         "exec".to_string(),
         // `review` is routinely launched from a directory that is not itself a
         // git repo (an umbrella dir whose repos live in subdirectories). Codex
-        // refuses to start there - "Not inside a trusted directory and
-        // --skip-git-repo-check was not specified" - so pass it always. The
-        // filesystem guarantee we rely on is `--sandbox`, which is unaffected:
-        // this flag only waives codex's own "am I in a repo?" precondition.
+        // refuses to start there ("Not inside a trusted directory and
+        // --skip-git-repo-check was not specified"), so pass it always.
+        // Marking the directory `trust_level = "trusted"` does not help
+        // (verified on 0.149.0): the repo check runs ahead of project trust,
+        // so there is no config-side fix. The filesystem guarantee is the
+        // sandbox selection, which this flag does not touch: it only waives
+        // codex's own "am I in a repo?" precondition.
         "--skip-git-repo-check".to_string(),
-        // `--sandbox` alone stopped being a filesystem guarantee in codex
-        // 0.150.x. `codex exec` sets `approval_policy = "never"` for headless
-        // runs, which is what made a read-only sandbox absolute: the model's
+        // `--sandbox` alone is not a filesystem guarantee (codex 0.150.x and
+        // later). `codex exec` sets `approval_policy = "never"` for headless
+        // runs, which is what makes a read-only sandbox absolute: the model's
         // `request_permissions` escalation is auto-denied under `never`. But
-        // `build_exec_config` now *drops* that headless default whenever the
+        // `build_exec_config` drops that headless default whenever the
         // resolved `approvals_reviewer` is `auto_review` (settable globally in
         // `~/.codex/config.toml`), falling back to `on-request`. Escalations
         // then go to codex's own auto-approving guardian, which grants them,
@@ -184,13 +211,13 @@ pub(super) async fn run_codex(
         // profile for the turn. Verified on 0.150.1: a bare
         // `codex exec --sandbox read-only` wrote a file; with this override the
         // same prompt is rejected ("writing is blocked by read-only sandbox").
-        // Pinning the policy here restores the invariant regardless of the
-        // operator's global codex config. Passed before profile `config`
-        // overrides so a profile can still opt back in deliberately.
+        // The `-c` survives because `build_exec_config` rewrites only the
+        // harness overrides, never the CLI ones. Pinning the policy keeps the
+        // invariant independent of the operator's global codex config.
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
-        // The second, independent hole in the same guarantee - and the one that
-        // actually fires in the field. Codex's execpolicy `.rules` files are not
+        // The second, independent hole in the same guarantee, and the one that
+        // fires in the field. Codex's execpolicy `.rules` files are not
         // only an approval allowlist: a `prefix_rule(..., decision="allow")`
         // whose pattern matches *every* parsed segment of a command makes
         // `exec_policy.rs` return `Skip { bypass_sandbox: true }`, which the
@@ -205,37 +232,37 @@ pub(super) async fn run_codex(
         // created the link, and `brokkr status` wrote a row into
         // `~/.local/share/brokkr/history.db` - both outside every writable root.
         // Prefixing one non-allowlisted segment (`echo probe; ...`) made the
-        // identical command sandboxed, which is why this looked like flaky,
-        // per-run behaviour for months: enforcement tracked the shape of the
-        // command the model happened to type. `--ignore-rules` drops the user
-        // and project rule layers for this invocation only, leaving the
-        // operator's interactive codex untouched. An older codex without the
-        // flag fails loudly on an unknown argument rather than silently running
-        // unsandboxed, which is the right way round.
+        // identical command sandboxed, so enforcement tracks the shape of the
+        // command the model happened to type and reads as flaky. Upstream
+        // documents this ("control which commands Codex can run outside the
+        // sandbox"): codex works as intended, it is review's guarantee that
+        // breaks. `--ignore-rules` drops the user and project rule layers for
+        // this invocation only, leaving interactive codex untouched; the
+        // root-owned `/etc/codex/rules/` layer still loads, correctly.
+        // Redirecting `CODEX_HOME` would also kill the bypass but would move
+        // auth, sessions and rollout discovery with it. An older codex
+        // without the flag fails loudly on an unknown argument rather than
+        // silently running unsandboxed.
         "--ignore-rules".to_string(),
-        // And the general form of the same lesson: a `review` run must be a
-        // function of `.review.toml` plus argv, never of a file the operator
-        // edited for unrelated reasons. Twice now the guarantee a profile
-        // advertised was silently voided by ambient global codex config - once
-        // by `approvals_reviewer = "auto_review"` rewriting the approval
-        // policy, once by the execpolicy rules above. Pinning each hole as it
-        // is found leaves the next one live, so drop `$CODEX_HOME/config.toml`
-        // wholesale. Auth is unaffected: it resolves from `CODEX_HOME`
-        // independently of this flag (verified - a run with it authenticates
-        // and completes normally). Two consequences, both deliberate: a run
-        // whose profile sets no `model` now takes codex's built-in default
-        // rather than the operator's configured one (identical on this host
-        // today, but no longer a silent coupling), and a profile whose `config`
-        // overrides name a custom `model_provider` defined in the operator's
-        // config.toml must now define it in the profile too.
+        // The general form of the same rule: a `review` run is a function of
+        // `.review.toml` plus argv, never of a file the operator edited for
+        // unrelated reasons. Both holes above are ambient global codex config
+        // voiding a profile's advertised guarantee, and pinning each hole as
+        // it is found leaves the next one live, so drop
+        // `$CODEX_HOME/config.toml` wholesale. Auth is unaffected: it resolves
+        // from `CODEX_HOME` independently of this flag (verified: a run with
+        // it authenticates and completes). It does not replace
+        // `--ignore-rules`: rules live outside config.toml, and measured, this
+        // flag alone leaves the bypass open. Two deliberate consequences: a
+        // profile with no `model` takes codex's built-in default rather than
+        // the operator's, and a profile naming a custom `model_provider` must
+        // define it in its own `config`.
         "--ignore-user-config".to_string(),
         // Rollout reasoning items carry `encrypted_content` - sealed server-side
         // and undecryptable here - and on the default `auto` summary setting
         // their `summary` arrays come back empty, so a rollout records *what* a
-        // run did and never *why*. That cost real time: reconstructing why an
-        // agent relocated a build meant inferring intent from the command
-        // sequence alone, because the transcript held no prose at any point.
-        // `detailed` fills the summaries, which `src/transcript.rs` forensics
+        // run did and never *why*, and intent has to be inferred from the
+        // command sequence. `detailed` fills the summaries, which `src/transcript.rs` forensics
         // and `review sessions <id>` can then surface. Passed before profile
         // `config` overrides, so a profile can still set `none` where the
         // summaries are not worth their tokens.
@@ -260,28 +287,28 @@ pub(super) async fn run_codex(
     // (`linux-sandbox/src/landlock.rs`) unconditionally denies `bind`,
     // `connect`, `listen` and `accept`, returning `EPERM`. It carves out
     // AF_UNIX for `socket()` and `socketpair()` only, so an AF_UNIX socket can
-    // be created and then used for nothing that needs a pathname. A daemon /
+    // be created and then used for nothing that needs a pathname. A daemon or
     // worker test suite that binds a socket under its own target directory
     // fails with `Operation not permitted` on a path that is demonstrably
-    // writable - verified by binding in the *cwd*, which codex grants
+    // writable: verified by binding in the cwd, which codex grants
     // unconditionally, and getting the same errno. So no `writable_roots`
-    // entry can fix it; there is no path for which it works.
+    // entry can fix it; there is no path for which it works. `socketpair`
+    // has the carve-out, so socketpair-only tests pass, which makes the
+    // failure look flaky.
     //
-    // Enabling network access is a blunt instrument - the filter is
-    // all-or-nothing, so this restores AF_INET egress too, and codex offers no
-    // AF_UNIX-only knob. It is nevertheless not a widening of what these runs
-    // have actually had: until `--ignore-rules` landed in a commit earlier that
-    // day, an operator execpolicy allowlist made build commands bypass the
-    // sandbox wrapper entirely, so no seccomp filter was installed and every
-    // `workspace-write` run in this tool's history ran with full network
-    // access. This makes that explicit and, unlike the bypass, it applies to
-    // every command rather than the ones whose argv happened to match a rule.
+    // Enabling network access is blunt: the filter is all-or-nothing, so this
+    // restores AF_INET egress too, and codex offers no AF_UNIX-only knob. It
+    // matches what an operator execpolicy allowlist gives a matching command
+    // without `--ignore-rules` (no wrapper, so no filter), applied to every
+    // command instead of the ones whose argv matched a rule. The upstream
+    // asymmetry looks like an oversight: `landlock.rs` keeps `recvfrom`
+    // allowed so `cargo clippy`'s socketpair machinery works, and misses the
+    // four pathname syscalls.
     //
     // Scoped to `workspace-write` because this key only exists for that level.
-    // `read-only` needs the same grant - the filter denies `connect` there too -
+    // `read-only` needs the same grant (the filter denies `connect` there too)
     // and gets it from the permissions profile in `codex_sandbox_args`, there
-    // being no `sandbox_read_only.network_access`. Passed before profile
-    // `config`, so a profile can restate the key and win.
+    // being no `sandbox_read_only.network_access`.
     if sandbox == "workspace-write" {
         args.push("-c".to_string());
         args.push("sandbox_workspace_write.network_access=true".to_string());
@@ -348,7 +375,7 @@ async fn run_codex_json(
         args,
         project_root,
         // Make a codex panic legible: without this it exits 1 with no trace,
-        // which is exactly the "no recorded reason" we kept hitting. A
+        // and the rollout records no reason for the death either. A
         // default, so an explicit profile override still wins; and part of the
         // spec, so the incident replay carries it by construction.
         &[("RUST_BACKTRACE", "1".to_string())],
@@ -434,10 +461,6 @@ async fn run_codex_json(
     }
 
     let start = std::time::Instant::now();
-    // (Gating transcript recovery to this run's turn is done by byte offset -
-    // `rollout_baseline` above - not by a wall-clock stamp, which was too coarse
-    // to separate a resume from an answer written in the same second.)
-    //
     // Installed before anything can return, so the `-o` file goes on every
     // path, the lifecycle's stop refusal included.
     let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
@@ -448,15 +471,17 @@ async fn run_codex_json(
     // up when `thread.started` reaches the reader (`Lease::set_session`);
     // nobody can message a session whose id has not been printed. The marker
     // shows `review sessions` the turn in flight instead of the previous
-    // turn's response - the ambiguity that made a 10-hour hang look identical
-    // to an idle session.
+    // turn's response, so a hung run does not look like an idle session.
     //
     // The keeper's pid is offered on the marker only from codex's first stdout
-    // byte. Until then the pid may front a node wrapper that has not installed
-    // the handler forwarding SIGINT to the native binary, so interrupting it
-    // could kill the wrapper and orphan codex - still holding the session's
-    // writer lock, which would make the resume `review interrupt` hands back
-    // fail.
+    // byte. On an npm install the pid is a node wrapper (`codex-cli/bin/
+    // codex.js`) that forwards one SIGINT to the native binary, but installs
+    // that forwarding only after spawning it. A SIGINT before then kills the
+    // wrapper and orphans codex, still holding the session's writer lock
+    // (`$CODEX_HOME/thread-writer-locks/ID.lock`), so the resume `review
+    // interrupt` hands back would fail "already has an active writer". The
+    // interrupt signals the leader only, never the group: the wrapper already
+    // forwards, and a group signal would hand the native binary a second copy.
     let session = match known_session_id.as_ref() {
         Some(sid) => SessionStart::Resume(sid.clone()),
         None => SessionStart::Fresh { id: None },
@@ -525,24 +550,14 @@ async fn run_codex_json(
     let mut quiet_secs: Option<u64> = None;
     let mut last_rollout_event: Option<crate::transcript::EventKind> = None;
 
-    // Wait for codex, but stay interruptible.
-    //
-    // Before this loop the code was a plain `join!` on the child plus both
-    // pipes, which had two failure modes, both observed:
-    //   - codex finishes its turn (final answer on disk, `task_complete`
-    //     recorded) and then never exits. `review` blocked for 10+ hours with
-    //     the answer sitting in the rollout the whole time, and produced no
-    //     digest, no incident bundle and no sidecar row, because all of that is
-    //     computed below this point.
-    //   - the operator kills `review`, and codex - a separate process - keeps
-    //     running detached, still modifying the tree.
-    // The watchdog, as the run's kill arm, fixes the first; the second is
-    // handled process-wide by `install_signal_supervisor`, and a signalled
-    // `review` ends the turn as `review interrupt` would through the
-    // lifecycle's stop arm.
-    //
-    // codex has demonstrably produced its answer but will not exit: the run is
-    // terminated, reaped, and the recovered `final_answer` reported as usual.
+    // Wait for codex, but stay interruptible: the wait ends on reap, and the
+    // watchdog can pre-empt it. Everything `review` knows about a run (digest,
+    // incident bundle, sidecar row) is computed below this point, so a wait
+    // that blocks on a codex that finished its turn and never exits (observed
+    // on 0.147.0: answer on disk, 10+ hours hung) produces nothing at all.
+    // On a stranded completion the run is terminated, reaped, and the
+    // recovered `final_answer` reported as usual. A signalled `review` ends
+    // the turn as `review interrupt` would, through the lifecycle's stop arm.
     // The watchdog judges codex only, never the teardown of what it left.
     let watchdog = {
         let watchdog = crate::watchdog::wait_for_stranded_completion(
@@ -582,10 +597,9 @@ async fn run_codex_json(
     // *every* holder of the write end to close it, which includes any process
     // codex spawned that inherited the descriptors. Reaping is the authoritative
     // signal; give the readers a moment to drain what is already buffered, then
-    // take what they have. (Investigation of codex 0.147.0 found no production
-    // `Stdio::inherit` on the exec path - `codex-rs/core/src/spawn.rs` gives
-    // children null/piped stdio - so this is defence in depth rather than a
-    // known live path.)
+    // take what they have. (Codex 0.147.0 has no production `Stdio::inherit`
+    // on the exec path: `codex-rs/core/src/spawn.rs` gives children null or
+    // piped stdio, so this is defence in depth rather than a known live path.)
     let stdout_buf = collect_reader(
         stdout_task,
         &stdout_shared,
@@ -697,11 +711,12 @@ async fn run_codex_json(
         None
     };
 
-    // Final-message priority:
-    //   1. the `-o` backstop - authoritative when codex managed to write it.
-    //   2. the transcript's recovered `final_answer` - the real report salvaged
-    //      when the stream/`-o` were truncated but the rollout reached the end.
-    //   3. the last streamed message - interim commentary, a last resort.
+    // Final-message priority is in the module doc. Recovery keys on the
+    // rollout's phase-tagged `final_answer`, never on `task_complete`: codex
+    // fires `task_complete` on aborted turns too, so it cannot tell a
+    // truncated-but-completed run (answer on disk, exit 1 at shutdown, closing
+    // stream events and `-o` lost) from a genuine mid-turn death. Both look
+    // like `exit 1 / captured false / turns 0` on stdout.
     // A trailing turn can reset the summary's answer. Preserve the exact
     // scoped evidence that licensed our kill even if the rollout later changes.
     // Final rollout bytes alone cannot reconstruct this decision: detection's
@@ -735,7 +750,10 @@ async fn run_codex_json(
     // `is_incident` on `Outcome`; only the interrupt exclusion is shared.
     // Dump a full forensic bundle for the same suspicious runs we post-mortem -
     // stderr (with backtraces), the raw stream, the transcript tail, the exact
-    // argv, and codex's version - so the next death is over-instrumented.
+    // argv, and codex's version - so the next death is over-instrumented and
+    // diagnosable without a repro, since codex records no reason for a death
+    // in its rollout. A stated failure is still bundled; its stated reason
+    // becomes the bundle's verdict, so it does not read as a hang.
     // An operator interrupt is not an incident: the missing answer is explained.
     let incident_path = if suspicious && !interrupted {
         // The version probe runs a harness binary too, so it is contained

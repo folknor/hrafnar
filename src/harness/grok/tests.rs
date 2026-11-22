@@ -518,7 +518,7 @@ async fn grok_trust_key_drift_is_not_a_verified_grant() {
     std::fs::remove_dir_all(base).expect("cleanup");
 }
 
-/// A recorded generated profile is recreated from its historical set, never
+/// A recorded generated profile is recreated from its recorded set, never
 /// from the current host's derived grants. No harness is needed for setup.
 #[tokio::test]
 async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatch() {
@@ -537,7 +537,7 @@ async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatc
     )
     .expect("trusted");
     let launch = |name: &str, roots: &[String]| {
-        // Exercise the same historical row decoder and inheritance path as message.
+        // Exercise the same sidecar row decoder and inheritance path as message.
         let row: crate::sessions::SessionRow = serde_json::from_value(serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z", "project": project,
             "hostname": "host", "audit_id": "audit", "provider": "grok",

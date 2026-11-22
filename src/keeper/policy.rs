@@ -92,8 +92,13 @@ impl TeardownSchedule {
     }
 }
 
-/// Historical `killed` means observed ended during cleanup, not causal proof
-/// that a signal killed it. Keep that accounting independent of the verdict.
+/// The keeper's one verdict on a tree. Only `ECHILD` proves `Clean`; without
+/// it, discovery cannot rule out unseen members even when every read
+/// succeeded, so `Survived` from observation always sets `more_unnamed`.
+/// Orphan logging and recording use this verdict rather than discovering
+/// survivors again. `killed` means observed ended during cleanup, not causal
+/// proof that a signal killed it. Keep that accounting independent of the
+/// verdict.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Teardown<Processes = Vec<Proc>> {
     Clean {

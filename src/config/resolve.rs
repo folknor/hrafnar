@@ -1,8 +1,19 @@
 //! Combining the local and global layers into one `ReviewConfig`. Every
 //! resolved value is `Sourced` (layer and table), and each profile records
 //! its layer and table, so `review list --all` can show where it came from.
-//! The precedence rules and their reasons are in `reference/design.md`; the
-//! tests are in `resolve/tests.rs`.
+//! The tests are in `resolve/tests.rs`.
+//!
+//! The rules, and why:
+//!
+//! - Archetypes are a union, the project winning per name, because a project
+//!   owns its domain archetypes.
+//! - Each `[_defaults]` key comes whole from the first layer that sets it.
+//! - Profiles are add-only: a project may add a profile but never redefine a
+//!   global one. Otherwise `-p deep` would run something different in one
+//!   project than everywhere else, and a field of a run could come from a
+//!   table that never mentioned it.
+//! - `[_audit]` is always the project's, because the audit id identifies the
+//!   project. A `.review.toml` holding only `[_audit]` is a complete config.
 
 use super::{ConfigFile, ConfigFiles, Layer, ProfileDef, ReviewConfig, Sourced};
 use anyhow::{Result, bail};

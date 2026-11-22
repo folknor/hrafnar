@@ -42,14 +42,15 @@ fn run_failed(r: &harness::HarnessResult) -> bool {
     !r.output.as_ref().is_ok_and(|turn| !turn.outcome.failed())
 }
 
-/// The archetype selection: `-a`, or the positional form it replaced.
+/// The archetype selection: `-a`, or the hidden positional alias.
 ///
-/// The archetype used to be the positional argument, which put archetypes and
-/// subcommands in one namespace - every new subcommand silently shadowed any
-/// project's archetype of that name. As a flag it cannot collide. The positional
-/// form is still accepted, with a warning, so orchestration procedures written
-/// against it keep working until they are updated; a positional `bare` (the old
-/// way to say "no archetype") means none.
+/// The archetype is a flag because a positional archetype shares one namespace
+/// with the subcommands, where every new subcommand would shadow any project's
+/// archetype of that name. The positional alias is accepted with a warning so
+/// orchestration procedures written against it keep working, and while it
+/// exists the subcommand names stay reserved (`config::reserved_names`). A
+/// stray word such as `review secruity` is taken as an archetype and reported
+/// as an unknown one. A positional `bare` means no archetype.
 fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Option<String>> {
     match (flag, legacy) {
         (Some(_), Some(positional)) => {
@@ -247,7 +248,9 @@ pub async fn run() -> Result<CommandExit> {
     }
 
     // One config reaches every machine, including ones missing a harness, so
-    // this is checked before anything launches.
+    // this is checked before anything launches. An error rather than a warning
+    // and a skip, which would quietly run less than was asked for; `review
+    // list` reports availability so an orchestrator can learn it up front.
     if !installed {
         bail!(
             "{prov_name} is not installed on this host (not found on PATH)\n  \

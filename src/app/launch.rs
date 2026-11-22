@@ -37,6 +37,11 @@ impl RecordCtx {
     ) -> bool {
         // Failed resumes did not warm the cache. This applies to automatic
         // and manual resumes alike; a requested ID is not proof a turn ran.
+        // Any resume that ran refreshes the clock, even one with no good
+        // answer (a codex mid-turn death returns `Ok` with a death digest):
+        // the clock tracks prompt-cache warmth, and reprocessing the prefix
+        // warmed it. Gating on answer quality would pin the clock to the last
+        // good answer and refuse a warm session as stale.
         // A run claude refused credentials for before doing anything never
         // reached the model either, though it comes back as a turn: a resume
         // must not refresh the cache clock, and a fresh session holding only

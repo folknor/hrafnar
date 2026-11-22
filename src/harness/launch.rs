@@ -120,45 +120,22 @@ pub struct InheritedSettings {
 }
 
 impl InheritedSettings {
-    /// What a `review resume` launches with, taken from the session's own last
-    /// recorded run: sandbox level, writable roots, model and reasoning effort.
+    /// What a `review resume` launches with comes from the session's last
+    /// recorded run: permissions, writable roots, model and effort, because they
+    /// are properties of the session, not of the invocation driving it. A resume
+    /// carries no profile, so without this a `workspace-write` session would
+    /// come back read-only.
     ///
-    /// A resume carries no profile; before restoration was explicit, a
-    /// resume used to silently drop the permissions the session was created with: a
-    /// `workspace-write` run that died mid-turn came back as a read-only resume that
-    /// could not touch the files it had been editing, and the failure surfaced as
-    /// the model reporting a read-only filesystem rather than as anything about
-    /// `review`. The permissions are a property of the *session*, not of the
-    /// invocation that happens to be driving it.
+    /// The row records effective values (what the run received, not what its
+    /// profile asked for). Roots go back as profile roots, not a verbatim list,
+    /// so they pass the same filters and are re-derived on this host.
     ///
-    /// The sidecar already records both, and records the **effective** values (what
-    /// the run received, not what its profile asked for), which is exactly what has
-    /// to carry forward - the recurring lesson of the codex sandbox work is that
-    /// those two differ. Roots are passed as profile roots rather than as a verbatim
-    /// list so they go back through the same filters and are re-derived against
-    /// *this* host: a host fact like the build lock belongs to the machine the
-    /// resume runs on, not to the one that recorded the row.
-    ///
-    /// Known levels are recorded in review's vocabulary. Grok also saves its
-    /// native selector in `harness_sandbox`, since a session cannot change profiles.
-    /// Old rows have only `sandbox`, already in Grok's native form, so that field
-    /// remains the fallback. A row predating both fields inherits nothing.
-    ///
-    /// Model and effort carry forward for the same reason and were originally left
-    /// out on the grounds that only `model` was recorded, so a partial restoration
-    /// would be less predictable than none. Measurement killed that argument: every
-    /// resume ran on codex's **built-in default model** at its default
-    /// effort, not the profile's, and since `--ignore-user-config` that default is
-    /// not even the operator's configured one. A session's first turn on
-    /// `gpt-5.6-sol`/`low` followed by five resumed turns on a different model is
-    /// not a neutral fallback - it silently changes the model mid-session, at a
-    /// different price, with nothing in the output saying so. The fix is to record
-    /// `effort` too rather than to keep inheriting neither.
-    ///
-    /// Env and profile `config` are still *not* inherited: env values are
-    /// deliberately never recorded (they can carry secrets) and `config` is not
-    /// recorded at all, so there is nothing to restore from. That is an absence of
-    /// data, not a judgement about predictability.
+    /// Model and effort are inherited because codex resolves the model again on
+    /// every invocation and would otherwise switch to its built-in default mid
+    /// session. Env values and raw `config` are not recorded, so they are not
+    /// inherited. A row for another harness inherits nothing.
+    /// [`Permissions::restore`] decides what a row without a selector means
+    /// (the native one is stored under the `provider_sandbox` key).
     pub fn from_record(record: Option<&sessions::SessionRecord>, harness: Harness) -> Self {
         let Some(record) = record.filter(|r| r.harness == harness.as_str()) else {
             return Self::default();

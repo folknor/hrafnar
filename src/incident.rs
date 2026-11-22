@@ -1,10 +1,13 @@
 //! Forensic capture for suspicious harness runs.
 //!
 //! When a codex run looks wrong (not captured / non-zero exit / signal) the
-//! live digest + transcript summary are not enough to explain *why* it died -
-//! the investigation that motivated this module kept stalling on information
-//! `review` had thrown away: codex's stderr, the raw NDJSON stream, whether the
-//! prompt even finished writing, and (absent `RUST_BACKTRACE`) any panic trace.
+//! live digest + transcript summary are not enough to explain *why* it died.
+//! That needs what `review` would otherwise discard: codex's stderr, the raw
+//! NDJSON stream, whether the prompt finished writing, and (absent
+//! `RUST_BACKTRACE`) any panic trace. Only the codex adapter writes bundles.
+//!
+//! An answer the watchdog preserved stays affirmative evidence in the bundle
+//! even when the later recovery read can no longer find the transcript.
 //!
 //! `write_bundle` dumps all of it to `~/.local/share/review/incidents/<dir>/`
 //! so the *next* death is over-instrumented instead of a mystery. It is

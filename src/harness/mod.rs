@@ -82,8 +82,7 @@ pub fn recovery(r: &HarnessResult) -> Option<&'static str> {
 /// Create a fresh, exclusively-owned temp file for codex's `-o` output and
 /// return its path. A random unguessable name (UUID) plus `O_EXCL` creation
 /// (`create_new`) makes collisions between concurrent runs impossible and
-/// defeats symlink pre-planting on what used to be a predictable pid+archetype
-/// path. The file is created empty; codex overwrites it with the final message.
+/// defeats the symlink pre-planting a predictable path would allow. The file is created empty; codex overwrites it with the final message.
 fn new_output_file() -> Result<String> {
     new_temp_file("codex")
 }

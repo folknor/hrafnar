@@ -2,9 +2,12 @@
 //! the profiles with an installed harness; `--projects` the `-C` registry;
 //! `--all` the effective configuration and where each value came from.
 //!
-//! Orchestrators used to parse `.review.toml` directly to learn which
-//! archetypes, harnesses and profiles exist. With the global layer that file no
-//! longer tells the whole story - a profile may come from
+//! The default view is terse because whoever picks a role needs only what is
+//! available; the full resolved view (file paths, sources, env names, every
+//! default) buries that answer.
+//!
+//! `.review.toml` alone does not say which archetypes, harnesses and profiles
+//! exist: a profile may come from
 //! `~/.config/review/config.toml`, and which harness it runs on depends on
 //! `[_defaults].prefer` and what this host has installed - so
 //! this command is the single source of truth. It renders what the resolver

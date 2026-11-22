@@ -122,7 +122,9 @@ impl Observation {
 }
 
 // Exactly one automatic recovery is supported. This is target selection, not
-// outcome merging: a waiter already holding the predecessor stays on it.
+// outcome merging: a waiter already holding the predecessor stays on it. The
+// successor is selected only from exactly two markers that match here; any
+// other set of live markers for a session is ambiguous.
 fn follows(previous: &crate::inflight::Live, next: &crate::inflight::Live) -> bool {
     previous.phase == crate::inflight::Phase::HandoffPending
         && !previous.cleanup_pending()

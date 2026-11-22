@@ -7,6 +7,13 @@
 //! capture, we read this to classify *why* it stopped: a `stream_error`, or a
 //! terminal `function_call` with no matching output (the tool that was running
 //! when it died).
+//!
+//! Discovery accepts a file only when its first record, capped at 1 MiB, is
+//! `session_meta` whose `payload.id` or legacy `payload.session_id` matches the
+//! requested id; both must be strings, and must agree when both are present.
+//! That verifies identity at discovery, not the authenticity of the content or
+//! that the file is not replaced later. `Scope::From` is the only scope that
+//! authorizes watchdog monitoring, and an offset past EOF yields no evidence.
 
 use std::{
     ffi::CStr,

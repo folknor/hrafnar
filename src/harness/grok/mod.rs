@@ -3,8 +3,25 @@
 //! until grok's own update log shows no background result the model missed,
 //! resuming the session with those results in the prompt (the wake loop). A
 //! `workspace-write` run needs a sandbox profile and folder trust set up in
-//! grok's state directory, which `state` owns. Grok cannot be interrupted.
-//! The mechanism and its evidence are in `reference/grok.md`.
+//! grok's state directory, which `state` owns. Grok cannot be interrupted:
+//! it has no external turn interrupt, so a running turn is ended by keeper
+//! teardown, and a pending stop prevents a new turn, wakes included.
+//!
+//! Grok needs none of codex's death detection, because it classifies its own
+//! turns: the result object's `stopReason` says whether `text` is an answer.
+//! So a turn is a plain spawn and parse, with no watchdog, no transcript
+//! forensics, no incident bundle and no auto-resume. Grok also has no
+//! verified on-disk rollout, so there is nothing to recover from. The wake
+//! loop answers a different question: did the model see its own work.
+//!
+//! `sandbox` maps honestly to grok's `--sandbox` (unlike claude, where it is
+//! ignored). A fresh run with no level gets `read-only`; a resume with no
+//! recorded level gets no `--sandbox`, see `run_grok_turn`. A write run does
+//! not use `--always-approve` or `bypassPermissions`: those disable approval
+//! for everything, where folder trust is scoped to one folder.
+//!
+//! Grok's observed behaviour and the upstream facts this module relies on are
+//! in `reference/grok.md`.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -108,7 +125,17 @@ const GROK_MAX_WAKES: u32 = 10;
 /// wake after a stated failure - grok said why the turn ended, and resending
 /// buys the same answer (`Outcome::stated_failure`); that outcome already
 /// fails the run. A wake turn that fails to launch keeps the first turn's output and
-/// session id rather than dropping both.
+/// session id rather than dropping both. Verification and wake failures are
+/// recorded as `unverified` (persisted as `review_error`), apart from grok's
+/// own stated reason (`turn_error`), and never invent an exit code or relabel
+/// a captured answer as interim text.
+///
+/// There is no overall wall-clock cap: each wake is one model turn plus at
+/// most one `GROK_COMMAND_WAIT_SECS` background wait. Each wake is printed,
+/// the answer is prefixed with the wake count, and counts, usage, cost and
+/// served models cover every turn (`GrokTurn::absorb`). This is codex's
+/// auto-resume idea applied to a different gap: codex's is a one-shot retry
+/// for a death, grok's a loop until a verifiable condition holds.
 pub(super) async fn run_grok(
     launch: &super::LaunchSpec,
     sandbox: Option<&str>,
@@ -371,12 +398,12 @@ async fn run_grok_turn(
     // codex's, so the profile field maps honestly and the default still holds:
     // a run with no profile cannot modify files.
     //
-    // Except on a resume with no recorded level (a session whose sidecar row
-    // predates sandbox recording): grok fixes a session's profile
+    // Except on a resume with no recorded level (a sidecar row without
+    // sandbox fields): grok fixes a session's profile
     // for its lifetime and refuses an explicit `--sandbox` that differs from the
     // saved one (`resolve_startup_sandbox`: explicit + saved, different =>
-    // `Conflict`), while no flag applies the saved one. Forcing `read-only` there
-    // made every such write session unresumable. Omitting the flag defers to
+    // `Conflict`), while no flag applies the saved one, so forcing `read-only`
+    // there would make every such write session unresumable. Omitting the flag defers to
     // what the session already had - no trust or root setup happens, because
     // there is nothing recorded to say the session writes.
     if let Some(level) = sandbox {
@@ -408,10 +435,9 @@ async fn run_grok_turn(
     // command that blocks longer than 15s to the background, and headless `-p`
     // then only waits for it to *finish* before exiting - it never gives the
     // model another turn to read the result (`headless.rs`: exits once
-    // `pending_bg` is empty). So every build over 15s ended a fixer's turn
-    // without a report: the second wave lost two that way, and a live probe
-    // watched `brokkr test` pass 13s after grok had already stopped listening.
-    // The switch itself (`toolset.bash.auto_background_on_timeout`) is
+    // `pending_bg` is empty). So a model that ends its turn on a build over
+    // 15s loses the build's result, and the run looks finished with no
+    // report (observed, see `reference/grok.md`). The switch itself (`toolset.bash.auto_background_on_timeout`) is
     // config.toml-only and not on the `GROK_CONFIG` allowlist, and turning it
     // off would *kill* commands at a 5-minute cap instead, so the budgets are
     // raised per run through grok's own env overrides: the auto-background
@@ -700,6 +726,15 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
 
 /// What a finished grok run amounts to. An `Err` alongside these two means the
 /// run never got as far as a turn at all.
+///
+/// `NoAnswer` is `Ok`, not `Err`, for the same reason codex returns a death
+/// outcome as `Ok`. `invoke` forces `session_id: None` on every error path,
+/// which would drop the id of the cut-off turn, the one most worth resuming.
+/// And `review resume` refreshes its cold-cache clock on `output.is_ok()`, so
+/// a turn that ran and warmed the cache would leave the clock stale and get
+/// the next resume refused. The run still fails: an outcome with no answer
+/// makes `Outcome::failed` true, so the process exits 1 whatever grok's exit
+/// code, and the digest's `turn_error` or `review_error` keeps the reason.
 #[derive(Debug)]
 enum GrokOutcome {
     Answered(GrokAnswer),
@@ -723,11 +758,11 @@ pub(super) enum GrokWrite {
     /// A resume of a session created under a `review-ws-*` profile: the same
     /// profile, with the roots recorded with the session. Grok fixes a
     /// session's sandbox profile for its lifetime and refuses a different
-    /// `--sandbox` on resume (`resolve_startup_sandbox` → `Conflict`).
+    /// `--sandbox` on resume (`resolve_startup_sandbox` returns `Conflict`).
     Resume(ProfileName),
-    /// A resume of a session created under grok's built-in `workspace`, before
-    /// `review` made profiles. It can only continue as it began: trusted, but
-    /// without the extra roots.
+    /// A resume of a session recorded under grok's built-in `workspace`. Grok
+    /// pins a session's profile, so it can only continue as it began: trusted,
+    /// but without the extra roots.
     BuiltinWorkspace,
 }
 
@@ -750,8 +785,23 @@ pub(super) struct GrokPrepared {
 /// folder trust gates whether the repo's own `.grok` MCP/LSP config may spawn
 /// servers (`trust.rs` module docs), so from then on every grok session there,
 /// interactive ones included, runs that config without asking. It is therefore
-/// announced on the run that makes it, and recorded in the sidecar.
-/// `check_trust` refuses the cases where the grant would be wrong.
+/// announced on the run that makes it, and recorded in the sidecar as
+/// `grok_trust` only once a post-run read of the store shows it
+/// (`Prepared::verify_trust`), because passing `--trust` is not proof that
+/// grok saved it. `check_trust` refuses the cases where the grant would be
+/// wrong.
+///
+/// Granting is accepted because a profile asking for `workspace-write`, from
+/// the project's `.review.toml` or the global config, is the operator's
+/// opt-in to letting an agent change this repo; making a human repeat that
+/// in grok's TUI buys nothing. Grok's own `--trust` is used rather than
+/// `review` writing `trusted_folders.toml`, so the entry uses grok's key and
+/// lock and cannot land where grok never looks.
+///
+/// A setup failure (unparseable file, edited profile, declined trust,
+/// symlink, grok worktree, roots not matching the recorded profile) is a
+/// launch `Err`, because running anyway reproduces the build-lock and
+/// cancellation failures more expensively.
 ///
 /// Creating a profile is printed, because it edits the operator's file and an
 /// edit nobody saw is the ambient widening the rest of this file refuses; an
@@ -813,6 +863,21 @@ fn prepare_grok_write(
 
 /// Prepared adapter state. The grant remains provisional until the post-run
 /// store read; neither preparation nor passing --trust proves persistence.
+///
+/// `Grok` is resolved once per invocation, before any launch, and reused for
+/// write setup, every wake, cancellation hints, the pre-grant check and the
+/// post-run check. Every launch needs a resolvable absolute grok home,
+/// read-only and inherited-selector ones included, because a turn whose
+/// background results cannot be checked fails anyway; refusing before spawn
+/// is cheaper. The resolved paths are a snapshot, not a frozen child
+/// environment: profile `HOME`/`GROK_HOME` still layer over the process
+/// environment through `ProcessSpec`.
+///
+/// The post-run check runs after the wake loop and its teardown return,
+/// including on a returned error; cancellation or panic promises neither the
+/// check nor a record. It records only a trusted decision on the key the
+/// grant announced, so a trusted replacement workspace is not taken as proof.
+/// Each check reads the store afresh: grok may have written it since.
 pub(super) struct Prepared {
     grok: state::Grok,
     trust_grant: Option<PathBuf>,
@@ -833,6 +898,7 @@ pub(super) async fn prepare(
         let root = launch.root.clone();
         let roots = RootSet::new(&plan.paths);
         let state = prepared.grok.clone();
+        // Blocking: file I/O plus a `flock` another `review` may hold.
         let write =
             tokio::task::spawn_blocking(move || prepare_grok_write(&kind, &root, &roots, &state))
                 .await

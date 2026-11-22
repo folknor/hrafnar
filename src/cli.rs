@@ -262,9 +262,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Migration: the archetype used to be positional (`review security`). Still
-    /// accepted, with a warning, so orchestration procedures written against
-    /// the old form keep working until they are updated; `bare` means none.
+    /// Migration alias: a positional archetype (`review security`), accepted
+    /// with a warning so orchestration procedures written against it keep
+    /// working; `bare` means none.
     #[arg(hide = true, value_name = "ARCHETYPE")]
     pub legacy_archetype: Option<String>,
 

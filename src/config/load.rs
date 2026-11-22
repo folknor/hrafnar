@@ -2,8 +2,11 @@
 //! by walking up from the selected directory (or taken exactly from a `-C`
 //! root) and is required for a run, because it carries the audit id; the
 //! global file is optional. `load_optional` serves `review list`, which
-//! outside a project shows the global layer alone. Loading is strict: a file
-//! that exists but does not parse is an error, never treated as absent.
+//! outside a project shows the global layer alone; `project_root` locates a
+//! project without parsing it, for `review sessions`. Loading is strict: a
+//! file that exists but does not parse is an error, never treated as absent,
+//! because `review message` reads `[_audit].private` from it, and a silent
+//! fallback would file a private project's rows in the public log.
 
 use super::{
     CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, Selection, hostname, parse_file,

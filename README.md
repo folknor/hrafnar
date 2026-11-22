@@ -87,7 +87,7 @@ Archetypes are optional named priming prompts defined under `[archetypes]` (name
 
 Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, holds the candidate harnesses; `--harness`, `[_defaults].prefer` and what is installed pick one. A chosen harness that is not installed on this machine fails the run before anything launches - `review list` marks the harness a plain `-p <name>` picks.
 
-How each harness is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every harness captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one harness that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
+What each harness was observed to do is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every harness captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one harness that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
 ### Upgrading from the positional archetype
 

@@ -1,147 +1,156 @@
 # Grok
 
-Session launch intent is typed as SessionStart. The shared invocation owner
-prepares the fresh UUID before dispatch; the runner validates the intent and
-never mints an ID. Resumes carry a checked SessionId. Historical log fields
-and provider-reported evidence remain strings; they are checked before reuse
-as launch input. Fresh results prefer the echoed ID, falling back to the
-requested UUID; resume results keep the requested ID.
-
-How `review` drives grok, and why. Everything here is grok-specific; the
-cross-provider permission machinery (sandbox vocabulary, derived writable roots,
-recorded permissions, what a resume inherits) is in [sandbox.md](sandbox.md).
-
-## Invocation
-
-A fresh run is `grok --session-id <generated UUID>`; a `review resume` is
-`grok --resume <id>`. Both carry `--prompt-file <tmp> --output-format json
---permission-mode dontAsk`, then:
-
-- `--sandbox <level>`, translated from `review`'s vocabulary by
-  `provider::Permissions::profile` (`workspace-write` → `workspace`, or the
-  content-addressed `review-ws-<hash>` profile of [Writable roots](#writable-roots)).
-  A fresh run with no level gets `read-only`; a resume with no recorded level
-  gets no `--sandbox` at all, so grok applies the one it saved.
-- `--trust`, only for a write run in a project with no trust decision yet - see
-  [Folder trust](#folder-trust).
-- Profile settings: `model` as `-m`, `effort` as `--reasoning-effort`, `env`.
-- `--background-wait-timeout` and the env overrides
-  `GROK_FOREGROUND_BLOCK_BUDGET_MS` / `GROK_MAX_FOREGROUND_BLOCK_MS`, all set to
-  `GROK_COMMAND_WAIT_SECS` - see [Background commands](#background-commands).
-
-Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read literally as a one-character prompt (it was tested; grok inspected the repo and asked what was wanted). `--prompt-file <path>` is the escape from argument length limits instead, written via `new_temp_file` and removed by `RemoveOnDrop`. `sandbox` maps honestly to grok's `--sandbox`, so unlike claude it is not ignored.
-
-## `src/provider/grok/state/`
-
-`src/provider/grok/mod.rs` owns the runner and write setup. Its private `state/mod.rs` resolves the child environment. `trust.rs` owns folder trust, `sandbox.rs` owns content-addressed sandbox profiles and symlink admission; `fsutil::locked_update` owns the generic locked atomic replacement, `events.rs` reads session files and cancellation causes, and `background.rs` detects unread work and builds wake prompts. Each module keeps its corresponding tests.
-
-`review`'s dealings with grok's state dir, through `Grok` - the environment *as the child will see it*: `Grok::resolve` takes `GROK_HOME` and `HOME` from the profile `env` first, then the process (the `CODEX_HOME`/`data_root` trap), and refuses a relative home. Trust is **read, not written** - grok writes it via `--trust`. `check_trust` returns the decision grok would reach and refuses where the grant would be wrong or cannot work: a covering `trusted = false` (grok's grant would overwrite it), a store grok cannot parse (grok would trust nothing), a symlinked store (grok refuses to load it), a grok-managed `-w` worktree (keyed through grok's sqlite registry, which `review` cannot read). `decision` models grok's gate: it queries with the *workspace key* (`folder_trust::decide_inputs`), and `is_trusted` only counts entries that prefix the key and share its workspace id - so the key's own entry is the only one that can decide (a `false` on a subdirectory is never consulted; one reviewer claimed otherwise, and grok's source settled it). `workspace_key` models grok's key: canonical git root, linked worktree collapsed onto its main checkout, the dir itself when the root is the user's home. `RootSet::profile_name` names a lexical root set by content (`review-ws-` + 16 lowercase hex digits from FNV-1a of the sorted, deduplicated set - FNV because `DefaultHasher` is not stable across Rust releases, pinned by a test); `ensure_profile`/`merge_profile` take only that `RootSet` and derive its name, then create that profile in `sandbox.toml` (`extends = "workspace"`, `read_write` = exactly the set, inline layouts accepted) and never modify one - an existing profile whose roots or base (absent reads as `workspace`, as grok does) no longer match its name is refused as edited. On resume, only that exact generated name shape is treated as a `review` profile; other names beginning `review-ws-` remain native Grok profiles. `TrustDocument`/`SandboxConfig` mirror grok's serde types field for field, because grok deserializes each file whole and drops all of it on one bad entry. The sandbox updater uses `toml_edit` within `fsutil::locked_update`: exclusive `flock` on `<file>.lock` (grok's convention for its trust store; grok never writes `sandbox.toml`, so there it serializes `review` against itself), then a unique 0600 temp renamed into place. Grok's caller refuses a path through a symlink because grok will not load a trust-boundary file through one. `trust_failures` picks grok's `folder trust` failure lines out of stderr. `untrusted_hint` explains a cancelled turn. `cancel_cause` retains an open `CancelCause { category, refused_tool }` until the existing flat digest text is rendered, and reads a session's `events.jsonl` (`turn_ended.cancellation_category` of the last turn, plus the tool whose `permission_resolved` was not `allow`); `session_events` finds that file by scanning `sessions/*/<id>/` so grok's cwd-encoding scheme is never re-implemented.
-
-Adapter preparation resolves `Grok` once per invocation, before any provider
-launch, and reuses that state for write setup, every wake, cancellation hints,
-the immediate pre-grant trust check and post-run durability verification. All
-launches require a resolvable absolute Grok home, including read-only, custom,
-full-access and inherited-selector launches. An invalid home is refused before
-spawning rather than launching a turn whose background results cannot be checked.
-The resolved locations are a snapshot, not a frozen child environment: profile
-HOME/GROK_HOME overrides still layer over the inherited process environment via
-ProcessSpec, and production code does not mutate that process environment.
-
-The adapter owns provisional trust state. After the wake driver and its child
-teardown return, including a returned launch/turn error, it re-reads the same
-store and projects only a verified durable grant into `ProviderResult.grok_trust`.
-Cancellation or panic does not promise a postcheck or a trust record. The pre-grant check refuses if the workspace key changed since preparation;
-the postcheck requires both the original key and a trusted decision, so a
-trusted replacement workspace cannot be recorded as proof of the announced
-grant. Turns without --trust leave enforcement to Grok. Generic invocation
-does not interpret Grok trust policy. Symlink admission remains at
-`ensure_profile`; the generic filesystem helper holds a separate lock across
-read, transform, write and rename, and cleans temporary files on returned errors.
-
-Trust observations share one `StoreState` loader: Missing, Unloadable(reason),
-or Loaded(TrustDocument). It rejects observed symlinks and inspection/read/parse
-errors consistently for preparation, cancellation hints and postchecks. Each
-phase reads afresh; no prelaunch snapshot is reused after Grok may have written.
-`observe_trust` retains Declined; `check_trust` adds the launch refusal. A hint
-names an explicit decline, an undecided/missing store, or a loadability error
-without claiming the latter proves a decision. The postcheck reports declines
-and unreadable stores distinctly and records only a matching-key Trusted result.
-Inspection and read remain separate operations, with the existing replacement
-race and best-effort workspace-key resolution limits.
-
-`RootSet` sorts and deduplicates the already selected strings; it performs no
-path expansion, filesystem resolution or host derivation. `ProfileName` means
-only the exact historical generated syntax, parsed from a record or minted by
-that set. A resume checks the captured name against the recorded set before
-profile creation. Missing recorded roots mean the empty set, never current host
-roots: only the historical empty-set name can match. The name binds the root
-list and workspace base, not the entire effective policy; other valid existing
-profile fields remain accepted as before.
-
-`WakeCheck` is Clean, Unread(items), or Unverifiable(reason). Unavailable logs
-include both missing and unreadable logs; malformed JSON retains its line and
-parser error as fields until display. Clean means the existing fold found no
-unread work, not proof of a complete log: empty logs, unknown JSON objects and
-valid final JSON without a newline retain their historical acceptance. This
-change does not add a stricter update schema or a terminal-record requirement.
-
-The module's tests resolve their scratch directory (`std::fs::canonicalize`) before use. The trust-boundary check refuses a path with *any* symlinked ancestor, and `target/` is itself a symlink on hosts that keep the build cache on another drive, so an unresolved scratch path made every store "reached through a symlink" before a test had planted one of its own.
+What grok does that the adapter in `src/harness/grok/` is built around:
+observed behaviour, measurements and upstream facts the code cannot state
+for itself, plus the two flows that span several modules. The rules and
+their reasons are on the code. The cross-harness permission machinery is
+in [sandbox.md](sandbox.md).
 
 ## Turns classify themselves
 
-**Grok needs none of codex's death-detection machinery, because it classifies its own turns.** Its `--output-format json` prints one result object per run carrying `stopReason`, and only `end_turn` means `text` is an answer; a turn cut off mid-flight comes back `cancelled` with `text` holding interim commentary. That is precisely the distinction codex forces `review` to reconstruct from rollout byte offsets and `final_answer` scanning, handed over as a field. So each grok turn (`run_grok_turn`) is a plain spawn-and-parse with no watchdog, no transcript forensics, no incident bundle, and no codex-style auto-resume (which is codex-gated). A pending stop prevents a new turn, including a background-result wake; the contained launch gate closes the race between that check and spawn. An already running grok turn is ended by keeper teardown because Grok has no external turn interrupt. The one loop grok *does* get - waking the model for background results it never read - answers a different question (did the model see its own work?) and is described under [Background commands](#background-commands). `interpret_grok_output` sorts a finished run into three outcomes, and the split between the last two is the load-bearing part: **an `Err` means the run never reached a turn** (spawn failure, unknown model, unknown session, a typed `{"type":"error"}` line - checked *first*, since every result field is optional and such a line otherwise parses as a valid empty result and loses its message); **`GrokOutcome::NoAnswer` means a turn ran and its result did not prove an answer**, and returns `Ok` carrying the session id plus a no-answer `Outcome` whose `stated` holds provider-stated reasons (persisted as `turn_error`); a missing `stopReason` is recorded as `unverified` (persisted as `review_error`). "A turn ran" is established by `GrokResult::ran_a_turn` (a `stopReason`, `sessionId` or `num_turns` is present), not by the JSON merely parsing: every field is optional, so *any* object deserializes into an all-default result, and since `NoAnswer` returns `Ok` it tells `review resume` the prompt cache was warmed - an unrecognised pre-turn failure would otherwise mark a cold session warm and get the *next* resume refused as stale. The digest records the **observed** exit code and signal rather than an assumed `1`; a real answer from a process that nonetheless exited non-zero also gets a digest (its outcome is still an answer, so it does not count as a death) because that status is the only sign something went wrong after the turn finished. Collapsing the second into `Err` - which the first version did - silently costs two things: `invoke` forces `session_id: None` on every error path, so the id review already minted is dropped and the cut-off turn (the one most worth resuming) cannot be resumed; and `review resume` refreshes its cold-cache clock on `output.is_ok()`, so a resume that ran and warmed the cache would leave the clock stale and get the *next* resume wrongly refused. This is the same reason codex returns `Ok`-with-a-death-outcome rather than `Err`. The failure still surfaces as one: an outcome with no answer makes `Outcome::failed` true so the process exits 1, independently of the observed provider exit code, and the flat digest `turn_error` or `review_error` keeps the reason greppable. Grok also has no verified on-disk rollout, which is the other reason recovery does not apply: there is nowhere to recover from.
-
-Resumed grok output retains the session ID supplied to the runner, so the
-shared result printer can name the resumed session.
+Grok's `--output-format json` prints one result object per run, and its
+`stopReason` is the only answer signal: `end_turn` means `text` is an
+answer, while a turn cut off mid-flight comes back `cancelled` with interim
+commentary in `text`. Every field of that object is optional, and a
+pre-turn failure prints a typed `{"type":"error"}` line that parses as an
+empty result. That is why `interpret_grok_output` checks the error type
+first and requires a field grok sets only after running a turn.
 
 ## Folder trust
 
-**A grok write run trusts its project first, because grok cancels edits in an untrusted folder.** In a folder with no trust decision in `trusted_folders.toml`, every file edit raises a permission prompt; `--permission-mode dontAsk` resolves it `cancelled`, and grok ends the *whole turn* rather than handing a denial back to the model. The sandbox level is irrelevant - `--sandbox workspace` was passed correctly throughout. Observed on grok 1.0.40: six `workspace-write` fixers in an untrusted checkout each read, diagnosed and announced their fix, then were cancelled at their first `search_replace` after 5-16 minutes. The same edit with the same flags succeeds in a trusted folder (verified A/B). Running `review` in a project with a profile that asks for `workspace-write` *is* the operator's decision that this project may be written - whether that profile lives in the project's `.review.toml` or in the global config, the invocation is the opt-in - so a grok write run launches with grok's own hidden `--trust` flag (`xai-grok-pager/src/app/cli.rs`, honoured in headless mode by `headless.rs` via `folder_trust::grant_folder_trust`) rather than making a human repeat that decision in grok's TUI. An earlier version wrote `trusted_folders.toml` itself; review found its model of grok's key diverged for linked worktrees and a dotfiles repo at `$HOME`, so an entry landed where grok never looks. `--trust` uses grok's own key and lock, so that class of bug cannot exist - verified on 1.0.40 against a scratch `GROK_HOME`: launched from `piners/target/grokperm`, it recorded `/home/folk/Programs/piners`, before the auth check. **What a grant actually is**, which the first version understated as "may edit": grok's folder trust is VS-Code-style workspace trust, and it gates whether the repo's own `.grok` MCP/LSP config may spawn servers - "arbitrary commands from repo-controlled config files" (`trust.rs` module docs). And it is **permanent and host-wide**: the entry stays in `trusted_folders.toml`, so from then on every grok session in that repo, the operator's interactive ones included, runs that config without asking. Accepted because the repos `review` is pointed at are the operator's own and launching a `workspace-write` run there is their explicit opt-in to letting an agent change the repo - but never silently: `--trust` is passed **only when the project has no decision yet** (an already-trusted project gets no flag), the run that grants it prints what it means (`grok: trusting <key> permanently ... grok will also run this repo's .grok MCP/LSP config without asking`), and the key lands in the sidecar as `grok_trust` (`jq 'select(.grok_trust)'` lists every grant `review` ever made) - but only after the store is re-read post-run and shows it: a grant grok fails to save (`KeyMoved`, `Unreadable`, a process-local fallback) is printed only to grok's stderr, so `trust_failures` surfaces it as a warning and nothing is recorded, because "we passed `--trust`" is not "the folder is now trusted". Limits that keep it from being ambient widening: grok's grant covers only grok's key for the project; `review` **never lets it override a `trusted = false`** on that key (grok's grant would; `check_trust` refuses the launch - automating a yes must not overturn a recorded no); an unsafe trust key (the filesystem root, the user home, or a relative path) is refused before any grant is announced; a store grok cannot parse is refused (grok would trust nothing); a grok-managed `-w` worktree is refused, because its key comes from grok's sqlite registry and a wrong guess could let the grant land on a declined source repo (grok consults that registry only for paths under `$GROK_HOME/worktrees` - `worktree_record_for_cwd_in` - so that is exactly the set refused). **Residual race, accepted**: the declined-check and grok's grant are separate reads of the store, and grok offers no "grant unless declined" operation, so a `false` written between them would be overwritten. `run_grok` re-checks immediately before spawn, shrinking the window to grok's startup; closing it needs grok. Likewise the symlink refusal is check-then-write; exploiting that needs write access to the grok home, which already means editing the config directly, so it is out of the threat model. A `read-only` run passes no `--trust` and touches no file: reads work untrusted. It also does **not** use `--always-approve`/`bypassPermissions`: those disable approval for everything, where trust is scoped to one folder. For a turn that is cancelled anyway, grok's own `cancellation_category` and the last refused tool from `events.jsonl` are appended to `turn_error` (a refusal that a later allowed permission superseded is not named: the turn went on past it, so it is not why the turn ended), with the trust hint when it applies. Grok's reported `num_turns` and `usage` now populate the digest too (input codex-shaped, i.e. including cache reads), so a cancelled run no longer reads as one that spent nothing.
+In a folder with no decision in `trusted_folders.toml`, grok raises a
+permission prompt on every file edit. Under `--permission-mode dontAsk`
+the prompt resolves `cancelled`, and grok ends the whole turn instead of
+handing the model a denial. The sandbox level does not matter. Observed on
+grok 1.0.40: six `workspace-write` runs in an untrusted checkout each read,
+diagnosed and announced a fix, then were cancelled at their first
+`search_replace` after 5 to 16 minutes. The same edit with the same flags
+succeeds in a trusted folder (A/B verified).
+
+Upstream facts the trust code models, from grok's source:
+
+- `--trust` is hidden (`xai-grok-pager/src/app/cli.rs`) and honoured in
+  headless mode by `headless.rs` through `folder_trust::grant_folder_trust`.
+  Verified on 1.0.40 against a scratch `GROK_HOME`: launched from a
+  subdirectory, it recorded the repo root, before the auth check.
+- A grant is VS-Code-style workspace trust: it also lets the repo's own
+  `.grok` MCP/LSP config spawn servers (`trust.rs` module docs). The entry
+  is permanent and host-wide, so the operator's interactive sessions in
+  that repo run that config too.
+- Grok's gate queries the store with the workspace key
+  (`folder_trust::decide_inputs`), and `is_trusted` counts only entries that
+  prefix the key and share its workspace id. Only the key's own entry can
+  decide: a `false` on a subdirectory is never consulted.
+- Grok's grant overwrites a `trusted = false`, and grok offers no "grant
+  unless declined" operation. The decline check and the grant are separate
+  reads, so a `false` written between them is lost; re-checking right
+  before spawn shrinks that window to grok's startup.
+- A grok-managed `-w` worktree is keyed through grok's sqlite registry,
+  consulted only for paths under `$GROK_HOME/worktrees`
+  (`worktree_record_for_cwd_in`). That is exactly the set `review` refuses.
+- A failed grant (`KeyMoved`, `Unreadable`, a process-local fallback) is
+  printed only to stderr, and success prints nothing
+  (`folder_trust::report_cli_trust_grant`).
+
+The grant spans three steps in `mod.rs`: `prepare` announces a grant only
+for an undecided key, `run_grok_turn` re-checks that key just before spawn,
+and `Prepared::verify_trust` re-reads the store after the run. Only a
+trusted entry on the announced key reaches the sidecar as `grok_trust`, so
+`jq 'select(.grok_trust)'` lists every grant `review` made.
 
 ## Writable roots
 
-**A grok write run gets exactly the same derived writable roots as codex, through a content-addressed sandbox profile `review` creates in `~/.grok/sandbox.toml`.** Grok's built-in `workspace` profile writes only to the workspace, the grok home and the temp dirs, so the second wave of fixers - trusted now - edited fine and then every `brokkr test` died at `lock: failed to open lock file` on `~/.brokkr`, exactly as codex did before `writable_roots/`. Two fixers worked around it by moving `HOME` under `target/`, which silently took a private brokkr lock and bypassed the host's build-contention gate. Grok offers no flag or env var for extra writable paths (checked in `research/grok-build`: `config.toml`'s `[sandbox]` and `GROK_SANDBOX` select a profile *by name* only; `GROK_HOME` would move auth, sessions and trust with it, the `CODEX_HOME` problem again). The one surface is a named profile, in the global file or a project `.grok/sandbox.toml`. The project file was rejected because it would put a host-specific generated file into every repo. `review` therefore derives the roots exactly as for codex (same `writable_roots::derive_with`, same filters, same announcement, same sidecar record), names a profile for that exact set (`review-ws-<hash>`), creates it if it is missing, and launches with `--sandbox review-ws-<hash>`. **One profile per distinct set, not one shared profile.** The first version shared a single `review-workspace-write`; sharing forces it to be union-only (a run that rewrote it to its own roots could strip a concurrent run's grants between the write and that run's grok starting), and union-only meant a root one project's `.review.toml` added became writable to every later grok write run on the host - broader than codex, where each run gets exactly its own roots. A codex review flagged it. Content-addressed profiles restore the codex property: a run gets exactly its set; a profile is created once and never modified (so concurrent runs cannot interfere, and there is nothing to prune); two runs with the same set share one entry. The cost is one entry per distinct set in the operator's `sandbox.toml` - in practice one per host, plus one per project whose profile adds extra roots. The recorded `writable_roots` is exactly the profile's set. The whole resulting file is validated against mirrors of grok's serde types before it is written, because grok drops the entire global file on one bad entry - and then a checked-out repo's `.grok/sandbox.toml` could define a `review-ws-*` name itself (project profiles only lose to a *loaded* global of the same name). A symlinked `sandbox.toml` (or grok home) is **refused**, not followed: grok lists `sandbox.toml` among its trust-boundary files and refuses to load one through a symlink (`resolve_trust_boundary_sources`, `ensure_grok_trust_boundary_slots`), so a profile written through a dotfile manager's link could never be used - an earlier version followed the link and wrote a profile grok would not load. The grok home is resolved as the child sees it, profile `env` `GROK_HOME` and `HOME` included - the `CODEX_HOME`/`data_root` trap again. **Resume**: grok fixes a session's sandbox profile for its lifetime and refuses an explicit `--sandbox` that differs from the saved one (`resolve_startup_sandbox` → `Conflict`), so the sidecar saves the exact name in `provider_sandbox` while `sandbox` carries the normalized review level. Resume prefers `provider_sandbox`, falling back to `sandbox` for old native-form rows, and `Permissions::restore` retains that native name without translating it. A session recorded under a `review-ws-*` profile resumes under that exact profile with the canonical root set **recorded with it** - not re-derived, because the name pins one set and a resume on another host would derive a different one; the recorded roots are checked to hash back to the name (a mismatch is a launch error), and the profile is recreated from them if someone deleted it, which grants nothing the session did not already have. One recorded as `workspace` (created before these profiles existed) resumes as `workspace` with trust ensured and no extra roots, because it cannot be moved. One with **no** recorded level (an old row) gets no `--sandbox` at all, so grok applies the saved one - forcing `read-only` there made every such write session unresumable - and no trust or root setup, since nothing says it writes. A setup failure (unparseable file, edited profile, declined trust, symlink, grok worktree, roots not matching the recorded profile, relative `GROK_HOME`) is a launch `Err`, because running anyway reproduces the lock and cancellation failures more expensively. The setup runs in `spawn_blocking`: file I/O plus a `flock` another `review` may hold (grok never writes `sandbox.toml`; the lock serializes concurrent `review` calls, where two runs may create the same profile at once). Grok's `workspace` leaves `restrict_network = false` (confirmed in `profiles.rs`), so the unix-socket grant codex needs has no grok counterpart.
+Grok's built-in `workspace` profile writes only to the workspace, the grok
+home and the temp dirs, and leaves `restrict_network = false`
+(`profiles.rs`), so codex's unix-socket grant has no grok counterpart.
+Grok offers no flag or env var for extra writable paths: `config.toml`'s
+`[sandbox]` and `GROK_SANDBOX` select a profile by name only, and moving
+`GROK_HOME` would move auth, sessions and trust with it. The one surface is
+a named profile in the global or a project `.grok/sandbox.toml`.
+
+Without the extra roots, trusted write runs edited fine and then every
+`brokkr test` died at `lock: failed to open lock file` on `~/.brokkr`. Two
+runs worked around it by moving `HOME` under `target/`, which took a
+private brokkr lock and bypassed the host's build-contention gate.
+
+Grok lists `sandbox.toml` among its trust-boundary files and refuses to
+load one through a symlink (`resolve_trust_boundary_sources`,
+`ensure_grok_trust_boundary_slots`). It deserializes the global file whole
+and drops it on one bad entry, after which a checked-out repo's project
+file may define a `review-ws-*` name: a project profile loses only to a
+loaded global one of the same name.
+
+On resume grok fixes a session's profile for its lifetime and refuses an
+explicit `--sandbox` that differs (`resolve_startup_sandbox` returns
+`Conflict`); no flag applies the saved one. The resume selector is decided
+across three places. The sidecar stores the exact native name in
+`provider_sandbox` beside the normalized `sandbox` level, and resume
+prefers `provider_sandbox`. `Permissions::restore` keeps that native name
+untranslated. A generated `review-ws-*` name maps to `GrokWrite::Resume`
+with the roots recorded alongside, `workspace` to
+`GrokWrite::BuiltinWorkspace`, and no recorded level to no `--sandbox` and
+no write setup.
 
 ## Background commands
 
-**Grok shell commands stay in the foreground until they finish, so reading a build's result does not depend on the model remembering to wait.** Grok moves any command that blocks longer than 15s to the background (`toolset.bash.auto_background_on_timeout`, on by default). A model that then calls `get_command_or_subagent_output` with a timeout blocks within the same turn and reads the result - session `db7ea2b1` did exactly that for two `brokkr test` runs, guided by grok's bundled `long-running-background-tasks` skill. A model that instead ends its turn loses the result: in `-p` mode `headless.rs` waits only for the task to *finish* and exits once `pending_bg` is empty, and the completion is queued as a wake-up for a model that never gets another turn. Two second-wave fixers ended that way ("I'll read the result when that build finishes"), and a live probe showed `brokkr test` passing 13s after grok had exited. Which of the two happens is model behaviour, and the failure is silent - a run that looks finished with no report - so `review` enforces the outcome instead of hoping for it, in two layers. **(1) Keep commands in the foreground where grok allows it.** The auto-background switch is `config.toml`-only (not on the `GROK_CONFIG` allowlist, `config_override::OVERLAY_ALLOW_PATHS`), and turning it off would not help - a non-backgroundable command is *killed* at `min(timeout, max(5min, configured))` instead - so `run_grok_turn` sets grok's own env overrides, `GROK_FOREGROUND_BLOCK_BUDGET_MS` (the 15s budget) and `GROK_MAX_FOREGROUND_BLOCK_MS` (the 5-minute kill cap for a command that *cannot* be backgrounded - not the normal path), to `GROK_COMMAND_WAIT_SECS` (20 minutes; a profile `env` can restate either). A command then holds the foreground for `min(model's timeout, 20min)` - the model may ask for up to 10h because production grok always sends `max_timeout_secs` = 10h (`PRODUCTION_MAX_TIMEOUT_SECS`; a reviewer's reading of the 5-minute `DEFAULT_MAX_TIMEOUT_MS` as the ceiling missed that). Verified: a 30s command ran in the foreground and its output was reported in the same turn. That cannot be a guarantee: the *model* picks the timeout (120s when it picks none, `DEFAULT_TIMEOUT`, raisable only via `config.toml`), and can background work on purpose. **(2) Wake the model for anything it missed - the actual guarantee.** `--background-wait-timeout` is raised to the same 20 minutes (default 600s, after which grok *kills* the pending work), so a command the model walked away from still finishes and leaves its output in the session. Then `run_grok` reads grok's own update stream (`Grok::wake_check`, using the private update fold) for work the model never saw: a `task_completed` or `subagent_finished` after the last *real* turn end; a `task_completed` marked `will_wake` that no *later* turn (one whose prompt arrived after the completion) has ended since; or a `task_backgrounded`/`subagent_spawned` in the latest turn that never finished. The `will_wake` rule came from a live test: a warm `brokkr test` the model had backgrounded finished *before* the model's turn ended, so "completed after the last turn end" called it read - but grok does not hand a background result to the running turn, it queues it as a wake-up, and that message sat unread after the turn. Grok records the difference on every completion: `will_wake: true` / `block_waited: false` when the model was not waiting (both lost sessions), `will_wake: false` / `block_waited: true` when it was blocked on it and got it in-turn (`db7ea2b1`). Subagents carry no such flag, so a background subagent finishing mid-turn is still judged by the turn-end rule alone - the one known gap. If there is any, it resumes the session (same sandbox, model; no `--trust`) with a prompt that **contains the shell results** (`provider::grok::state::wake_prompt`: each command's exit status and the last 16 KB of its output from grok's own `task_snapshot`, with the full log's path when grok recorded one; a plain "did NOT finish" for work grok stopped at exit, naming the partial log only when there is one), and repeats until a turn ends with nothing unread. Carrying the result rather than pointing at it is the load-bearing part, and a second review forced it: a first version only told the model to go and read the output, and a model that ignored that and ended its turn produced a clean-looking turn boundary with the result still unseen. A prompt that contains the result has delivered it by being sent. **Subagents are the exception**: the update fields `review` reads carry a finished subagent's status and error but not its result text, so the wake prompt can only *notify* the model and tell it to fetch the result with `get_command_or_subagent_output` before ending. A clean wake turn therefore proves a shell result was delivered, but not that a subagent's result was read. Details a first review found: grok starts its *own* wake turns when background work finishes (prompt ids `task-completed-*` etc., `notification_bridge.rs`), and one torn down at exit writes a non-`end_turn` `turn_completed` that must not count as the model reading anything; work that never finished is only counted within the latest turn, because each resume is a new grok process that can never finish an earlier one's task (safe to drop after that turn *because* the wake prompt told the model it did not finish); and persistent monitors (`task_backgrounded` with `monitor_description`) never complete by design and are not counted. The run **fails closed**: if grok's home or the session's update log cannot be read, or a line of it does not parse (grok flushes the log before a headless process exits, so a bad line means something is wrong), the run fails rather than passing unverified. Verification and wake-launch failures are recorded as `review_error`, separately from grok's own `turn_error`. They preserve whether an answer was captured and the last observed process status; review's failure verdict never invents an exit code or labels a captured answer as interim text. It also fails at `GROK_MAX_WAKES` (10) - each wake delivers or notifies what it names, so only a model that keeps starting new background work reaches it. It does not wake after a stated failure or missing `stopReason` (the codex stated-failure lesson; that outcome already fails the run), and a wake turn that fails to launch keeps the first turn's output and session id. Each wake is printed, the answer is prefixed with the wake count, and cost, turns and token usage are summed across every turn into the run's digest, and the served models of every turn are recorded together. The wake turn's text, outcome and digest replace the earlier turn's whole (`GrokTurn::absorb`), so an outcome is never assembled from two turns. There is no overall wall-clock cap: each wake is one model turn plus at most one 20-minute background wait. This is the codex auto-resume idea applied to a different gap: codex's is a one-shot retry for a death; grok's is a loop until a verifiable condition holds. Side finding: grok honours the repo's Claude Code permission file (`.claude/settings.local.json`) - a probe's `sleep` was refused by its deny rules - so an agent's allowlist shapes what a grok run can execute too.
+Grok moves any shell command that blocks longer than 15s to the background
+(`toolset.bash.auto_background_on_timeout`, on by default). In `-p` mode
+`headless.rs` waits only for the task to finish, exits once `pending_bg` is
+empty, and queues the completion as a wake-up for a model that never gets
+another turn. Which happens depends on the model:
+
+- Session `db7ea2b1` called `get_command_or_subagent_output` with a timeout
+  for two `brokkr test` runs, guided by grok's bundled
+  `long-running-background-tasks` skill, and read both in-turn.
+- Two other runs ended their turn ("I'll read the result when that build
+  finishes"), and a live probe showed `brokkr test` passing 13s after grok
+  had exited.
+- A warm `brokkr test` that the model had backgrounded finished before the
+  model's turn ended, and its wake-up message still sat unread afterwards:
+  grok never hands a background result to the running turn.
+
+Grok records the difference on every shell completion: `will_wake: true`
+with `block_waited: false` when the model was not waiting (both lost
+sessions), `will_wake: false` with `block_waited: true` when it was blocked
+on it (`db7ea2b1`). Subagent completions carry no such flag, which is the
+one known gap in the unread-work detection.
+
+Limits that shape the timeouts in `run_grok_turn`, from grok's source:
+
+- The auto-background switch is `config.toml` only, not on the
+  `GROK_CONFIG` allowlist (`config_override::OVERLAY_ALLOW_PATHS`).
+  Turning it off kills a command at `min(timeout, max(5min, configured))`.
+- Production grok always sends `max_timeout_secs` of 10h
+  (`PRODUCTION_MAX_TIMEOUT_SECS`); the 5-minute `DEFAULT_MAX_TIMEOUT_MS` is
+  not the ceiling. The model's default timeout is 120s (`DEFAULT_TIMEOUT`),
+  raisable only through `config.toml`.
+- `--background-wait-timeout` defaults to 600s, after which grok kills the
+  pending work.
+- Grok starts its own wake turns when background work finishes (prompt ids
+  `task-completed-*` and similar, `notification_bridge.rs`).
+
+Verified: with the raised budgets, a 30s command ran in the foreground and
+its output was reported in the same turn.
+
+Grok also honours the repo's Claude Code permission file
+(`.claude/settings.local.json`): a probe's `sleep` was refused by its deny
+rules, so an agent's allowlist shapes what a grok run can execute.
 
 ## The served model
 
-**Grok's served model is recorded, never inherited.** Grok reports in its result JSON (`modelUsage` keys) which model actually served the run, and it is a *different name* from the one selected: `-m grok-4.7` is served as `grok-4.7-build`, which `grok models` does not list and `-m grok-4.7-build` refuses as an unknown model id. It is persisted as `served_model` (with `cost_usd` from `total_cost_usd`) because it is the truthful record of what ran, but it is deliberately absent from `SessionRecord`, so no resume can read it back into `-m` and fail the launch. `model` keeps holding the selectable name. Record-only today; nothing consumes either field.
-
-Grok also stores the model with the session, so the `-m` a resume inherits is redundant for grok rather than corrective - see [sandbox.md](sandbox.md#what-a-resume-inherits).
+Grok reports the model that served a run in its result JSON (`modelUsage`
+keys), and it is a different name from the selected one: `-m grok-4.7` is
+served as `grok-4.7-build`, which `grok models` does not list and `-m`
+refuses as unknown. That is why `served_model` is recorded but kept out of
+`SessionRecord`, so no resume reads it back into `-m`. Grok also stores the
+model with the session, so the `-m` a resume inherits is redundant for grok
+(see [sandbox.md](sandbox.md#what-a-resume-inherits)).
 
 ## Source checkout
 
-`research/grok-build` is a gitignored checkout of grok's source. Like
-`research/codex` (see [codex.md](codex.md#source-checkout-and-diagnostics)) it
-is not ours and not guaranteed to be present, but when it is it is the
-authority on grok behaviour asserted here: `xai-grok-pager/src/app/cli.rs` for
-the hidden `--trust` and `--background-wait-timeout` flags, `headless.rs` for
-what `-p` mode waits for, `trust.rs`/`folder_trust` for the trust key, and
-`profiles.rs` for the built-in sandbox profiles.
-
-Caller-minted fresh identities are marked before spawning, just like resumes.
-If a fresh result echoes a different identity, a second guard covers that
-identity while the original guard stays alive through the wake loop. Wake
-launches convert the selected result identity to SessionId; a failed conversion
-preserves the completed turn and marks a review failure.
-
-## Runner fixtures
-
-ProviderRuntime.commands supplies Grok's executable and leading arguments, just
-as for the other adapters. Each turn, including background-result wakes, appends
-its prepared arguments to that prefix; cwd, environment, prompt-file transport
-and containment remain the runner's responsibility. tests/provider_runs.rs uses
-a shell prefix to exercise fresh launches, resumes, background-result wakes and a provider-stated failure
-with exit 0 without installing Grok. The fixture reads the prompt before its
-file is removed and writes the session update log used by background verification.
-
-The launch argv table covers fresh/resume and omitted/named sandbox levels,
-including generated workspace profiles, their exact effective root lists,
-permission mode, selectors, trust flag and background timeout. These are argv
-assertions; fixtures never wait those production durations. A shared per-adapter
-lifecycle suite covers launch notification, stop-before-spawn, pending ownership
-and death, with each protocol's distinct turn-establishment rule. Grok remains
-non-interruptible; interrupt cases are specific to Claude and Codex.
+`research/grok-build` is a gitignored checkout of grok's source, not
+guaranteed present. When it is, it is the authority for the facts above:
+`xai-grok-pager/src/app/cli.rs` for the hidden `--trust` and
+`--background-wait-timeout` flags, `headless.rs` for what `-p` mode waits
+for, `trust.rs` and `folder_trust` for the trust key, and `profiles.rs` for
+the built-in sandbox profiles.

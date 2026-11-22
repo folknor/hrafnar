@@ -4,16 +4,20 @@
 //!
 //! The sidecar log (`sessions.rs`) is written *after* a run returns, so a run
 //! that is still going - or one that is wedged and will never return - is
-//! completely invisible to `review sessions`. During the 10-hour codex hang that
-//! motivated the watchdog, `review sessions` showed the session sitting at one
-//! touch the entire time, with the *previous* turn's response, which read
-//! exactly like "nothing is happening" while codex was in fact running. The
-//! touch count only ever increments on detected completion, so it cannot be used
-//! to tell working from wedged.
+//! completely invisible to `review sessions`, which would show a long codex
+//! turn at its last touch with the *previous* turn's response: exactly what
+//! "nothing is happening" looks like. The touch count only increments on
+//! detected completion, so it cannot tell working from wedged.
 //!
 //! A marker file is written as soon as the session id is known and retained
 //! through recording and handoff publication, which gives `review sessions` a third state to report:
 //! "turn in flight since <time>".
+//!
+//! Each marker is `SESSION.RUN_ID.json`, one per invocation, carrying the
+//! owner's and the keeper's process identity. An exact `SESSION.RUN_ID.interrupt`
+//! request is consumed when the run's lease closes, and closing turns its
+//! markers `HandoffPending` rather than removing them; the receipt is
+//! `sessions::handoff`.
 //!
 //! # Why a file rather than a sidecar row
 //!
@@ -542,12 +546,14 @@ pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Live> {
 /// in-flight marker exists (every runner writes it before spawning when the
 /// session id is known). Released by dropping it.
 ///
-/// Without it, two messages to one idle session both saw no turn in flight and
-/// both launched a turn on the same session at once. Codex's session lock made
-/// the second fail; claude has none, so both ran. And a message waiting behind
-/// the global lock was invisible to every other verb: no marker until it
-/// launched. With it, a second message waits for the first to launch, then
-/// finds its marker and interrupts it, as `review message` promises.
+/// Without it, two messages to one idle session would both see no turn in
+/// flight and both launch a turn on the same session at once: codex's session
+/// lock fails the second, but claude has none, so both run. And a message
+/// waiting behind the global lock would be invisible to every other verb, with
+/// no marker until it launched; holding this lock is what `review sessions`
+/// shows as `[queued]`. With it, a second message waits for the first to
+/// launch, then finds its marker and interrupts it, as `review message`
+/// promises. The whole sequence is in `reference/steering.md`.
 pub struct LaunchLock {
     /// Held only so the lock lives as long as this value: closing it releases
     /// the `flock`.
@@ -573,7 +579,7 @@ fn launch_lock_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBu
 /// Take `session_id`'s launch lock, waiting while another message to the same
 /// session holds it. Blocking - call off the async runtime. `Ok(None)` when no
 /// lock can be made (unsafe id, no data dir): the message then proceeds
-/// unserialised, as it did before the lock existed, rather than failing.
+/// unserialised rather than failing.
 pub fn lock_session_launch(
     session_id: &str,
     data_root: Option<&Path>,

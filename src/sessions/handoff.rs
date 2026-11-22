@@ -63,7 +63,7 @@ pub fn publish(data: &crate::data::DataDir, handoff: &Handoff) -> std::io::Resul
     })();
     let _ = std::fs::remove_file(tmp);
     // Keep receipts long enough for independent waiters. Only completed receipts
-    // age out; neither live markers nor requests are touched here.
+    // age out, after a day; neither live markers nor requests are touched here.
     if let Ok(entries) = std::fs::read_dir(path.parent().expect("result parent")) {
         for entry in entries.flatten() {
             let p = entry.path();

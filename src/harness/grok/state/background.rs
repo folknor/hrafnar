@@ -1,8 +1,10 @@
 use super::Grok;
 
 /// The existing update fold found no unread work, found work to deliver, or
-/// could not inspect the log. Clean does not claim log completeness: empty
-/// logs and future JSON objects retain their historical acceptance.
+/// could not inspect the log (missing, unreadable, or a line that is not
+/// JSON). Clean does not claim log completeness: an empty log, unknown JSON
+/// objects and a final line without a newline are accepted, and no terminal
+/// record is required.
 #[derive(Debug)]
 pub(in crate::harness::grok) enum WakeCheck {
     Clean,
@@ -167,8 +169,7 @@ impl Unread {
 /// *before* the turn's `turn_completed`. A model that ends its turn instead
 /// never sees it: headless `-p` waits for the task to finish, queues a wake-up,
 /// and exits without running that turn (`headless.rs` has no wake handling).
-/// That shows up as a completion *after* the last turn end - the exact
-/// signature of the live probe that lost a passing `brokkr test`, and absent
+/// That shows up as a completion *after* the last turn end, which is absent
 /// from a session whose model waited. Background subagents
 /// (`subagent_spawned`/`subagent_finished`) have no read signal in the update
 /// data we retain, so completion relative to a turn end is only a heuristic for
@@ -289,9 +290,8 @@ pub(in crate::harness::grok) fn unread_background_results(
     // completion it holds even if the model's turn ended *after* it: grok does
     // not hand the result to the running turn, it queues a wake-up message, so
     // the model has it only once a turn that *started* after the completion (a
-    // new prompt) has ended. The live test that motivated this: a warm
-    // `brokkr test` finished while the model was still writing "started", its
-    // turn then ended cleanly, and the wake-up message sat unread after it.
+    // new prompt) has ended. A completion that arrives while the model is
+    // still writing its turn would otherwise count as read.
     let read_by_later_turn = |i: usize| {
         prompts
             .iter()

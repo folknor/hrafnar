@@ -140,7 +140,7 @@ impl Grok {
 impl Grok {
     /// The decision grok would reach for a run in `dir`. Grok's gate queries
     /// the store with the *workspace key*, not the directory
-    /// (`folder_trust::decide_inputs` → `is_trusted_this_process(key)`), and
+    /// (`folder_trust::decide_inputs` then `is_trusted_this_process(key)`), and
     /// `trust.rs` `is_trusted` only counts an entry the key starts with *and*
     /// that shares the key's workspace id. An ancestor of the key belongs to a
     /// different workspace, and an entry below it does not prefix it, so the

@@ -18,6 +18,15 @@
 //! output. What it could not check is reported too, rather than passing as
 //! unchanged.
 //!
+//! The snapshot is taken for every harness and sandbox level, after launch
+//! preparation, so preparation's own writes are not attributed to the run. It
+//! covers `config`, `config.worktree` and `hooks/` in both the gitdir and the
+//! common dir, and follows `include.path`, `includeIf.*.path` and
+//! `core.hooksPath`. Each config is parsed by `git config --file -
+//! --no-includes` from bytes already read, under a 1 MiB limit, so git opens no
+//! file the snapshot did not capture. Nothing is ever restored: a warning is
+//! the whole response.
+//!
 //! This is advisory and best effort, and a clean result means nothing about
 //! security: it is a comparison of two points in time, and a change it reports
 //! may have been made by anything, not only the run. Not watched: the `config`

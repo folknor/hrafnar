@@ -156,7 +156,10 @@ impl Keeper {
         let term_until = deadlines.term;
         let final_at = deadlines.kill;
         // SIGTERM (and SIGCONT, so a stopped process can act on it) to every
-        // member as it is found, until the grace runs out.
+        // member as it is found, until the grace runs out. SIGTERM reaching a
+        // supervisor and its child together is fine for codex's:
+        // `codex-linux-sandbox` forwards a SIGTERM to its bwrap child and still
+        // waits for it before cleaning up.
         loop {
             if self.reap() {
                 self.account_dead();
@@ -181,8 +184,11 @@ impl Keeper {
         // removing the placeholder files it created in the workspace) can
         // reap and clean up before its turn. Only for half: a parent that
         // forks a new child each time its last one dies is never a leaf, and
-        // leaves-first alone would kill its children forever. From then on,
-        // every known member each round.
+        // leaves-first alone would kill its children forever, and a child it
+        // forked just before its own final kill would be left alive, adopted
+        // and unseen. From then on, every known member each round. One absolute
+        // deadline covers both phases, so a wide tree cannot stretch the
+        // teardown.
         let beat = self.spec.schedule.beat;
         let leaves_until = deadlines.leaves;
         loop {

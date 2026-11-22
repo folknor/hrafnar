@@ -48,33 +48,21 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // The build lock. Fatal when missing, and never inside the workspace.
     //
     // The grant is the whole directory, which also covers brokkr's `--commit`
-    // worktrees under `worktrees/`. They used to be siblings of the project
-    // (`<parent>/.brokkr-worktree-<project>-<sha>`) so that `../dep` path
-    // dependencies resolved, and that location could not be granted at all:
-    // creating one writes into the parent of every repo, the sha is chosen
-    // inside the run, and codex writable roots take no globs. Brokkr now makes
-    // a per-worktree container here, with the checkout and one symlink per
-    // out-of-repo path dependency side by side, so `../dep` still resolves
+    // worktrees under `worktrees/`. A sibling of the project could not be
+    // granted: creating one writes into the parent of every repo, the sha is
+    // chosen inside the run, and codex writable roots take no globs. Brokkr
+    // makes a per-worktree container here, with the checkout and one symlink
+    // per out-of-repo path dependency side by side, so `../dep` still resolves
     // and the sandbox, which binds the resolved path, keeps the real sibling
     // checkout read-only. Their build output goes under the project's target,
     // which the cargo-target grants below already cover.
     //
-    // `$HOME/.brokkr`, not `$XDG_RUNTIME_DIR`. The latter looked like a generic
-    // machine fact but never was one - nothing about a Rust build needs it, and
-    // it was derived purely because that is where the build lock used to live.
-    // It failed as a location twice over: it is absent from any login that does
-    // not go through pam_systemd (Tailscale SSH constructs the child environment
-    // itself, so an entire host had it unset while `systemctl --user
-    // show-environment` still reported it), and when absent the lock fell back
-    // under `$HOME` - outside every granted root - so the derivation went silent
-    // in exactly the case the build needed it most. Granting it was also far
-    // wider than the lock warranted: `/run/user/<uid>` holds D-Bus, Wayland,
-    // keyring and agent sockets.
-    //
-    // `$HOME` is set by every login path including the ones that drop
-    // `XDG_RUNTIME_DIR`, so this resolves identically from a terminal, an ssh
-    // session and an agent harness - which is what makes the grant derivable at
-    // all rather than something each project has to declare.
+    // `$HOME/.brokkr`, not `$XDG_RUNTIME_DIR`, because `$HOME` is set by every
+    // login path, including the ones that skip pam_systemd and so drop
+    // `XDG_RUNTIME_DIR`. It resolves identically from a terminal, an ssh
+    // session and an agent harness, which is what makes the grant derivable
+    // at all rather than something each project has to declare. A directory,
+    // never a lock file at the home root, which would need `$HOME` writable.
     if let Some(home) = host.var("HOME") {
         let path = PathBuf::from(home).join(".brokkr");
         if path.is_absolute() {
@@ -91,13 +79,12 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // The cargo home: registry index, downloaded `.crate` archives, git
     // checkouts, and the package-cache lock.
     //
-    // This one hid for a long time because it fails *conditionally*. A build
-    // whose dependencies are already unpacked needs nothing here that matters:
-    // cargo's `.package-cache` flock degrades silently on a read-only
-    // filesystem rather than erroring, and the global-cache tracker tolerates
-    // the same. So sandboxed runs compiled, linted and ran full test suites
-    // with no cargo home grant at all, and the gap read as absent. It turns
-    // fatal the moment a crate has to be *fetched* - a new dependency, a bump,
+    // This one fails *conditionally*. A build whose dependencies are already
+    // unpacked needs nothing here that matters: cargo's `.package-cache` flock
+    // degrades silently on a read-only filesystem rather than erroring, and
+    // the global-cache tracker tolerates the same. So a sandboxed run without
+    // this grant compiles, lints and runs full test suites. It turns fatal the
+    // moment a crate has to be *fetched* - a new dependency, a bump,
     // a lockfile the workspace has not populated yet - at which point the run
     // dies before compilation with `failed to open ... registry/cache/...:
     // Read-only file system (os error 30)`, an error whose text points at the
@@ -116,9 +103,9 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // Brokkr's command history (`history.db`, SQLite, so its journal files
     // need the directory, not just the file).
     //
-    // Failing this write is silent: the command itself still succeeds, so a
-    // sandboxed codex session's `brokkr fmt` and `corpus-results` both
-    // completed and neither appeared in `brokkr history`.
+    // Failing this write is silent: the command itself still succeeds but
+    // leaves no row in `brokkr history`, which is the one record of what an
+    // agent's brokkr was doing (for instance, which run held the build lock).
     //
     // `$XDG_DATA_HOME/brokkr`, else `$HOME/.local/share/brokkr`, which is
     // where brokkr itself resolves it. A relative `XDG_DATA_HOME` is invalid
@@ -188,7 +175,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // sandbox cannot write the index either, so every sandboxed status in that
     // checkout fails until someone runs one outside. The failed git call made
     // the build stamp unidentifiable, which surfaced as test failures far from
-    // the cause.
+    // the cause. The checkouts come from `dependencies::path_dependency_repos`.
     //
     // Only `.git/lfs` is granted, never `.git`: refs, config and hooks stay
     // read-only. Only checkouts that already have a `.git/lfs` directory, so a
@@ -272,10 +259,9 @@ mod tests {
         );
     }
 
-    /// The lock directory must not depend on `XDG_RUNTIME_DIR`. It was the
-    /// previous location and is absent from any login that skips pam_systemd -
-    /// a whole host had it unset under Tailscale SSH - so a derivation that
-    /// still consulted it would go silent in exactly that case.
+    /// The lock directory must not depend on `XDG_RUNTIME_DIR`, which is
+    /// absent from any login that skips pam_systemd (Tailscale SSH among
+    /// them), so a derivation consulting it would go silent in that case.
     #[test]
     fn the_build_lock_ignores_xdg_runtime_dir() {
         let host = FakeHost::new()

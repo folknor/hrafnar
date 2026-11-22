@@ -6,15 +6,15 @@
 //! A harness's descendants do not stay in the process group `review` gives it.
 //! codex's Linux sandbox runs bwrap with `--new-session` and unified-exec
 //! shells `setsid()`, so a shell the agent started is in a session of its own,
-//! and when codex exits it is reparented to init. That is how two hung codemods
-//! from a finished run kept a machine busy for five hours while `review` had
-//! reported the run over. Killing the group cannot reach such a process, and
-//! making `review` itself a child subreaper cannot attribute one: with several
-//! runs in one `review`, an adopted orphan may belong to a run that is still
-//! going, and killing it destroys live work. So each invocation gets its own
-//! subreaper. Everything the harness starts, whatever it does to its session
-//! or group, stays a descendant of this process, and this process belongs to
-//! exactly one run.
+//! and when codex exits it is reparented to init, still able to write the
+//! project. Killing the group cannot reach such a process. Making `review`
+//! itself the child subreaper is rejected because an adopted orphan carries no
+//! mark of the invocation that started it, and because the teardown would die
+//! with `review`. So each invocation gets its own subreaper. Everything the
+//! harness starts, whatever it does to its session or group, stays a
+//! descendant of this process, and this process belongs to exactly one
+//! invocation. If `review` dies, the control pipe's EOF tells the keeper to
+//! tear down anyway.
 //!
 //! # The proof of emptiness
 //!
@@ -23,8 +23,9 @@
 //! `waitpid` returning `ECHILD` therefore proves the tree is empty, and nothing
 //! else is accepted as that proof. Discovery (walking
 //! `/proc/<pid>/task/<tid>/children`) only finds signal targets: the kernel
-//! documents that walk as unreliable while siblings exit, so an empty walk
-//! proves nothing.
+//! documents that walk as unreliable while siblings exit, and a leader that
+//! called `pthread_exit` has no readable task list, so an empty walk proves
+//! nothing and a failed one is never terminal.
 //!
 //! # Identity
 //!
@@ -34,15 +35,19 @@
 //! reading `c`'s parent from `/proc/c/stat`, both `c`'s and `p`'s pidfds still
 //! show them alive: a process alive at the end of the check was alive
 //! throughout and held its pid, so the parent read named `p` while `p` owned
-//! that number, and `c` is in the tree.
+//! that number, and `c` is in the tree. Admitting by a parent's pid number
+//! alone would admit strangers once that number is reused. pidfd liveness is
+//! also right for a zombie leader whose other threads still run, where `/proc`
+//! state is not.
 //!
 //! # Protocol
 //!
 //! `review` spawns `review __keep <spec-fd>` with SIGINT, SIGTERM, SIGCHLD
 //! and SIGPIPE blocked, so no signal can take its default action before the
 //! keeper reads them from a signalfd. The spec is a sealed memfd, read and closed
-//! before any harness fork; argv carries only its descriptor number. Two pipes beyond stdio, whose numbers are
-//! in the spec: control (review to keeper: `g` go, `i` interrupt, `t`
+//! before any harness fork; argv carries only its descriptor number, never an
+//! environment value. Two pipes beyond stdio, numbered at least 3 so a spawn's
+//! stdio setup cannot overwrite them, whose numbers are in the spec: control (review to keeper: `g` go, `i` interrupt, `t`
 //! terminate; EOF means `review` is gone) and events (keeper to review, one
 //! JSON `Event` per line). The keeper launches nothing before `g`, so `review`
 //! can record the keeper's identity first. Its own stdio is the harness's and

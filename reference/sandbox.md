@@ -1,79 +1,134 @@
 # Sandbox and permissions
 
-The permission machinery shared across providers: `review`'s sandbox
-vocabulary, the writable roots a build needs, how the permissions a run
-launched with are recorded, and what a `review resume` inherits. The
-provider-specific halves are in [codex.md](codex.md), [grok.md](grok.md) and
-[claude.md](claude.md) (claude has no filesystem sandbox, so little of this
-applies to it).
+This page covers what the code can't show from one module: how a sandbox
+level turns into native permissions, then a record, then a resume's
+permissions, and the build and harness facts behind the writable roots.
+Each module's own rules are in its module docs: `config::sandbox` for the
+vocabulary, `harness::permissions` for native selection and restoration,
+`writable_roots` for derivation and filtering. The harness-specific halves
+are in [codex.md](codex.md), [grok.md](grok.md) and [claude.md](claude.md).
 
-## The vocabulary
+## From a level to a record and back
 
-**`sandbox` is `review`'s own vocabulary, parsed as `config::SandboxLevel` and resolved by `provider::Permissions::profile`.** The levels (`read-only`, `workspace-write`, `danger-full-access`) are codex's names, kept because they were the documented config surface before translation existed - a fresh set would have silently changed the meaning of every profile already written. Codex takes them verbatim; grok's built-ins are `read-only`/`workspace`/`none`, so the upper two are rewritten. This is not cosmetic: grok cannot resolve an unknown profile name and **refuses to start**, so before the mapping a profile written for codex broke the moment it was pointed at grok, at launch, with an error that reads as a missing config file. `read-only` happens to be spelled identically everywhere, which is why the *default* path was portable by luck rather than design - only an explicit write opt-up ever hit the mismatch. An unrecognised value is passed through verbatim rather than rejected, because grok resolves names against user-defined profiles in `~/.grok/sandbox.toml`: rejecting it would make `review` the reason a valid provider config could not be used, and the provider validates its own vocabulary with a better error than we could write (and fails before running a turn, so a typo is cheap). The three level names are therefore **reserved** - a custom grok profile named `workspace-write` or `danger-full-access` cannot be selected from a `.review.toml` profile. That is the deliberate trade: the point of the levels is that they mean the same thing whichever provider a profile is pointed at, which fails the moment one provider can reinterpret them. Custom profiles have the rest of the namespace.
+A run's permissions pass through three modules, and the record they leave
+is what the next resume launches with:
 
-`sandbox` defaults to `read-only` for codex and grok; a profile opts up to `workspace-write`. Claude has no filesystem sandbox and its profiles must omit the setting (see [claude.md](claude.md#no-filesystem-sandbox)).
+1. `config::SandboxLevel` parses the profile's `sandbox`. An omitted level
+   becomes `read-only` in `Permissions::profile`, before any runner sees it.
+2. `harness::Permissions` maps the level to the harness's native selector.
+   `PermissionPlan` derives writable roots (codex and grok
+   `workspace-write` only), adds the codex `.git` grant, and holds the
+   effective paths. Codex renders them as
+   `-c sandbox_workspace_write.writable_roots=[...]` before profile
+   `config`. Grok gets them through a generated `review-ws-*` sandbox
+   profile.
+3. The sidecar row records the effective result: `sandbox` in review's
+   vocabulary, `provider_sandbox` with grok's exact selector, and
+   `writable_roots` only when non-empty. A row with the field is a row that
+   widened something.
 
-## Writable roots
-
-### `src/writable_roots/mod.rs`
-
-Derives the writable roots a build needs that live outside the workspace: the build lock and brokkr's `--commit` worktrees (`$HOME/.brokkr` - see below), the cargo home (`$CARGO_HOME`, else `$HOME/.cargo`), brokkr's command history (`$XDG_DATA_HOME/brokkr`, else `$HOME/.local/share/brokkr`), `$CARGO_TARGET_DIR`, and the resolved `./target` symlink. Keeps only absolute paths already outside cwd (one inside is writable anyway, and granting it would imply a widening that did not happen), normalises trailing slashes so a symlink target and the env var naming the same directory are one grant, and refuses `/`. Profile-supplied roots go through `derive_with`, which shares path expansion with `project::select` and accepts bare `~`, `~/...`, `$VAR` and `${VAR}`; `~user` is rejected, and an unset variable drops the entry rather than silently granting `/data` or `/`. `Host` is a trait so the derivation and the expansion are pure functions under test - the developer's own `CARGO_TARGET_DIR` and `HOME` must not decide whether the suite passes. `provider/codex/roots.rs` renders the codex `-c sandbox_workspace_write.writable_roots=[...]`, TOML-escaping each path, including control characters accepted through explicit raw Codex config overrides; the escaping is tested by *parsing* the result, because a substring assertion cannot distinguish an injected key from the same text safely quarantined inside a string. Applies to `workspace-write` only. Grok gets the same set through a sandbox profile instead (see [grok.md](grok.md#writable-roots)).
-
-### Why roots are derived
-
-**A `workspace-write` codex run derives its extra writable roots from the host (`src/writable_roots/mod.rs`), because closing the sandbox hole broke every build.** Once `--ignore-rules` made build commands genuinely sandboxed (see [codex.md](codex.md#--ignore-rules)), `workspace-write` granted only cwd and `/tmp` - and that is not enough to build anywhere. A real `brokkr check` died at `[error] lock: failed to open lock file: Read-only file system` **before reaching the compiler**, identically whether `CARGO_TARGET_DIR` was inherited, unset, or redirected inside the workspace: the lock lived under `$XDG_RUNTIME_DIR` at the time (it has since moved to `$HOME/.brokkr` - see below). So the obstacle order is lock (fatal) → cargo target (fatal) → cargo home (fatal, but only on a fetch) → history db (silent), and where `./target` points is the *second* problem, not the first. **The cargo home outlived the other two because it fails conditionally.** `$CARGO_HOME` (`$HOME/.cargo` by default) holds the registry index, the downloaded `.crate` archives, the git checkouts and the package-cache lock, and a workspace whose dependencies are already unpacked needs none of it writable: cargo's `.package-cache` flock degrades silently on a read-only filesystem rather than erroring. So sandboxed agents compiled, linted and ran whole test suites with no grant there at all, which read as the path not being needed. The first build that has to *fetch* a crate - a new dependency, a bump, a lockfile the shared target has not populated - dies before compilation with `failed to open ... registry/cache/...: Read-only file system (os error 30)`, an error naming the cache rather than the sandbox. Observed as exactly that split across two concurrent agents on the same tree: one passed `brokkr check` twice on a warm crate set, the other failed on a single missing `crc32fast`. It meets the determinism test the same way the lock does - `$CARGO_HOME` else `$HOME/.cargo` is cargo's own documented default, not a prediction about a login path. Both fatal paths are properties of the **machine**, not the project - five hosts, two exporting a global `CARGO_TARGET_DIR` onto a separate drive, several repos carrying a `target` symlink at the same shared cache - so restating them per project would put a host fact in fifteen files and get it wrong on every host that was not in front of whoever edited them. `review` derives instead: the build lock, the cargo home, `$CARGO_TARGET_DIR`, and the resolved `./target` symlink, keeping only those that are absolute and already **outside** cwd, deduplicated (a symlink target carries a trailing slash where the env var does not; `/` is refused outright). This is the one place ambient environment is allowed to influence a run, which is uncomfortable so soon after `--ignore-user-config` removed exactly that coupling - so it is fenced: **`workspace-write` only** (a `read-only` profile derives nothing, since nothing being writable is the whole point of it), only paths a build provably needs, every grant printed at launch with its reason so effective permissions are visible rather than inferred, and passed *before* profile `config` so a profile can restate `sandbox_workspace_write.writable_roots` and win. A profile can name **additional** roots (`writable_roots = [...]`) for what one project needs beyond what any build needs - a data directory, a sibling checkout - and they are added to the derived set rather than replacing it, because the derived set is what makes a build run at all and a profile that replaced it would break the build it was widening. Profile entries pass the same filters, so a `.review.toml` cannot grant `/`, a path containing `..` (which defeats every lexical check - `/..` is absolute, is not a prefix of cwd and is not empty, and codex resolves it to `/`), an **ancestor** of the workspace (`~`, or a `$HOME` that lost its subdirectory, resolves to the home directory and would hand over every repo, `~/.ssh` and review's own logs), a path carrying a control character (treated as a likely mangled path rather than a deliberate grant), or a relative path - all of which hold after expansion. A sibling of the workspace *is* granted: the ancestor check is component-wise, not a string prefix. Profile roots hit the `..` refusal on their spelling, before resolution, because canonicalizing first strips the `..` and lets a profile entry like `<project>/../../../../etc` arrive as a plain `/etc`; the spelling is the evidence that an entry was meant to climb. Environment-derived roots are canonicalized through their last `..` component before that refusal when the prefix resolves; any suffix is kept, so a cache directory that does not exist yet can still be granted. If the prefix cannot be resolved, the spelling is still refused. The `./target` symlink is also canonicalized at derivation, so the shared-cache layout (`target -> ../shared-target`, which `read_link` hands back joined to the project directory, `..` included) is granted by its real path rather than refused, and a dangling link spelled with `..` is dropped. The remaining filters run against the **resolved** path, because a lexical check answers "what does this say" while the sandbox binds "what does this reach" - `/srv/cache` may be a symlink to `/`, which passes every string test. The resolved form is what gets granted and recorded, so the log names the directory that actually becomes writable rather than the alias someone typed; a path that does not exist yet cannot be resolved and is taken at its word, since refusing it would break granting a cache directory the build itself creates. Roots are derived against **`project_root`**, not the process cwd: the runners spawn the provider with `.current_dir(project_root)` and `.review.toml` discovery allows launching from a descendant, so deriving from cwd inspected `<subdir>/target` and silently withheld the root a build needed. They support bare `~`, `~/...`, `$VAR` and `${VAR}`, with the same grammar as project paths; `~user` is rejected and its entry is dropped with a warning. This is what lets one file serve hosts with different layouts - the deliberate, written-down kind of environment use, unlike the derivation. An entry naming an **unset** variable is dropped with a warning rather than expanded to nothing: `$UNSET/data` would otherwise collapse to `/data`, granting a path nobody named, and a bare `$UNSET` to `/`. A profile with non-empty `writable_roots` is rejected unless its permissions derive roots: codex workspace-write or grok workspace-write (including the native workspace alias). Previously ignored combinations now fail at parsing with instructions to remove the field or select workspace-write; Claude must remove it. The announcement is printed **once per distinct root set**, not per invocation: an automatic retry or resume relaunches the same profile in the same directory, so per-invocation printing would stack identical blocks above the result instead of saying anything new. Keyed on the set rather than a bare "announced?" flag, so that if roots ever *can* differ between invocations in one process the wider run is not left silently unannounced behind the narrower one's block. Verified: a full `brokkr check` passes inside the sandbox while an ungranted path is still refused, and a profile-granted directory is writable while its own sibling on the same drive is not. **The history db is granted too, reversing an earlier decision to leave it out.** Its write failing never fails the command, and keeping agent runs out of the operator's build history was once counted a feature. It turned out to cost the one record that answers "what was this agent's brokkr doing": a codex session whose own `brokkr test` held the global lock (holder identity unverifiable from inside its namespace) left no trace in `brokkr history` - not even the `fmt` and `corpus-results` calls that completed - so the stall could only be reconstructed from the codex rollout. Its directory, not the file, because SQLite writes its journal beside the database; `$XDG_DATA_HOME/brokkr` else `$HOME/.local/share/brokkr` is where brokkr resolves it, and a relative `XDG_DATA_HOME` falls back as the XDG spec requires.
-
-- **The build-lock root is `$HOME/.brokkr`, and the reason it is not `$XDG_RUNTIME_DIR` is the whole lesson.** `$CARGO_TARGET_DIR` and the `./target` symlink are genuine cargo/workspace facts. The build lock never was one - nothing about a Rust build needs it, and it is derived *specifically* because brokkr locks there, which the reason string says outright. `$XDG_RUNTIME_DIR` looked like the safely generic way to spell that, being a standardised XDG variable the host sets, and it was in fact the fragile one: **it is absent from any login that does not go through `pam_systemd`.** Tailscale SSH constructs the child environment itself, so on a host reached that way every shell had it unset while `systemctl --user show-environment` still reported `/run/user/1000` - those two read *different* environments, and the manager's copy is set by systemd for itself and is never evidence about a login shell. Worse, the failure was silent from both ends: `review` derived no root, and brokkr - inheriting the same environment - fell back under `$HOME`, outside every granted root, so the derivation went quiet in exactly the case the build needed it. Measured: 41 consecutive `workspace-write` runs recorded `writable_roots: null` and every build inside them died at `lock: failed to open lock file: Read-only file system` before compiling. All 41 were on the one affected host, which is why this looked like a tool bug and was a host-reachability fact. Granting `/run/user/<uid>` was also far wider than the lock warranted - it holds D-Bus, Wayland, keyring and agent sockets.
-- So the fix was to make the location **deterministic** rather than to teach `review` to guess: brokkr now locks unconditionally in `$HOME/.brokkr`. `$HOME` is set by every login path including the ones that drop `XDG_RUNTIME_DIR`, so the root resolves identically from a terminal, an ssh session, an agent harness and inside the sandbox - which is what makes it derivable at all. The test for whether a path may be derived is therefore **determinism, not whether the variable looks standard**. A directory, never a bare lock file at the home root: creating or replacing `$HOME/.brokkr.lock` would require `$HOME` itself writable, handing over every repo, `~/.ssh` and review's own logs. Because it is derived, **no project declares it** - the alternative was one `writable_roots` line in every repo that uses `review`, which is the fifteen-project restatement this module exists to prevent.
-- **The same grant covers brokkr's `--commit` worktrees, because the old location could not be granted at all.** Brokkr builds another commit in a persistent git worktree, and those used to be siblings of the project (`<parent>/.brokkr-worktree-<project>-<sha>`) so that `../dep` path dependencies kept resolving. No root can cover that: creating one writes into the directory holding every repo, which the ancestor filter refuses, the sha is only known inside the run, and codex writable roots take no globs (its Linux sandbox expands globs only for *unreadable* paths, against what exists at startup). A codex agent comparing two builds therefore worked around brokkr with a hand-made `CARGO_TARGET_DIR` and private `XDG_*` dirs inside the project, leaving tens of gigabytes behind. Brokkr now puts each worktree in a container under `$HOME/.brokkr/worktrees/`, holding the checkout and one symlink per path dependency that leaves the repo. Cargo joins a path dependency to its manifest's directory and normalises lexically without following symlinks, so `../dep` lands on the symlink and reaches the real checkout, which stays read-only because the sandbox binds the resolved path. Nothing above `$HOME/.brokkr` has a `Cargo.toml`, so cargo's upward workspace search cannot pick up the live project the way a container inside the project tree would. The worktrees' build output goes under the project's target, which the cargo-target roots already cover. One consequence for brokkr rather than `review`: a cached worktree is now writable by any `workspace-write` run, so reusing one has to verify it is clean, or an A/B could measure edited code under a commit's name.
-- **The `.git/lfs` store of every sibling checkout a path dependency lives in is granted, and nothing else of its `.git`.** Build stamps run `git status` over those checkouts, which the sandbox leaves read-only. When a tracked LFS file's stat data no longer matches the index (a re-checkout, a touch), git re-hashes it through the LFS clean filter, which writes into `.git/lfs/tmp` and then `.git/lfs/objects`, and failed with `open .../.git/lfs/tmp/...: read-only file system`. Outside the sandbox status would save the refreshed stat data and the problem would happen once. Inside, the index is unwritable too, so every sandboxed status in that checkout failed until someone ran one by hand, and the failed git call made the build stamp unidentifiable, which showed up as test failures far from the cause. The checkouts are found from the `path` entries of every `*dependencies` table in the workspace's root `Cargo.toml`, resolved, and walked up to their `.git`. The workspace's own repo is skipped, and so is any checkout without a `.git/lfs` directory. The grant stops at `.git/lfs` so refs, config and hooks stay read-only.
-- **A codex run's own `.git` is granted, so it can commit, and every run is audited for what it changed there instead of being prevented.** Codex adds `<workspace>/.git` (and `.agents`, `.codex`, `.aws`) as a default read-only subpath of a `workspace-write` workspace, but only "if no explicit rule" already covers the path (`append_default_read_only_*_if_no_explicit_rule` in codex's `protocol/src/permissions.rs`). Interactively the gap is papered over by approval - the commit fails, codex asks to rerun it outside the sandbox. Under `review` nobody can approve, so a write agent finished green and stopped uncommitted (bz review#9, `.git/index.lock: read-only file system`). Naming `.git` as a writable root is the explicit rule: traced through the legacy `-c sandbox_workspace_write.writable_roots` path to the bubblewrap mounts, where the exact write entry wins over the default read entry and `.git` drops out of the protected metadata names, and verified on the installed codex with a `touch .git/...` that succeeds under the grant. The grant is made in `provider::permissions` for codex only (grok has its own profile mechanism and saw no such failure), only for a real `.git` directory in the project root, which is the exception to the inside-the-workspace filter: the premise "the workspace is writable anyway" is false for that one path. A pointer file is not followed, because a linked worktree's common dir is state other checkouts share; a project below the repository's top level has its `.git` outside the workspace altogether. Both get a launch note instead. The no-build-roots warning ignores this grant, since it says nothing about whether the build roots were found. Carving `config` and `hooks` back read-only inside the grant was rejected rather than deferred: git rewrites `config` by renaming `config.lock` over it, so a read-only `config` breaks branch tracking (creating a branch from a remote one writes it), trading "cannot commit" for "cannot branch"; and claude and maki, with no filesystem sandbox, can write all of `.git` anyway, so a codex-only prevention would still need the audit. `git_watch::Snapshot` is that audit: taken after preparation and before the run for every provider and level, it records `config`, `config.worktree` and the hooks directory of the gitdir and common dir, follows `include.path`/`includeIf.*.path` (relative to the including file) and `core.hooksPath` (relative to the top level), parsed by `git config --file - --no-includes` from the bytes already read so git opens nothing past the 1 MiB read limit, and at the end warns per path with the kind of change - never contents, since config can carry credentials and hook bodies are untrusted output. Warn only, never restore: an operator or a concurrent run can change config legitimately, and the operator reads the output. A clean result has no security meaning.
-- The lock is a **CPU-contention gate** (`check`, `test`, `clippy`, `bench` take it; `fmt` does not - which is why `fmt` kept working while the gate died, and why an agent's one surviving check was `rust-analyzer`, whose false green hid a broken tree). It never protected build-state integrity; that is cargo's own target-directory locking and is unaffected by any of this. Two consequences: a partitioned lock costs contention and contaminated benchmark timings, both recoverable, so failing closed on it would trade a certain total loss for a recoverable partial one; and `review` must **not** hold the lock parent-side around a codex run, because a run is dominated by model latency, so holding a CPU gate across it would block other work while the CPU sits idle, inverting the gate's purpose.
-
-## Recorded permissions
-
-**The permissions a run launched with are persisted, not just printed.** The fences around the derivation above included "every grant is printed at launch", which turned out to mean *visible in the terminal that launched it and nowhere else*: the sidecar recorded model, env var names and the digest, but neither the sandbox level nor the derived roots, so nothing could answer "which runs could write?" after the fact. The profile name is not an answer - it is a claim about what was requested, and the whole lesson of the two codex sandbox holes ([codex.md](codex.md#the-sandbox-guarantee)) is that what a run requested and what it received are different things. So `ProviderResult` carries typed `permissions` and `writable_roots`, persisted into the sidecar row with known sandbox levels normalized to review's vocabulary and Grok's exact selector saved separately as `provider_sandbox`, making `jq 'select(.sandbox=="workspace-write")'` and `jq 'select(.writable_roots)'` the queries they should always have been. Derivation moved from `run_codex` up to `invoke` so the values that widen the run are literally the ones recorded - a grant applied from one computation and logged from another is exactly the invisible permission this is meant to prevent. Empty roots are omitted rather than written as `[]`, so a row carrying the field is a row that widened something. A failed launch still records what it asked for; a panicked task records no permission facts, because its effective grants are unavailable. A profile `config` entry restating `sandbox_workspace_write.writable_roots` wins over the derivation (codex takes the last `-c`), so the recorded roots follow the *run* rather than the derivation - `config_writable_roots_override` parses the override back out, and an explicit `[]` records as empty rather than as "no override". Without that, a profile overriding to `["/secret"]` would be logged with the derived roots and one overriding to `[]` logged as widened when it was not. Profile defaults resolve once in `Permissions::profile`, before the runner sees a selector. `Permissions::restore` reads native records without translating them back through config vocabulary. Its native selector and normalized query projection remain separate through preparation and recording. A Grok resume with no recorded selector passes no override, uses the provider's saved profile, and records no level: its permissions are unknown to review, rather than known read-only. A Codex resume with no recorded selector resolves to read-only at restoration.
+A profile `config` entry that restates `sandbox_workspace_write.writable_roots`
+wins, because codex takes the last `-c`. `codex::config_writable_roots_override`
+parses it back so the record follows the run. An explicit `[]` records as
+empty, not as "no override". A failed launch records what it asked for; a
+panicked task records no permission facts, because its effective grants are
+unavailable.
 
 ## What a resume inherits
 
-**A `review resume` inherits its permissions, model and effort from the session, because they are properties of the session and not of the invocation driving it.** `review resume` takes no profile - it reads the session's own project config only for its audit id, privacy and runtime settings - and the runners default to `read-only` - so a resume silently dropped whatever the run that created the session was launched with. The case that makes this concrete is the one auto-resume was built for: a `workspace-write` run dies mid-turn, the operator resumes it, and the session that had been editing files comes back unable to write to them. The failure surfaces as the model reporting a read-only filesystem, which reads as a broken workspace rather than as anything `review` did. `provider::InheritedSettings::from_record` takes the level, roots, model and effort from the session's last sidecar row (`latest_for_session`, already looked up by `resume_record` for the provider and the cold-cache gate) and passes them to `invoke`, so the chain carries forward: each resume records what it launched with, and the next inherits from that row. Three details are load-bearing. The row records the **effective** permissions, not the profile's request, which is exactly what has to be inherited - the recurring lesson of the sandbox work is that those two differ. Roots are passed as *profile* roots rather than as a verbatim list, so they go back through `writable_roots`' filters and are re-derived against **this** host: the build lock is a fact about the machine the resume runs on, not the one that wrote the row. And inheritance is skipped when the row names a different provider, which `resume_record` makes impossible today (the provider is taken from that same row), but the guard stays because a grok level fed to codex is a widening nobody asked for. An old row predating these fields resolves to `read-only` for Codex; Grok instead leaves the selector absent and uses its saved profile; a session with no row at all is not resumed - `resume_record` refuses it, since without a record there is no provider to resume it with. (Grok is the exception on roots: a `review-ws-*` session resumes with its recorded roots verbatim - see [grok.md](grok.md#writable-roots).)
+A `review resume` takes no profile, so permissions, model and effort come
+from the session's last sidecar row (`InheritedSettings::from_record`),
+because they belong to the session, not the invocation. Each resume records
+what it launched with, so the chain carries forward. The parts that only
+line up across modules:
 
-- **Model and effort were originally excluded, and measurement overturned that.** The stated reason was that only `model` was recorded (env values and `config` are not, by design), so a partial restoration would be less predictable than none. What it actually produced: every resume ran on codex's **built-in default model at its default effort**, and since `--ignore-user-config` that default is not even the operator's configured one. Read off the rollouts directly - `turn_context` records the model per turn, and one field session shows `gpt-5.6-sol`/`low` for the fresh turn followed by five resumed turns on a different model entirely, against a profile that named `gpt-5.6-sol` throughout. The sidecar showed the same thing from the other side: every `kind: "session"` row carried `"model": null`. That is not a neutral fallback - it changes the model mid-session, at a different price, with nothing in the output saying so, and on a session whose turns are mostly resumes (5 of 6 above) it decides the majority of the run. So `effort` is now recorded too and both are inherited, rather than neither. The announcement lines (`model: ... (inherited from the session record)`) exist because the failure was *silent*; the same reasoning as printing every writable root. The evidence is codex-specific only because codex is the provider with an on-disk rollout to read `turn_context` out of - the inheritance itself is **provider-agnostic**, so a claude resume now carries `--model`/`--effort` where it previously carried neither, and a grok one carries `-m`/`--reasoning-effort`. That is the same fix, not a widening - but the defect it fixes is **not** universal. Grok stores the model with the session: measured on grok 1.0.40, a session created with `-m grok-4.6` and resumed with no `-m` was still served by `grok-4.6-build`. So for grok the inherited `-m` is redundant rather than corrective, and harmless, since it names the model the session already has. Codex re-resolves the model on every invocation, which is the whole reason this was needed.
-- `model` and `effort` are projected from the same `provider::ModelSpec` that renders runner arguments. They are launch selectors, not served identity. Codex's explicit `-m` wins over raw `model`; otherwise the last raw `model` is recorded. Its final raw `model_reasoning_effort` wins over dedicated effort. The raw-value parser mirrors Codex: parse TOML, falling back to quote-trimmed literal text only on parse failure. A final valid TOML non-string is refused before runner side effects with repair instructions; a later string override can repair an earlier non-string. This keeps a rejected selection from looking like an absent/default selection. Historical rows remain readable but cannot retroactively recover overrides they never recorded.
-- Env and profile `config` are still **not** inherited, but for a different reason than the old one: env values are deliberately never recorded and `config` is not recorded at all, so there is nothing to restore from. That is an absence of data, not a judgement about predictability.
-- Grok's *served* model is recorded but never inherited - see [grok.md](grok.md#the-served-model).
+- The row holds the effective permissions, not the profile's request, and
+  that is what a resume must inherit.
+- `Permissions::restore` reads the native record. Codex roots go back in as
+  profile roots, so they pass the `writable_roots` filters again and are
+  re-derived against this host: the build lock belongs to the machine the
+  resume runs on. A restored grok `review-ws-*` profile keeps its recorded
+  root set verbatim instead (see [grok.md](grok.md#writable-roots)).
+- A row with no selector restores codex as `read-only`. Grok passes no
+  override, runs on the session's saved profile, and records no level.
+- Inheritance is skipped when the row names a different harness. The
+  harness comes from that same row today, but a grok level fed to codex
+  would widen a run nobody asked to widen.
+- Env values and profile `config` aren't recorded, so a resume can't
+  inherit them.
 
-## Permission planning
+Model and effort are inherited because codex resolves the model again on
+every invocation. Without `-m`, every resume ran on codex's built-in default
+at its default effort, and since `--ignore-user-config` that isn't even the
+operator's configured model. A field session's rollout `turn_context` showed
+one turn on the profile's model and five resumed turns on another. Grok
+stores the model with the session: measured on grok 1.0.40, a session
+created with `-m grok-4.6` and resumed without `-m` was still served by
+`grok-4.6-build`. The inherited `-m` is redundant there, and harmless.
 
-Config owns only the reserved `SandboxLevel` vocabulary, including opaque custom
-names. The provider layer owns native permission selections. Fresh Grok custom
-names never acquire generated-profile behavior just because they look like a
-`review-ws-*` name. Restoration alone recognizes that historical generated-name
-shape, canonicalizes its recorded root set once, and retains it for setup and
-recording. Native `provider_sandbox` wins over an inconsistent normalized field;
-old Grok rows fall back to the native syntax in `sandbox`. A native custom name
-that happens to spell a review level is never translated on restoration.
+## What a sandboxed build needs
 
-A per-invocation `PermissionPlan` retains root derivation and effective grant
-facts. Exhaustive adapter preparation applies Codex config precedence or Grok
-trust/profile setup; the returned `Prepared` variant selects execution. Codex
-receives those effective paths, which are also announced and recorded. Preparation
-only replaces the requested Grok selector after setup succeeds. A setup failure
-retains the request under the failed-launch recording contract; it does not
-claim that a provider process ran. Trust is still checked after the turn before
-claiming a durable grant. Claude has an explicit no-filesystem-sandbox selection;
-no review level claims enforcement by its tool permission configuration.
+Codex `workspace-write` grants the cwd and `/tmp`. With `--ignore-rules`
+(see [codex.md](codex.md#the-sandbox-guarantee)) build commands really run
+sandboxed, and a `brokkr check` fails in this order:
 
+1. The build lock: fatal, before the compiler starts.
+2. The cargo target (`$CARGO_TARGET_DIR` or a `./target` symlink onto a
+   shared drive): fatal.
+3. The cargo home: fatal only when a crate has to be fetched.
+4. Brokkr's history database: silent.
 
-## Launch requests
+The cargo home looked unneeded because warm builds pass. Two agents on one
+tree split exactly that way: one passed `brokkr check` twice on a warm crate
+set, the other failed on one missing `crc32fast` with `failed to open ...
+registry/cache/...: Read-only file system (os error 30)`.
 
-`provider::LaunchSpec` carries provider, session intent, `RunSettings`, prompt
-and project root through invocation and the runners. It is a complete request,
-not a claim that preparation has succeeded. `RunSettings::from_profile` captures
-the winning definition and its layer/table origin; `from_inherited` restores
-recorded policy and the saved Codex home, explicitly omitting profile env and
-raw config. The same settings survive automatic retries. A manual message
-selects no profile and records no profile origin. Configured roots remain in
-the request; prepared effective grants remain in `PermissionPlan` and the
-result, and are the only grants execution and recording use. Runtime, launch
-handshake and launch spacing are execution/scheduling context outside the request.
+Brokkr's lock is a CPU-contention gate, taken by `check`, `test`, `clippy`
+and `bench` but not `fmt`. Cargo's own target-directory locking protects
+build state, so a partitioned brokkr lock costs contention and noisy
+benchmarks, both recoverable. For the same reason `review` must not hold the
+lock around a run: model latency dominates a run, and holding a CPU gate
+across it blocks other work while the CPU is idle.
+
+### Why the lock lives in HOME
+
+The lock root is `$HOME/.brokkr` because a derivable path has to resolve
+identically from every login. `$XDG_RUNTIME_DIR` doesn't. Tailscale SSH
+builds the child environment itself, without `pam_systemd`, so on a host
+reached that way every shell had it unset, while `systemctl --user
+show-environment` still reported `/run/user/1000`. That command reads the
+user manager's environment, not a login shell's. Brokkr then fell back under
+`$HOME`, outside every granted root. Measured: 41 consecutive
+`workspace-write` runs on that host recorded `writable_roots: null`, and
+every build in them died at `lock: failed to open lock file: Read-only file
+system`. `/run/user/<uid>` would also have been far too wide a grant: it
+holds D-Bus, Wayland, keyring and agent sockets.
+
+### Brokkr's commit worktrees
+
+Brokkr builds another commit in a container under
+`$HOME/.brokkr/worktrees/`, with the checkout and one symlink per path
+dependency that leaves the repo. Cargo joins a path dependency to its
+manifest's directory and normalizes lexically without following symlinks,
+so `../dep` reaches the symlink and then the real checkout. The real
+checkout stays read-only, because the sandbox binds the resolved path.
+Nothing above `$HOME/.brokkr` has a `Cargo.toml`, so cargo's upward
+workspace search can't pick up the live project.
+
+Codex writable roots take no globs: its Linux sandbox expands globs only
+for unreadable paths, against what exists at startup. A cached worktree is
+writable by any `workspace-write` run, so brokkr has to check that a
+worktree is clean before reusing it. Otherwise an A/B could measure edited
+code under a commit's name.
+
+## Verified behaviour
+
+These checks were run on the installed harnesses:
+
+- A full `brokkr check` passes inside the codex sandbox, while an ungranted
+  path is still refused.
+- A profile-granted directory is writable, while its sibling on the same
+  drive is not.
+- Under the `.git` grant, `touch .git/...` succeeds on the installed codex.
+  The grant was traced through the legacy
+  `-c sandbox_workspace_write.writable_roots` path to the bubblewrap mounts.

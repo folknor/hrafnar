@@ -1,5 +1,36 @@
 //! Permission intent and native launch policy. Config contains only review's
 //! vocabulary; restoration is the only boundary that interprets native records.
+//!
+//! `Permissions::profile` resolves an omitted level (read-only) once, before
+//! any runner sees a selector. `Permissions::restore` reads a sidecar row's
+//! native record without translating it back through config vocabulary:
+//!
+//! - the native `provider_sandbox` field wins over an inconsistent normalized
+//!   `sandbox` field, and grok rows without it carry native syntax in
+//!   `sandbox`;
+//! - a native custom name that happens to spell a review level is never
+//!   translated;
+//! - only restoration recognizes the generated `review-ws-*` profile shape and
+//!   canonicalizes its recorded root set. A fresh custom name that looks
+//!   generated stays an opaque custom name;
+//! - a grok row with no selector restores as `InheritSaved`: no override is
+//!   passed, grok uses the session's saved profile, and no level is recorded,
+//!   because the permissions are unknown to review rather than known
+//!   read-only. A codex row with no selector restores as read-only.
+//!
+//! Two projections leave this type and stay separate through preparation and
+//! recording: `selector`/`native_to_record` (native launch syntax) and
+//! `recorded_level` (review's vocabulary, for queries such as
+//! `jq 'select(.sandbox=="workspace-write")'`). The profile name is never the
+//! record of what a run could do, because what a run requested and what it
+//! received differ.
+//!
+//! `PermissionPlan` holds one invocation's derived roots and effective grants.
+//! The effective paths are the only grants execution, announcement and
+//! recording use, so the values that widen a run are literally the ones
+//! recorded. Grok preparation replaces the requested selector only after its
+//! profile setup succeeds; a setup failure keeps the request for the failed
+//! launch record without claiming a harness process ran.
 use super::{Harness, grok};
 use crate::config::SandboxLevel;
 use crate::writable_roots::GrantedRoot;
@@ -51,8 +82,8 @@ impl Permissions {
                 SandboxLevel::ReadOnly => GrokPermissions::ReadOnly,
                 SandboxLevel::WorkspaceWrite => GrokPermissions::FreshWorkspace,
                 SandboxLevel::DangerFullAccess => GrokPermissions::FullAccess,
-                // A native alias `workspace` historically requests the same
-                // built-in as the translated level. Custom generated-looking
+                // The native alias `workspace` requests the same built-in as
+                // the translated level. Custom generated-looking
                 // names, however, never acquire restoration behavior here.
                 SandboxLevel::Custom(name) if name == "workspace" => {
                     GrokPermissions::FreshWorkspace
@@ -212,6 +243,22 @@ pub(super) struct PermissionPlan {
 /// the repository's top level has its `.git` outside the workspace, so both
 /// get a note instead of a grant. What a run changes in git's executable
 /// metadata is reported at exit (`crate::git_watch`).
+///
+/// Codex applies the default read-only `.git` (and `.agents`, `.codex`,
+/// `.aws`) subpath only when no explicit rule covers it
+/// (`append_default_read_only_*_if_no_explicit_rule` in codex's
+/// `protocol/src/permissions.rs`); the exact write entry wins in the
+/// bubblewrap mounts. Interactively codex asks to rerun a failed commit
+/// outside the sandbox; under `review` nobody can approve, so the run ends
+/// green and uncommitted. This is the one exception to the
+/// inside-the-workspace filter, whose premise ("the workspace is writable
+/// anyway") is false for `.git`.
+///
+/// `config` and `hooks` are not carved back read-only inside the grant: git
+/// rewrites `config` by renaming `config.lock` over it, so a read-only
+/// `config` breaks creating a branch from a remote one, and claude and maki
+/// can write all of `.git` anyway, so the audit is needed regardless. Codex
+/// only, because grok selects writable paths through its own profile.
 fn codex_git_grant(root: &Path) -> Option<GrantedRoot> {
     use crate::git_watch::Layout;
     let dirs = crate::git_watch::locate(root)?;
@@ -252,7 +299,7 @@ impl PermissionPlan {
             std::fs::canonicalize(root).ok().map(|r| r.join(".git")),
         ];
         // Codex only: grok has no automatic `.git` grant, so an explicit or
-        // recorded one there keeps its previous meaning.
+        // recorded one there goes through the generic filter.
         let is_codex = matches!(permissions.0, NativePermissions::Codex(_));
         let profile_roots: Vec<String> = profile_roots
             .iter()

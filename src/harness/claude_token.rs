@@ -11,9 +11,15 @@
 //!
 //! The command is run lazily - only after a fresh run failed to authenticate,
 //! or before continuing a session that was created with it - so a synced
-//! global config is harmless on hosts that log claude in some other way. Its
-//! output goes only into the environment of that claude process, and is never
-//! printed, recorded, or kept past the `review` process.
+//! global config is harmless on hosts that log claude in some other way. The
+//! key is read from the global layer only, because a project file naming a
+//! command would run code from any checkout.
+//!
+//! The token goes only into the environment of that claude process, after
+//! the profile's `env`, and is never printed, recorded, or kept past the
+//! `review` process: the adapter replaces it in claude's stdout and stderr
+//! before either is interpreted. The helper's own stderr reaches the terminal
+//! unfiltered, so the helper can explain a failure to the operator.
 
 use std::io::Read;
 use std::process::{Command, Stdio};

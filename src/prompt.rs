@@ -11,10 +11,13 @@
 /// primes exactly as much as `""` does, and the difference is invisible in a
 /// config file.
 ///
-/// There is deliberately no slash-command handling. Inlining stdin onto a
-/// `/goal ` prime's line was tried; `/goal` works in an interactive session but
-/// does nothing when sent headless through `review`, so the special case served
-/// nothing.
+/// There is deliberately no slash-command handling: a command such as `/goal`
+/// works in an interactive session but does nothing sent headless through
+/// `review`, so a `/goal ` prime is an ordinary prime.
+///
+/// The prompt reaches most harnesses on a stdin pipe rather than as an
+/// argument, so its length is never bounded by the argument limit; grok takes
+/// no prompt on stdin and gets a prompt file instead.
 pub fn assemble(prime: &str, stdin_instructions: &str) -> String {
     if prime.trim().is_empty() {
         return stdin_instructions.to_string();
@@ -68,8 +71,7 @@ mod tests {
 
     #[test]
     fn slash_prime_gets_no_special_treatment() {
-        // Existing configs still carry `goal = "/goal "`; it is an ordinary
-        // prime now, separated like any other.
+        // `goal = "/goal "` is an ordinary prime, separated like any other.
         let out = assemble("/goal ", "ship it");
         assert_eq!(out, "/goal \n\nship it");
     }

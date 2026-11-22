@@ -1,10 +1,9 @@
 //! Which harness a run talks to, and the facts about it that `review` decides
 //! by harness rather than by run.
 //!
-//! The harness used to be a string end to end, matched in a dozen places with
-//! `_ =>` fallbacks, so a new name added to the known list compiled and quietly
-//! fell into every default arm: the wrong sandbox text, the wrong cutoff, no
-//! graceful stop. It is parsed once where it enters - the config files, the
+//! A harness matched as a string with `_ =>` fallbacks lets a new name compile
+//! and quietly fall into every default arm: the wrong sandbox text, the wrong
+//! cutoff, no graceful stop. So it is parsed once where it enters - the config files, the
 //! command line, a session's record - and everything past that point matches
 //! on the enum exhaustively, with no wildcard, so adding a variant makes the
 //! compiler list every site that has to decide something about it.
@@ -71,8 +70,8 @@ impl Harness {
     /// grok has no such lever.
     ///
     /// The one answer read by `review interrupt`, `review message` and the
-    /// signal supervisor's wait for unrecorded runs (`Unrecorded`), which used
-    /// to hold two separate copies of it. Answering `true` here is a promise the
+    /// signal supervisor's wait for unrecorded runs (`Unrecorded`), so they
+    /// cannot disagree. Answering `true` here is a promise the
     /// runner must keep - offer its keeper's pid, observe the stop channel,
     /// classify the interruption - and a runner-level test is what shows it
     /// does; this only keeps the callers agreeing.

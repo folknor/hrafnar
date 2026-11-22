@@ -2,6 +2,30 @@
 //! Claude Code and maki print under `-p --output-format stream-json`.
 //! Adapters own argv, readiness publication and harness-specific termination
 //! policy; what differs in *reading* the stream is the `Dialect`.
+//!
+//! The stream opens with a `system`/`init` event naming the session and ends
+//! in one `result` object per run, whatever the outcome; that result alone
+//! decides the answer (`interpret_claude_output`). How the outcome maps onto
+//! `HarnessResult`:
+//!
+//! - **An answer**: `Ok`, session id kept.
+//! - **A result that is not an answer**: `Ok` with the session id and a stated
+//!   or unverified reason. A reason the harness gave is `stated`; one review
+//!   inferred (a missing flag) is `unverified`, so it is never passed off as
+//!   the harness's account.
+//! - **No result, after `init`**: the session exists, so the adapter returns
+//!   `Ok` with a death digest and the id, as codex's deaths do.
+//! - **No result, before `init`**: nothing ran, an `Err`.
+//!
+//! An answer followed by a non-zero exit stays an answer with the observed
+//! status recorded; that status is not a stated reason. The exit code decides
+//! nothing for maki either: a provider failure exits 0 with `is_error: true`,
+//! and a setup failure exits 1 with nothing on stdout.
+//!
+//! Metrics come from every `result` event, not only the last: `modelUsage`
+//! keys are unioned into the served model, and cost, usage and turn counts
+//! are summed. maki writes no `modelUsage`, and the model in its other events
+//! is the one it requested, so nothing is recorded as served for maki.
 use super::*;
 
 const CLAUDE_DETAIL_MAX: usize = 2000;

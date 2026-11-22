@@ -123,6 +123,11 @@ impl Capture {
     }
 }
 
+/// Physical-line framing for observers such as session discovery. A line is
+/// offered only up to the observer's cap (codex: 1 MiB). An oversized line is
+/// discarded through its newline and never reparsed from a suffix, which could
+/// otherwise read as a fabricated event. A final unterminated line is offered
+/// at EOF.
 #[derive(Default)]
 struct Lines {
     pending: Vec<u8>,

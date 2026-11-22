@@ -7,7 +7,8 @@ impl Grok {
     /// Make sure the profile named by `roots` exists in `<home>/sandbox.toml` granting exactly
     /// `roots`, returning whether this call created it. Locked because
     /// concurrent `review` calls launch several grok runs at once and two creating the same
-    /// profile unlocked would race; renamed into place so a grok starting
+    /// profile unlocked would race (grok never writes `sandbox.toml`, so the
+    /// lock serializes `review` against itself); renamed into place so a grok starting
     /// concurrently never reads a half-written file.
     pub(in crate::harness::grok) fn ensure_profile(&self, roots: &RootSet) -> anyhow::Result<bool> {
         let path = self.home.join("sandbox.toml");
@@ -36,9 +37,9 @@ impl Grok {
 /// would put a host-specific generated file into every repo). So the roots
 /// `writable_roots` derives - the brokkr lock, the cargo home, a shared target -
 /// reach grok through a profile `review` creates in the operator's global
-/// sandbox file. Without it every grok build died at `lock: failed to open lock
-/// file` before compiling, and fixers worked around it by moving `HOME` under
-/// `target/`, which silently bypassed the host's build-contention lock.
+/// sandbox file. Without it a grok build fails at `lock: failed to open lock
+/// file` before compiling, and a model working around that by moving `HOME`
+/// under `target/` silently bypasses the host's build-contention lock.
 ///
 /// **One profile per distinct root set, named for its content**
 /// (`profile_name`), never one shared profile. A shared profile has to be
@@ -48,7 +49,8 @@ impl Grok {
 /// on the host - broader than codex, where each run gets exactly its own roots.
 /// Content-addressed profiles give grok the codex property: a run gets exactly
 /// its set, a profile is created once and never modified, and concurrent runs
-/// with different sets touch different entries.
+/// with different sets touch different entries. Nothing needs pruning; the
+/// cost is one entry per distinct set in the operator's `sandbox.toml`.
 pub(in crate::harness::grok) const PROFILE_PREFIX: &str = "review-ws-";
 
 const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose writable roots are exactly\n\
@@ -57,7 +59,9 @@ const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose 
 # delete the profile and review recreates it. Other profiles are left alone.\n";
 
 /// A lexical set of already selected paths, not filesystem canonicalization
-/// or proof of a grant. The historical byte ordering and hash stay stable.
+/// or proof of a grant: no path expansion, resolution or host derivation.
+/// The byte ordering and hash are fixed, because recorded sessions name their
+/// profile by them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::harness) struct RootSet(Vec<String>);
 
@@ -73,8 +77,9 @@ impl RootSet {
         &self.0
     }
 
-    /// FNV-1a, with a NUL after each path. Never DefaultHasher: historical
-    /// generated profiles must survive compiler changes. A collision is
+    /// `review-ws-` plus 16 lowercase hex digits of FNV-1a, with a NUL after
+    /// each path. Never DefaultHasher, which is not stable across Rust
+    /// releases: recorded profiles must survive compiler changes. A collision is
     /// refused by the create-only writer's content check.
     pub(in crate::harness) fn profile_name(&self) -> ProfileName {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -88,9 +93,15 @@ impl RootSet {
     }
 }
 
-/// Only review-generated profile syntax. Parsing historical evidence does
-/// not prove matching roots; preparation checks that before the writer runs.
-/// Fresh custom selectors remain opaque native names, even with this syntax.
+/// Only review-generated profile syntax; other names starting `review-ws-`
+/// stay native grok profiles. Parsing a recorded name does not prove matching
+/// roots; preparation checks that before the writer runs. Fresh custom
+/// selectors remain opaque native names, even with this syntax.
+///
+/// A resume under a generated name uses the roots recorded with the session,
+/// not re-derived ones, because the name pins one set and another host would
+/// derive a different one. Missing recorded roots mean the empty set, never
+/// the current host's roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::harness) struct ProfileName(String);
 
@@ -166,7 +177,7 @@ pub(in crate::harness::grok) fn merge_profile(
         })?
     };
     if let Some(p) = existing.profiles.get(name) {
-        // The historical name binds the read_write set and workspace base,
+        // The generated name binds the read_write set and workspace base,
         // not the entire effective policy. Other valid fields remain accepted.
         let base_ok = matches!(p.extends.as_deref(), None | Some("workspace"));
         if !base_ok || RootSet::new(&p.read_write) != *roots {

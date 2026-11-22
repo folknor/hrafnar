@@ -142,8 +142,8 @@ pub const INTERRUPT_PID_POLL: Duration = Duration::from_millis(100);
 
 /// How long a fresh run holds the host-wide launch lock after launching, so
 /// that `review` calls fired together on one host reach their harnesses spaced
-/// apart rather than all at once, to avoid rate limits. Not tunable: nobody
-/// ever set the old `--stagger` flag.
+/// apart rather than all at once, to avoid rate limits. Released early if the
+/// run ends first. Not tunable, because no caller has needed another value.
 pub const LAUNCH_SPACING: Duration = Duration::from_secs(30);
 
 #[cfg(test)]

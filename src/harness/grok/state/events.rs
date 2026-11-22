@@ -4,9 +4,9 @@ use std::path::Path;
 ///
 /// Takes the *last* `turn_ended` (a resumed session holds several turns), and
 /// the last permission refusal before it unless a later allowed permission
-/// superseded it.
-/// Open protocol category and independent refusal evidence. Keep both facts
-/// typed until explanation; the historical flat digest remains a text projection.
+/// superseded it: the turn went on past that refusal, so it is not why the
+/// turn ended. The category is grok's open protocol string; both facts stay
+/// typed until they are rendered into the flat `turn_error` text.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::harness::grok) struct CancelCause {
     pub category: String,

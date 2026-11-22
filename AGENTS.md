@@ -14,11 +14,14 @@ each value's source.
 
 Where to read further:
 
-- [reference/architecture.md](reference/architecture.md) - what each module owns.
-- [reference/design.md](reference/design.md) - the harness-agnostic design
-  decisions and why, and the reserved words.
-- [reference/codex.md](reference/codex.md), [reference/claude.md](reference/claude.md),
-  [reference/grok.md](reference/grok.md) - how each harness is driven.
+- `src/lib.rs` - the module layers and the rules that hold across them; each
+  module's `//!` comment says what it owns, and each design rule and its
+  reason sit on the code that enforces it.
+- [reference/steering.md](reference/steering.md) - how `review message` and
+  `review interrupt` coordinate on one session.
+- How each harness is driven: [reference/codex.md](reference/codex.md),
+  [reference/claude.md](reference/claude.md), [reference/grok.md](reference/grok.md),
+  [reference/maki.md](reference/maki.md).
 - [reference/sandbox.md](reference/sandbox.md) - permissions and writable roots.
 - [reference/teardown.md](reference/teardown.md) - the keeper every run runs under.
 - `docs/` - the `review man` topics: observable behaviour, and the binding
@@ -101,8 +104,10 @@ bz close 12 -m "fixed by ..."
 ### Where notes go
 
 - Harness-specific notes go in `reference/<harness>.md`; permission machinery
-  shared across harnesses in `reference/sandbox.md`; harness-agnostic design
-  in `reference/design.md`. This file keeps the rules and pointers only.
+  shared across harnesses in `reference/sandbox.md`. A harness-agnostic design
+  rule and its reason go on the code that enforces it; only behaviour that
+  needs several modules read at once to understand gets a `reference/` page,
+  like `reference/steering.md`. This file keeps the rules and pointers only.
 
 ## Document folders
 

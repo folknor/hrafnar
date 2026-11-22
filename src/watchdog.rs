@@ -1,7 +1,7 @@
 //! Progress watchdog: source-owned revisions and answer evidence, shared patience.
 //! The Codex source uses append-only rollout length and a run-scoped phase
-//! answer. Its empirical silence policy and failure history are documented in
-//! reference/codex.md. Other adapters must supply their own measured policy;
+//! answer. Its measured silence policy lives on `src/harness/codex/watch.rs`.
+//! Other adapters must supply their own measured policy;
 //! generic timings disable stall detection by default.
 
 use std::time::{Duration, Instant};

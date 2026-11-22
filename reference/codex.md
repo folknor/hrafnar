@@ -1,301 +1,179 @@
 # Codex
 
-How `review` drives codex, and why. Everything here is codex-specific; the
-cross-provider permission machinery (sandbox vocabulary, derived writable roots,
-recorded permissions, what a resume inherits) is in [sandbox.md](sandbox.md).
+What codex does that shapes how `review` drives it: observed behaviour,
+measured evidence and upstream facts. The rules themselves, and the reason
+for each flag, are on the code in `src/harness/codex.rs` and its modules. The
+permission machinery shared across harnesses is in [sandbox.md](sandbox.md).
 
-## Invocation
+## Scoping a run inside a shared rollout
 
-A fresh run is `codex exec --json` (to capture `thread_id`); a `review resume`
-is `codex exec resume <id>`. Every run carries:
+A resume appends to the same rollout file as every earlier turn, so each
+read of the rollout must know where this run's bytes begin. The runner
+measures the rollout's length before spawn and turns it into one `Scope`,
+which every reader then uses:
 
-- `--skip-git-repo-check`, `-c approval_policy="never"`, `--ignore-rules`,
-  `--ignore-user-config` - see [The sandbox guarantee](#the-sandbox-guarantee).
-- `-c model_reasoning_summary="detailed"` - see [Reasoning summaries](#reasoning-summaries).
-- For `read-only` (the default): a `[permissions]` profile extending
-  `:read-only` with network enabled, *instead of* `--sandbox` - see
-  [Network access](#network-access).
-- For any other level: `--sandbox <level>`. `workspace-write` additionally gets
-  the derived `-c sandbox_workspace_write.writable_roots=[...]` and
-  `-c sandbox_workspace_write.network_access=true`.
-- Profile settings: `model` as `-m`, `effort` as `-c model_reasoning_effort=`,
-  `env`, then the profile's own `config` entries, each as a verbatim `-c`. The
-  fixed overrides above are passed **before** profile `config`, so a profile can
-  restate any of them and win (codex takes the last `-c`).
+- The watchdog (`harness/codex/watch.rs`) judges only bytes in that scope,
+  so a previous turn's answer can't license killing a quiet resume.
+- Recovery (`transcript.rs`) salvages an answer only from that scope, so a
+  previous turn's answer can't be reported as this run's, which would also
+  suppress auto-resume.
+- The incident bundle (`harness/codex/forensics.rs`) tails and scans the
+  same scope.
 
-The prompt is piped via stdin.
+A byte offset, not a timestamp, because `review`'s own clock string is
+second-resolution and an answer written in the launch second would pass a
+time filter. A fresh run's scope starts at 0, exactly. A resume whose
+rollout can't be measured gets `Scope::Untrusted`, which disables both the
+watchdog and recovery: scoping it to 0 would admit the whole history, and no
+recovery beats a wrong one.
 
-## Modules
+The watchdog's answer is a separate input to recovery. A trailing real or
+phantom turn can clear the rollout's current-turn answer after the watchdog
+killed on it, so the runner prefers the exact answer the watchdog saw, and
+the bundle's answer flag follows the same evidence.
 
-- `src/provider/codex.rs` - Both fresh and resumed runs drive `run_codex_json`.
-  It captures process evidence independently of `Outcome`, never bailing on a
-  non-zero exit after a turn was established. The final-message priority is the
-  `-o` file, a recovered rollout answer (including the exact watchdog-licensed
-  answer), then the last unphased stream message as interim text only. With no
-  text, `Outcome::placeholder` supplies the settled outcome's wording and stderr
-  remains available as detail. `run_codex` builds argv; `new_output_file` creates
-  the random exclusive `-o` path. The child gets `RUST_BACKTRACE=1` and its stdin
-  write result is retained.
-- `src/provider/codex/rollout.rs` - One rollout fold owns phase-aware answer
-  recognition, turn boundaries and shutdown-phantom rollback, physical last
-  event, open tool calls and the last non-null rate-limit snapshot. It exposes
-  two distinct projections: the current real turn for transcript recovery and
-  session show; and `latest_phase_answer` for any answer in the supplied scope,
-  which the watchdog must retain across trailing real or phantom turns. Both
-  old `agent_message` and assistant `message`/`output_text` final-phase shapes
-  count; `task_complete.last_agent_message` alone never proves an answer. Exec
-  stream decoding shares this owner but is a separate format: unphased
-  `item.completed` text is diagnostic fallback and cannot become `PhaseAnswer`.
-- `src/transcript.rs` - Resolves Codex home and locates
-  `$CODEX_HOME/sessions/**/*-<session_id>.jsonl` candidates, then requires the
-  first physical record to be `session_meta` with an exact `payload.id` or
-  legacy `payload.session_id`. Both keys, when present, must be strings and
-  agree. A well-formed different identity is skipped; malformed, oversized or
-  unreadable headers are reported if no verified candidate is found. The first
-  record is capped at 1 MiB including an optional LF; complete JSON at EOF and
-  CRLF are accepted. Nonblocking open and opened-handle regular-file inspection
-  keep special files from blocking header reads. Suffixes and paths use native
-  bytes, including opaque IDs and non-UTF-8 path components. This verifies
-  identity at discovery time, not content authenticity, uniqueness, symlink
-  confinement or immunity to later file replacement.
-  `Scope::WholeFile` is the session-show view; `Scope::From(RolloutOffset)`
-  restricts reads to the invocation's measured baseline; `Scope::Untrusted`
-  attributes no bytes. Past-EOF offsets also yield no evidence. Only From
-  authorizes watchdog monitoring. The runner resolves home once before launch
-  and reuses it for baseline, watchdog and recovery; saved homes let session
-  show find the same storage later.
-- `src/provider/codex/forensics.rs` - `CodexForensics` holds log lines,
-  transcript, quiet duration and last rollout event. It renders the provider
-  block and the transcript block also used by `provider::session_artifacts`.
-  `CodexIncident` writes the last 80 scoped rollout lines and obtains rate
-  limits from the same fold. It receives the exact Scope used for recovery and
-  the watchdog, including explicit Untrusted authority. Live transcript and
-  incident paths stay native through filesystem reads; only display and the
-  historical string wire fields project them lossily. Open EventKind values
-  retain both physical event names until their historical type/payload display
-  projection. InFlightTool retains raw optional call IDs; missing IDs match
-  nothing, while present empty IDs match equal present empty IDs.
-- `src/incident.rs` - Common bundle storage takes `ProcessSpec`, settled
-  `Outcome`, process evidence and optional provider artifacts. Only Codex's
-  adapter currently elects to bundle (`!captured || exit!=0 || signal`, excluding
-  interrupts). Bundles contain stderr, the last MiB of stdout, exact prompt,
-  provider artifacts and `meta.json` under the incident data directory with a
-  UTC/session/random-suffix name. Replay argv, cwd and env overrides come from
-  the spawn spec, including profile env, `RUST_BACKTRACE` and `PWD`; secret
-  values are redacted. Inherited env is not snapshotted, and argv temp paths
-  such as `-o` are not captured artifacts. The owned `Meta` schema-1 DTO is used
-  for both write and read, defaulting historical omissions and checking the
-  schema, provider and UTC time before listing. Flat key names, including
-  `codex_version`, remain compatible. `Meta::verdict` preserves the historical
-  tri-state transcript evidence and gives a stated reason priority. An answer
-  preserved by the watchdog remains affirmative evidence even if the recovery
-  read later loses the transcript. Write/read
-  errors retain their failed paths; incomplete bundles are never advertised as
-  complete and listing warns while showing other readable bundles.
-- `src/watchdog.rs` - The generic patience loop consumes source revisions and
-  typed answer evidence. Unavailable reads skip judgment; an observed revision
-  change resets patience. Generic timings default stall detection off.
-  `src/provider/codex/watch.rs` owns Codex rollout discovery, progress (file
-  length), evidence, and verdict wording. Any length change, including
-  truncation, resets patience; malformed or partial bytes count as progress but
-  not as answer evidence. Equal-length replacement is outside the append-only
-  assumption. Stat and read are separate observations, not an atomic snapshot.
-  Unknown baseline disables the watchdog; fresh baseline zero is exact. The
-  Codex-owned default enables its measured 15-minute stall budget, with the
-  configured override applied only to this provider. An answer prevents a
-  stall; `Stranded` needs that answer plus quiet grace, while `Stalled` needs
-  no answer plus stall grace. The monitor preserves typed `PhaseAnswer` until
-  Codex constructs its verdict. Recovery prefers that exact licensed answer
-  over a later current-turn summary. Quiet duration and last event reach the
-  digest and bundle.
-- `tests/provider_runs.rs` - End-to-end tests through `invoke` and the complete Codex adapter against a **stub `codex`** shell script, an integration test because the runner's keeper is the built `review` binary (see [teardown.md](teardown.md)). The behaviours under test are *process* behaviours - finishing work then refusing to exit, wedging mid-turn, leaving a descendant that holds stdout open or ignores `SIGTERM` - none of which can be faked with a mocked return value; they need a real child, pipe and kill. `ProviderRuntime` (`commands`, the per-provider executable and leading arguments, watchdog `Timings`, `drain_grace`, `data`, and `teardown`, the keeper's binary and graces) is the injection point that makes a 3-minute detection and 10-second escalation resolve in under a second. `data: DataDir` is load-bearing, not tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s own paths otherwise resolve from the real `HOME`/`XDG_DATA_HOME` - an earlier version of this suite wrote stub incident bundles into the operator's real `~/.local/share/review/incidents`. Coverage: stranded completion is killed and recovered; a mid-turn wedge trips the stall timeout (killed, bundled, *no* answer recovered, `quiet_secs`/`last_rollout_event` recorded); a disabled stall timeout never fires; an advancing rollout is never killed (answer present *and* still writing - the advancement gate, not the answer gate); a pipe-retaining child blocks neither reaping nor output capture, and is ended as a leftover; the keeper's escalation actually reaps a `SIGTERM`-ignoring descendant; a refused turn (`error` + `turn.failed`, exit 1, no `final_answer` on disk) carries its stated reason into the digest, the summary and `meta.json` while keeping the rest of its failure signature; resumed incident bundles exclude previous rollout turns and use the shared phase-aware answer summary, including no-append, commentary-only and trailing-phantom cases. Scratch lives in `target/test-scratch/<uuid>/`; stubs record any deliberately-left-running pid to `$LINGER_PID` so tests clean up after themselves.
+## Two ways a run fails
 
-## Failures, recovery and hangs
+A failed `codex exec --json` run looks the same on stdout either way:
+`exit 1`, nothing captured, zero turns. The two causes are:
 
-### Two ways a run fails
+- **Truncated but completed**: the model wrote a real `final_answer` to the
+  rollout, but codex exited non-zero at shutdown and dropped the closing
+  stream events and the `-o` file.
+- **Mid-turn death**: no `final_answer` was ever written; the turn was cut
+  off, typically after a tool call.
 
-Codex `exec --json` runs fail two distinct ways, both surfacing as `exit 1 / captured false / turns 0` on stdout. (1) *Truncated-but-completed*: the model produced a real `final_answer` on disk but codex exited non-zero at shutdown, dropping the closing stdout events and the `-o` file. (2) *Genuine mid-turn death*: no `final_answer` was ever produced - the turn was cut off after a tool call. **`task_complete` does not tell these apart** - it fires on aborted turns too; the authoritative recovery signal is the rollout's phase-tagged final answer. `task_complete.last_agent_message` often echoes it, but is not an independent answer predicate. So `review` keys recovery on `final_answer`, not `task_complete`: recovery is scoped to the bytes *this run* appended (the same `rollout_baseline` byte offset the watchdog uses, not a wall-clock stamp - a second-resolution stamp let a prior answer written in the same second as a resume's launch be recovered as the new run's result, suppressing auto-resume and writing a wrong response into the sidecar; an untrustworthy baseline scopes to `u64::MAX`, i.e. recovers nothing, because no recovery beats a wrong answer). When it exists (including from a later `review resume` of the same session) it's restored from the rollout instead of surfacing the last streamed `commentary` (an interim "I am now doing X" note); when it's absent the run genuinely died, `review` keeps the interim text but the digest note says "died without a final answer" (exit status distinguishes a death from a benign no-answer). Why codex exits 1 / dies is codex-side and is *not* recorded in the rollout - no `stream_error`, abort, or rate/context-limit event; recovery salvages output but does not explain the death.
+`task_complete` fires on aborted turns too, so it can't tell them apart; the
+rollout's phase-tagged final answer can. Codex records no reason for either
+in the rollout: no `stream_error`, abort or limit event. Recovery salvages
+the output; it doesn't explain the death, which is why suspicious runs get
+an incident bundle with stderr and `RUST_BACKTRACE=1`.
 
-### Auto-resume
+A turn codex refuses is not a death. Codex ends it with an `error` and
+`turn.failed` pair carrying the same message (content flagged, rate limit,
+auth, or a harness error) and exits promptly on its own. Observed on
+codex-cli 0.146.0.
 
-Auto-resume is the "work around" for a codex mid-turn death: a fresh codex run that ends with no real final answer (`!Outcome::has_answer`: no `-o` capture and nothing recovered from the rollout; decided by `codex::recovery`) is resumed **once**, immediately (cache still warm), inside the same spawned task so the profile model/effort/sandbox/env are reused, with a fixed nudge (`RESUME_NUDGE`). If the resume produces a real answer (`Outcome::has_answer`) it replaces the dead result, prefixed `(auto-resumed after the initial run died...)`; otherwise the original dead result stands. **A run whose provider stated why it produced nothing is excluded** (`Outcome::stated_failure`): see [A stated failure is not a death](#a-stated-failure-is-not-a-death). **So is a run ended by `review interrupt`** (`Outcome::interrupted`): see [Interrupting a run](#interrupting-a-run). A manual resume is exactly what rescued the original Death 2. It calls `provider::invoke` directly, bypassing the `review resume` cold-cache gate (that gate guards a *cold* manual resume; this one is warm by construction). Always on. Both invocations are recorded in order after recovery, with their
-actual prompts (original assembled prompt, then recovery nudge). The operator
-prompt remains the original request in both rows. The successful recovery's
-application prefix is also retained in its recorded response.
+## Hangs on codex 0.147.0
 
-### A stated failure is not a death
+Codex 0.147.0 can finish a turn and never exit. Two hangs were diagnosed
+against sessions that worked on 0.146.0:
 
-**A stated failure is not a death, and is never retried.** Codex ends a turn it will not do with a stream `error` + `turn.failed` pair carrying the same message (an upstream refusal - content flagged, rate limit, auth - or a harness error). `review` dropped both event types, so a fully-explained refusal surfaced identically to an unexplained mid-turn death: `exit 1 / captured false / turns 0`, the note "died without a final answer", the last interim commentary presented as the result, an incident bundle filed under the hang class, and - because the run had no answer - an auto-resume straight into the identical refusal. That last part is the signature: **every field occurrence left two bundles seconds apart**, which reads as two deaths and is really one refusal retried. The message is now carried on `Outcome.stated` (persisted as the digest's `turn_error`), printed first (`turn failed: <msg>`) since the operator's next move follows from the message rather than the exit status, persisted flat (`jq 'select(.digest.turn_error != null)'`), recorded in `meta.json` where it becomes the `review incidents` verdict, and used to gate auto-resume (`Outcome::stated_failure`). The retry gate is the substantive half: auto-resume exists for the mid-turn wedge, where the work was real and interrupted so replaying it can finish the job; a stated failure is a verdict on the request itself, so resending it costs a second full run to be told the same thing. What deliberately does *not* change: the run still exits 1 (a refusal produced no work and must not report success to CI), and it still writes a bundle (the evidence is worth keeping) - the bundle just no longer masquerades as a hang. Observed on codex-cli 0.146.0 and unrelated to the 0.147.0 hang class; the process exited promptly and cleanly on its own.
+- **Stranded completion**: every turn reached `task_complete` with an
+  answer, the rollout stopped advancing, and the process hung over 10
+  hours with the answer on disk.
+- **Mid-turn wedge**: the rollout stopped mid-turn with 25 unified-exec
+  background cells running.
 
-### Incident bundles
+The leading upstream explanation for the stranded case is the resume-only
+`exclude_turns: true` that `thread_resume_params_from_config` sends from
+0.147.0 (openai/codex#35621). After `TurnCompleted`, exec issues an unbounded
+`thread/read` with `include_turns: true` (`maybe_backfill_turn_completed_items`)
+while its single `select!` loop isn't draining notifications. With turns
+excluded at resume, that read rebuilds the whole thread from the rollout,
+which fits "resumes hang, fresh runs don't, small sessions are fine". A
+secondary candidate is the synchronous `Drop` of `OtelProvider`, bounded
+only for the TUI by openai/codex#37109, with a Statsig metrics exporter on by
+default in release builds. Neither is proven. `review` catches the hang with
+the watchdog rather than explaining it.
 
-A suspicious codex run writes a full forensic bundle (`src/incident.rs`), because the death investigation kept stalling on information `review` discarded: codex's stderr, the raw NDJSON stream, whether the prompt finished writing, and (absent `RUST_BACKTRACE`) any panic trace. The bundle over-instruments the *next* death so it's diagnosable without a repro. It's the "catch" half of the strategy; recovery (final_answer) is the "work around" half. Root-causing codex itself is explicitly out of scope.
+Codex 0.147.0 also opens a phantom turn during `codex exec` teardown and
+aborts it within 46 ms; its shape and the rollback are on the fold in
+`harness/codex/rollout.rs`.
 
-### codex 0.147.0 hangs
+## The stall timeout
 
-**codex 0.147.0 can finish a turn and never exit.** Two hangs were diagnosed on 0.147.0 against sessions that worked on 0.146.0. (1) *Stranded completion*: every turn reached `task_complete` with a non-null `last_agent_message`, the rollout then stopped advancing, and the process hung 10+ hours with the answer on disk the whole time. (2) *Mid-turn wedge*: the rollout stopped mid-turn with 25 unified-exec background cells running. Leading upstream explanation for (1) is the resume-only `exclude_turns: true` that `codex exec`'s `thread_resume_params_from_config` began sending in 0.147.0 (openai/codex#35621): after `TurnCompleted`, exec issues an unbounded `thread/read` with `include_turns: true` (`maybe_backfill_turn_completed_items`) while its single `select!` loop is not draining notifications, and with turns excluded at resume that read must rebuild the whole thread history from the rollout - which fits "resumes hang, fresh runs don't, small sessions are fine". Secondary candidate: `OtelProvider`'s `Drop` shutdown, bounded for the TUI only by openai/codex#37109 - `codex exec` still drops it synchronously, and a Statsig metrics exporter is on by default in release builds. Neither is proven; root-causing codex is out of scope. `review` catches it rather than explains it.
+The stall verdict rests on an observed property, not a contract: codex
+wakes itself every 2 to 5 minutes even while waiting on a long tool call,
+and the observed wedge was silent for hours. The evidence and why the
+default is safe are on `harness/codex/watch.rs`. No other harness has a
+measured cadence, so the stall branch is off for them.
 
-- The old `join!` on child-exit **plus both pipes** made this unsurvivable: everything `review` knows about a run (digest, transcript, incident bundle, sidecar row) is computed after that join, so a wedged run produced no output, no error and no incident bundle. The wait is now a `select!` loop that breaks on reap, with the watchdog able to pre-empt it. Pipe EOF is no longer required to finish - reaping is authoritative, and the readers get a 5s drain grace (defence in depth: 0.147.0 has no production `Stdio::inherit` on the exec path, so a descendant holding the pipes is not a known live path). Readers append into a shared buffer instead of returning at EOF, so a grace-period expiry keeps whatever was captured rather than discarding the stream; the reader is `abort()`ed rather than detached by dropping its `JoinHandle`. The session ID is published on a watch channel the instant `thread.started` is seen, so it survives a truncated capture - losing it would cost the transcript, the recovery path and the sidecar row.
-- `Outcome::termination` (persisted as `DigestSummary.terminated_by_review`) records that *we* killed the run and why, because otherwise a watchdog kill is indistinguishable from codex dying on its own - the exit/signal describe our kill, not codex's fate. Persisted flat, so `jq 'select(.digest.terminated_by_review != null)'` finds the hang class.
+## Interrupting a run
 
-### The stall timeout
+A running `codex exec` turn can't be spoken to, only ended. Established
+from the codex source (checkout at 50fc133d05, installed 0.156.1):
 
-**The stall branch is a timeout, and is named one.** `Stalled` rests on an *empirical* property of codex rather than a documented contract: codex cannot stay silent - it wakes itself every 2-5 minutes even while babysitting a long-running task (the field rollout shows `wait` calls with `yield_time_ms: 30000` and events landing every 5-15s throughout the working portion), whereas the wedge was silent for hours. Two to three orders of magnitude separate them, which is what makes a 15-minute default safe and what made a `/proc` CPU-liveness check unnecessary (it would have added platform-specific complexity for a weaker signal: healthy API waits are CPU-idle and broken processes can spin). The property is codex's alone, and none of this runs for claude, whose result object states its own outcome (see [claude.md](claude.md#transcript-no-watchdog)). Because the invariant is empirical, it is named `stall timeout` rather than something softer (a future cadence change must be diagnosable, not mysterious), it is tunable and disableable via `[_defaults].stall_timeout_secs` (`0` = off), and `quiet_secs` + `last_rollout_event` are recorded on every verdict so a misfire shows how close the call was and what codex was last doing.
+- Exec reads stdin once (`read_prompt_from_stdin`) and runs its app-server
+  in-process, with no socket or remote-control endpoint.
+- It handles one signal, SIGINT, which it turns into `turn/interrupt`: the
+  turn ends `Interrupted` and exec exits 1.
+- In-turn steering (`turn/steer`) exists, but only for a client of the
+  process that owns the thread, and exec is its own only client.
+- No other process can take the thread over. Each live thread holds an
+  flock at `$CODEX_HOME/thread-writer-locks/ID.lock`, and `thread/resume`
+  elsewhere fails "already has an active writer" until the kernel releases
+  it at exit.
+- `codex queue` reaches another process's thread only as a new turn after
+  the current one ends, and an exec run is a single turn.
 
-### Keepers and signals
-
-Codex runs under a keeper (see [teardown.md](teardown.md)), which puts it in a process group of its own and, when the run ends however it ends, tears down everything codex started - exec-server, unified-exec cells, MCP servers, and the sandboxed shells that `--new-session` and `setsid()` put beyond any process group. A wedged codex usually still has live children; the watchdog's kill is the keeper's terminate. Outside the terminal's foreground group, codex no longer receives a terminal SIGINT implicitly, so `supervisor::install_signal_supervisor` installs **one** process-wide SIGINT/SIGTERM handler that - after first trying a graceful stop (see [Interrupting a run](#interrupting-a-run)) - terminates every live keeper, waits for their teardowns within a bound, reports anything left running, and exits 130/143. Signal registration must be once per command, not a per-run `select!` arm; its captured `Lifecycle` owns the command's stop state and keepers: tokio's signal registration is process-wide and permanent, so a per-run handler would leave `review` silently ignoring every SIGTERM after its first codex invocation - *harder* to kill than before. Reaching the terminate can forfeit the run's digest and sidecar row (`review` exits once the keepers have reported, which may be before the runner writes its rows); the rollout is still on disk for `review sessions <id>`.
-
-### Interrupting a run
-
-`review interrupt <id>` exists because a running `codex exec` turn cannot be spoken to. Established from the codex source (checkout at 50fc133d05, installed 0.156.1): exec reads stdin once (`read_prompt_from_stdin`), runs its app-server in-process with no socket or remote-control endpoint, and handles exactly one signal - SIGINT, which it turns into `turn/interrupt`, ending the turn `Interrupted` and exiting 1. In-turn steering (`turn/steer`, landing at the next sampling boundary) exists but only for a client of the process that owns the thread, and exec is its own only client. No other process can take the thread over either: each live thread holds an flock at `$CODEX_HOME/thread-writer-locks/<thread_id>.lock`, and `thread/resume` from anywhere else fails "already has an active writer" until it is released. `codex queue` does reach another process's thread, but only as a *new* turn once the current one ends, and an exec run is a single turn - so for us it can only deliver after the work is done, which `review resume` already does. The one lever is therefore end the turn, then resume.
-
-Mechanics: the in-flight marker records one keeper identity and a separate readiness fact, `review interrupt` writes `<id>.<run_id>.interrupt` beside it and then sends SIGINT to the keeper, which forwards one SIGINT to codex's own pid through a pidfd. On an npm install that pid is the node wrapper, which forwards SIGINT to the native binary once (`codex-cli/bin/codex.js`); signalling the whole group would hand the native binary a second copy. The wrapper installs that forwarding only *after* spawning the native binary, and a SIGINT in between would kill the wrapper and orphan codex still holding the writer lock - so the marker becomes signal-ready only once codex has written to stdout. Before signalling, the verb checks that the keeper still leads its own group *and* is the owning `review`'s child, since it may have exited and its pid been reused.
-
-The request file exists because an interrupted turn is otherwise indistinguishable from a mid-turn death - `exit 1`, no answer - and [auto-resume](#auto-resume) would resume straight past the operator's decision. The owning run consumes it once codex is reaped (before dropping its marker, since `read_live` sweeps requests with no marker beside them), and it counts only if the run has no answer: codex can finish between the request and the signal. An interrupted run gets `Outcome::interrupted` (persisted as `DigestSummary.interrupted`; `jq 'select(.digest.interrupted)'`) and `terminated_by_review`, no incident bundle, no auto-resume, and the resume command in its output. If the interrupt lands on an auto-resume's second invocation, that invocation is what gets reported. `review interrupt` waits for the captured invocation's bounded result receipt,
-published only after recovery and all recording attempts. It does not scan or
-count sidecar rows. The receipt reports that invocation's interruption separately
-from the final session's successful sidecar append. Marker visibility continues
-as handoff pending through that interval. Automatic recovery projects its explicit
-predecessor into its marker, allowing the resolver to select that successor while
-an already captured waiter stays on its original invocation. Unrelated overlaps
-are refused as ambiguous. Active markers lacking the supported handoff protocol
-are refused before signalling; historical recorded sessions remain readable.
-The flock is released by the kernel on exit, so resume is not blocked by the
-ended provider.
-
-`review message <id>` is the verb orchestrators are pointed at: with a codex turn in flight it runs the interrupt above, then resumes the session with stdin; on an idle session it is a plain resume (`review resume` survives as a hidden, warning alias). It exists for its name. Told to "interrupt the agent", an orchestrating Claude reached for its own task-stop tool, which signals `review`, not the turn, and the old supervisor then killed codex and exited before any sidecar row was written - a fresh session left with no record, so it could never be resumed. "Message the agent" has no rival tool, and `--help` and `review list` both say not to stop the process.
-
-The signal path is made safe too, since the mistake will recur. With codex runs in flight, the first SIGINT/SIGTERM to `review` closes admission and flips its command-owned stop channel (`ProviderRuntime.lifecycle`, independently constructible for tests): each run ends its turn exactly as `review interrupt` would - SIGINT to the leader once codex has spoken, the group killed before that - and counts it as interrupted, and launches that have not spawned yet are refused. The supervisor exits once every codex run is recorded (`supervisor::Unrecorded`, a guard held by `run_launch` and the resume path from before `invoke` until after the row is written), bounded by `timings::GRACEFUL_STOP`; a second signal skips straight to the kill below. Checked live against Claude Code's TaskStop: the session was recorded, the continue command printed, and `review message` resumed it warm. SIGKILL cannot be caught and still loses the row.
-
-### The shutdown-time phantom turn
-
-A turn that aborts without carrying a user request or model output is codex's shutdown-time phantom, not a real turn: 0.147.0 opens a turn during `codex exec` teardown and aborts it within milliseconds. It is **not** an empty event sequence - the observed shape is `task_started`, `turn_context`, a synthetic `role: "developer"` message whose text is `<turn_aborted>`, then `turn_aborted` - so "zero items" cannot be the test. What distinguishes it is the absence of both a `user_message` (every real turn is opened by one) and any model output, so the shared rollout fold keys the rollback on a positive list of real-content events (`user_message`, `agent_message`, `reasoning`, tool calls/outputs, `task_complete`, `stream_error`, and `message` with a non-`developer` role). Attributing the phantom made fully-completed sessions report `task_complete=false` - which sent the hang investigation chasing a non-existent "truncated turn" condition. A turn cancelled early but carrying real content is a genuine interruption and is kept.
-
-### The digest is persisted
-
-The digest is persisted (flat `DigestSummary`) into the audit + sidecar logs. Before this, `run_codex_json` returned `Ok` on any mid-run death and the digest was print-only, so a dead run was filed as a clean short `response` with `error: null` - invisible to `jq`. Now `jq 'select(.digest.captured==false)'` (or `.digest.stream_error==true`) finds them. The run still returns `Ok` (never `Err`) so the session ID + digest survive; the digest fields, not the `error` field, carry the failure.
+So the one lever is to end the turn with SIGINT, then resume. On an npm
+install the pid is the node wrapper `codex-cli/bin/codex.js`, which forwards
+one SIGINT to the native binary but installs that forwarding only after
+spawning it. That is why the marker becomes signal-ready only at codex's
+first stdout byte, and why the signal goes to the leader, not the group.
 
 ## The sandbox guarantee
 
-### `--skip-git-repo-check`
+The filesystem guarantee a profile advertises has needed four fixed flags,
+because ambient operator config could void `--sandbox` twice over. Each
+flag's mechanism and measurement is on the line in `run_codex` that passes
+it; the facts in short:
 
-**Codex is always passed `--skip-git-repo-check`.** `review` is routinely launched from an umbrella directory that is not itself a git repo but whose repos live in subdirectories (`~/Programs/PRs`, holding `PRs/projects/<repo>`); codex refuses to start there with *"Not inside a trusted directory and --skip-git-repo-check was not specified."* Marking the directory `trust_level = "trusted"` in `~/.codex/config.toml` does **not** help - verified on codex-cli 0.149.0 against two separately-trusted non-repo directories, both refused - so the git-repo precondition is checked ahead of, not satisfied by, project trust, and there is no config-side fix. Waiving it costs nothing we rely on: the filesystem guarantee is `--sandbox` (default `read-only`), a different mechanism that this flag does not touch. All it waives is codex's own "am I in a repo?" question, whose answer was never load-bearing for a tool that only builds prompts.
+- **`approval_policy="never"`**: from 0.150.x, `approvals_reviewer =
+  "auto_review"` in the operator's config drops exec's headless `never`,
+  and codex's guardian grants write escalations. Measured on 0.150.1.
+- **`--ignore-rules`**: an execpolicy `allow` rule matching every segment
+  of a command runs it with no sandbox at all, at every level, regardless
+  of approval policy. Measured on 0.151.0.
+- **`--ignore-user-config`**: drops `config.toml` wholesale. It doesn't
+  close the rules hole: alone it leaves the command unsandboxed,
+  `--ignore-rules` alone sandboxes it.
+- **`--skip-git-repo-check`**: codex refuses non-repo directories even when
+  trusted (0.149.0), and the flag doesn't touch the sandbox.
 
-### `-c approval_policy="never"`
+Network access is enabled at both sandboxed levels because codex's Linux
+seccomp filter for restricted network denies the pathname socket syscalls,
+so AF_UNIX sockets are unusable. `read-only` can get that grant only from a
+named permissions profile, which `--sandbox` would make inert; the measured
+table is on `codex_sandbox_args`, produced by
+`scripts/readonly_network_check.py` on 0.151.0.
 
-**Codex is always passed `-c approval_policy="never"`, because `--sandbox` alone stopped being a filesystem guarantee in codex 0.150.x.** What made `--sandbox read-only` absolute was never the sandbox on its own: it was the headless approval policy. `codex exec` sets `approval_policy = "never"` in its `ConfigOverrides`, and under `never` the model's `request_permissions` escalation is short-circuited to an empty grant (`session::request_permissions_for_environment`), so a read-only run has no path to widen its own permissions. 0.150.x added `build_exec_config`, which **discards that headless default and rebuilds the config with `approval_policy: None`** whenever the resolved `approvals_reviewer` is `auto_review` - a setting an operator can turn on globally in `~/.codex/config.toml`, with nothing on the `review` command line hinting at it. The policy then falls back to `on-request`, escalations route to codex's own auto-approving guardian rather than to a human, the guardian grants them, and the granted `AdditionalPermissionProfile` is layered onto the read-only profile for the turn. Verified on codex-cli 0.150.1: a bare `codex exec --sandbox read-only --skip-git-repo-check` asked to create a file created it; the same invocation plus `-c approval_policy="never"` was rejected with *"patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings"*. The `-c` override survives because `build_exec_config` only rewrites the harness overrides, never the CLI ones. This is why `review` pins the policy rather than trusting the provider's headless default: the guarantee `.review.toml` profiles advertise must not depend on an unrelated key in the operator's global codex config. It is passed **before** profile `config` overrides, so a profile that genuinely wants approvals can still opt back in with a later `-c`.
+## Model selection
 
-### `--ignore-rules`
+Codex resolves model and effort as `review` mirrors them in
+`harness::ModelSpec`. Checked against source at 2bc8e7f545 with codex-cli
+0.167.0 installed:
 
-**Codex is always passed `--ignore-rules`, because an operator's execpolicy allowlist silently disables the sandbox outright.** This is the second, independent hole in the same guarantee, and unlike the `auto_review` one it had been firing in the field for months. Codex's `$CODEX_HOME/rules/*.rules` are not merely an approval allowlist: when a `prefix_rule(..., decision="allow")` matches **every** parsed segment of a command, `exec_policy.rs` returns `Skip { bypass_sandbox: true }`, `tools/sandboxing.rs` turns that into `SandboxOverride::BypassSandboxFirstAttempt`, and the orchestrator resolves `initial_sandbox = SandboxType::None`. On Linux the sandbox *is* an argv wrapper (`codex-linux-sandbox … -- <cmd>`), so this is not a weakened sandbox but **no sandbox at all**. Three properties make it worse than it sounds. (1) `approval_policy="never"` does not gate this branch - the pin above is irrelevant to it. (2) `read-only` is exposed exactly as much as `workspace-write`: `unsandboxed_execution_allowed` tests only `has_denied_read_restrictions()`, i.e. deny-*read* entries, which neither level emits. (3) The condition is `all()` over segments, so enforcement tracks **the shape of the command the model happened to type**, not any configuration - which is precisely why this read as flaky, unreproducible behaviour. A bare `brokkr check` ran unsandboxed; `sed -n '…' file; brokkr test …` ran sandboxed, because `sed` matched no rule. An agent that hit the sandbox for the first time this way read it as a broken build setup, relocated `CARGO_TARGET_DIR` to `/tmp` - which guaranteed no rule would ever match again, pinning itself in the sandboxed regime - and filled 12G of tmpfs. Verified on 0.151.0 against an operator rules file carrying `["ln","-s"]` and `["brokkr","status"]`: under `--sandbox read-only`, `ln -s /etc/hostname x` created the link inside the workspace and `brokkr status` wrote a row into `~/.local/share/brokkr/history.db`; with `--ignore-rules` both were refused *"Read-only file system"*. The behaviour is documented upstream ("control which commands Codex can run outside the sandbox"), so it is codex working as intended - it is `review`'s advertised guarantee that it breaks. `--ignore-rules` drops the user and project rule layers for this invocation only, leaving interactive codex untouched; it does not touch `CODEX_HOME`, so auth, sessions and rollout discovery are unaffected (redirecting `CODEX_HOME` also kills the bypass, and was rejected for exactly that reason). Residue: the root-controlled `System` layer (`/etc/codex/rules/`) is still loaded, which is correct - it is not the operator's to smuggle. An older codex lacking the flag fails loudly on an unknown argument rather than silently running unsandboxed.
-
-### `--ignore-user-config`
-
-**Codex is always passed `--ignore-user-config`, so a run is a function of `.review.toml` plus argv and nothing else.** This is the general form of the lesson the two decisions above teach individually: twice the guarantee a profile advertised was silently voided by ambient global codex config the `review` command line gave no hint of - once by `approvals_reviewer = "auto_review"` rewriting the approval policy, once by `$CODEX_HOME/rules/*.rules` disabling the sandbox. Pinning each hole as it is discovered leaves the next one live, so `$CODEX_HOME/config.toml` is dropped wholesale rather than audited key by key. Auth is unaffected - it resolves from `CODEX_HOME` independently of the flag (verified: a run carrying it authenticates and completes normally). **It does not close the rules hole** - rules live outside `config.toml`, so `--ignore-rules` is separately necessary; the measured matrix is `--ignore-user-config` alone = still unsandboxed, `--ignore-rules` alone = sandboxed, both = sandboxed. Two deliberate consequences: a run whose profile sets no `model` takes codex's built-in default instead of the operator's configured one (identical on this host today, and no longer a silent coupling either way), and a profile whose `config` overrides name a custom `model_provider` from the operator's `config.toml` must now define it in the profile.
-
-### Network access
-
-**A `workspace-write` codex run is passed `-c sandbox_workspace_write.network_access=true`, because without it codex cannot use unix domain sockets.** This has nothing to do with the network. The seccomp filter codex installs when network access is off (`linux-sandbox/src/landlock.rs`) unconditionally denies `bind`, `connect`, `listen` and `accept`, returning `EPERM`; it carves out AF_UNIX for `socket()` and `socketpair()` only. So an AF_UNIX socket can be created and then used for nothing that needs a pathname. A daemon/worker test suite fails 80 tests at `bind control socket: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }` on a path under its own `target/` that cargo had just written test binaries into. **No `writable_roots` entry can fix this** - verified by binding in the *cwd*, which codex grants unconditionally, and getting the identical errno, so there is no path for which it works. That is what distinguishes this from every other sandbox problem here, all of which were grants. The `UnixStream::pair` sites in the same suite pass, because `socketpair` has the AF_UNIX carve-out - which is also how the failure disguises itself as flaky, since socket-free crates and socketpair-only tests come back green. Enabling network access is blunt: the filter is all-or-nothing, so this restores AF_INET egress too and codex offers no AF_UNIX-only knob. It is nevertheless **not a widening of what these runs have actually had** - until `--ignore-rules` landed, an operator execpolicy allowlist made build commands bypass the sandbox wrapper entirely, so no seccomp filter was installed and every `workspace-write` run in this tool's history ran with full network access. This makes that explicit and, unlike the bypass, applies to every command rather than the ones whose argv happened to match a rule. Passed before profile `config`, so a profile can restate the key and win. The upstream asymmetry looks like an oversight rather than policy - they carved out AF_UNIX where they noticed it mattered (there is a comment keeping `recvfrom` allowed so `cargo clippy`'s socketpair machinery works) and missed the four pathname syscalls.
-
-**A `read-only` codex run gets the same network grant, and to do it `review` stops passing `--sandbox` on that path.** The seccomp filter above is not scoped to a sandbox level - it is installed whenever the network policy is `Restricted`, which `read-only` always was - so a read-only run was equally unable to `connect` to a running daemon, use socket options, or open an AF_INET socket at all. The initial scoping of the fix to `workspace-write` ("the reviewer profile has no build to run and so no socket to bind") was simply wrong about what the filter denies: the four pathname syscalls are only half of it. **There is no `sandbox_read_only.network_access`.** `SandboxPolicy::ReadOnly` does carry a `network_access` field, but nothing in the legacy `sandbox_mode` pipeline sets it - `derive_permission_profile` maps `SandboxMode::ReadOnly` to `PermissionProfile::read_only()` with the network policy hardcoded `Restricted`, and only the workspace-write arm consults config. The one surface that can express "read-only filesystem, network enabled" is codex's named-permissions pipeline: a `[permissions.<id>]` profile extending the built-in `:read-only` with `network.enabled = true`, selected by `default_permissions`. The catch, and the reason this is a decision rather than another `-c`, is that `resolve_permission_config_syntax` returns `Legacy` the instant a `sandbox_mode` override is present, and `Legacy` renders `[permissions]` profiles **inert** - so the profile and `--sandbox` cannot be combined, and `review` passes the profile instead of the flag for `read-only` only. Giving up `--sandbox` on the default path for every review run deserved evidence, so `scripts/readonly_network_check.py` measures three configurations against one witness program (`scripts/sandbox_probe.py`). Verified on codex-cli 0.151.0: `write_cwd` is `EROFS` and `read_etc_hostname` is `ok` in **all three**, and the middle configuration - the same profile with network left `Restricted` - reproduces `--sandbox read-only` witness-for-witness, which is what establishes that dropping the flag does not widen the filesystem independently of the network change. Only the socket lines move (`unix_connect`, `unix_sockopt`, `inet_socket_create`, `inet_bind_listen`, `tcp_connect`: `EPERM` → `ok`). Confirmed end-to-end through `review` itself, not just the argv builder. Two details worth keeping: the witnesses are `connect()` and socket options rather than `bind()` on a unix path, because under `read-only` nothing is writable and binding an AF_UNIX socket cannot succeed on filesystem grounds however the filter is set - what a read-only run gains is the ability to *reach* something already listening, plus AF_INET egress; and no proxy is configured, deliberately, because a proxy would put the run in `NetworkSeccompMode::ProxyRouted`, which denies AF_UNIX `socket()` outright and would be worse than the status quo. The Linux path also has no finer knob - `NetworkToml` carries `unix_sockets` and `allow_local_binding`, but only `seatbelt.rs` (macOS) reads them. An older codex without the permissions pipeline fails soft rather than silently wide: it ignores `default_permissions` and falls through to `SandboxMode::default()`, which is `ReadOnly`.
-
-## Reasoning summaries
-
-**Codex is passed `-c model_reasoning_summary="detailed"` so a rollout records why, not just what.** Reasoning items carry `encrypted_content`, sealed server-side and undecryptable locally, and on the default `auto` setting their `summary` arrays come back empty - so a rollout is a command log with no prose anywhere in it. Reconstructing an agent's intent then means inferring it from the command sequence, which is exactly what made the sandbox investigation above expensive. `detailed` populates the summaries for `src/transcript.rs` and `review sessions <id>` to surface. Passed before profile `config` overrides, so a profile can set `none` where the summaries are not worth their tokens.
-
-## Background
-
-`review` subsumed the pbfhogg spec-loop python scripts (codex review/implement roles). Landed: sandbox as a profile field, the rich codex digest + `-o` backstop, transcript forensics, resume-path digest parity, transcript `final_answer` recovery for truncated runs, and digest persistence into the audit + sidecar logs (+ `review sessions <id>` artifact view).
-
-## Model selection and records
-
-`provider::ModelSpec` owns model/effort rendering and raw config argv. The
-explicit `-m` selection wins over raw `model`; without it the last raw model
-is selected. Effort is a generated `-c model_reasoning_effort=...` followed by
-profile config, so the last raw effort assignment wins. These selectors feed
-the session record and manual resume, separately from served-model evidence.
-The dedicated effort string uses TOML serialization.
-
-Source checked at 2bc8e7f545 (2026-11-07), with codex-cli 0.167.0 installed:
-`codex-rs/exec/src/lib.rs` builds `ConfigOverrides.model` from the CLI;
-`core/src/config/mod.rs` uses `model.or(cfg.model)` and reads effort from
-`cfg.model_reasoning_effort`. `utils/cli/src/config_override.rs` parses the
-first `=`, trims, parses a TOML value, and only on parse failure falls back to
-literal text trimmed of quote characters. Review mirrors those scalar rules.
-A final non-string raw selector is refused locally before side effects; a
-later string assignment repairs an earlier non-string. Other raw config
-remains verbatim and codex validates it. This is a projection of launch
-selection, not a claim to reconstruct all effective provider configuration.
+- `exec/src/lib.rs` builds `ConfigOverrides.model` from `-m`, and
+  `core/src/config/mod.rs` takes `model.or(cfg.model)`, so `-m` beats a raw
+  `model` override.
+- Effort comes only from `cfg.model_reasoning_effort`, so the last `-c`
+  assignment wins.
+- `utils/cli/src/config_override.rs` splits a `-c` at the first `=`, trims,
+  and parses a TOML value. Only on parse failure does it fall back to the
+  literal text with quote characters trimmed.
 
 ## Source checkout and diagnostics
 
-**`research/codex` is a checkout of the codex source, and it is gitignored.**
-Not ours, not committed, not guaranteed to be present - but when it is, it is
-the authority on every codex behaviour this document asserts, and reading it
-beats guessing from a binary or from release notes. Nearly all of the sandbox
-archaeology above came out of it: `protocol/src/protocol.rs` for `SandboxPolicy`,
-`config/src/config_toml.rs` and `core/src/config/` for how a `sandbox_mode` or
-`default_permissions` selection compiles into one, `linux-sandbox/src/landlock.rs`
-for what the seccomp filter actually denies. Check `git log -1` and the newest
-tag in that checkout against `codex --version` before trusting it - the two
-drift, and a config key that exists in the checkout may not exist in the
-installed binary. Reading it is not a substitute for `scripts/`: the source says
-what should happen, the scripts measure what does.
+`research/codex` is a gitignored checkout of the codex source. When it's
+present it's the authority on codex behaviour. The sandbox findings above
+came from `protocol/src/protocol.rs` (`SandboxPolicy`),
+`config/src/config_toml.rs` and `core/src/config/` (how `sandbox_mode` or
+`default_permissions` compiles into a policy) and `linux-sandbox/src/landlock.rs`
+(what the seccomp filter denies). Compare `git log -1` and the newest tag
+there with `codex --version` before trusting it: a key in the checkout may
+not exist in the installed binary.
 
-The maintained diagnostics in `scripts/` keep the claims above re-testable
-against a codex that upgrades underneath us. `ignore_rules_check.py` is the
-regression check for the sandbox guarantee (`--ignore-rules`); `flag_matrix.py`
-measures which isolation flags actually close the hole; `rules_survey.py`
-reports which command prefixes an operator's `~/.codex/rules` exempts from the
-sandbox; `rollout_commands.py` dumps a codex rollout's commands and outputs,
-which is the only readable record of a run when reasoning summaries are off;
-`readonly_network_check.py` measures what a `read-only` run can do with sockets
-across the three ways of selecting that level, and is the evidence behind
-passing a permissions profile instead of `--sandbox` there - it drives
-`sandbox_probe.py`, the witness program that runs *inside* the sandbox and is
-the one file there not meant to be run directly. They shell out to `codex` and
-cost real turns, so they are run deliberately after a provider upgrade, never
-from `brokkr check`.
+The source says what should happen; the scripts in `scripts/` measure what
+does, against whatever codex is installed:
 
-All runners take their launch prefix from ProviderRuntime.commands. Codex resolves
-its prefix once and uses that same program and leading arguments for execution,
-incident replay and the contained version probe. Replay appends the run arguments;
-the probe appends only --version. Prefix arguments are never shell-split.
-
-## Stream framing
-
-The shared reader in `src/provider/stream.rs` captures the stdout head while a
-Codex observer publishes readiness on the first byte and the session ID from
-`thread.started`. Session discovery uses complete physical lines up to 1 MiB;
-an oversized line is discarded through its newline, never reparsed from a
-suffix. A final unterminated eligible line is offered at EOF or read error.
-Discovery stops after the session event, while raw capture and draining continue.
-Published lease facts survive reader cancellation even beyond the capture cap.
-
-## Forensic compatibility boundary
-
-The internal Digest has common process/count/usage/incident facts and an optional
-ProviderForensics block. Codex-only fields live in CodexForensics; providers
-without such artifacts have no block. Outcome and Served keep answer/termination
-and served-model/cost facts under their existing owners. Persisted DigestSummary
-remains flat with its established names and defaults; it never serializes the
-internal enum. Schema-1 bundles also remain flat and readable, including the
-original writer's omitted later fields. Invalid present values in writer-only
-metadata fields now report a decode error rather than being silently ignored by
-the old subset reader. This is corruption handling, not a historical format
-migration. Unknown schemas are rejected.
-
-Runner helpers, their intermediate result and output-file creation are private.
-Fixtures inject only the executable prefix and runtime, then observe the actual
-adapter argv, including fresh/resume output placement, isolation flags, network
-policy and late raw overrides. Tables cover omitted and named sandbox levels;
-a separate derived-root case compares process arguments with effective recorded
-grants. The fixture owns the invocation result until handoff assertions finish,
-so pending markers retain the same lifetime as app recording.
-
-Pure rollout folds and outcome policy have independent tests. A final-byte-only
-classifier cannot replace the live composition: the watchdog may have retained
-an authoritative scoped answer that later rollout bytes no longer contain.
-The process regressions exercise that detection-time evidence through recovery;
-app tests separately pin retry vetoes and result selection.
+- `ignore_rules_check.py`: regression check that `--ignore-rules` keeps
+  rules from bypassing the sandbox
+- `flag_matrix.py`: which isolation flags close the rules hole
+- `rules_survey.py`: which command prefixes `~/.codex/rules` exempts
+- `rollout_commands.py`: a rollout's commands and outputs, the only
+  readable record of a run with reasoning summaries off
+- `readonly_network_check.py`: what a `read-only` run can do with sockets
+  across three ways of selecting the level; it drives `sandbox_probe.py`,
+  the witness that runs inside the sandbox

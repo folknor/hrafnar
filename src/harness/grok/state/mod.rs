@@ -5,9 +5,9 @@
 //! **Folder trust** (`trusted_folders.toml`). In a folder grok does not trust,
 //! every file edit raises a permission prompt, and under
 //! `--permission-mode dontAsk` that prompt resolves `cancelled` - which ends the
-//! whole turn rather than handing a denial back to the model. Observed on grok
-//! 1.0.40: six write runs in an untrusted checkout each diagnosed their task and
-//! were cancelled at their first edit. A write run therefore launches with
+//! whole turn rather than handing a denial back to the model, whatever the
+//! sandbox level (observed, see `reference/grok.md`). A write run therefore
+//! launches with
 //! grok's own (hidden) `--trust` flag, which records the grant under grok's own
 //! key and lock - `review` does not write this file. What `review` does here is
 //! read it: to refuse a folder the operator explicitly declined (grok's grant
@@ -16,7 +16,7 @@
 //!
 //! **Writable roots** (`sandbox.toml`). Grok's `workspace` profile writes only
 //! to the workspace, the grok home and temp; the brokkr lock and the cargo
-//! home are outside it, so every build died before compiling. The only surface
+//! home are outside it, so a build fails before compiling. The only surface
 //! grok offers for more is a named profile, so `review` creates one per
 //! distinct root set, named for its content (`profile_name`, `ensure_profile`)
 //! and never modified after. That write copies grok's own discipline for its
@@ -35,6 +35,15 @@
 //! means the global definition of `review`'s profile vanishes and a checked-out
 //! repo's `.grok/sandbox.toml` may define the name instead. Validating only our
 //! own table would miss both.
+//!
+//! Submodules: `trust` reads folder trust, `sandbox` owns the
+//! content-addressed profiles, `events` reads session files and cancellation
+//! causes, `background` finds unread background work and builds wake
+//! prompts. The generic locked atomic replacement is `fsutil::locked_update`.
+//!
+//! A symlink refusal here is check-then-write. Exploiting that race needs
+//! write access to the grok home, which already allows editing these files
+//! directly, so it is outside the threat model.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,8 +117,8 @@ mod test_support {
     /// in play must be the ones a test plants. `target` is itself a symlink on
     /// hosts that keep the build cache on another drive, and the trust-boundary
     /// check refuses a path with *any* symlinked ancestor - so an unresolved
-    /// scratch path made every store "reached through a symlink" before a test
-    /// had planted one, failing the suite on those hosts only.
+    /// scratch path would make every store "reached through a symlink" before
+    /// a test planted one, failing the suite on those hosts only.
     pub(super) fn scratch() -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-scratch")

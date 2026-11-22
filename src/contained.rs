@@ -72,8 +72,8 @@ fn is_zero(n: &usize) -> bool {
 }
 
 impl Leftovers {
-    /// Keep existing append-only audit/sidecar rows readable: the historical
-    /// flat schema is an explicit projection, never the keeper wire type. All
+    /// Keep existing append-only audit/sidecar rows readable: the flat row
+    /// schema is an explicit projection, never the keeper wire type. All
     /// unknown reasons remain in its one string; do not replace it with a tag.
     pub fn from_teardown(teardown: &keeper::Teardown) -> Self {
         let (killed, killed_dropped) = teardown.accounting();
@@ -170,6 +170,12 @@ impl Events {
         }
     }
 
+    /// The verdict is complete only with one valid `Done` and nothing after it,
+    /// `survivor` and `killed` events matching its counts, unique survivor
+    /// pids, intact framing and a keeper reaped with a normal exit. Anything
+    /// less is an unknown outcome, never a clean one. `Done` carries counts
+    /// rather than an unbounded duplicate list; each physical event is bounded,
+    /// the number of survivors is not.
     fn finished(&self, keeper_status: &std::io::Result<std::process::ExitStatus>) -> Finished {
         let mut reasons = self.damage.clone();
         match keeper_status {
