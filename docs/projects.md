@@ -3,7 +3,7 @@
 `-C <project>` makes a command act on another project than the one the current
 directory is in, for an agent working in one checkout that wants a review of
 another. It goes before or after the subcommand:
-`echo "check this" | review -C bz -a bugs`, `review config -C bz`.
+`echo "check this" | review -C bz -a bugs`, `review list -C bz`.
 
 The current directory never changes. `-C` decides which `.review.toml`, audit
 id and project root the command uses; providers run in that project root.
@@ -40,7 +40,7 @@ There is **no fallback** between the two. `-C bz` never means a directory
 named `bz`; write `-C ./bz`. A name that does not resolve is an error listing
 what this host has registered, so registering a project, or a checkout going
 missing, can never silently change what an existing command acts on.
-`review config` lists the registered projects for this host.
+`review list --projects` lists the registered projects for this host.
 
 ## Project identity
 
@@ -53,7 +53,7 @@ checks them again before sending anything.
 
 ## Per command
 
-- A run, `review config`, `review init` and `review sessions` act on the
+- A run, `review list`, `review init` and `review sessions` act on the
   selected project. `review init -C <name>` creates the file in the
   registered directory.
 - `review message <ID>` and `review sessions <ID>` take the project from the

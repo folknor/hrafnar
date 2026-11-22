@@ -111,8 +111,18 @@ pub async fn run() -> Result<CommandExit> {
             config_write::init(&project::select(selector)?)?;
             return Ok(CommandExit::Success);
         }
+        Some(cli::Command::List { projects, all }) => {
+            let view = match (projects, all) {
+                (true, _) => config_cmd::View::Projects,
+                (false, true) => config_cmd::View::All,
+                (false, false) => config_cmd::View::Terse,
+            };
+            config_cmd::run(&project::select(selector)?, view)?;
+            return Ok(CommandExit::Success);
+        }
         Some(cli::Command::Config) => {
-            config_cmd::run(&project::select(selector)?)?;
+            eprintln!("warning: `review config` is now `review list --all`");
+            config_cmd::run(&project::select(selector)?, config_cmd::View::All)?;
             return Ok(CommandExit::Success);
         }
         Some(cli::Command::Message { id, dry_run }) => {
@@ -159,7 +169,7 @@ pub async fn run() -> Result<CommandExit> {
     if let Some(ref p) = cli.provider {
         bail!(
             "--provider was removed: the provider is part of the profile\n  \
-             Pick a profile whose provider is {p} with -p <name> (`review config` lists them)."
+             Pick a profile whose provider is {p} with -p <name> (`review list` lists them)."
         );
     }
 

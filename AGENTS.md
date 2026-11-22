@@ -1,14 +1,16 @@
 # review
 
-A Rust CLI (`review`) that fans out code reviews and work to fresh, headless AI
-sessions across providers (Claude Code, Codex, Grok). It is a prompt builder:
-the agents fetch code themselves. Each run starts a clean session, optionally
-primed with an archetype's prompt, and is recorded so it can be messaged,
-interrupted or resumed while its cache is warm.
+A Rust CLI (`review`) that hands code reviews and work to a fresh, headless AI
+session on one of several providers (Claude Code, Codex, Grok, maki), chosen
+by a named profile. It is a prompt builder: the agents fetch code themselves.
+Each run starts a clean session, optionally primed with an archetype's prompt,
+and is recorded so it can be messaged, interrupted or resumed while its cache
+is warm.
 
 Config is layered: the command line, then the project's `.review.toml`, then
-the operator's global `~/.config/review/config.toml`. `review config` prints
-the effective result with each value's source.
+the operator's global `~/.config/review/config.toml`. `review list` prints the
+archetypes and runnable profiles; `review list --all` the effective result with
+each value's source.
 
 Where to read further:
 

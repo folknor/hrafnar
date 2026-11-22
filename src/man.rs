@@ -1,6 +1,6 @@
 //! `review man [TOPIC]` - the bundled topics behind `--help`.
 //!
-//! `--help` and `review config` are meant to be enough to drive `review`; a
+//! `--help` and `review list` are meant to be enough to drive `review`; a
 //! topic is for when an agent needs the rule behind what it saw. Each is one
 //! `docs/*.md` file compiled in with `include_str!` and printed raw: markdown
 //! is what an agent reads best, and `review` prints plain text everywhere.

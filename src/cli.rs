@@ -1,11 +1,12 @@
 //! The command line. `review` with no subcommand is the run itself (stdin to
 //! the providers), with the archetype as `-a`, the profile as `-p` and the
 //! global `-C` selecting the project. The verbs are `message`, `interrupt`,
-//! `config`, `sessions`, `incidents`, `init` and `man`.
+//! `list`, `sessions`, `incidents`, `init` and `man`.
 //!
-//! Three hidden migration aliases warn when used: the old positional archetype
+//! Hidden migration aliases warn when used: the old positional archetype
 //! (`review security`, with `review bare` meaning none), `review resume <ID>`
-//! and `--session <ID>`, both now `review message <ID>`. Run flags beside a
+//! and `--session <ID>`, both now `review message <ID>`, and `review config`,
+//! now `review list --all`. A retired `--provider` is refused by the run. Run flags beside a
 //! subcommand are refused by hand (`Cli::parse_checked`), because clap would
 //! accept them in front of one and silently drop them. Which commands accept
 //! `-C` is one exhaustive policy here (`Cli::project_scope`).
@@ -40,8 +41,9 @@ the largest timeout the harness allows.
 
 Settings resolve from the command line, then the project's .review.toml, then
 the global config ($XDG_CONFIG_HOME/review/config.toml, else
-~/.config/review/config.toml). `review config` shows the effective result and
-where each value came from.
+~/.config/review/config.toml). `review list` shows the archetypes and profiles
+you can use; `review list --all` the whole result and where each value came
+from.
 
 Another project (-C): `review -C <name>` acts on a project registered on this
 host in the global config, under [_projects.<host>] as `name = \"path\"`; the
@@ -108,7 +110,7 @@ Examples:
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
   review interrupt <ID>                                Stop a {INTERRUPTIBLE} run mid-turn
-  review config                                        Effective configuration
+  review list                                          Archetypes and profiles
 
 More depth on any of this: `review man` lists the bundled topics.";
 
@@ -186,15 +188,18 @@ second signal skips that and tears the runs down at once, which can lose their
 records, and a third exits without waiting for the teardown to report. SIGKILL
 loses the session, though what the runs started is still torn down.";
 
-const CONFIG_AFTER_HELP: &str = "\
-This is the authoritative view of what a run in this directory will use. It
+const LIST_AFTER_HELP: &str = "\
+This is the authoritative view of what a run in this directory can use. It
 merges the project's .review.toml with the global config, so reading
 .review.toml alone gives an incomplete and often wrong answer: profiles and
 archetypes may live in the global file.
-Lists the files consulted, provider availability on this host, archetypes,
-and profiles with the default profile, each with its source and any
-definition it shadows. Env vars are listed by name only, never by value.
-Outside a project it shows the global layer alone.";
+
+By default it lists the archetypes, and the profiles whose provider is
+installed on this host with the default marked; profiles hidden for a missing
+provider are named. --all adds everything: the files consulted, provider
+availability, each value's source and any definition it shadows, and the
+remaining settings. Env vars are listed by name only, never by value. Outside
+a project it shows the global layer alone.";
 
 #[derive(Parser)]
 #[command(
@@ -357,8 +362,20 @@ pub enum Command {
         id: String,
     },
 
-    /// Show the effective configuration and where each value came from
-    #[command(after_help = CONFIG_AFTER_HELP)]
+    /// List the archetypes and runnable profiles; --all for the whole config
+    #[command(visible_alias = "ls", after_help = LIST_AFTER_HELP)]
+    List {
+        /// List the projects registered for -C on this host instead
+        #[arg(long, conflicts_with = "all")]
+        projects: bool,
+
+        /// Show the whole resolved configuration, every value with its source
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Migration: the old name of `list --all`. Still accepted, with a warning.
+    #[command(hide = true)]
     Config,
 
     /// List recent sessions, or show one session's artifacts by ID
@@ -420,6 +437,7 @@ impl Command {
                 ..
             }
             | Self::Init
+            | Self::List { .. }
             | Self::Config => ProjectScope::Selected,
             Self::Interrupt { .. } => ProjectScope::Unscoped("review interrupt"),
             Self::Incidents { .. } => ProjectScope::Unscoped("review incidents"),
@@ -574,15 +592,42 @@ mod tests {
     }
 
     #[test]
+    fn list_takes_its_view_and_an_alias() {
+        for name in ["list", "ls"] {
+            assert!(matches!(
+                parsed(&[name]).command,
+                Some(Command::List {
+                    projects: false,
+                    all: false
+                })
+            ));
+        }
+        assert!(matches!(
+            parsed(&["list", "--all"]).command,
+            Some(Command::List { all: true, .. })
+        ));
+        assert!(matches!(
+            parsed(&["ls", "--projects"]).command,
+            Some(Command::List { projects: true, .. })
+        ));
+        assert!(parse(&["list", "--all", "--projects"]).is_err());
+        // The old name still parses, as `list --all`.
+        assert!(matches!(parsed(&["config"]).command, Some(Command::Config)));
+    }
+
+    #[test]
     fn a_subcommand_keeps_its_own_dry_run() {
         assert!(parse(&["message", "abc", "--dry-run"]).is_ok());
     }
 
     #[test]
     fn project_goes_before_or_after_a_subcommand() {
-        for args in [&["-C", "bz", "config"][..], &["config", "-C", "bz"]] {
+        for args in [&["-C", "bz", "list"][..], &["list", "-C", "bz"]] {
             let cli = parsed(args);
-            assert!(matches!(cli.command, Some(Command::Config)), "{args:?}");
+            assert!(
+                matches!(cli.command, Some(Command::List { .. })),
+                "{args:?}"
+            );
             assert_eq!(cli.project.as_deref(), Some("bz"), "{args:?}");
         }
         let cli = parsed(&["--project", "bz", "-a", "bugs"]);

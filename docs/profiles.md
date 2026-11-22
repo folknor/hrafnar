@@ -28,8 +28,10 @@ model = "openrouter/qwen/qwen3-coder"
 provider = "grok"
 ```
 
-`review config` lists every profile visible here, where each one comes from,
-and any definition it hides. Ask it before choosing a profile for a role.
+`review list` lists the profiles a run here can use, without their provider,
+and names any hidden because their provider is not installed; ask it before
+choosing a profile for a role. `review list --all` adds each profile's
+provider, where it comes from, and any definition it hides.
 Session rows record the selected definition as `profile_origin` (layer and
 table), including automatic retries. This describes the requested launch
 source, not proof of successful execution or that the profile still exists.
@@ -54,7 +56,7 @@ A profile in the project file beats one of the same name in the global file,
 and the winner replaces it **entirely**. Fields are never merged, so a project
 profile that leaves out `model` does not inherit the global profile's `model`:
 it runs on the provider's default. Every field of a run therefore comes from
-one table you can point at; `review config` shows each profile next to what it
+one table you can point at; `review list --all` shows each profile next to what it
 hides.
 
 The one thing a project profile may not change is the provider: naming a
@@ -71,7 +73,8 @@ are errors too. Empty `config` and `writable_roots` lists are accepted
 everywhere.
 
 - `provider`: the provider the profile runs on.
-- `comment`: free text shown by `review config`, never sent to a provider.
+- `comment`: free text for whoever picks the profile, never sent to a provider.
+  `review list` shows its first line, `review list --all` all of it.
 - `model`: the model to request. For maki, `provider/model-id`; without one,
   maki picks its last used model, then its configured default.
 - `effort`: the reasoning effort to request. Maki profiles must omit it: maki
@@ -99,7 +102,7 @@ everywhere.
 - `env`: environment variables set for the provider process. They override
   the defaults `review` sets for a provider, but not `PWD`, which is always
   the project root the provider runs in. The session log
-  and `review config` show only their names, since values can carry secrets.
+  and `review list --all` show only their names, since values can carry secrets.
   A codex incident bundle keeps values too, except for names that look
   secret, so it can replay the run.
 

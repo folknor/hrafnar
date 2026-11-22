@@ -1,4 +1,6 @@
-//! `review config`: the effective configuration and where each value came from.
+//! `review list`: what a run here can use. By default only the archetypes and
+//! the profiles whose provider is installed; `--projects` the `-C` registry;
+//! `--all` the effective configuration and where each value came from.
 //!
 //! Orchestrators used to parse `.review.toml` directly to learn which
 //! archetypes, providers and profiles exist. With the global layer that file no
@@ -28,13 +30,154 @@ pub type Availability<'a> = &'a dyn Fn(Provider) -> bool;
 /// How much of an archetype's first prompt line the human view shows.
 const PRIME_PREVIEW_CHARS: usize = 72;
 
+/// Which view `review list` prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    /// What can be run here: archetypes and runnable profiles.
+    Terse,
+    /// The `-C` registry.
+    Projects,
+    /// The whole resolved configuration, every value with its source.
+    All,
+}
+
 /// Works outside a project too: with no `.review.toml` it shows the global
-/// layer and provider availability, which is what an orchestrator needs before
-/// it has picked a project.
-pub fn run(sel: &config::Selection) -> Result<()> {
+/// layer, which is what an orchestrator needs before it has picked a project.
+pub fn run(sel: &config::Selection, view: View) -> Result<()> {
     let cfg = config::load_optional(sel)?;
-    print!("{}", render_text(&cfg, &crate::provider::is_available));
+    let avail = &crate::provider::is_available;
+    print!(
+        "{}",
+        match view {
+            View::Terse => render_list(&cfg, avail),
+            View::Projects => render_projects(&cfg),
+            View::All => render_text(&cfg, avail),
+        }
+    );
     Ok(())
+}
+
+/// The default view: what a run here can be primed with and run as. Which
+/// provider serves a profile is left out - it is plumbing, and a provider can
+/// serve another vendor's models. Profiles whose provider is not installed are
+/// hidden but counted by name, so one an agent was told to use does not just
+/// vanish.
+pub fn render_list(cfg: &ReviewConfig, avail: Availability) -> String {
+    let mut out = String::new();
+    let _ = write_list(&mut out, cfg, avail);
+    out
+}
+
+fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std::fmt::Result {
+    writeln!(out, "archetypes:")?;
+    if cfg.archetypes.is_empty() {
+        writeln!(out, "  (none)")?;
+    }
+    let aw = cfg.archetypes.keys().map(String::len).max().unwrap_or(0);
+    for (name, s) in &cfg.archetypes {
+        writeln!(out, "  {name:<aw$}  {}", prime_preview(&s.value))?;
+    }
+
+    writeln!(out)?;
+    writeln!(out, "profiles:")?;
+    let default = cfg.default_profile();
+    let (shown, hidden): (Vec<_>, Vec<_>) = cfg
+        .profiles
+        .iter()
+        .partition(|(_, e)| avail(e.effective.provider));
+    if shown.is_empty() {
+        writeln!(out, "  (none)")?;
+    }
+    let pw = shown.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+    for (name, entry) in &shown {
+        let def = &entry.effective;
+        let mark = if default == Some(name.as_str()) {
+            "  (default)"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "  {name:<pw$}  {}{mark}",
+            terse_settings(def.provider, &def.profile)
+        )?;
+        if let Some(line) = def
+            .profile
+            .comment
+            .as_deref()
+            .and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()))
+        {
+            writeln!(out, "  {:pw$}  # {line}", "")?;
+        }
+    }
+    if !hidden.is_empty() {
+        let names: Vec<String> = hidden
+            .iter()
+            .map(|(n, e)| format!("{n} ({} not installed)", e.effective.provider))
+            .collect();
+        writeln!(out, "  hidden: {}", names.join(", "))?;
+    }
+    match default {
+        None => writeln!(out, "  no default profile: a run needs -p")?,
+        Some(name) => match cfg.resolve_profile(name) {
+            None => writeln!(
+                out,
+                "  warning: default profile '{name}' is not defined - a run without -p will fail"
+            )?,
+            Some(def) if !avail(def.provider) => writeln!(
+                out,
+                "  warning: default profile '{name}' needs {}, which is not installed - \
+                 a run without -p will fail",
+                def.provider
+            )?,
+            Some(_) => {}
+        },
+    }
+
+    writeln!(out)?;
+    writeln!(
+        out,
+        "steer a running agent: echo \"<new info>\" | review message <ID>; \
+         stop one: review interrupt <ID>. Never kill `review` itself."
+    )?;
+    writeln!(out, "Everything, with sources: review list --all")?;
+    Ok(())
+}
+
+/// `model m, effort e, sandbox`, saying what an unset value means rather
+/// than "unset". A provider with its own permission system shows that.
+fn terse_settings(provider: Provider, p: &Profile) -> String {
+    let sandbox = match (
+        crate::provider::Permissions::profile(provider, None).selector(),
+        p.sandbox.as_ref().map(crate::config::SandboxLevel::as_str),
+    ) {
+        (None, _) => "own permissions".to_string(),
+        (Some(_), Some(s)) => s.to_string(),
+        (Some(default), None) => default.to_string(),
+    };
+    format!(
+        "{}, effort {}, {sandbox}",
+        p.model.as_deref().unwrap_or("default model"),
+        p.effort.as_deref().unwrap_or("default")
+    )
+}
+
+/// `review list --projects`: this host's `-C` registry.
+pub fn render_projects(cfg: &ReviewConfig) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "projects (for -C, global [_projects.{}]):",
+        config::toml_key(&cfg.hostname)
+    );
+    if cfg.projects.is_empty() {
+        let _ = writeln!(out, "  (none)");
+    }
+    let nw = cfg.projects.keys().map(String::len).max().unwrap_or(0);
+    for (name, path) in &cfg.projects {
+        let _ = writeln!(out, "  {name:<nw$}  {path}");
+    }
+    out
 }
 
 /// Env var *names* only - values can carry secrets.
@@ -180,7 +323,7 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         None => writeln!(out, "claude_token_command: unset")?,
     }
 
-    // Printed on every call because everyone runs `review config` before using
+    // Printed on every call because everyone runs `review list` before using
     // the tool, and an orchestrating agent told to "interrupt the agent" will
     // otherwise stop its own background task - killing `review`, not the turn.
     writeln!(out)?;
@@ -494,6 +637,62 @@ model = \"opus\"
         assert!(
             text.contains("default: ghost  (local [_defaults], NOT DEFINED)"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_list_shows_runnable_profiles_without_their_provider() {
+        let t = render_list(&cfg(), &avail(true));
+        assert!(
+            t.contains("deep  stale-model, effort low, read-only  (default)"),
+            "{t}"
+        );
+        // Claude has its own permission system rather than a sandbox level.
+        assert!(
+            t.contains("opus  opus, effort default, own permissions"),
+            "{t}"
+        );
+        assert!(t.contains("        # Heavy reasoning."), "{t}");
+        assert!(t.contains("security  You are a security expert...."), "{t}");
+        // None of the provenance or plumbing the full view carries.
+        for absent in [
+            "codex",
+            "claude",
+            "[profiles.",
+            "shadows",
+            "SECRET_TOKEN",
+            "stall",
+        ] {
+            assert!(!t.contains(absent), "{absent}: {t}");
+        }
+        assert!(t.contains("review message <ID>"), "{t}");
+    }
+
+    #[test]
+    fn the_list_names_profiles_hidden_for_a_missing_provider() {
+        let t = render_list(&cfg(), &avail(false));
+        assert!(!t.contains("stale-model"), "{t}");
+        assert!(t.contains("hidden: deep (codex not installed)"), "{t}");
+        assert!(
+            t.contains("default profile 'deep' needs codex, which is not installed"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn the_projects_view_is_the_registry_alone() {
+        let global =
+            parse_file("[_projects.host]\nbz = \"~/bz\"\n", "global", Layer::Global).unwrap();
+        let c = resolve(
+            config::ConfigFile::default(),
+            Some(global),
+            "host",
+            config::ConfigFiles::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            render_projects(&c),
+            "projects (for -C, global [_projects.host]):\n  bz  ~/bz\n"
         );
     }
 

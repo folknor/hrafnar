@@ -155,9 +155,9 @@ impl std::fmt::Display for StallTimeout {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Free text for whoever picks a profile - what it is for, when to reach
-    /// for it. Never sent to a provider; `review config` shows it. A field
+    /// for it. Never sent to a provider; `review list` shows it. A field
     /// rather than a TOML comment because the parser discards comments, and
-    /// `review config` renders only what the resolver produced.
+    /// `review list` renders only what the resolver produced.
     pub comment: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -237,7 +237,7 @@ pub struct ProfileEntry {
 #[derive(Debug, Clone, Default)]
 pub struct ConfigFiles {
     /// The project's `.review.toml`. `None` only from `load_optional` outside a
-    /// project, which `review config` uses to show the global layer anyway.
+    /// project, which `review list` uses to show the global layer anyway.
     pub local: Option<PathBuf>,
     /// Where the global config is looked for. `None` when neither
     /// `XDG_CONFIG_HOME` nor `HOME` names a usable directory.

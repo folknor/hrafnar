@@ -40,7 +40,7 @@ still works with a warning.
 The profile names the provider and its settings: `-p deep`, else
 `[_defaults].profile` in the config (see `review man profiles`). A run with
 neither, or naming a profile no file defines, errors before launching. So does
-a profile whose provider is not installed on this host; `review config` shows
+a profile whose provider is not installed on this host; `review list --all` shows
 which are installed. `--provider` was removed and is refused with that advice.
 
 ## Several sessions

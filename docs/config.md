@@ -5,11 +5,15 @@ then the operator's global config: `$XDG_CONFIG_HOME/review/config.toml`, else
 `~/.config/review/config.toml`. Both files share one format. Nothing is built
 in.
 
-**`review config` is the authoritative view.** It runs the same resolver a run
-uses and shows every effective value with the file and table it came from, and
-what each one shadows. Reading `.review.toml` alone gives an incomplete and
-often wrong answer, because profiles and archetypes may live in the global
-file. Outside a project it shows the global layer alone.
+**`review list` is the authoritative view.** It runs the same resolver a run
+uses. By default it shows what a run here can use: the archetypes, and the
+profiles whose provider is installed, with the default marked and any profile
+hidden for a missing provider named. `review list --all` shows every effective
+value with the file and table it came from, and what each one shadows;
+`review list --projects` the `-C` registry. Reading `.review.toml` alone gives
+an incomplete and often wrong answer, because profiles and archetypes may live
+in the global file. Outside a project it shows the global layer alone.
+`review config` is a hidden alias of `review list --all` that warns.
 
 ## Finding the project file
 
@@ -141,7 +145,9 @@ is checked against that vocabulary.
 | `message` | a subcommand |
 | `resume` | a subcommand (hidden alias of `message`) |
 | `interrupt` | a subcommand |
-| `config` | a subcommand |
+| `list` | a subcommand |
+| `ls` | a subcommand (alias of `list`) |
+| `config` | a subcommand (hidden alias of `list --all`) |
 | `sessions` | a subcommand |
 | `incidents` | a subcommand |
 | `init` | a subcommand |

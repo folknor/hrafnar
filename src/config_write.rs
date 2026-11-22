@@ -88,7 +88,7 @@ fn set_audit_id(doc: &mut DocumentMut, id: &str) -> Result<()> {
 const INIT_TEMPLATE_PREFIX: &str = "\
 # Project config for `review`. Everything here is optional except [_audit].
 # Settings resolve command line, then this file, then the operator's global
-# config (~/.config/review/config.toml, same format). Run `review config` to see
+# config (~/.config/review/config.toml, same format). Run `review list` to see
 # the effective result and where each value came from.
 #
 # Archetypes are priming prompts: a name mapped to text prepended to stdin.
@@ -137,7 +137,7 @@ pub fn init(sel: &Selection) -> Result<()> {
     println!("Created {}", path.display());
     println!();
     println!("Next steps:");
-    println!("  1. Run `review config` to see what the global config already provides");
+    println!("  1. Run `review list` to see what the global config already provides");
     println!("  2. Run: echo \"check for issues\" | review -p <profile>");
     Ok(())
 }

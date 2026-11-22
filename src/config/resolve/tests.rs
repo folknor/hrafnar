@@ -2,7 +2,7 @@
 //!
 //! `config::parse`'s own `mod tests` covers parsing a single file; everything here
 //! is about how two files combine: which one wins, whether a winner replaces or
-//! merges, and whether the provenance (`layer`, `table`) that `review config`
+//! merges, and whether the provenance (`layer`, `table`) that `review list --all`
 //! reports is the provenance of the value actually used.
 
 #[allow(clippy::unwrap_used)]
@@ -69,7 +69,7 @@ mod layering {
 
     #[test]
     fn the_shadowed_global_profile_is_retained_for_display() {
-        // `review config` shows what a stale local override is hiding; that
+        // `review list --all` shows what a stale local override is hiding; that
         // only works if the loser survives resolution intact.
         let cfg = layered(
             "[profiles.deep]\nprovider = \"codex\"\nmodel = \"l\"\n",
@@ -208,7 +208,7 @@ mod layering {
     #[test]
     fn defaults_are_none_when_no_layer_sets_them() {
         // Nothing is built in: an unset key stays unset rather than acquiring
-        // a value `review config` would have to attribute to no file.
+        // a value `review list --all` would have to attribute to no file.
         let cfg = layered("[_defaults]\n", "[_defaults]\n").unwrap();
         assert!(cfg.profile.is_none());
         assert!(cfg.stall_timeout_secs.is_none());

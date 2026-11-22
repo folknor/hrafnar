@@ -45,7 +45,7 @@ security = "You are a security expert for this project. Read the codebase."
 bugs = "You hunt for edge cases and correctness bugs."
 ```
 
-`review config` shows the effective result and which file each value came from.
+`review list` shows the archetypes and profiles you can use; `review list --all` the effective result and which file each value came from.
 
 ### 3. Run
 
@@ -61,7 +61,7 @@ echo "second opinion please" | review -a bugs -p opus
 ```
 echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--dry-run]
 echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
-review config
+review list [--projects | --all]
 review sessions [ID] [--all] [--limit N]
 review incidents [--limit N]
 review init
@@ -85,7 +85,7 @@ Archetypes are optional named priming prompts defined under `[archetypes]` (name
 | `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, naming the provider and its `model`/`effort`/`sandbox`/`env`. Project config first, then global. Overrides `[_defaults].profile`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the provider. A profile whose provider is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the provider. A profile whose provider is not installed on this machine fails the run before anything launches - `review list --all` shows which are installed.
 
 How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every provider captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
@@ -365,11 +365,23 @@ How the layers combine:
 - **`[_defaults]` keys** come from the first file that sets them.
 - **Profiles** come from the first definition found, project file first, and win whole. A project profile may not name a different provider than the global one of the same name.
 
-### `review config`
+### `review list`
 
-Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, whether each provider is installed on this machine, every archetype with its source, the default profile, and every profile with its provider, the table it came from and any definitions it shadows. Env vars show by name only.
+Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles whose provider is installed on this machine with their model, effort and sandbox, the default marked. A profile hidden because its provider is not installed is named.
 
-Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer and provider availability on their own.
+```
+$ review list
+archetypes:
+  (none)
+
+profiles:
+  read            gpt-6.2-sol, effort low, read-only  (default)
+  write           gpt-6-luna, effort max, workspace-write
+```
+
+`review list --all` prints the whole effective configuration: the files consulted, whether each provider is installed, every archetype with its source, and every profile with its provider, the table it came from and any definitions it shadows. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
+
+Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer on its own.
 
 ### Upgrading existing files
 
