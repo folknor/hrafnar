@@ -30,7 +30,7 @@ impl std::error::Error for ExpandError {}
 
 /// Expand a configured path using one grammar for both project selection and
 /// writable roots. Empty values count as unset, matching environment lookup
-/// behavior elsewhere in `review`.
+/// behavior elsewhere in `hrafnar`.
 pub(crate) fn expand(
     raw: &str,
     var: &dyn Fn(&str) -> Option<String>,

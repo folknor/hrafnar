@@ -416,7 +416,7 @@ fn parse(content: &str) -> TranscriptSummary {
 /// rollout's size at launch, restricting the
 /// summary to that run's own events - used by recovery so a prior turn's
 /// `final_answer` can never be reported as this run's result. Use WholeFile to
-/// summarize the whole rollout (e.g. `review sessions <id>`).
+/// summarize the whole rollout (e.g. `hrafnar sessions <id>`).
 pub fn summarize_session_lookup(
     session_id: &str,
     override_home: Option<&str>,
@@ -771,7 +771,7 @@ mod tests {
         // The resume died before writing anything of its own.
         let rollout = prior.clone();
 
-        // Whole-file view (e.g. `review sessions <id>`): the old answer shows.
+        // Whole-file view (e.g. `hrafnar sessions <id>`): the old answer shows.
         assert_eq!(
             parse_from(&rollout, None).final_answer.as_deref(),
             Some("Old answer from turn one.")

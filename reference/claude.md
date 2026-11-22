@@ -49,14 +49,14 @@ pid is offered for signalling only after `init`.
 
 Claude has no session lock of its own: two turns on one idle session both
 run. The per-session launch lock in `inflight` is the only thing that
-serialises `review message` calls to a claude session.
+serialises `hrafnar message` calls to a claude session.
 
-Verified end to end through `review`:
+Verified end to end through `hrafnar`:
 
-- a `SIGTERM` to `review` mid-command ended the turn in 0.2s, recorded it,
-  printed the `review message` command and left nothing running
-- `review interrupt` from a second process did the same
-- `review message` interrupted the turn and resumed it with the new message,
+- a `SIGTERM` to `hrafnar` mid-command ended the turn in 0.2s, recorded it,
+  printed the `hrafnar message` command and left nothing running
+- `hrafnar interrupt` from a second process did the same
+- `hrafnar message` interrupted the turn and resumed it with the new message,
   which the model answered
 
 ## Credentials from a Claude Code session
@@ -66,7 +66,7 @@ credential. Claude Code doesn't pass `CLAUDE_CODE_OAUTH_TOKEN` to the shells
 it runs, so a claude started from one falls back to its saved login in
 `~/.claude/.credentials.json`. With that file stale (`expiresAt: 0`, refresh
 token expired), every such run and a plain `claude -p` failed after 30.0s
-with "OAuth session expired and could not be refreshed" (bz review#10).
+with "OAuth session expired and could not be refreshed" (bz hrafnar#10).
 Blanking the Claude Code session variables (`CLAUDECODE`,
 `CLAUDE_CODE_CHILD_SESSION`, the messaging socket and token) changed
 nothing; the missing token was the whole cause.
@@ -111,5 +111,5 @@ each is spread over `app::launch`, the session log and the adapter:
 The token is redacted by name in incident bundles like any `*TOKEN*`
 variable. The keeper redacts it from every process record it emits, using
 the child's own secret-named environment values, so its orphan log is
-covered when `review` has died. A command line cut part-way through a token
+covered when `hrafnar` has died. A command line cut part-way through a token
 has the trailing fragment redacted when it is at least 8 characters.

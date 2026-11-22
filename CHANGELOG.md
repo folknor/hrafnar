@@ -1,9 +1,22 @@
 # Changelog
 
-Changes that affect how you use `review`: flags, commands, config format and
+Changes that affect how you use `hrafnar`: flags, commands, config format and
 output. Each entry says what to do if you relied on the old behaviour.
 
 ## Unreleased
+
+### Renamed
+
+- **`review` is now `hrafnar`.** The binary, the project file
+  (`.review.toml` to `.hrafnar.toml`), the global config
+  (`~/.config/review/` to `~/.config/hrafnar/`), the data directory
+  (`~/.local/share/review/` to `~/.local/share/hrafnar/`), the host launch
+  lock and the generated `review-ws-*` and `review-read-only` harness
+  profiles all take the new name. Rename the files and directories you
+  have. Old values are not read. Record fields `review_version`,
+  `terminated_by_review` and `review_error` are now `hrafnar_version`,
+  `terminated_by_hrafnar` and `hrafnar_error`. Rows written under the old
+  names still parse, but update any `jq` queries that use them.
 
 ### Removed
 

@@ -1,4 +1,4 @@
-//! The `review` command itself: argument handling, the run and the verbs.
+//! The `hrafnar` command itself: argument handling, the run and the verbs.
 //! `main.rs` only dispatches between this and the keeper.
 
 use anyhow::{Result, bail};
@@ -18,7 +18,7 @@ use history::{run_incidents, run_session_show, run_sessions};
 use launch::{Launch, RecordCtx, run_launch};
 use message::run_message;
 
-/// Format the wall-clock runtime printed when `review` returns: sub-minute runs
+/// Format the wall-clock runtime printed when `hrafnar` returns: sub-minute runs
 /// get a decimal second (short runs differ by fractions), longer ones roll up to
 /// m/s then h/m/s. `sessions::format_age` is deliberately not reused because it
 /// shows whole seconds below a minute and omits seconds at longer durations.
@@ -35,7 +35,7 @@ fn format_runtime(d: std::time::Duration) -> String {
 }
 
 /// The exit-status verdict for one result: no turn, no answer, or an answer
-/// `review` could not verify (`Outcome::failed`). Retries are decided
+/// `hrafnar` could not verify (`Outcome::failed`). Retries are decided
 /// separately: an unverified answer is a failure, but resending the request
 /// would not verify it.
 fn run_failed(r: &harness::HarnessResult) -> bool {
@@ -49,7 +49,7 @@ fn run_failed(r: &harness::HarnessResult) -> bool {
 /// archetype of that name. The positional alias is accepted with a warning so
 /// orchestration procedures written against it keep working, and while it
 /// exists the subcommand names stay reserved (`config::reserved_names`). A
-/// stray word such as `review secruity` is taken as an archetype and reported
+/// stray word such as `hrafnar secruity` is taken as an archetype and reported
 /// as an unknown one. A positional `bare` means no archetype.
 fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Option<String>> {
     match (flag, legacy) {
@@ -58,14 +58,14 @@ fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Opt
         }
         (Some(a), None) => Ok(Some(a.to_string())),
         (None, Some("bare")) => {
-            eprintln!("warning: `review bare` is now plain `review` - no -a means no archetype");
+            eprintln!("warning: `hrafnar bare` is now plain `hrafnar` - no -a means no archetype");
             Ok(None)
         }
         // The name is not echoed back: this runs before the config is loaded,
-        // so a typo would be recommended verbatim (`use review -a secruity`).
+        // so a typo would be recommended verbatim (`use hrafnar -a secruity`).
         // The unknown-archetype error that follows lists what is configured.
         (None, Some(positional)) => {
-            eprintln!("warning: the archetype is now a flag - use `review -a <name>`");
+            eprintln!("warning: the archetype is now a flag - use `hrafnar -a <name>`");
             Ok(Some(positional.to_string()))
         }
         (None, None) => Ok(None),
@@ -86,7 +86,7 @@ pub async fn run() -> Result<CommandExit> {
     // Forward SIGINT/SIGTERM to any running codex process groups before exiting.
     // codex runs in its own process group (so we can kill it and its children as
     // a unit), which means it no longer receives a terminal Ctrl-C implicitly -
-    // without this, killing `review` would leave codex running detached.
+    // without this, killing `hrafnar` would leave codex running detached.
     // Installed once, process-wide, and before any harness can be spawned; see
     // `supervisor::install_signal_supervisor` for why it cannot be per-run.
     let lifecycle = crate::supervisor::Lifecycle::default();
@@ -122,7 +122,7 @@ pub async fn run() -> Result<CommandExit> {
             return Ok(CommandExit::Success);
         }
         Some(cli::Command::Config) => {
-            eprintln!("warning: `review config` is now `review list --all`");
+            eprintln!("warning: `hrafnar config` is now `hrafnar list --all`");
             config_cmd::run(&project::select(selector)?, config_cmd::View::All)?;
             return Ok(CommandExit::Success);
         }
@@ -130,7 +130,7 @@ pub async fn run() -> Result<CommandExit> {
             return run_message(id, *dry_run, selector, started, &lifecycle).await;
         }
         Some(cli::Command::Resume { id, dry_run }) => {
-            eprintln!("warning: `review resume <ID>` is now `review message <ID>`");
+            eprintln!("warning: `hrafnar resume <ID>` is now `hrafnar message <ID>`");
             return run_message(id, *dry_run, selector, started, &lifecycle).await;
         }
         Some(cli::Command::Interrupt { id }) => {
@@ -151,11 +151,11 @@ pub async fn run() -> Result<CommandExit> {
         None => {}
     }
 
-    // Migration: `--session <ID>` is the old spelling of `review resume <ID>`.
+    // Migration: `--session <ID>` is the old spelling of `hrafnar resume <ID>`.
     // Everything that rode along with it is ignored rather than refused, so a
     // procedure written against the old form keeps working until it is updated.
     if let Some(ref session_id) = cli.session {
-        eprintln!("warning: `--session <ID>` is now `review message <ID>`");
+        eprintln!("warning: `--session <ID>` is now `hrafnar message <ID>`");
         if cli.profile.is_some() || cli.harness.is_some() || cli.retired_provider.is_some() {
             eprintln!(
                 "warning: --profile/--harness/--provider are ignored on a resume - the \
@@ -170,7 +170,7 @@ pub async fn run() -> Result<CommandExit> {
     if let Some(ref p) = cli.retired_provider {
         bail!(
             "--provider was removed: pick the profile with -p <name> and its harness \
-             with --harness {p}\n  `review list` lists each profile's harnesses."
+             with --harness {p}\n  `hrafnar list` lists each profile's harnesses."
         );
     }
 
@@ -178,7 +178,7 @@ pub async fn run() -> Result<CommandExit> {
         resolve_archetype_arg(cli.archetype.as_deref(), cli.legacy_archetype.as_deref())?;
     let archetype_arg = archetype_arg.as_deref();
 
-    // A bare `review` - no arguments at all and nothing piped in - gets the help
+    // A bare `hrafnar` - no arguments at all and nothing piped in - gets the help
     // text. Read before the config so this works outside a project too. With any
     // flag given the operator meant to run something, so a missing stdin falls
     // through to `read_stdin`'s error, which says what is missing, rather than
@@ -249,7 +249,7 @@ pub async fn run() -> Result<CommandExit> {
 
     // One config reaches every machine, including ones missing a harness, so
     // this is checked before anything launches. An error rather than a warning
-    // and a skip, which would quietly run less than was asked for; `review
+    // and a skip, which would quietly run less than was asked for; `hrafnar
     // list` reports availability so an orchestrator can learn it up front.
     if !installed {
         bail!(
@@ -260,8 +260,8 @@ pub async fn run() -> Result<CommandExit> {
     }
 
     // Harness execution and recording live in launch; views live in history.
-    // The host-wide launch lock spaces out `review` calls fired together.
-    let lock_path = std::env::temp_dir().join("review.lock");
+    // The host-wide launch lock spaces out `hrafnar` calls fired together.
+    let lock_path = std::env::temp_dir().join("hrafnar.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
@@ -310,7 +310,7 @@ pub async fn run() -> Result<CommandExit> {
     };
     let mut handle = tokio::spawn(run_launch(launch, std::sync::Arc::clone(&ctx)));
 
-    // Hold the lock for the launch spacing, so the next queued `review` on this
+    // Hold the lock for the launch spacing, so the next queued `hrafnar` on this
     // host launches that much later. A run that is over sooner releases it
     // then: it is no longer talking to its harness, and its result should not
     // wait on the spacing.
@@ -364,13 +364,13 @@ pub async fn run() -> Result<CommandExit> {
 
     // A codex run that died without a final answer returns Ok (so its session
     // id + digest survive), but it is a failure for exit-code purposes - a dead
-    // review that exits 0 lies to scripts and CI. Leftovers are a separate
+    // hrafnar that exits 0 lies to scripts and CI. Leftovers are a separate
     // verdict that outranks it.
     Ok(CommandExit::of_runs(run_failed(&result), left_running))
 }
 
 /// Print what is still running, or may be, from every invocation this
-/// `review` made (see `contained`), whichever results were reported. Returns
+/// `hrafnar` made (see `contained`), whichever results were reported. Returns
 /// whether there was anything: exit 0 promises nothing the run started is
 /// alive.
 fn print_left_running(lifecycle: &crate::supervisor::Lifecycle) -> bool {
@@ -386,15 +386,15 @@ fn print_left_running(lifecycle: &crate::supervisor::Lifecycle) -> bool {
 }
 
 /// The project root `-C <sel>` names: a registered root as it stands, a path
-/// walked up to its `.review.toml`.
+/// walked up to its `.hrafnar.toml`.
 fn selected_root(sel: &str) -> Result<project::ProjectRoot> {
     match project::select(Some(sel))? {
         config::Selection::Exact(dir) => Ok(project::ProjectRoot::observe(&dir)),
-        // No ReviewConfig exists on this path, so there is no `files.local`
+        // No HrafnarConfig exists on this path, so there is no `files.local`
         // value from which to take the filename for this diagnostic.
         discover => config::project_root(&discover)?.ok_or_else(|| {
             anyhow::anyhow!(
-                "-C {sel}: no .review.toml at or above {}",
+                "-C {sel}: no .hrafnar.toml at or above {}",
                 discover.dir().display()
             )
         }),
@@ -414,7 +414,7 @@ mod tests {
 
     #[test]
     fn the_old_positional_archetype_still_works() {
-        // Orchestration procedures written against `review security` keep
+        // Orchestration procedures written against `hrafnar security` keep
         // working until they are updated; they get a warning, not a failure.
         let got = resolve_archetype_arg(None, Some("security")).expect("ok");
         assert_eq!(got.as_deref(), Some("security"));
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn a_positional_bare_means_no_archetype() {
-        // `review bare` was the old way to say "no priming".
+        // `hrafnar bare` was the old way to say "no priming".
         assert_eq!(resolve_archetype_arg(None, Some("bare")).expect("ok"), None);
     }
 

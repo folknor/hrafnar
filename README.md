@@ -1,6 +1,6 @@
-# review
+# hrafnar
 
-`review` is a command-line tool that hands a prompt to a fresh, headless AI
+`hrafnar` is a command-line tool that hands a prompt to a fresh, headless AI
 coding session and prints the answer. You pipe in instructions; it starts a
 new session on Claude Code, Codex, Grok or maki, and the agent reads the code
 itself. Use it for code reviews, second opinions, and with a write profile,
@@ -12,28 +12,28 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 Every run starts a clean session. Reviving a long-lived session on a cold
 prompt cache reprocesses its whole history, which only grows; a fresh session
-costs about one review's worth of tokens. Each run prints its session ID, so
-you can follow up with `review message ID` while the cache is still warm.
+costs about one hrafnar's worth of tokens. Each run prints its session ID, so
+you can follow up with `hrafnar message ID` while the cache is still warm.
 
-`review` is built to be driven by other agents as much as by people:
+`hrafnar` is built to be driven by other agents as much as by people:
 
 - All output is plain text, and the exit status says whether the run
   produced an answer.
 - When a run ends, everything its agent started is torn down, and anything
   that survives is named.
-- A running agent is steered with `review message`, never by killing
-  `review`.
+- A running agent is steered with `hrafnar message`, never by killing
+  `hrafnar`.
 
 ## Install
 
-`review` is a Rust crate. From a checkout:
+`hrafnar` is a Rust crate. From a checkout:
 
 ```sh
 cargo install --path .
 ```
 
 It drives whichever harnesses are on your `PATH`: `claude`, `codex`, `grok`
-or `maki`. `review list --all` shows which ones this host has.
+or `maki`. `hrafnar list --all` shows which ones this host has.
 
 ## Quick start
 
@@ -42,16 +42,16 @@ id, and can hold its archetypes:
 
 ```sh
 cd /path/to/your/project
-review init
+hrafnar init
 ```
 
 Define profiles once, in the global config at
-`~/.config/review/config.toml`. A profile is a tier of work with one entry
+`~/.config/hrafnar/config.toml`. A profile is a tier of work with one entry
 per harness that can serve it:
 
 ```toml
 [_defaults]
-profile = "review"
+profile = "hrafnar"
 prefer = ["codex", "claude"]
 
 [profiles.review]
@@ -61,7 +61,7 @@ claude = { model = "opus" }
 ```
 
 Give the project its archetypes, the priming prompts for each kind of
-review, in its `.review.toml`:
+hrafnar, in its `.hrafnar.toml`:
 
 ```toml
 [archetypes]
@@ -72,18 +72,18 @@ bugs = "You hunt for edge cases and correctness bugs."
 Then run it:
 
 ```sh
-echo "look for auth boundary violations" | review -a security
-echo "second opinion please" | review -a bugs --harness claude
-echo "what's the worst of those?" | review message SESSION_ID
-review list
+echo "look for auth boundary violations" | hrafnar -a security
+echo "second opinion please" | hrafnar -a bugs --harness claude
+echo "what's the worst of those?" | hrafnar message SESSION_ID
+hrafnar list
 ```
 
-`review list` shows the archetypes and profiles you can use here, with the
+`hrafnar list` shows the archetypes and profiles you can use here, with the
 harness each profile would pick.
 
 ## Documentation
 
-`review --help` is the complete short form. `review man` lists the longer
+`hrafnar --help` is the complete short form. `hrafnar man` lists the longer
 topics, which are the same pages as this repository's [docs](docs/):
 
 - **`run`**: a fresh run, from stdin to exit status
@@ -95,7 +95,7 @@ topics, which are the same pages as this repository's [docs](docs/):
 - **`failures`**: what a failed run tells you, and what to do
 - **`projects`**: acting on another project with `-C`
 
-Changes that affect how you use `review` are in
+Changes that affect how you use `hrafnar` are in
 [CHANGELOG.md](CHANGELOG.md).
 
 ## License

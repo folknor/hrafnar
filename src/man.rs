@@ -1,9 +1,9 @@
-//! `review man [TOPIC]` - the bundled topics behind `--help`.
+//! `hrafnar man [TOPIC]` - the bundled topics behind `--help`.
 //!
-//! `--help` and `review list` are meant to be enough to drive `review`; a
+//! `--help` and `hrafnar list` are meant to be enough to drive `hrafnar`; a
 //! topic is for when an agent needs the rule behind what it saw. Each is one
 //! `docs/*.md` file compiled in with `include_str!` and printed raw: markdown
-//! is what an agent reads best, and `review` prints plain text everywhere.
+//! is what an agent reads best, and `hrafnar` prints plain text everywhere.
 //!
 //! A topic is printed whole. There is no section addressing - each topic is
 //! capped in size instead (`tests::MAX_TOPIC_BYTES`), so one that grows is split into
@@ -12,7 +12,7 @@
 //!
 //! The docs describe observable behaviour. They never link into `reference/`
 //! or by repository path - an installed binary has no checkout to follow the
-//! link into - and refer to each other only as complete `review man <topic>`
+//! link into - and refer to each other only as complete `hrafnar man <topic>`
 //! commands, which the tests below resolve.
 
 use std::io::Write;
@@ -67,7 +67,7 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "sessions",
-        summary: "review sessions and review incidents: reading what a run left behind",
+        summary: "hrafnar sessions and hrafnar incidents: reading what a run left behind",
         path: "docs/sessions.md",
         content: include_str!("../docs/sessions.md"),
     },
@@ -99,7 +99,7 @@ pub fn run(topic: Option<&str>) -> crate::exit::CommandExit {
 
 fn index() -> String {
     let width = TOPICS.iter().map(|t| t.name.len()).max().unwrap_or(0);
-    let mut out = String::from("Topics. Run `review man <topic>` to read one.\n\n");
+    let mut out = String::from("Topics. Run `hrafnar man <topic>` to read one.\n\n");
     for t in TOPICS {
         out.push_str(&format!("  {:width$}  {}\n", t.name, t.summary));
     }
@@ -177,21 +177,21 @@ mod tests {
         }
     }
 
-    /// A cross-reference is a complete command - `review man` or `review man
+    /// A cross-reference is a complete command - `hrafnar man` or `hrafnar man
     /// <topic>` inside backticks, the one spelling the docs use - and every one
-    /// must resolve. Anything else around `review man` is an error, opening
+    /// must resolve. Anything else around `hrafnar man` is an error, opening
     /// backtick included, so a renamed topic cannot linger in a reference that
     /// no longer works.
     #[test]
     fn every_man_reference_names_a_topic() {
         for t in TOPICS {
-            for (i, _) in t.content.match_indices("review man") {
+            for (i, _) in t.content.match_indices("hrafnar man") {
                 assert!(
                     t.content[..i].ends_with('`'),
-                    "{}: `review man` reference not opened by a backtick",
+                    "{}: `hrafnar man` reference not opened by a backtick",
                     t.name
                 );
-                let rest = &t.content[i + "review man".len()..];
+                let rest = &t.content[i + "hrafnar man".len()..];
                 if rest.starts_with('`') {
                     continue;
                 }
@@ -202,7 +202,7 @@ mod tests {
                 match target {
                     Some(name) if TOPICS.iter().any(|x| x.name == name) => {}
                     _ => panic!(
-                        "{}: `review man{}` is not `review man` or `review man <topic>` in backticks",
+                        "{}: `hrafnar man{}` is not `hrafnar man` or `hrafnar man <topic>` in backticks",
                         t.name,
                         rest.lines().next().unwrap_or("")
                     ),
@@ -309,7 +309,7 @@ mod tests {
     /// Pins the translation each harness receives and that claude records no
     /// level. It does not prove the harness enforces the level - that is the
     /// harness tests' and diagnostics' job - only that the table says what
-    /// `review` passes on.
+    /// `hrafnar` passes on.
     /// One column per harness, so a new harness fails this until the table
     /// says what it does with each level.
     #[test]

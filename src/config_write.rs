@@ -1,4 +1,4 @@
-//! The only code that writes config. `init` creates a new `.review.toml`;
+//! The only code that writes config. `init` creates a new `.hrafnar.toml`;
 //! `ensure_audit_id` is the only writer of an existing one, generating and
 //! persisting the audit id under a lock on the file when it is absent, so two
 //! first runs of an id-less project agree on one id. Archetypes and profiles
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, value};
 
-/// Load .review.toml as an editable document (or an empty doc if missing).
+/// Load .hrafnar.toml as an editable document (or an empty doc if missing).
 fn load_doc(config_path: &Path) -> Result<DocumentMut> {
     let raw = match std::fs::read_to_string(config_path) {
         Ok(raw) => raw,
@@ -65,13 +65,13 @@ fn configured_audit_id(doc: &DocumentMut) -> Result<Option<crate::data::AuditId>
     };
     let table = audit
         .as_table()
-        .ok_or_else(|| anyhow::anyhow!("[_audit] is not a table in .review.toml"))?;
+        .ok_or_else(|| anyhow::anyhow!("[_audit] is not a table in .hrafnar.toml"))?;
     let Some(id) = table.get("id") else {
         return Ok(None);
     };
     let id = id
         .as_str()
-        .ok_or_else(|| anyhow::anyhow!("[_audit].id is not a string in .review.toml"))?;
+        .ok_or_else(|| anyhow::anyhow!("[_audit].id is not a string in .hrafnar.toml"))?;
     Ok(crate::data::AuditId::from_record(id))
 }
 
@@ -80,15 +80,15 @@ fn set_audit_id(doc: &mut DocumentMut, id: &str) -> Result<()> {
         .entry("_audit")
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[_audit] is not a table in .review.toml"))?;
+        .ok_or_else(|| anyhow::anyhow!("[_audit] is not a table in .hrafnar.toml"))?;
     audit_table.insert("id", value(id));
     Ok(())
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
-# Project config for `review`. Everything here is optional except [_audit].
+# Project config for `hrafnar`. Everything here is optional except [_audit].
 # Settings resolve command line, then this file, then the operator's global
-# config (~/.config/review/config.toml, same format). Run `review list` to see
+# config (~/.config/hrafnar/config.toml, same format). Run `hrafnar list` to see
 # the effective result and where each value came from.
 #
 # Archetypes are priming prompts: a name mapped to text prepended to stdin.
@@ -139,8 +139,8 @@ pub fn init(sel: &Selection) -> Result<()> {
     println!("Created {}", path.display());
     println!();
     println!("Next steps:");
-    println!("  1. Run `review list` to see what the global config already provides");
-    println!("  2. Run: echo \"check for issues\" | review -p <profile>");
+    println!("  1. Run `hrafnar list` to see what the global config already provides");
+    println!("  2. Run: echo \"check for issues\" | hrafnar -p <profile>");
     Ok(())
 }
 

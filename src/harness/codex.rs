@@ -78,12 +78,12 @@ impl super::stream::Observer for CodexObserver {
     }
 }
 
-/// Name of the codex permissions profile `review` synthesises for `read-only`.
+/// Name of the codex permissions profile `hrafnar` synthesises for `read-only`.
 ///
 /// Never read from the operator's config - `--ignore-user-config` drops that
 /// file, and the profile is defined entirely by the `-c` overrides below - so
 /// the name only has to avoid colliding with a built-in (those all start `:`).
-const CODEX_READ_ONLY_PROFILE: &str = "review-read-only";
+const CODEX_READ_ONLY_PROFILE: &str = "hrafnar-read-only";
 
 /// The codex arguments that select a sandbox level.
 ///
@@ -134,7 +134,7 @@ const CODEX_READ_ONLY_PROFILE: &str = "review-read-only";
 /// network left restricted, and it reproduces `--sandbox read-only` exactly -
 /// which is what establishes that dropping the flag does not widen the
 /// filesystem, separately from the network change. `write_cwd` stays `EROFS`
-/// in all three: the guarantee `.review.toml` advertises for `read-only` is
+/// in all three: the guarantee `.hrafnar.toml` advertises for `read-only` is
 /// intact, and only the socket lines move.
 ///
 /// Note the witnesses are `connect()` and socket options, not `bind()` on a
@@ -189,7 +189,7 @@ pub(super) async fn run_codex(
     // Exec-level options shared by both paths.
     let mut args: Vec<String> = vec![
         "exec".to_string(),
-        // `review` is routinely launched from a directory that is not itself a
+        // `hrafnar` is routinely launched from a directory that is not itself a
         // git repo (an umbrella dir whose repos live in subdirectories). Codex
         // refuses to start there ("Not inside a trusted directory and
         // --skip-git-repo-check was not specified"), so pass it always.
@@ -235,7 +235,7 @@ pub(super) async fn run_codex(
         // identical command sandboxed, so enforcement tracks the shape of the
         // command the model happened to type and reads as flaky. Upstream
         // documents this ("control which commands Codex can run outside the
-        // sandbox"): codex works as intended, it is review's guarantee that
+        // sandbox"): codex works as intended, it is hrafnar's guarantee that
         // breaks. `--ignore-rules` drops the user and project rule layers for
         // this invocation only, leaving interactive codex untouched; the
         // root-owned `/etc/codex/rules/` layer still loads, correctly.
@@ -244,8 +244,8 @@ pub(super) async fn run_codex(
         // without the flag fails loudly on an unknown argument rather than
         // silently running unsandboxed.
         "--ignore-rules".to_string(),
-        // The general form of the same rule: a `review` run is a function of
-        // `.review.toml` plus argv, never of a file the operator edited for
+        // The general form of the same rule: a `hrafnar` run is a function of
+        // `.hrafnar.toml` plus argv, never of a file the operator edited for
         // unrelated reasons. Both holes above are ambient global codex config
         // voiding a profile's advertised guarantee, and pinning each hole as
         // it is found leaves the next one live, so drop
@@ -263,7 +263,7 @@ pub(super) async fn run_codex(
         // their `summary` arrays come back empty, so a rollout records *what* a
         // run did and never *why*, and intent has to be inferred from the
         // command sequence. `detailed` fills the summaries, which `src/transcript.rs` forensics
-        // and `review sessions <id>` can then surface. Passed before profile
+        // and `hrafnar sessions <id>` can then surface. Passed before profile
         // `config` overrides, so a profile can still set `none` where the
         // summaries are not worth their tokens.
         "-c".to_string(),
@@ -465,12 +465,12 @@ async fn run_codex_json(
     // path, the lifecycle's stop refusal included.
     let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
     // A resume knows its session id, so its in-flight marker goes up before the
-    // spawn: `review message` releases its session launch lock when the launch
+    // spawn: `hrafnar message` releases its session launch lock when the launch
     // signal fires, and a second message must then find this marker to
     // interrupt the run rather than launch beside it. A fresh run's marker goes
     // up when `thread.started` reaches the reader (`Lease::set_session`);
     // nobody can message a session whose id has not been printed. The marker
-    // shows `review sessions` the turn in flight instead of the previous
+    // shows `hrafnar sessions` the turn in flight instead of the previous
     // turn's response, so a hung run does not look like an idle session.
     //
     // The keeper's pid is offered on the marker only from codex's first stdout
@@ -478,7 +478,7 @@ async fn run_codex_json(
     // codex.js`) that forwards one SIGINT to the native binary, but installs
     // that forwarding only after spawning it. A SIGINT before then kills the
     // wrapper and orphans codex, still holding the session's writer lock
-    // (`$CODEX_HOME/thread-writer-locks/ID.lock`), so the resume `review
+    // (`$CODEX_HOME/thread-writer-locks/ID.lock`), so the resume `hrafnar
     // interrupt` hands back would fail "already has an active writer". The
     // interrupt signals the leader only, never the group: the wrapper already
     // forwards, and a group signal would hand the native binary a second copy.
@@ -516,7 +516,7 @@ async fn run_codex_json(
     )?;
 
     // Bound in-memory buffering: a runaway/noisy harness could otherwise OOM
-    // `review` long before the 1 MiB forensic tail is applied. Buffer up to a
+    // `hrafnar` long before the 1 MiB forensic tail is applied. Buffer up to a
     // generous cap and keep draining past it so codex never blocks on a full
     // pipe. Real reviews are far under the cap.
     //
@@ -543,7 +543,7 @@ async fn run_codex_json(
     run.launch(launched).await?;
 
     // Records that *we* ended the run, and why. See `Outcome::ended`.
-    let mut terminated_by_review: Option<crate::harness::Termination> = None;
+    let mut terminated_by_hrafnar: Option<crate::harness::Termination> = None;
     // Forensics from the watchdog verdict, carried onto the digest and into the
     // incident bundle.
     let mut watchdog_answer: Option<String> = None;
@@ -551,13 +551,13 @@ async fn run_codex_json(
     let mut last_rollout_event: Option<crate::transcript::EventKind> = None;
 
     // Wait for codex, but stay interruptible: the wait ends on reap, and the
-    // watchdog can pre-empt it. Everything `review` knows about a run (digest,
+    // watchdog can pre-empt it. Everything `hrafnar` knows about a run (digest,
     // incident bundle, sidecar row) is computed below this point, so a wait
     // that blocks on a codex that finished its turn and never exits (observed
     // on 0.147.0: answer on disk, 10+ hours hung) produces nothing at all.
     // On a stranded completion the run is terminated, reaped, and the
-    // recovered `final_answer` reported as usual. A signalled `review` ends
-    // the turn as `review interrupt` would, through the lifecycle's stop arm.
+    // recovered `final_answer` reported as usual. A signalled `hrafnar` ends
+    // the turn as `hrafnar interrupt` would, through the lifecycle's stop arm.
     // The watchdog judges codex only, never the teardown of what it left.
     let watchdog = {
         let watchdog = crate::watchdog::wait_for_stranded_completion(
@@ -573,7 +573,7 @@ async fn run_codex_json(
         }
     };
     if let Some(verdict) = run.wait(watchdog).await {
-        terminated_by_review = Some(verdict.termination());
+        terminated_by_hrafnar = Some(verdict.termination());
         watchdog_answer = verdict.final_answer;
         quiet_secs = Some(verdict.quiet_secs);
         last_rollout_event = verdict.last_event.clone();
@@ -740,7 +740,11 @@ async fn run_codex_json(
     };
     let mut outcome = Outcome::answered(answer);
     outcome.stated = turn_error;
-    let outcome = outcome.ended(interrupt_requested, stopped_by_signal, terminated_by_review);
+    let outcome = outcome.ended(
+        interrupt_requested,
+        stopped_by_signal,
+        terminated_by_hrafnar,
+    );
     let interrupted = outcome.interrupted();
 
     // Whether to bundle is this adapter's policy over its own evidence, not a

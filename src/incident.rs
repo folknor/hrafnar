@@ -2,14 +2,14 @@
 //!
 //! When a codex run looks wrong (not captured / non-zero exit / signal) the
 //! live digest + transcript summary are not enough to explain *why* it died.
-//! That needs what `review` would otherwise discard: codex's stderr, the raw
+//! That needs what `hrafnar` would otherwise discard: codex's stderr, the raw
 //! NDJSON stream, whether the prompt finished writing, and (absent
 //! `RUST_BACKTRACE`) any panic trace. Only the codex adapter writes bundles.
 //!
 //! An answer the watchdog preserved stays affirmative evidence in the bundle
 //! even when the later recovery read can no longer find the transcript.
 //!
-//! `write_bundle` dumps all of it to `~/.local/share/review/incidents/<dir>/`
+//! `write_bundle` dumps all of it to `~/.local/share/hrafnar/incidents/<dir>/`
 //! so the *next* death is over-instrumented instead of a mystery. It is
 //! best-effort: `write_bundle` returns failures to its caller, which reports
 //! them without derailing the run. Only suspicious runs write a bundle, so
@@ -31,7 +31,7 @@ pub struct Incident<'a> {
     /// directory and the env overrides (adapter defaults, profile, forced,
     /// `PWD`). The replay command and the env list are rendered from it, so
     /// nothing a runner injects can be missing from them. What it cannot
-    /// carry: the environment the child inherited from `review` (only the
+    /// carry: the environment the child inherited from `hrafnar` (only the
     /// overrides are recorded), and the contents of runner-created temp files
     /// named in argv (codex's `-o` file, grok's prompt file).
     pub process: &'a crate::harness::ProcessSpec,
@@ -84,7 +84,8 @@ pub struct Meta {
     #[serde(rename = "provider")]
     pub harness: String,
     pub session_id: Option<String>,
-    pub review_version: String,
+    #[serde(alias = "review_version")]
+    pub hrafnar_version: String,
     // Historical schema-1 key: keep it even though Incident uses harness_version.
     pub codex_version: Option<String>,
     /// Full argv including argv[0] (the binary).
@@ -103,7 +104,8 @@ pub struct Meta {
     pub captured: bool,
     pub recovered_from_transcript: bool,
     pub turns: u32,
-    pub terminated_by_review: Option<String>,
+    #[serde(alias = "terminated_by_review")]
+    pub terminated_by_hrafnar: Option<String>,
     pub quiet_secs: Option<u64>,
     pub last_rollout_event: Option<String>,
     /// Codex's stated reason for the turn ending, when it gave one.
@@ -179,7 +181,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     // same dir and overwriting each other's artifacts. It is the audit id's
     // generator (32 hex characters), but this path is best-effort: without
     // system randomness it falls back to pid and clock nanoseconds, which are
-    // still distinct between two failures of one `review`, rather than
+    // still distinct between two failures of one `hrafnar`, rather than
     // panicking or dropping the bundle.
     let nonce = crate::config::try_generate_short_id().unwrap_or_else(|_| {
         let nanos = std::time::SystemTime::now()
@@ -253,7 +255,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         timestamp,
         harness: inc.harness.to_string(),
         session_id: inc.session_id.map(str::to_string),
-        review_version: env!("CARGO_PKG_VERSION").to_string(),
+        hrafnar_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_version: inc.harness_version.clone(),
         argv: full_argv,
         command,
@@ -266,7 +268,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         captured: inc.outcome.answer == crate::harness::Answer::Captured,
         recovered_from_transcript: inc.outcome.answer == crate::harness::Answer::Recovered,
         turns: inc.turns,
-        terminated_by_review: inc.outcome.termination().map(ToString::to_string),
+        terminated_by_hrafnar: inc.outcome.termination().map(ToString::to_string),
         quiet_secs: codex.and_then(|c| c.quiet_secs),
         last_rollout_event: codex
             .and_then(|c| c.last_rollout_event)
@@ -282,7 +284,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         rate_limits,
         env,
     };
-    // meta.json is the index `review incidents` reads and the file that makes
+    // meta.json is the index `hrafnar incidents` reads and the file that makes
     // the bundle self-describing. If it can't be written (quota, unwritable
     // dir), don't advertise a path that points at a broken bundle.
     match serde_json::to_vec_pretty(&meta) {
@@ -703,7 +705,7 @@ mod tests {
         let base = scratch_incident_dir();
         let original = r#"{
             "schema":1,"timestamp":"2026-01-01T00:00:00Z","provider":"codex",
-            "session_id":"old","review_version":"0.1.0","codex_version":"codex 0.146.0",
+            "session_id":"old","hrafnar_version":"0.1.0","codex_version":"codex 0.146.0",
             "argv":["codex","exec"],"cwd":"/project","exit_code":1,"signal":null,
             "stdin_write_error":null,"duration_ms":1234,"captured":false,
             "recovered_from_transcript":false,"turns":0,"stdout_bytes":12,"stderr_bytes":4,

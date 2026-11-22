@@ -37,7 +37,7 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     if table.contains_key("_groups") {
         bail!(
             "[_groups] in {origin}: archetype groups were removed - a run takes one \
-             archetype, so launch one `review -a <name>` per member instead"
+             archetype, so launch one `hrafnar -a <name>` per member instead"
         );
     }
     if let Some(toml::Value::Table(d)) = table.get("_defaults") {
@@ -70,7 +70,7 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     };
     if layer == Layer::Local && defaults.claude_token_command.is_some() {
         bail!(
-            "[_defaults].claude_token_command in {origin}: a command review runs to fetch a \
+            "[_defaults].claude_token_command in {origin}: a command hrafnar runs to fetch a \
              credential belongs in the global config; one named by a project's \
              {CONFIG_FILENAME} would run code from any checkout"
         );
@@ -121,7 +121,7 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
         if name == BARE && !prime.trim().is_empty() {
             bail!(
                 "archetype 'bare' in {origin} has a prompt, but `bare` means no archetype - \
-                 `review bare` and `-a bare` ignore it\n  \
+                 `hrafnar bare` and `-a bare` ignore it\n  \
                  Give it an empty prompt (bare = \"\") or rename it."
             );
         }
@@ -238,12 +238,12 @@ fn parse_profiles(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::super::{ReviewConfig, resolve};
+    use super::super::{HrafnarConfig, resolve};
     use super::*;
 
     /// Parse a single local file and resolve it alone, as a project with no
     /// global config would be.
-    fn local_only(raw: &str) -> Result<ReviewConfig> {
+    fn local_only(raw: &str) -> Result<HrafnarConfig> {
         Ok(resolve(
             parse_file(raw, "local", Layer::Local)?,
             None,
@@ -252,7 +252,7 @@ mod tests {
         )?)
     }
 
-    /// A project file naming a command review would run is code execution
+    /// A project file naming a command hrafnar would run is code execution
     /// from any checkout; only the operator's global file may.
     #[test]
     fn claude_token_command_is_global_only() {
@@ -479,7 +479,7 @@ grok = {}
     #[test]
     fn subcommand_names_are_reserved_as_archetype_names() {
         // `-a` cannot collide with a subcommand, but the legacy positional form
-        // can: `review sessions` runs the subcommand, silently, instead of the
+        // can: `hrafnar sessions` runs the subcommand, silently, instead of the
         // archetype.
         for name in ["sessions", "help", "init", "incidents", "config", "resume"] {
             let as_archetype = format!("[archetypes]\n{name} = \"x\"\n");
@@ -490,7 +490,7 @@ grok = {}
 
     #[test]
     fn bare_may_only_be_an_empty_archetype() {
-        // `bare = ""` is in most existing configs and means what `review bare`
+        // `bare = ""` is in most existing configs and means what `hrafnar bare`
         // means. A prompt under that name would be silently ignored by it.
         assert!(local_only("[archetypes]\nbare = \"\"\n").is_ok());
         let err = local_only("[archetypes]\nbare = \"be terse\"\n")

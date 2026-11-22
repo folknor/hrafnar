@@ -1,15 +1,15 @@
-# review
+# hrafnar
 
-A Rust CLI (`review`) that hands code reviews and work to a fresh, headless AI
+A Rust CLI (`hrafnar`) that hands code reviews and work to a fresh, headless AI
 session on one of several harnesses (Claude Code, Codex, Grok, maki), chosen
 by a named profile. It is a prompt builder: the agents fetch code themselves.
 Each run starts a clean session, optionally primed with an archetype's prompt,
 and is recorded so it can be messaged, interrupted or resumed while its cache
 is warm.
 
-Config is layered: the command line, then the project's `.review.toml`, then
-the operator's global `~/.config/review/config.toml`. `review list` prints the
-archetypes and runnable profiles; `review list --all` the effective result with
+Config is layered: the command line, then the project's `.hrafnar.toml`, then
+the operator's global `~/.config/hrafnar/config.toml`. `hrafnar list` prints the
+archetypes and runnable profiles; `hrafnar list --all` the effective result with
 each value's source.
 
 Where to read further:
@@ -17,14 +17,14 @@ Where to read further:
 - `src/lib.rs` - the module layers and the rules that hold across them; each
   module's `//!` comment says what it owns, and each design rule and its
   reason sit on the code that enforces it.
-- [reference/steering.md](reference/steering.md) - how `review message` and
-  `review interrupt` coordinate on one session.
+- [reference/steering.md](reference/steering.md) - how `hrafnar message` and
+  `hrafnar interrupt` coordinate on one session.
 - How each harness is driven: [reference/codex.md](reference/codex.md),
   [reference/claude.md](reference/claude.md), [reference/grok.md](reference/grok.md),
   [reference/maki.md](reference/maki.md).
 - [reference/sandbox.md](reference/sandbox.md) - permissions and writable roots.
 - [reference/teardown.md](reference/teardown.md) - the keeper every run runs under.
-- `docs/` - the `review man` topics: observable behaviour, and the binding
+- `docs/` - the `hrafnar man` topics: observable behaviour, and the binding
   config format (`docs/config.md`, `docs/profiles.md`, `docs/projects.md`).
   Change the behaviour, change the doc - and the `--help` text, which is what
   orchestrating agents read first.
@@ -114,7 +114,7 @@ bz close 12 -m "fixed by ..."
 | Folder | Contents | Rule |
 |---|---|---|
 | `reference/` | Only what code can't say: behaviour you'd need three modules open to get right, and harness facts and evidence that shape the code | Citable from source as a source of truth. What it says must be true. |
-| `docs/` | How the thing is used: the `review man` topics, one file each, flat | Same must-be-true rule. |
+| `docs/` | How the thing is used: the `hrafnar man` topics, one file each, flat | Same must-be-true rule. |
 | `notes/` | Transient: plans, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
 | `plans/` | Retired | Plan documents go in `notes/`. |
 

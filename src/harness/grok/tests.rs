@@ -73,14 +73,14 @@ fn grok_cancelled_turn_is_not_an_answer() {
         .expect("a cancelled turn still ran - it is not a launch failure");
     let super::GrokOutcome::NoAnswer {
         reason,
-        review_error,
+        hrafnar_error,
         text,
         session_id,
     } = outcome
     else {
         panic!("a cancelled turn is not an answer");
     };
-    assert!(!review_error, "grok stated the stop reason");
+    assert!(!hrafnar_error, "grok stated the stop reason");
     assert!(
         reason.contains("cancelled"),
         "names the stop reason: {reason}"
@@ -184,7 +184,7 @@ fn grok_missing_stop_reason_is_not_an_answer() {
     .expect("an unlabelled turn still ran");
     let super::GrokOutcome::NoAnswer {
         reason,
-        review_error,
+        hrafnar_error,
         ..
     } = outcome
     else {
@@ -195,8 +195,8 @@ fn grok_missing_stop_reason_is_not_an_answer() {
         "says the reason was absent: {reason}"
     );
     assert!(
-        review_error,
-        "the missing stop reason is review's diagnosis"
+        hrafnar_error,
+        "the missing stop reason is hrafnar's diagnosis"
     );
     let outcome = super::Outcome::no_answer().unverified(reason);
     assert!(outcome.stated.is_none());
@@ -215,7 +215,7 @@ fn json_that_is_not_a_result_object_is_a_launch_failure() {
     // deserializes into an all-default `GrokResult`. Reading that as "a turn
     // ran but did not answer" would infer the fact from successful parsing
     // rather than from evidence - and `NoAnswer` returns `Ok`, which tells
-    // `review resume` the prompt cache was warmed. An unrecognised pre-turn failure
+    // `hrafnar resume` the prompt cache was warmed. An unrecognised pre-turn failure
     // would then mark a cold session warm and get the *next* resume refused.
     let err = super::interpret_grok_output(r#"{"unexpected": "shape"}"#, "Error: something else")
         .expect_err("nothing here says a turn ran");
@@ -319,7 +319,7 @@ fn review_verification_failure_preserves_a_real_answer_and_observed_status() {
     assert!(run.outcome.failed(), "unverified work still fails the run");
     let summary = digest.summary(&run.outcome);
     assert_eq!(
-        summary.review_error.as_deref(),
+        summary.hrafnar_error.as_deref(),
         Some("unread background results")
     );
     assert!(summary.captured);
@@ -409,7 +409,7 @@ async fn grok_preparation_retains_request_and_rechecks_distrust_before_spawn() {
         plan.permissions
             .selector()
             .expect("native profile")
-            .starts_with("review-ws-")
+            .starts_with("hrafnar-ws-")
     );
     assert!(prepared.trust_grant.is_some());
     assert!(prepared.verified_grant.is_none());
@@ -544,7 +544,7 @@ async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatc
             "archetype": "bare", "session_id": "historical-grok",
             "sandbox": "workspace-write", "provider_sandbox": name,
             "writable_roots": roots, "operator_prompt": "p",
-            "assembled_prompt": "p", "review_version": "0.0.0"
+            "assembled_prompt": "p", "hrafnar_version": "0.0.0"
         }))
         .expect("historical row");
         let mut settings = RunSettings::from_inherited(
@@ -565,9 +565,9 @@ async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatc
         }
     };
     for (name, recorded) in [
-        ("review-ws-cbf29ce484222325", vec![]),
+        ("hrafnar-ws-cbf29ce484222325", vec![]),
         (
-            "review-ws-a4924c479efe6e4c",
+            "hrafnar-ws-a4924c479efe6e4c",
             vec![
                 "/home/u/.cargo".into(),
                 "/home/u/.brokkr".into(),
@@ -607,7 +607,7 @@ async fn generated_profile_resume_recreates_recorded_roots_and_refuses_a_mismatc
         }
     }
     std::fs::remove_file(home.join("trusted_folders.toml")).expect("undecided project");
-    let launch = launch("review-ws-cbf29ce484222325", &["/different".into()]);
+    let launch = launch("hrafnar-ws-cbf29ce484222325", &["/different".into()]);
     let mut plan = super::super::permissions::PermissionPlan::new(
         launch.settings.permissions.clone(),
         &project,

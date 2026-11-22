@@ -63,7 +63,7 @@ impl GrokResult {
     /// all-default `GrokResult`. Treating that as "a turn ran but did not
     /// answer" infers the fact from successful parsing rather than from
     /// evidence, and the inference is load-bearing: `NoAnswer` returns `Ok`,
-    /// which tells `review resume` the prompt cache was warmed and refreshes the
+    /// which tells `hrafnar resume` the prompt cache was warmed and refreshes the
     /// staleness clock. An unrecognised pre-turn failure would therefore mark a
     /// cold session warm. Requiring one of grok's own result fields keeps that
     /// claim tied to something grok actually said.
@@ -72,7 +72,7 @@ impl GrokResult {
     }
 }
 
-/// How long `review` lets a grok shell command run: 20 minutes. Three grok
+/// How long `hrafnar` lets a grok shell command run: 20 minutes. Three grok
 /// limits are set from it:
 /// - the auto-background budget (`GROK_FOREGROUND_BLOCK_BUDGET_MS`, default
 ///   15s): a command holds the foreground for `min(model's timeout, this)` -
@@ -126,7 +126,7 @@ const GROK_MAX_WAKES: u32 = 10;
 /// buys the same answer (`Outcome::stated_failure`); that outcome already
 /// fails the run. A wake turn that fails to launch keeps the first turn's output and
 /// session id rather than dropping both. Verification and wake failures are
-/// recorded as `unverified` (persisted as `review_error`), apart from grok's
+/// recorded as `unverified` (persisted as `hrafnar_error`), apart from grok's
 /// own stated reason (`turn_error`), and never invent an exit code or relabel
 /// a captured answer as interim text.
 ///
@@ -152,10 +152,10 @@ pub(super) async fn run_grok(
     let session_id = session.id().expect("validated grok identity").as_str();
     let data = &runtime.data;
     // In flight for the whole run, wake turns included. Never offered a pid:
-    // grok has no clean way to end a turn, so `review interrupt` refuses it.
-    // What the marker buys is `review message` seeing the turn in flight and
+    // grok has no clean way to end a turn, so `hrafnar interrupt` refuses it.
+    // What the marker buys is `hrafnar message` seeing the turn in flight and
     // refusing, as its help says, instead of launching a second turn on the
-    // session beside this one - and `review sessions` showing it. A resume
+    // session beside this one - and `hrafnar sessions` showing it. A resume
     // marks before launch, including fresh caller-minted identities. If the
     // harness echoes a different identity, the lease holds a marker for both
     // through the wakes, each kept current with the turn's keeper. One lease
@@ -206,7 +206,7 @@ pub(super) async fn run_grok(
             }
         };
         // A failed turn is not fixed by waking, whether grok stated a reason or
-        // review found its stop reason missing. The outcome already fails it.
+        // hrafnar found its stop reason missing. The outcome already fails it.
         if run.out.outcome.explained_failure() {
             break;
         }
@@ -217,7 +217,7 @@ pub(super) async fn run_grok(
         // it does not authorize a launch. Run::spawn still uses the lifecycle's
         // admission gate if stop arrives after this check.
         if runtime.lifecycle.stop_requested() {
-            let reason = "grok wake-up not launched: review was signalled to stop".to_string();
+            let reason = "grok wake-up not launched: hrafnar was signalled to stop".to_string();
             eprintln!("grok: {reason}");
             run.out.digest = Some(wake_failure(&mut run.out, reason));
             break;
@@ -561,7 +561,7 @@ async fn run_grok_turn(
         },
         GrokOutcome::NoAnswer {
             reason,
-            review_error,
+            hrafnar_error,
             text,
             session_id,
         } => {
@@ -575,7 +575,7 @@ async fn run_grok_turn(
             };
             let untrusted = grok.untrusted_hint(project_root);
             let reason = explain_grok_no_answer(reason, cause.as_ref(), untrusted.as_deref());
-            let outcome = if review_error {
+            let outcome = if hrafnar_error {
                 Outcome::no_answer().unverified(reason)
             } else {
                 Outcome::no_answer().stated(reason)
@@ -708,7 +708,7 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
     if stop != GROK_OK_STOP {
         return Ok(GrokOutcome::NoAnswer {
             reason: format!("grok ended the turn without an answer (stopReason: {stop})"),
-            review_error: result.stop_reason.is_none(),
+            hrafnar_error: result.stop_reason.is_none(),
             // Whatever the model had said when it was cut off. Kept because it
             // is all there is and often the only clue about what the run was
             // doing - the digest, not this text, is what says it is not an
@@ -730,20 +730,20 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
 /// `NoAnswer` is `Ok`, not `Err`, for the same reason codex returns a death
 /// outcome as `Ok`. `invoke` forces `session_id: None` on every error path,
 /// which would drop the id of the cut-off turn, the one most worth resuming.
-/// And `review resume` refreshes its cold-cache clock on `output.is_ok()`, so
+/// And `hrafnar resume` refreshes its cold-cache clock on `output.is_ok()`, so
 /// a turn that ran and warmed the cache would leave the clock stale and get
 /// the next resume refused. The run still fails: an outcome with no answer
 /// makes `Outcome::failed` true, so the process exits 1 whatever grok's exit
-/// code, and the digest's `turn_error` or `review_error` keeps the reason.
+/// code, and the digest's `turn_error` or `hrafnar_error` keeps the reason.
 #[derive(Debug)]
 enum GrokOutcome {
     Answered(GrokAnswer),
     /// A turn ran and either grok stated a non-answer or omitted its stop reason.
     NoAnswer {
         reason: String,
-        /// `true` when review inferred a failure because grok omitted the
+        /// `true` when hrafnar inferred a failure because grok omitted the
         /// field that says how its turn ended.
-        review_error: bool,
+        hrafnar_error: bool,
         text: String,
         session_id: Option<String>,
     },
@@ -752,10 +752,10 @@ enum GrokOutcome {
 /// How a grok run that may write is launched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GrokWrite {
-    /// A fresh write run: roots derived, launched under the `review-ws-*`
+    /// A fresh write run: roots derived, launched under the `hrafnar-ws-*`
     /// profile named for them.
     Fresh,
-    /// A resume of a session created under a `review-ws-*` profile: the same
+    /// A resume of a session created under a `hrafnar-ws-*` profile: the same
     /// profile, with the roots recorded with the session. Grok fixes a
     /// session's sandbox profile for its lifetime and refuses a different
     /// `--sandbox` on resume (`resolve_startup_sandbox` returns `Conflict`).
@@ -769,7 +769,7 @@ pub(super) enum GrokWrite {
 /// What `prepare_grok_write` decided.
 #[derive(Debug, Default)]
 pub(super) struct GrokPrepared {
-    /// The `review-ws-*` profile to launch under, when the run uses one.
+    /// The `hrafnar-ws-*` profile to launch under, when the run uses one.
     pub(super) profile: Option<RootSet>,
     /// The trust key `--trust` will grant, when the project had no decision
     /// yet. `None` when it was already trusted: no flag, no grant, nothing to
@@ -792,10 +792,10 @@ pub(super) struct GrokPrepared {
 /// wrong.
 ///
 /// Granting is accepted because a profile asking for `workspace-write`, from
-/// the project's `.review.toml` or the global config, is the operator's
+/// the project's `.hrafnar.toml` or the global config, is the operator's
 /// opt-in to letting an agent change this repo; making a human repeat that
 /// in grok's TUI buys nothing. Grok's own `--trust` is used rather than
-/// `review` writing `trusted_folders.toml`, so the entry uses grok's key and
+/// `hrafnar` writing `trusted_folders.toml`, so the entry uses grok's key and
 /// lock and cannot land where grok never looks.
 ///
 /// A setup failure (unparseable file, edited profile, declined trust,
@@ -898,7 +898,7 @@ pub(super) async fn prepare(
         let root = launch.root.clone();
         let roots = RootSet::new(&plan.paths);
         let state = prepared.grok.clone();
-        // Blocking: file I/O plus a `flock` another `review` may hold.
+        // Blocking: file I/O plus a `flock` another `hrafnar` may hold.
         let write =
             tokio::task::spawn_blocking(move || prepare_grok_write(&kind, &root, &roots, &state))
                 .await

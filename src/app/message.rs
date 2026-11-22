@@ -9,15 +9,15 @@ use crate::{
     config, config_write, harness, inflight, input, interrupt_cmd, lock, project, sessions,
 };
 
-/// The harness a `review resume` talks to: the one the sidecar recorded for the
+/// The harness a `hrafnar resume` talks to: the one the sidecar recorded for the
 /// session.
 ///
 /// A session belongs to exactly one harness, and the only place an operator
-/// gets a session ID from is `review`'s own output, whose run wrote that record.
+/// gets a session ID from is `hrafnar`'s own output, whose run wrote that record.
 /// So there is nothing to ask for: no `--harness`, and no scanning harness
-/// session stores. No record means the session is not one this host's `review`
+/// session stores. No record means the session is not one this host's `hrafnar`
 /// created - another host's (whose harness store is not here either), one made
-/// outside `review`, or a lost log - and that is an error, not a guess.
+/// outside `hrafnar`, or a lost log - and that is an error, not a guess.
 ///
 /// A recorded harness is still parsed, so a row naming a harness this build
 /// does not drive cannot turn into an unrunnable invocation.
@@ -28,7 +28,7 @@ use crate::{
 /// given a new integration: rows the earlier one wrote would parse as the new
 /// one. The stale-session gate does
 /// not cover that - rows with no usable epoch bypass it - so re-adding a name
-/// must come with a compatibility check here, a minimum `review_version` per
+/// must come with a compatibility check here, a minimum `hrafnar_version` per
 /// harness below which rows are refused, with the crate version bumped past
 /// every build of the old integration (rows record `CARGO_PKG_VERSION`), and
 /// a missing or malformed version refused.
@@ -39,7 +39,7 @@ fn resume_record(
     let record = record.ok_or_else(|| sessions::query::not_found(session_id))?;
     let Ok(harness) = record.harness.parse::<harness::Harness>() else {
         bail!(
-            "session {session_id} was recorded for harness '{}', which review no \
+            "session {session_id} was recorded for harness '{}', which hrafnar no \
              longer supports\n  supported: {}",
             record.harness,
             harness::Harness::supported()
@@ -58,13 +58,13 @@ fn resume_record(
 /// flight, its marker) and `-C` can only confirm it.
 ///
 /// Everything is checked before anything is interrupted: the recorded root
-/// must still exist and hold its `.review.toml` directly - every recorded run
+/// must still exist and hold its `.hrafnar.toml` directly - every recorded run
 /// required one, so its absence is drift, and walking up instead would adopt an
 /// ancestor's audit id and privacy - and that config must parse. The audit id
 /// must match the record too: a path alone cannot tell the original checkout
 /// from another project initialized in its place.
 struct MessageTarget {
-    config: config::ReviewConfig,
+    config: config::HrafnarConfig,
 }
 
 /// A snapshot to compare with a newly loaded target after interruption. Keeping
@@ -102,7 +102,7 @@ fn message_target(
     if !root.is_dir() {
         bail!(
             "session {session_id} belongs to {recorded}, which no longer exists\n  \
-             `review sessions {session_id}` still shows what it recorded."
+             `hrafnar sessions {session_id}` still shows what it recorded."
         );
     }
     if let Some(sel) = selector {
@@ -158,15 +158,15 @@ fn session_uses_token_command(
     })
 }
 
-/// `review message <id>`: deliver stdin to a session whatever it is doing. A
+/// `hrafnar message <id>`: deliver stdin to a session whatever it is doing. A
 /// turn in flight on an interruptible harness is ended first, exactly as
-/// `review interrupt` ends it, and the message then continues the session as a
+/// `hrafnar interrupt` ends it, and the message then continues the session as a
 /// resume. How the launch lock, marker, interrupt request and handoff keep two
 /// messages from running beside each other is in `reference/steering.md`.
 ///
 /// The verb exists for its name. Told to "interrupt the agent", an
 /// orchestrating Claude reached for its own task-stop tool instead, killing
-/// `review` rather than the turn, which left a fresh session with no record to
+/// `hrafnar` rather than the turn, which left a fresh session with no record to
 /// resume. "Message the agent" has no such rival.
 pub(super) async fn run_message(
     session_id: &str,
@@ -267,7 +267,7 @@ pub(super) async fn run_message(
         if !outcome.interrupted {
             eprintln!(
                 "the turn finished before the interrupt took effect - its answer is in \
-                 `review sessions {session_id}`"
+                 `hrafnar sessions {session_id}`"
             );
         }
     }
@@ -361,14 +361,14 @@ pub(super) async fn run_message(
         None
     };
 
-    // Global lock: serialize the *launch* against other `review` invocations,
+    // Global lock: serialize the *launch* against other `hrafnar` invocations,
     // as a fresh run does (it releases the lock after its launch spacing, not
     // when the run finishes).
     //
     // It is deliberately NOT held across the run. The lock exists to space out
     // harness launches, and a resume launches exactly one thing, so there is
     // nothing left to serialize once it is running. Holding it for the turn's
-    // duration meant a single wedged resume froze all `review` traffic on the
+    // duration meant a single wedged resume froze all `hrafnar` traffic on the
     // host indefinitely - every later invocation sat waiting on the lock
     // behind a process that would never return.
     // A hung run should cost you that run, not the tool.
@@ -379,13 +379,13 @@ pub(super) async fn run_message(
     // limiting the lock exists to provide.
     // Held to the end, past the sidecar row: see `run_launch`.
     let _unrecorded = lifecycle.unrecorded_for(harness_name);
-    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_path = std::env::temp_dir().join("hrafnar.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
     // Persist an id before launching so every concurrent resume records the
     // same project identity, and a write failure cannot leave an unidentifiable
     // session behind.
-    let audit_id = config_write::ensure_audit_id(&project_root.join(".review.toml"))?;
+    let audit_id = config_write::ensure_audit_id(&project_root.join(".hrafnar.toml"))?;
     let scope = crate::data::LogScope::new(audit_id, cfg.audit.private);
     let data = crate::data::DataDir::process().clone();
     // Prompt/profile settings are inherited; the current stall safety setting is honoured.
@@ -510,13 +510,13 @@ mod tests {
             "session_id": "s",
             "operator_prompt": "p",
             "assembled_prompt": "p",
-            "review_version": "0.0.0",
+            "hrafnar_version": "0.0.0",
         }))
     }
 
     #[test]
     fn a_resume_takes_the_harness_from_the_record() {
-        // The session ID came from review's own output, whose run wrote this
+        // The session ID came from hrafnar's own output, whose run wrote this
         // row, so the harness is on record and is never asked for.
         let (rec, harness) = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
         assert_eq!(harness, harness::Harness::Codex);
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn grok_resume_prefers_native_selector_and_accepts_old_rows() {
-        for native in ["workspace", "none", "review-ws-abc", "custom"] {
+        for native in ["workspace", "none", "hrafnar-ws-abc", "custom"] {
             let mut rec = minimal_row("grok");
             rec.sandbox = Some(native.to_string());
             assert_eq!(
@@ -583,7 +583,7 @@ mod tests {
             "effort": "low",
             "operator_prompt": "p",
             "assembled_prompt": "p",
-            "review_version": "0.0.0",
+            "hrafnar_version": "0.0.0",
         }));
         let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(
@@ -615,7 +615,7 @@ mod tests {
             "model": "gpt-5.6-sol",
             "operator_prompt": "p",
             "assembled_prompt": "p",
-            "review_version": "0.0.0",
+            "hrafnar_version": "0.0.0",
         }));
         let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
@@ -637,7 +637,7 @@ mod tests {
             "session_id": "s",
             "operator_prompt": "p",
             "assembled_prompt": "p",
-            "review_version": "0.0.0",
+            "hrafnar_version": "0.0.0",
         }));
         let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
             "model": "grok-4",
             "operator_prompt": "p",
             "assembled_prompt": "p",
-            "review_version": "0.0.0",
+            "hrafnar_version": "0.0.0",
         }));
         let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(got.sandbox, None);
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn a_resume_with_no_record_is_refused_and_points_at_sessions() {
         let err = resume_error(None);
-        assert!(err.contains("review sessions"), "{err}");
+        assert!(err.contains("hrafnar sessions"), "{err}");
     }
 
     #[test]

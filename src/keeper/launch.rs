@@ -171,7 +171,7 @@ impl Launcher {
         // SAFETY: constant NUL-terminated name; fresh anonymous descriptor.
         let fd = unsafe {
             libc::memfd_create(
-                c"review-spec".as_ptr(),
+                c"hrafnar-spec".as_ptr(),
                 libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
             )
         };

@@ -12,7 +12,7 @@ returns `Legacy` (making `[permissions]` profiles inert) whenever a
 
 This script measures three configurations against the same witness program:
 
-  legacy-read-only   `--sandbox read-only`, what review passes today
+  legacy-read-only   `--sandbox read-only`, what hrafnar passes today
   profile-restricted the permissions profile with network left restricted,
                      which must reproduce legacy-read-only exactly - the
                      control that proves the profile is not silently widening
@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 
-PROFILE = "review-read-only"
+PROFILE = "hrafnar-read-only"
 
 COMMON = [
     "exec",

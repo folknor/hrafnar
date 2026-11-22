@@ -108,7 +108,7 @@ impl ModelSpec {
             Harness::Maki => {
                 // Refused rather than passed: maki takes its thinking level
                 // from its config or the level last used on the host, so a
-                // profile effort would be silently dropped. Review therefore
+                // profile effort would be silently dropped. hrafnar therefore
                 // records no effort for maki.
                 if self.effort.is_some() {
                     bail!(

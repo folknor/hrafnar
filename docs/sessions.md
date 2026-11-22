@@ -1,25 +1,25 @@
 # Sessions and incidents
 
-This page covers what `review` records about each run, where it keeps those
-records, and the two commands that read them: `review sessions` lists and
-shows sessions, and `review incidents` lists the forensic bundles filed for
+This page covers what `hrafnar` records about each run, where it keeps those
+records, and the two commands that read them: `hrafnar sessions` lists and
+shows sessions, and `hrafnar incidents` lists the forensic bundles filed for
 suspicious codex runs. The fields of a stored row are listed under "The
 session log".
 
 ## Where records are stored
 
-Everything `review` records lives in one data directory on this host:
-`$XDG_DATA_HOME/review`, or `~/.local/share/review` when `XDG_DATA_HOME` is
-unset. `review` resolves that directory once, from its own environment, when
+Everything `hrafnar` records lives in one data directory on this host:
+`$XDG_DATA_HOME/hrafnar`, or `~/.local/share/hrafnar` when `XDG_DATA_HOME` is
+unset. `hrafnar` resolves that directory once, from its own environment, when
 the command starts. A profile's `env` changes the harness's environment, not
-this one, so it can't move `review`'s storage. The directory holds:
+this one, so it can't move `hrafnar`'s storage. The directory holds:
 
 - **`sessions.jsonl`**: the session log, one row per recorded invocation
 - **`sessions-private.jsonl`**: the session log for a project with
-  `[_audit] private = true` (see `review man config`)
+  `[_audit] private = true` (see `hrafnar man config`)
 - **`audit/`**: one `audit.jsonl` per project, with each invocation's
   full prompt and response; `audit-private/` for private projects
-- **`incidents/`**: the forensic bundles `review incidents` lists
+- **`incidents/`**: the forensic bundles `hrafnar incidents` lists
 - **`inflight/`**: markers for runs happening right now
 - **`teardowns.jsonl`**: the teardown log, `teardowns-private.jsonl` for
   private projects
@@ -29,8 +29,8 @@ the harness's own storage and are not part of this directory.
 
 ## What a run records
 
-`review` appends a row to the session log when an invocation ends with a
-session ID. That row is what `review message` reads to find the session's
+`hrafnar` appends a row to the session log when an invocation ends with a
+session ID. That row is what `hrafnar message` reads to find the session's
 harness, project and settings. Each row has:
 
 - **`kind`**: `run` for a fresh session, `session` for a resume, automatic
@@ -43,7 +43,7 @@ Some invocations go to the audit log only and never to the session log:
 
 - a resume whose launch failed, so it didn't refresh the cache clock
 - a claude run refused credentials before doing any work
-- a claude attempt abandoned for its token retry (see `review man config`)
+- a claude attempt abandoned for its token retry (see `hrafnar man config`)
 
 An automatic recovery records two rows, the dead run and its resume, in the
 order they were invoked. The resume's `assembled_prompt` is the recovery
@@ -52,7 +52,7 @@ written after the recovery ends, whichever answer is displayed.
 
 ## Listing sessions
 
-`review sessions` lists the current project's sessions, most recently touched
+`hrafnar sessions` lists the current project's sessions, most recently touched
 first. `--limit` caps the list (default 20), `--all` lists every project's,
 and `-C` lists another project's. Each entry shows:
 
@@ -72,20 +72,20 @@ would look like an idle session showing its previous answer. The entries are:
 
 - **`[in flight] HARNESS / turn in flight since AGE`**: a turn is running now
 - **`[recording] HARNESS / waiting for the run handoff`**: the harness has
-  been torn down and `review` is still recording the result
-- **`[cleanup pending] HARNESS / ...`**: the `review` process that owned the
+  been torn down and `hrafnar` is still recording the result
+- **`[cleanup pending] HARNESS / ...`**: the `hrafnar` process that owned the
   run is gone, but its processes are still being torn down
-- **`[queued] message waiting to launch`**: a `review message` holds the
+- **`[queued] message waiting to launch`**: a `hrafnar message` holds the
   session but hasn't launched yet, usually because it is waiting for the
   host-wide launch lock
 - **`[ambiguous] session: ID / ...`**: more than one live run was observed
   for the session; retry shortly rather than picking one
 
-How each state affects a new message is in `review man message`.
+How each state affects a new message is in `hrafnar man message`.
 
 ## Showing one session
 
-`review sessions ID` shows the last row of a session, from whichever project
+`hrafnar sessions ID` shows the last row of a session, from whichever project
 started it. A project whose checkout was deleted still shows. With `-C`, the
 command refuses a session that doesn't belong to the selected project. The
 output has:
@@ -95,7 +95,7 @@ output has:
 - the run digest, when one was recorded
 - the response, or the error when there was no response
 
-For a codex session, `review sessions ID` also reads the session's transcript
+For a codex session, `hrafnar sessions ID` also reads the session's transcript
 from the codex home saved with the row. A row with no saved `codex_home` uses
 the current environment's `CODEX_HOME`, or codex's default. The transcript
 section shows its path, whether the turn completed, the last event, and any
@@ -110,7 +110,7 @@ that the turn produced no conclusion, and the recorded response follows it.
 
 ## Listing incidents
 
-`review incidents` lists the forensic bundles filed for suspicious codex
+`hrafnar incidents` lists the forensic bundles filed for suspicious codex
 runs, such as deaths, stalls and stated failures, newest first (`--limit`,
 default 20). Interrupted runs never get a bundle. Each entry shows the time,
 harness, session, exit status and signal, a verdict, the codex version, and
@@ -128,7 +128,7 @@ the bundle directory. The verdicts are:
 A bundle has codex's stderr, the raw event stream, the digest and the
 transcript excerpt, so you can diagnose the run without reproducing it. A run
 reports its bundle path only when every file was written, and otherwise names
-the files that failed. `review incidents` warns about any bundle whose
+the files that failed. `hrafnar incidents` warns about any bundle whose
 metadata it can't read, can't parse, or whose schema version it doesn't
 support, and lists the rest.
 
@@ -161,7 +161,7 @@ The fields of a row are:
   what the harness reported serving, and what the run left running
 - **`credential`**: `token_command` when claude authenticated with the
   global `claude_token_command`
-- **`review_version`**: the `review` version that wrote the row
+- **`hrafnar_version`**: the `hrafnar` version that wrote the row
 
 Some rows on disk lack the optional fields; a missing field means it wasn't
 recorded. A message inherits only the requested settings from a row: the
@@ -171,6 +171,6 @@ These queries select runs that captured no answer, and runs at the
 `workspace-write` sandbox level, from the default data directory:
 
 ```sh
-jq 'select(.digest.captured == false)' ~/.local/share/review/sessions.jsonl
-jq 'select(.sandbox == "workspace-write")' ~/.local/share/review/sessions.jsonl
+jq 'select(.digest.captured == false)' ~/.local/share/hrafnar/sessions.jsonl
+jq 'select(.sandbox == "workspace-write")' ~/.local/share/hrafnar/sessions.jsonl
 ```

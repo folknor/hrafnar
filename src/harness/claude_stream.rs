@@ -10,7 +10,7 @@
 //!
 //! - **An answer**: `Ok`, session id kept.
 //! - **A result that is not an answer**: `Ok` with the session id and a stated
-//!   or unverified reason. A reason the harness gave is `stated`; one review
+//!   or unverified reason. A reason the harness gave is `stated`; one hrafnar
 //!   inferred (a missing flag) is `unverified`, so it is never passed off as
 //!   the harness's account.
 //! - **No result, after `init`**: the session exists, so the adapter returns
@@ -331,7 +331,7 @@ pub(super) enum ClaudeOutcome {
     },
     /// A result object that is not an answer. The session exists, so this is
     /// `Ok` with its ID kept. `stated` is the harness's own account; a field
-    /// review needed and did not get is `unverified`. Either or both are set.
+    /// hrafnar needed and did not get is `unverified`. Either or both are set.
     NoAnswer {
         stated: Option<String>,
         unverified: Option<String>,
@@ -443,7 +443,7 @@ fn claude_verdict(result: &ClaudeResult, text: &str) -> (Option<String>, Option<
     }
     if result.is_error.is_none() {
         let reason = with_facts(
-            "review could not classify claude result".into(),
+            "hrafnar could not classify claude result".into(),
             &facts,
             text,
         );
@@ -480,7 +480,7 @@ fn maki_verdict(result: &ClaudeResult, text: &str) -> (Option<String>, Option<St
     };
     let missing_reason = result.stop_reason.is_none().then(|| {
         with_facts(
-            "review could not classify maki result".into(),
+            "hrafnar could not classify maki result".into(),
             &["no stop_reason".to_string()],
             text,
         )
@@ -489,7 +489,11 @@ fn maki_verdict(result: &ClaudeResult, text: &str) -> (Option<String>, Option<St
         None => {
             let mut facts = vec!["no is_error flag".to_string()];
             facts.extend(reason_fact);
-            let reason = with_facts("review could not classify maki result".into(), &facts, text);
+            let reason = with_facts(
+                "hrafnar could not classify maki result".into(),
+                &facts,
+                text,
+            );
             (None, Some(reason))
         }
         Some(true) => {
@@ -508,7 +512,7 @@ fn maki_verdict(result: &ClaudeResult, text: &str) -> (Option<String>, Option<St
                 None => {
                     let facts: Vec<String> = reason_fact.into_iter().collect();
                     let reason = with_facts(
-                        "review could not classify maki result (is_error false, unrecognised ending)"
+                        "hrafnar could not classify maki result (is_error false, unrecognised ending)"
                             .into(),
                         &facts,
                         "",

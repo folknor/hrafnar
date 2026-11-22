@@ -1,4 +1,4 @@
-//! Permission intent and native launch policy. Config contains only review's
+//! Permission intent and native launch policy. Config contains only hrafnar's
 //! vocabulary; restoration is the only boundary that interprets native records.
 //!
 //! `Permissions::profile` resolves an omitted level (read-only) once, before
@@ -8,19 +8,19 @@
 //! - the native `provider_sandbox` field wins over an inconsistent normalized
 //!   `sandbox` field, and grok rows without it carry native syntax in
 //!   `sandbox`;
-//! - a native custom name that happens to spell a review level is never
+//! - a native custom name that happens to spell a hrafnar level is never
 //!   translated;
-//! - only restoration recognizes the generated `review-ws-*` profile shape and
+//! - only restoration recognizes the generated `hrafnar-ws-*` profile shape and
 //!   canonicalizes its recorded root set. A fresh custom name that looks
 //!   generated stays an opaque custom name;
 //! - a grok row with no selector restores as `InheritSaved`: no override is
 //!   passed, grok uses the session's saved profile, and no level is recorded,
-//!   because the permissions are unknown to review rather than known
+//!   because the permissions are unknown to hrafnar rather than known
 //!   read-only. A codex row with no selector restores as read-only.
 //!
 //! Two projections leave this type and stay separate through preparation and
 //! recording: `selector`/`native_to_record` (native launch syntax) and
-//! `recorded_level` (review's vocabulary, for queries such as
+//! `recorded_level` (hrafnar's vocabulary, for queries such as
 //! `jq 'select(.sandbox=="workspace-write")'`). The profile name is never the
 //! record of what a run could do, because what a run requested and what it
 //! received differ.
@@ -41,7 +41,7 @@ pub struct Permissions(NativePermissions);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum NativePermissions {
-    /// claude and maki run on their own permission configuration; `review`
+    /// claude and maki run on their own permission configuration; `hrafnar`
     /// grants nothing and claims no filesystem enforcement for them.
     Claude,
     Maki,
@@ -96,7 +96,7 @@ impl Permissions {
 
     /// Native takes precedence, including over inconsistent normalized data.
     /// Old Grok rows contain native syntax in `sandbox`; do not translate that
-    /// fallback through review's vocabulary. Unknown native names remain opaque.
+    /// fallback through hrafnar's vocabulary. Unknown native names remain opaque.
     pub fn restore(
         harness: Harness,
         level: Option<&str>,
@@ -249,7 +249,7 @@ pub(super) struct PermissionPlan {
 /// (`append_default_read_only_*_if_no_explicit_rule` in codex's
 /// `protocol/src/permissions.rs`); the exact write entry wins in the
 /// bubblewrap mounts. Interactively codex asks to rerun a failed commit
-/// outside the sandbox; under `review` nobody can approve, so the run ends
+/// outside the sandbox; under `hrafnar` nobody can approve, so the run ends
 /// green and uncommitted. This is the one exception to the
 /// inside-the-workspace filter, whose premise ("the workspace is writable
 /// anyway") is false for `.git`.
@@ -427,7 +427,7 @@ mod tests {
     fn generated_looking_custom_names_only_gain_restore_behavior_at_the_record_boundary() {
         let roots = vec!["/b".into(), "/a".into(), "/b".into()];
         let canonical = grok::RootSet::new(&roots);
-        let name = "review-ws-0123456789abcdef".to_string();
+        let name = "hrafnar-ws-0123456789abcdef".to_string();
         let fresh = Permissions::profile(Harness::Grok, Some(&SandboxLevel::Custom(name.clone())));
         assert_eq!(fresh.selector(), Some(name.as_str()));
         assert_eq!(fresh.recorded_level(), Some(name.as_str()));

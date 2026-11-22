@@ -1,15 +1,15 @@
-//! Review-owned storage. Harness homes and the host-wide launch lock are separate.
+//! Hrafnar-owned storage. Harness homes and the host-wide launch lock are separate.
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// An immutable XDG data base (before `review/`), including unavailable storage.
+/// An immutable XDG data base (before `hrafnar/`), including unavailable storage.
 /// Resolution preserves historical empty/relative and Unicode-env semantics.
 ///
 /// The process base is resolved once from `XDG_DATA_HOME`, falling back to
 /// HOME's `.local/share`. Unavailable storage stays unavailable for the
 /// process; nothing retries it. The orphan-log path is derived from the
 /// scope's `LogFamily` before the keeper spawns, since the keeper writes it.
-/// The host launch lock is not here: it stays at `temp_dir()/review.lock`.
+/// The host launch lock is not here: it stays at `temp_dir()/hrafnar.lock`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataDir(Option<PathBuf>);
 
@@ -32,7 +32,7 @@ impl DataDir {
         &PROCESS
     }
 
-    /// Explicitly disable review-owned storage without selecting ambient paths.
+    /// Explicitly disable hrafnar-owned storage without selecting ambient paths.
     pub fn unavailable() -> Self {
         Self(None)
     }
@@ -48,7 +48,7 @@ impl DataDir {
     }
 
     fn child(&self, name: &str) -> Option<PathBuf> {
-        Some(self.0.as_ref()?.join("review").join(name))
+        Some(self.0.as_ref()?.join("hrafnar").join(name))
     }
     pub fn sessions(&self, family: LogFamily) -> Option<PathBuf> {
         self.child(match family {
@@ -86,7 +86,7 @@ impl DataDir {
 }
 
 /// The audit directory's name, `<host>-<project>-<id>`, as exactly one path
-/// component. The audit id is opaque config (a committed `.review.toml` can
+/// component. The audit id is opaque config (a committed `.hrafnar.toml` can
 /// hold `x/../../elsewhere`) and `sethostname` accepts `/` too, so the whole
 /// name is escaped: `/`, `%` and NUL become `%2F`, `%25` and `%00`, and every
 /// other byte is kept. A name with none of those three is unchanged, so every
@@ -248,7 +248,7 @@ mod tests {
                 let path = data.audit(Path::new("/p/proj"), &scope).expect("path");
                 assert_eq!(
                     path.parent(),
-                    Some(Path::new("/data/review").join(family).as_path()),
+                    Some(Path::new("/data/hrafnar").join(family).as_path()),
                     "{id:?} must stay directly under {family}"
                 );
                 let name = path.file_name().expect("name").to_string_lossy();

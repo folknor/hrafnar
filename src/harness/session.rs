@@ -27,7 +27,7 @@ impl SessionId {
 
     // No adapter imposes syntax on an id it is handed to resume. Do not impose
     // UUID syntax on historical opaque IDs; maki's own ids are base58, and a
-    // session started outside `review` may be resumed by its id. New adapters
+    // session started outside `hrafnar` may be resumed by its id. New adapters
     // must decide their own shape here.
     fn validate_for(&self, harness: Harness) -> Result<()> {
         match harness {
@@ -35,7 +35,7 @@ impl SessionId {
         }
     }
 
-    /// A hyphenated UUID, `8-4-4-4-12` hex digits: the form `review` mints,
+    /// A hyphenated UUID, `8-4-4-4-12` hex digits: the form `hrafnar` mints,
     /// and the one maki's `--session-id` accepts besides its own base58.
     fn is_uuid(&self) -> bool {
         let groups: Vec<&str> = self.0.split('-').collect();
@@ -81,7 +81,7 @@ impl SessionStart {
                 bail!("codex reports fresh session ids from its stream")
             }
             // maki rejects a `--session-id` it cannot parse as a UUID or its
-            // own base58, after `review` has already recorded the launch.
+            // own base58, after `hrafnar` has already recorded the launch.
             (Harness::Maki, Self::Fresh { id: Some(id) }) if !id.is_uuid() => {
                 bail!(
                     "maki fresh launch requires a UUID session id, got '{}'",
@@ -155,7 +155,7 @@ mod tests {
             };
             assert!(start.validate(Harness::Maki).is_err(), "{bad}");
         }
-        // maki's own ids are base58; resuming one started outside review works.
+        // maki's own ids are base58; resuming one started outside hrafnar works.
         SessionStart::Resume(SessionId::parse("1111114bZ6BZRUqUqZeo").expect("id"))
             .validate(Harness::Maki)
             .expect("resume ids are opaque");

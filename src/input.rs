@@ -12,7 +12,7 @@ pub fn read_stdin() -> Result<String> {
         None => bail!(
             "no instructions provided on stdin\n\n\
              Pipe your instructions via stdin, e.g.:\n  \
-             echo \"review for security issues\" | review"
+             echo \"review for security issues\" | hrafnar"
         ),
     }
 }

@@ -9,18 +9,18 @@
 //!
 //! - The session id is minted by the invocation owner before dispatch, so the
 //!   in-flight marker goes up before the spawn. The prompt goes on stdin.
-//! - Neither has a filesystem sandbox `review` controls: claude's
+//! - Neither has a filesystem sandbox `hrafnar` controls: claude's
 //!   `--permission-mode` is a tool-approval policy, and maki has only its own
 //!   permission files. Profiles for both must omit `sandbox`, non-empty
 //!   `writable_roots` and non-empty `config` (config parsing refuses them),
 //!   and a run records no sandbox level.
-//! - The result object states the outcome, so `review` reads nothing from
+//! - The result object states the outcome, so `hrafnar` reads nothing from
 //!   either harness's transcript and runs no stall watchdog: codex's watchdog
 //!   rests on codex writing its rollout every few minutes, which nothing has
 //!   established for these harnesses. There is no auto-resume either, because
 //!   a failed turn says why.
 //! - A first SIGINT ends the turn with a result and keeps the session, which
-//!   `review interrupt`, `review message` and a signalled `review` rely on.
+//!   `hrafnar interrupt`, `hrafnar message` and a signalled `hrafnar` rely on.
 //!   Before the first event the group is killed instead.
 //!
 //! The measured harness behaviour behind these choices is in
@@ -73,7 +73,7 @@ impl Observer for ClaudeObserver {
     }
 }
 
-/// How long `review` lets a claude shell command run in the foreground: 20
+/// How long `hrafnar` lets a claude shell command run in the foreground: 20
 /// minutes, the allowance grok gets (`GROK_COMMAND_WAIT_SECS`) for the same
 /// reason - long enough for a full gate, short enough that a wedged command
 /// cannot hold a run for hours. Set as both `BASH_DEFAULT_TIMEOUT_MS` and
@@ -112,7 +112,7 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
         .expect("validated caller-minted identity")
         .as_str()
         .to_string();
-    // A fresh run writes the session under the id `review` minted; a resume
+    // A fresh run writes the session under the id `hrafnar` minted; a resume
     // names the one it continues. Both harnesses spell these the same way.
     // maki parses a hyphenated UUID or its own base58 and echoes the caller's
     // string verbatim, so the minted UUID serves it too; a resume id stays
@@ -148,7 +148,7 @@ fn launch_args(dialect: Dialect, session: &SessionStart, selection: &ModelSpec) 
         // maki needs no `--verbose` for stream-json, and takes no permission
         // mode outside its SDK mode (it would drop `--permission-mode`
         // silently): an unattended `-p` run denies whatever would prompt,
-        // which is claude's `dontAsk`. Never `--trust`: `review` grants no
+        // which is claude's `dontAsk`. Never `--trust`: `hrafnar` grants no
         // folder trust, so an untrusted project's `.maki` config can tighten
         // maki's permissions but not loosen them (trust the operator gave
         // maki itself still applies: a saved trust answer, the operator's
@@ -255,19 +255,19 @@ pub(super) async fn run_claude_compat(
     );
     // The lifecycle clears a stale interrupt request on a resume (one would
     // mark a failed resume as interrupted, hiding claude's stated reason), and
-    // refuses to launch once `review` was told to stop: a launch then would
+    // refuses to launch once `hrafnar` was told to stop: a launch then would
     // only be killed before its first event - and, a stopped run being
     // recorded as interrupted, file a row and print a resume command for a
     // session claude may never have written.
     //
     // The session id is known before the run starts - generated for a fresh
     // run, passed in for a resume - so the in-flight marker goes up before the
-    // spawn. That ordering is load-bearing: `review message` releases its
+    // spawn. That ordering is load-bearing: `hrafnar message` releases its
     // session launch lock when the launch signal below fires, and a second
     // message must then find this marker, or it launches beside this run
     // instead of interrupting it. Removed on any early return below.
     //
-    // The keeper's pid is offered on the marker for `review interrupt` only
+    // The keeper's pid is offered on the marker for `hrafnar interrupt` only
     // once the harness has printed its `init` event (`lease.ready()` in the
     // reader). A SIGINT before claude installs its handler takes the default
     // action and kills it with nothing printed; after, it ends the turn with a
@@ -310,7 +310,7 @@ pub(super) async fn run_claude_compat(
     run.track(&stderr_task);
     run.launch(launched).await?;
 
-    // Wait for the harness, but end the turn if `review` is signalled to
+    // Wait for the harness, but end the turn if `hrafnar` is signalled to
     // stop. Probed on Claude Code 2.1.284 mid-command: a SIGINT to claude ends
     // the turn at once, kills the running command, and still prints a result
     // object (`is_error: true`, `terminal_reason: "aborted_tools"`) naming the
@@ -446,7 +446,7 @@ pub(super) async fn run_claude_compat(
         // name. Recording one would print a resume command that fails.
         Err(_) if stopped_by_signal => {
             anyhow::bail!(
-                "not started: review was signalled to stop before {harness}'s first event"
+                "not started: hrafnar was signalled to stop before {harness}'s first event"
             );
         }
         // No result object and claude never started: the prompt may never
@@ -543,6 +543,6 @@ fn claude_served(stdout: &str) -> Served {
 #[path = "claude_tests.rs"]
 mod tests;
 
-/// Neither dialect has review-managed permission files to prepare: each runs
+/// Neither dialect has hrafnar-managed permission files to prepare: each runs
 /// on its own permission configuration.
 pub(super) fn prepare(_launch: &super::LaunchSpec) {}

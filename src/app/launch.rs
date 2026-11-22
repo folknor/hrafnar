@@ -91,7 +91,7 @@ impl RecordCtx {
             assembled_prompt: prompt.to_owned(),
             response: result.output.as_ref().ok().map(|t| t.text.clone()),
             error: result.output.as_ref().err().map(ToString::to_string),
-            review_version: env!("CARGO_PKG_VERSION").to_owned(),
+            hrafnar_version: env!("CARGO_PKG_VERSION").to_owned(),
             digest: summary_of(result),
             leftovers: (!result.leftovers.is_empty()).then(|| result.leftovers.clone()),
             codex_home: result.codex_home.clone(),
@@ -137,7 +137,7 @@ impl RecordCtx {
     /// never the session sidecar (it advanced no session), and publish its own
     /// receipt now, naming itself with no sidecar written, so anything waiting
     /// on its id settles instead of waiting on an unrelated replacement. This
-    /// is where its id stops being a target for `review interrupt`. False when
+    /// is where its id stops being a target for `hrafnar interrupt`. False when
     /// its audit row could not be written or its receipt could not be
     /// published, in which case the replacement must not launch: the
     /// abandoned attempt would be unaccounted for, or its waiters stuck.
@@ -349,7 +349,7 @@ fn after_auto_resume(
 /// Not after a stop. Startup hooks run again, as on any relaunch. The first
 /// attempt is settled - audited, kept out of the sidecar, its receipt
 /// published - before the command runs, so its id stops being a target for
-/// `review interrupt` there; a receipt that cannot be published stops the
+/// `hrafnar interrupt` there; a receipt that cannot be published stops the
 /// retry, since waiters on that id would otherwise hang behind it.
 async fn claude_auth_retry(
     launch: &Launch,
@@ -363,9 +363,9 @@ async fn claude_auth_retry(
         Some(
             "claude could not authenticate. If claude is logged in through \
              CLAUDE_CODE_OAUTH_TOKEN in your login shell: Claude Code does not pass that \
-             variable to the commands it runs, so a review started from inside a Claude Code \
+             variable to the commands it runs, so a hrafnar started from inside a Claude Code \
              session lacks it. Launch from a terminal, or set [_defaults].claude_token_command \
-             in the global review config (`review man config`).",
+             in the global hrafnar config (`hrafnar man config`).",
         )
     } else if launch.spec.settings.has_own_claude_token() {
         Some(
@@ -384,7 +384,7 @@ async fn claude_auth_retry(
              teardown could not be confirmed.",
         )
     } else if launch.runtime.lifecycle.stop_requested() {
-        Some("review is stopping; not retrying.")
+        Some("hrafnar is stopping; not retrying.")
     } else {
         None
     };
@@ -419,7 +419,7 @@ async fn claude_auth_retry(
         None => return Ok(settled(first)),
     };
     if launch.runtime.lifecycle.stop_requested() {
-        eprintln!("review is stopping; not retrying.");
+        eprintln!("hrafnar is stopping; not retrying.");
         return Ok(settled(first));
     }
     eprintln!(
@@ -433,7 +433,7 @@ async fn claude_auth_retry(
     // A launch of its own, so it takes the host's launch lock like any other
     // and releases it once spawned (the run's own may be long gone).
     let lock = tokio::task::spawn_blocking(|| {
-        let file = crate::lock::open_lock_file(&std::env::temp_dir().join("review.lock"))?;
+        let file = crate::lock::open_lock_file(&std::env::temp_dir().join("hrafnar.lock"))?;
         crate::lock::acquire_blocking(&file)?;
         Ok::<_, anyhow::Error>(file)
     })
@@ -485,12 +485,12 @@ async fn claude_auth_retry(
 
 /// One run: launch, maybe auto-resume, then record.
 ///
-/// Recorded here, after any recovery, as soon as the run ends: `review message`
-/// needs the sidecar row, and `review interrupt` waits for it. Rows are written
+/// Recorded here, after any recovery, as soon as the run ends: `hrafnar message`
+/// needs the sidecar row, and `hrafnar interrupt` waits for it. Rows are written
 /// in launch order, so the most recent invocation also wins a same-second
 /// timestamp tie.
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
-    // Held until the rows below are written, so a signalled `review` does not
+    // Held until the rows below are written, so a signalled `hrafnar` does not
     // exit with this session unrecorded (see `supervisor::install_signal_supervisor`).
     let _unrecorded = launch.runtime.lifecycle.unrecorded_for(launch.spec.harness);
     let prov = launch.spec.harness;
@@ -571,7 +571,7 @@ mod tests {
     use crate::contained;
 
     /// A codex result with session `sid`: `answered` says whether `-o` captured
-    /// a final answer; `interrupted` whether `review interrupt` ended it.
+    /// a final answer; `interrupted` whether `hrafnar interrupt` ended it.
     fn codex_run(sid: &str, answered: bool, interrupted: bool) -> harness::HarnessResult {
         let answer = if answered {
             harness::Answer::Captured
@@ -725,9 +725,9 @@ mod tests {
             assert_eq!(
                 runtime.data.orphan_log(runtime.log_family),
                 Some(root.join(if private {
-                    "review/teardowns-private.jsonl"
+                    "hrafnar/teardowns-private.jsonl"
                 } else {
-                    "review/teardowns.jsonl"
+                    "hrafnar/teardowns.jsonl"
                 }))
             );
         }

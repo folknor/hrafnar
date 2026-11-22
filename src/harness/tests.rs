@@ -3,7 +3,7 @@
 //! runners. The tests that run a real
 //! child process are in
 //! `tests/provider_runs.rs`, an integration test, because their keeper is the
-//! built `review` binary (see `keeper`).
+//! built `hrafnar` binary (see `keeper`).
 
 #[test]
 fn a_resume_result_retains_the_session_id_known_to_its_caller() {
@@ -194,9 +194,9 @@ fn announcement_is_empty_when_an_override_grants_nothing() {
 fn persisted_sandbox_levels_normalize_known_grok_names() {
     for (native, level) in [
         ("workspace", "workspace-write"),
-        ("review-ws-cbf29ce484222325", "workspace-write"),
+        ("hrafnar-ws-cbf29ce484222325", "workspace-write"),
         // Only the generated shape is ours; another prefixed name is native.
-        ("review-ws-abc", "review-ws-abc"),
+        ("hrafnar-ws-abc", "hrafnar-ws-abc"),
         ("none", "danger-full-access"),
         ("read-only", "read-only"),
         ("custom", "custom"),

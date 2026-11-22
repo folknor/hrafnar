@@ -126,7 +126,7 @@ impl Keeper {
         }
         drop(status_w);
         // The harness has its stdio; the keeper's copies would only hold its
-        // pipes open past its exit, delaying `review`'s EOF and its EPIPE on a
+        // pipes open past its exit, delaying `hrafnar`'s EOF and its EPIPE on a
         // prompt nobody reads.
         if let Ok(null) = std::fs::OpenOptions::new()
             .read(true)

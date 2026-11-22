@@ -35,7 +35,7 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
 /// Expand a configured root with the same grammar as project paths. Expansion
 /// errors are local to this optional grant, so report and drop the entry.
 ///
-/// One `.review.toml` is read on machines whose layouts differ, so a
+/// One `.hrafnar.toml` is read on machines whose layouts differ, so a
 /// literal path is often unwritable somewhere. Expansion is the deliberate,
 /// visible-in-config kind of environment use - unlike the derivation above, the
 /// operator wrote the variable name down.
@@ -74,7 +74,7 @@ mod tests {
     }
 
     /// Profile entries go through the same filters as derived ones, so a
-    /// `.review.toml` cannot hand a run the whole filesystem, and a relative
+    /// `.hrafnar.toml` cannot hand a run the whole filesystem, and a relative
     /// path (which codex would reject as a config error at launch) is dropped
     /// with a warning rather than emitted.
     #[test]

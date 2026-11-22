@@ -42,7 +42,7 @@ pub(super) fn push_root(
     // An *ancestor* of the workspace is the mirror image of the check below and
     // just as wrong: `~` or a `$HOME` whose intended subdirectory was dropped
     // resolves to the home directory, and granting it hands over every repo,
-    // `~/.ssh`, and `review`'s own logs. A grant that contains the workspace is
+    // `~/.ssh`, and `hrafnar`'s own logs. A grant that contains the workspace is
     // never the narrow thing this module promises.
     if cwd.starts_with(path) {
         eprintln!(
@@ -203,7 +203,7 @@ mod tests {
     /// The mirror of the inside-the-workspace filter, and the likelier operator
     /// mistake: `~` (or a `$HOME` whose intended subdirectory was dropped)
     /// resolves to the home directory, which *contains* the workspace. Granting
-    /// it hands over every repo, `~/.ssh`, and review's own logs.
+    /// it hands over every repo, `~/.ssh`, and hrafnar's own logs.
     #[test]
     fn a_root_containing_the_workspace_is_refused() {
         let host = FakeHost::new().var("HOME", "/home/dev");

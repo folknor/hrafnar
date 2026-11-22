@@ -48,7 +48,7 @@ pub(crate) fn locked_update(
         return Ok(());
     };
     let tmp = dir.join(format!(
-        "{file_name}.review-{}",
+        "{file_name}.hrafnar-{}",
         crate::ids::generate_uuid()
     ));
     let mut f = std::fs::OpenOptions::new()
@@ -161,7 +161,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
             "timestamp": "t", "project": "/p", "hostname": "h", "audit_id": "a", "provider": "codex",
             "archetype": "bare", "session_id": "session", "operator_prompt": prompt,
-            "assembled_prompt": prompt, "review_version": "0",
+            "assembled_prompt": prompt, "hrafnar_version": "0",
         })).expect("encode")
         };
         let first = row("first");
@@ -281,7 +281,7 @@ mod tests {
                 .expect("entry")
                 .file_name()
                 .to_string_lossy()
-                .contains(".review-")
+                .contains(".hrafnar-")
         }));
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

@@ -1,9 +1,9 @@
 # Teardown: nothing a run started outlives it
 
-Every harness process `review` starts runs under a keeper (`src/keeper/`),
+Every harness process `hrafnar` starts runs under a keeper (`src/keeper/`),
 launched through `contained::spawn`, the only spawn site for a harness. This
 page holds what the code can't show on its own: the protocol that spans
-`review`, the keeper and the harness, and the harness and kernel facts the
+`hrafnar`, the keeper and the harness, and the harness and kernel facts the
 design rests on. The rules for each piece live in the `//!` docs of
 `src/keeper/mod.rs`, `src/contained.rs` and `src/supervisor.rs`.
 
@@ -20,7 +20,7 @@ A process group can't hold a codex run's descendants. In the codex source
 
 An agent's shell is therefore in a session and group of its own, and when
 codex exits it is orphaned to init with write access to the project. Hung
-scripts left this way have run for hours after `review` exited 0.
+scripts left this way have run for hours after `hrafnar` exited 0.
 
 The escalation order follows two observed behaviours:
 
@@ -63,7 +63,7 @@ The keeper's verdict depends on these Linux behaviours:
 Two alternatives fail on facts outside the code:
 
 - **A cgroup per run**: `cgroup.kill` is the stronger primitive, but it needs
-  a writable, delegated cgroup. On the operator's hosts `review` runs in a
+  a writable, delegated cgroup. On the operator's hosts `hrafnar` runs in a
   logind session scope (`/user.slice/user-UID.slice/session-N.scope`), which
   is root-owned and not delegated, and a systemd user scope needs a reachable
   user manager. A backend that never runs where it matters is not
@@ -73,12 +73,12 @@ Two alternatives fail on facts outside the code:
   before `main` as unsupported, the default panic hook can block on a full
   stderr before `catch_unwind` runs, and other constructors can start
   threads first. That is why the crate is a library plus a thin binary: the
-  runner tests are integration tests using `CARGO_BIN_EXE_review` as their
+  runner tests are integration tests using `CARGO_BIN_EXE_hrafnar` as their
   keeper, since a bin crate's unit tests don't get that path.
 
 ## The protocol across the three processes
 
-`review` spawns `review __keep SPEC_FD` with SIGINT, SIGTERM, SIGCHLD and
+`hrafnar` spawns `hrafnar __keep SPEC_FD` with SIGINT, SIGTERM, SIGCHLD and
 SIGPIPE blocked; the mask survives exec, so no signal takes its default
 action before the keeper reads them from a signalfd. The control and events
 pipes are private to the keeper once it starts; the harness inherits
@@ -86,7 +86,7 @@ neither.
 
 A launch proceeds in this order:
 
-1. `review` records the keeper's pid in the in-flight marker, then writes
+1. `hrafnar` records the keeper's pid in the in-flight marker, then writes
    `g`. The keeper forks nothing before `g`, so a keeper whose owner is gone
    first launches nothing.
 2. The keeper forks the harness with its exec status on a close-on-exec pipe
@@ -100,29 +100,29 @@ A launch proceeds in this order:
    one `killed` per ended process, and `done` with the verdict and both
    counts. Events are queued and written on writability, so a slow reader
    never blocks a teardown.
-5. The keeper exits; `review` reaps it.
+5. The keeper exits; `hrafnar` reaps it.
 
 `exited` and the keeper's exit are separate moments, and the difference is
 load-bearing. The codex watchdog judges whether codex refuses to exit, so it
 waits on `exited` (`Contained::wait_harness`) and only then the teardown.
 Waiting on the keeper alone makes a leftover that needs the SIGKILL rounds
 look like a stranded codex. The in-flight marker stays until the keeper is
-reaped and recording is done, so a `review message` arriving mid-teardown
+reaped and recording is done, so a `hrafnar message` arriving mid-teardown
 finds the session in flight instead of launching beside its leftovers.
 
 An interrupt reaches the harness two ways: `i` on the control pipe from the
-owning `review`, or SIGINT to the keeper from `review interrupt`, which reads
-the keeper's pid from the marker. Either way the keeper forwards one SIGINT
-through the harness's pidfd, only while the harness runs. `done` reports
-whether that delivery succeeded, not whether the harness handled it.
+owning `hrafnar`, or SIGINT to the keeper from `hrafnar interrupt`, which
+reads the keeper's pid from the marker. Either way the keeper forwards one
+SIGINT through the harness's pidfd, only while the harness runs. `done`
+reports whether that delivery succeeded, not whether the harness handled it.
 
-If `review` dies, the control pipe's EOF (or EPIPE on events) tells the
+If `hrafnar` dies, the control pipe's EOF (or EPIPE on events) tells the
 keeper to tear down. It appends its outcome to `teardowns.jsonl`
 (`teardowns-private.jsonl` for a private project) beside the sidecar logs,
 best-effort; nothing reads that log back. An outcome that reached the events
-pipe in the moment before `review` died is in neither place. While such a
+pipe in the moment before `hrafnar` died is in neither place. While such a
 keeper is still tearing down, the marker reads as cleanup pending and
-`review message` and `review interrupt` refuse the session; once the keeper
+`hrafnar message` and `hrafnar interrupt` refuse the session; once the keeper
 is gone that protection ends.
 
 ## What stays outside every tree

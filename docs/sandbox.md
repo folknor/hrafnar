@@ -5,11 +5,11 @@ its `writable_roots` adds paths outside the project to a write run. This
 page covers each level per harness, the roots a write run is granted, the
 git metadata check every run gets, what a resumed session keeps, and what
 to do when a write fails. The profile fields themselves are in
-`review man profiles`.
+`hrafnar man profiles`.
 
 ## Levels per harness
 
-The levels are `review`'s own names, and each harness gets its own
+The levels are `hrafnar`'s own names, and each harness gets its own
 spelling of them. An entry that omits `sandbox` runs `read-only`:
 
 | `sandbox` | codex | grok | claude | maki |
@@ -33,7 +33,7 @@ at any level but `workspace-write`.
 
 ## Claude and maki runs
 
-Claude and maki have no filesystem sandbox that `review` controls, so
+Claude and maki have no filesystem sandbox that `hrafnar` controls, so
 their entries must omit `sandbox` and `writable_roots`, and their runs
 record no level. A profile that sets either fails to load.
 
@@ -48,7 +48,7 @@ file-writing tools inside the working directory, so a maki run with no
 permissions file of its own can edit the project. Deny those tools in
 maki's permissions to make its runs read-only.
 
-`review` never marks a project as trusted for maki, but maki keeps any
+`hrafnar` never marks a project as trusted for maki, but maki keeps any
 trust you gave it: an answer in an interactive maki session, or a
 `trust.paths` pattern in maki's own config. In an untrusted project the
 project's `.maki` configuration can tighten maki's permissions but not
@@ -60,13 +60,13 @@ A `read-only` run can read the filesystem, and can't write to the project
 or anywhere else you own. Grok's `read-only` still lets it write grok's own
 home and the temporary directories.
 
-On codex the level holds whatever your own codex setup says. `review`
+On codex the level holds whatever your own codex setup says. `hrafnar`
 pins the approval policy to never, and ignores your codex `config.toml` and
 your user and project `.rules` files, either of which could otherwise let
 a command run outside the sandbox. A read-only codex run can still make
 network connections, including to sockets of services already running.
 
-A profile's codex `config` overrides are applied after `review`'s own
+A profile's codex `config` overrides are applied after `hrafnar`'s own
 settings. One that restates the approval policy, the permission settings
 or network access replaces them, and the guarantees on this page assume a
 profile that doesn't.
@@ -80,15 +80,15 @@ run also has network access, which lets build and test suites use unix
 sockets.
 
 Codex keeps some paths inside the project read-only on its own account:
-`.git`, `.agents`, `.codex` and `.aws`. `review` lifts that for `.git`
+`.git`, `.agents`, `.codex` and `.aws`. `hrafnar` lifts that for `.git`
 only, as Git metadata below describes.
 
 ### Grok write runs
 
 Grok's built-in `workspace` profile can't add writable paths, so a grok
-write run uses a profile `review` creates in grok's global `sandbox.toml`.
-Each profile is named `review-ws-` plus a hash of its root set, so a run
-gets exactly its own roots. `review` creates a profile once
+write run uses a profile `hrafnar` creates in grok's global `sandbox.toml`.
+Each profile is named `hrafnar-ws-` plus a hash of its root set, so a run
+gets exactly its own roots. `hrafnar` creates a profile once
 and never modifies it.
 
 A grok write run first marks the project as trusted in grok's folder trust
@@ -97,9 +97,9 @@ is **permanent and host-wide**: grok also runs that repository's own MCP
 and LSP configuration without asking, in every grok session. The run that
 grants it says so. The run is refused instead when the project:
 
-- is marked untrusted in grok's store; `review` never overrides that
+- is marked untrusted in grok's store; `hrafnar` never overrides that
 - is the filesystem root or your home directory, which grok never trusts
-- is a grok-managed worktree, whose trust key `review` can't model
+- is a grok-managed worktree, whose trust key `hrafnar` can't model
 - has a trust store grok can't load
 
 ## Writable roots
@@ -158,7 +158,7 @@ outside any sandbox, the next time anyone runs git in that repository: a
 hook, or a config entry naming a program. Claude and maki runs can always
 write `.git`. So every run, on every harness and level, is checked.
 
-At launch `review` notes these files, in both the git directory and the
+At launch `hrafnar` notes these files, in both the git directory and the
 shared one:
 
 - `config` and `config.worktree`
@@ -167,7 +167,7 @@ shared one:
 - the files that say where the git directory is: a `.git` pointer and
   `commondir`
 
-At the end of the run `review` warns about each one that changed, and
+At the end of the run `hrafnar` warns about each one that changed, and
 about anything it couldn't check:
 
 ```text
@@ -180,7 +180,7 @@ before running git in this repository:
 The warning is one line; it's wrapped here. Each entry names the path and
 the kind of change, never the contents, since config can hold credentials.
 The kinds are: added, removed, content or mode changed, symlink changes,
-repository layout changed, and not checked. `review` undoes nothing, so
+repository layout changed, and not checked. `hrafnar` undoes nothing, so
 inspect the change yourself. Setting a branch's upstream writes `config`
 too (`git branch -u`, `git push -u`, or creating a branch from a remote
 one), so a warning isn't proof of anything malicious.
@@ -191,11 +191,11 @@ mean the repository is safe. It doesn't cover:
 - nested git directories under `modules/` and `worktrees/`
 - git's global and system config
 - anything run in the repository while the run was still going
-- a `review` killed before the run ended
+- a `hrafnar` killed before the run ended
 
 ## What a resumed session gets
 
-`review message` keeps the session's own level, from the last run recorded
+`hrafnar message` keeps the session's own level, from the last run recorded
 for it, so a `workspace-write` session stays writable.
 
 - **Codex**: the recorded roots are passed again as profile roots and go
@@ -204,18 +204,18 @@ for it, so a `workspace-write` session stays writable.
   other, so it carries over if it passes the filters. The override itself
   doesn't: its replacing the whole set, and its exemption from the filters.
 - **Grok**: grok fixes a session's sandbox for its lifetime. A session
-  started under a `review-ws-` profile resumes under exactly that profile
+  started under a `hrafnar-ws-` profile resumes under exactly that profile
   and its recorded roots. A session recorded under grok's plain `workspace`
   resumes that way, with no extra roots. A session with no recorded level
   resumes under whatever grok saved for it, and the run records no level,
-  because `review` doesn't know that saved setting.
+  because `hrafnar` doesn't know that saved setting.
 
 ## When a write fails
 
 A run that reports a read-only filesystem was launched `read-only`, is
 writing outside its roots, or is writing a path the harness protects, such
 as `.codex` on codex or a `.git` the run wasn't granted. Run
-`review sessions ID` to see the level and roots it launched with, then:
+`hrafnar sessions ID` to see the level and roots it launched with, then:
 
 - **Launched read-only**: use a profile with `workspace-write`.
 - **Writing outside its roots**: add the path to the profile's

@@ -1,6 +1,6 @@
 # Codex
 
-What codex does that shapes how `review` drives it: observed behaviour,
+What codex does that shapes how `hrafnar` drives it: observed behaviour,
 measured evidence and upstream facts. The rules themselves, and the reason
 for each flag, are on the code in `src/harness/codex.rs` and its modules. The
 permission machinery shared across harnesses is in [sandbox.md](sandbox.md).
@@ -20,7 +20,7 @@ which every reader then uses:
 - The incident bundle (`harness/codex/forensics.rs`) tails and scans the
   same scope.
 
-A byte offset, not a timestamp, because `review`'s own clock string is
+A byte offset, not a timestamp, because `hrafnar`'s own clock string is
 second-resolution and an answer written in the launch second would pass a
 time filter. A fresh run's scope starts at 0, exactly. A resume whose
 rollout can't be measured gets `Scope::Untrusted`, which disables both the
@@ -75,7 +75,7 @@ rebuilds the whole thread from the rollout, which fits "resumes hang, fresh
 runs don't, small sessions are fine". A
 secondary candidate is the synchronous `Drop` of `OtelProvider`, bounded
 only for the TUI by openai/codex#37109, with a Statsig metrics exporter on by
-default in release builds. Neither is proven. `review` catches the hang with
+default in release builds. Neither is proven. `hrafnar` catches the hang with
 the watchdog rather than explaining it.
 
 Codex 0.147.0 also opens a phantom turn during `codex exec` teardown and
@@ -142,7 +142,7 @@ table is on `codex_sandbox_args`, produced by
 
 ## Model selection
 
-Codex resolves model and effort as `review` mirrors them in
+Codex resolves model and effort as `hrafnar` mirrors them in
 `harness::ModelSpec`. Checked against source at 2bc8e7f545 with codex-cli
 0.167.0 installed:
 

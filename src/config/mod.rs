@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 pub use crate::harness::Harness;
 
-pub(crate) const CONFIG_FILENAME: &str = ".review.toml";
+pub(crate) const CONFIG_FILENAME: &str = ".hrafnar.toml";
 
 /// Reserved CLI vocabulary is derived from Clap (including hidden commands
 /// and aliases). Keep the dependency one way: CLI construction must not consult
@@ -46,14 +46,14 @@ pub fn reserved_names() -> &'static std::collections::BTreeSet<String> {
 }
 
 /// `bare` is the explicit no-prime selector, and the legacy positional
-/// `review bare` means the same. Existing `bare = ""` definitions stay valid;
+/// `hrafnar bare` means the same. Existing `bare = ""` definitions stay valid;
 /// a non-empty prompt would be ignored by both forms.
 const BARE: &str = "bare";
 
 /// Which file a resolved value came from.
 ///
 /// Resolution is POSIX-tool style: the command line beats the project's
-/// `.review.toml`, which beats the operator's global config. Nothing is built
+/// `.hrafnar.toml`, which beats the operator's global config. Nothing is built
 /// in. The split exists because the two files answer different questions: a
 /// project owns its domain archetypes, while *which model serves a tier* is the
 /// operator's current opinion, which changes with every model release, so it
@@ -161,7 +161,7 @@ impl std::fmt::Display for StallTimeout {
 pub struct Profile {
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Review's sandbox vocabulary, resolved into native permissions before
+    /// hrafnar's sandbox vocabulary, resolved into native permissions before
     /// launch. Custom names reach the harness unchanged. Defaults to read-only
     /// when unset. Claude and maki entries must omit this field: neither has a
     /// filesystem sandbox on this axis.
@@ -219,9 +219,9 @@ pub struct Sourced<T> {
 #[derive(Debug, Clone)]
 pub struct ProfileDef {
     /// Free text for whoever picks a profile - what it is for, when to reach
-    /// for it. Never sent to a harness; `review list` shows it. A field
+    /// for it. Never sent to a harness; `hrafnar list` shows it. A field
     /// rather than a TOML comment because the parser discards comments, and
-    /// `review list` renders only what the resolver produced.
+    /// `hrafnar list` renders only what the resolver produced.
     pub comment: Option<String>,
     /// Never empty: parsing refuses a profile with no harness entry.
     pub entries: BTreeMap<Harness, Profile>,
@@ -257,11 +257,11 @@ pub struct HarnessEntry {
     pub table: String,
 }
 
-/// The files that were read to build a `ReviewConfig`.
+/// The files that were read to build a `HrafnarConfig`.
 #[derive(Debug, Clone, Default)]
 pub struct ConfigFiles {
-    /// The project's `.review.toml`. `None` only from `load_optional` outside a
-    /// project, which `review list` uses to show the global layer anyway.
+    /// The project's `.hrafnar.toml`. `None` only from `load_optional` outside a
+    /// project, which `hrafnar list` uses to show the global layer anyway.
     pub local: Option<PathBuf>,
     /// Where the global config is looked for. `None` when neither
     /// `XDG_CONFIG_HOME` nor `HOME` names a usable directory.
@@ -273,7 +273,7 @@ pub struct ConfigFiles {
 /// The effective configuration: local and global layers resolved, for this
 /// host.
 #[derive(Debug)]
-pub struct ReviewConfig {
+pub struct HrafnarConfig {
     pub archetypes: BTreeMap<String, Sourced<String>>,
     /// Always the project's: an audit id identifies a project.
     pub audit: AuditConfig,
@@ -294,7 +294,7 @@ pub struct ReviewConfig {
     pub projects: BTreeMap<String, String>,
 }
 
-impl ReviewConfig {
+impl HrafnarConfig {
     pub fn files(&self) -> &ConfigFiles {
         &self.files
     }
@@ -308,7 +308,7 @@ impl ReviewConfig {
     /// The archetype a run is primed with, as `(name, prime)`. No selector and
     /// `bare` both mean no prime: `bare` is a selector, not a configured
     /// prompt, so it works without any definition. One run is one session, so
-    /// there is exactly one archetype; several are several `review` calls.
+    /// there is exactly one archetype; several are several `hrafnar` calls.
     pub(crate) fn select_archetype(
         &self,
         selector: Option<&str>,
@@ -321,7 +321,7 @@ impl ReviewConfig {
         if name.contains(',') {
             anyhow::bail!(
                 "-a takes one archetype, not a list ('{name}')\n  \
-                 Each run is one session: launch one `review` per archetype."
+                 Each run is one session: launch one `hrafnar` per archetype."
             );
         }
         if let Some(prime) = self.archetype(name) {
@@ -430,7 +430,7 @@ mod selection_tests {
             None,
             "host",
             ConfigFiles {
-                local: Some("/missing/project/.review.toml".into()),
+                local: Some("/missing/project/.hrafnar.toml".into()),
                 ..Default::default()
             },
         )

@@ -14,12 +14,12 @@ mod teardown;
 
 /// The keeper process. Returns its exit code: 0 once it has run to the end of
 /// its protocol, whether or not its events could all be delivered (a reader
-/// that stopped draining, or a `review` that is gone; `review` judges the
+/// that stopped draining, or a `hrafnar` that is gone; `hrafnar` judges the
 /// report by what reached it, never by this code alone), 1 for an unusable
 /// spec or setup, 101 for a panic.
 pub fn main() -> i32 {
     // stdio belongs to the harness, so a panic must print nothing; an aborted
-    // keeper is reported by `review` as a keeper failure.
+    // keeper is reported by `hrafnar` as a keeper failure.
     std::panic::set_hook(Box::new(|_| {}));
     match std::panic::catch_unwind(run_from_args) {
         Ok(Ok(())) => 0,
@@ -85,7 +85,7 @@ fn handled_signals() -> libc::sigset_t {
     }
 }
 
-/// Block the handled signals in the calling thread. `review` calls this in the
+/// Block the handled signals in the calling thread. `hrafnar` calls this in the
 /// keeper's pre-exec hook, so they are blocked from the keeper's first
 /// instruction; the keeper repeats it, which is harmless.
 pub fn block_handled_signals() -> std::io::Result<()> {
@@ -168,7 +168,7 @@ impl Keeper {
             set_cloexec(fd)?;
             set_nonblocking(fd)?;
         }
-        // SAFETY: review handed us these descriptors, ours alone from here.
+        // SAFETY: hrafnar handed us these descriptors, ours alone from here.
         let control = Some(unsafe { OwnedFd::from_raw_fd(spec.control_fd) });
         let events = Some(unsafe { OwnedFd::from_raw_fd(spec.events_fd) });
         Ok(Self {
@@ -376,7 +376,7 @@ impl Keeper {
         }
     }
 
-    /// `review` is gone: tear down, and keep the outcome for the orphan log.
+    /// `hrafnar` is gone: tear down, and keep the outcome for the orphan log.
     fn owner_gone(&mut self) {
         self.owner_gone = true;
         self.control = None;

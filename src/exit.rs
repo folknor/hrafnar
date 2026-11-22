@@ -1,8 +1,8 @@
-//! The exit statuses `review` itself ends with: the command's contract with
-//! the scripts and agents that launch it (see `review --help`). One type, so
+//! The exit statuses `hrafnar` itself ends with: the command's contract with
+//! the scripts and agents that launch it (see `hrafnar --help`). One type, so
 //! the codes are stated once and a whole command's status can be asserted on.
 
-/// How a `review` command ended. `app::run` returns it and `main` exits with
+/// How a `hrafnar` command ended. `app::run` returns it and `main` exits with
 /// it; an `Err` from `app::run` is reported and exits `Failed`, as it always
 /// has. The signal supervisor is the one other exit site: it ends the process
 /// from its own task once every turn it could end has been recorded, because
@@ -11,17 +11,17 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandExit {
     Success,
-    /// The run failed: no turn, no answer, or an answer `review`
+    /// The run failed: no turn, no answer, or an answer `hrafnar`
     /// could not verify. Also any error before or instead of a run.
     Failed,
-    /// Asked to do nothing it could do: a bare `review` with nothing on stdin
+    /// Asked to do nothing it could do: a bare `hrafnar` with nothing on stdin
     /// gets the help text, as a usage error does.
     Usage,
     /// Something a run started was left running, or its teardown could not be
     /// confirmed. Outranks `Failed`: processes that may still be changing the
     /// tree are checked before anything is retried.
     LeftRunning,
-    /// `review` was stopped by this signal: 128 plus its number.
+    /// `hrafnar` was stopped by this signal: 128 plus its number.
     Signalled(i32),
 }
 

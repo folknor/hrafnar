@@ -73,7 +73,7 @@ _USED_TO = r"(?<!\bis )(?<!\bare )(?<!\bbe )(?<!\bbeen )(?<!\bbeing )(?<!\bnever
 #   "no longer"  a runtime state change ("once it retries, interrupt no longer
 #                targets the failed attempt")
 #   "legacy"     codex's own name for its `sandbox_mode` pipeline, and the
-#                on-disk spellings `review` still reads
+#                on-disk spellings `hrafnar` still reads
 #   "deprecated" a current state a doc may need to state
 HISTORY_DOCS = re.compile(
     _USED_TO
@@ -97,7 +97,7 @@ COMMENT = re.compile(r"^\s*//")
 NOTES_CITATION = re.compile(r"(?<![\w/.-])notes/[\w.-][\w./-]*")
 # Durable root files a `notes/` citation is read in. AGENTS.md, CLAUDE.md and
 # README.md are left out: they describe the whole layout, `notes/` included.
-NOTES_ROOT_FILES = ("brokkr.toml", "Cargo.toml", ".review.toml")
+NOTES_ROOT_FILES = ("brokkr.toml", "Cargo.toml", ".hrafnar.toml")
 # This file spells `notes/` to describe the rule.
 SELF = "scripts/check_docs.py"
 URL = re.compile(r"https?://")

@@ -157,11 +157,11 @@ fn claude_result_without_is_error_fails_closed() {
         ..
     } = outcome
     else {
-        panic!("a result with no is_error is review's diagnosis, not an answer");
+        panic!("a result with no is_error is hrafnar's diagnosis, not an answer");
     };
     assert_eq!(
         reason,
-        "review could not classify claude result (no is_error flag): maybe"
+        "hrafnar could not classify claude result (no is_error flag): maybe"
     );
 }
 
@@ -433,7 +433,7 @@ fn maki_harness_failure_is_stated_with_its_api_error() {
     };
     assert!(stated.contains("API error (402)"), "{stated}");
     assert!(session_id.is_some(), "the session survives an API failure");
-    // A cancelled run that review did not interrupt: someone else signalled it.
+    // A cancelled run that hrafnar did not interrupt: someone else signalled it.
     let outcome = maki_verdict(&maki_result("true", Some(r#""cancelled""#), ""));
     let super::ClaudeOutcome::NoAnswer {
         stated: Some(stated),
@@ -461,7 +461,7 @@ fn maki_results_review_cannot_classify_fail_closed() {
             ..
         } = outcome
         else {
-            panic!("{what} is review's diagnosis, not an answer");
+            panic!("{what} is hrafnar's diagnosis, not an answer");
         };
         assert!(
             unverified.contains("could not classify maki"),

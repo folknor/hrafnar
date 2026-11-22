@@ -1,7 +1,7 @@
-//! `review`'s own sandbox vocabulary as it appears in config: `read-only` (the
+//! `hrafnar`'s own sandbox vocabulary as it appears in config: `read-only` (the
 //! default), `workspace-write`, `danger-full-access`, or a harness-native
 //! name. Native translation and grant semantics belong to
-//! `harness::Permissions`, not to the config parser or `review list`.
+//! `harness::Permissions`, not to the config parser or `hrafnar list`.
 //!
 //! The level names are codex's, because they are the config surface profiles
 //! are already written in, and a fresh set would change the meaning of every
@@ -22,7 +22,7 @@
 //! Claude and maki have no filesystem sandbox; their profiles omit the level.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Review's reserved permission vocabulary. Other names belong to the harness.
+/// hrafnar's reserved permission vocabulary. Other names belong to the harness.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SandboxLevel {
     #[default]

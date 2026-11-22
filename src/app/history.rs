@@ -5,7 +5,7 @@ use anyhow::Result;
 use super::selected_root;
 use crate::{config, harness, incident, project, sessions};
 
-/// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
+/// `hrafnar incidents` - list recent forensic bundles (see `incident.rs`) so a
 /// dead run is triageable at a glance instead of buried under the incidents dir.
 pub(super) fn run_incidents(limit: usize) -> Result<()> {
     let listing = incident::list_recent(limit);
@@ -57,7 +57,7 @@ pub(super) fn run_incidents(limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// `review sessions <id>` - surface one session's artifacts: its digest, the
+/// `hrafnar sessions <id>` - surface one session's artifacts: its digest, the
 /// on-disk codex rollout transcript (the authoritative record), and the final
 /// response. This is the on-demand form of the post-mortem that a suspicious
 /// run prints inline - reachable for any past session by ID.
@@ -127,7 +127,7 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
     Ok(())
 }
 
-/// `review sessions` - aggregate sidecar records by session_id and print
+/// `hrafnar sessions` - aggregate sidecar records by session_id and print
 /// recent sessions with their age, harness, archetype, touch count, and the
 /// prompt that opened them. Filtered to the current project unless `--all`.
 pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> Result<()> {
@@ -195,7 +195,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
             let since = sessions::format_age(now.saturating_sub(m.started_epoch));
             if m.cleanup_pending() {
                 println!(
-                    "[cleanup pending] {} / its review is gone; processes still being torn down",
+                    "[cleanup pending] {} / its hrafnar is gone; processes still being torn down",
                     m.harness
                 );
             } else if m.phase == crate::inflight::Phase::HandoffPending {
@@ -310,7 +310,7 @@ mod tests {
         harness::Outcome::interpret_summary(d)
             .lines(&d.status_facts())
             .into_iter()
-            .filter(|l| l.starts_with("note:") || l.starts_with("terminated by review:"))
+            .filter(|l| l.starts_with("note:") || l.starts_with("terminated by hrafnar:"))
             .collect()
     }
 
@@ -358,12 +358,12 @@ mod tests {
             "exit_code": 0, "captured": false, "turns": 1,
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
             "reasoning_output_tokens": 0, "interrupted": true,
-            "terminated_by_review": "review was signalled to stop",
+            "terminated_by_hrafnar": "hrafnar was signalled to stop",
         }));
         let lines = notes(&d);
         assert_eq!(
             lines[0],
-            "terminated by review: review was signalled to stop"
+            "terminated by hrafnar: hrafnar was signalled to stop"
         );
         assert!(lines[1].starts_with("note: interrupted"), "{lines:?}");
     }

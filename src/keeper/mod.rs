@@ -1,19 +1,19 @@
-//! The keeper: one per harness invocation, between `review` and the harness,
+//! The keeper: one per harness invocation, between `hrafnar` and the harness,
 //! so that when a run ends nothing it started is left running.
 //!
 //! # Why a process of its own
 //!
-//! A harness's descendants do not stay in the process group `review` gives it.
+//! A harness's descendants do not stay in the process group `hrafnar` gives it.
 //! codex's Linux sandbox runs bwrap with `--new-session` and unified-exec
 //! shells `setsid()`, so a shell the agent started is in a session of its own,
 //! and when codex exits it is reparented to init, still able to write the
-//! project. Killing the group cannot reach such a process. Making `review`
+//! project. Killing the group cannot reach such a process. Making `hrafnar`
 //! itself the child subreaper is rejected because an adopted orphan carries no
 //! mark of the invocation that started it, and because the teardown would die
-//! with `review`. So each invocation gets its own subreaper. Everything the
+//! with `hrafnar`. So each invocation gets its own subreaper. Everything the
 //! harness starts, whatever it does to its session or group, stays a
 //! descendant of this process, and this process belongs to exactly one
-//! invocation. If `review` dies, the control pipe's EOF tells the keeper to
+//! invocation. If `hrafnar` dies, the control pipe's EOF tells the keeper to
 //! tear down anyway.
 //!
 //! # The proof of emptiness
@@ -42,14 +42,14 @@
 //!
 //! # Protocol
 //!
-//! `review` spawns `review __keep <spec-fd>` with SIGINT, SIGTERM, SIGCHLD
+//! `hrafnar` spawns `hrafnar __keep <spec-fd>` with SIGINT, SIGTERM, SIGCHLD
 //! and SIGPIPE blocked, so no signal can take its default action before the
 //! keeper reads them from a signalfd. The spec is a sealed memfd, read and closed
 //! before any harness fork; argv carries only its descriptor number, never an
 //! environment value. Two pipes beyond stdio, numbered at least 3 so a spawn's
-//! stdio setup cannot overwrite them, whose numbers are in the spec: control (review to keeper: `g` go, `i` interrupt, `t`
-//! terminate; EOF means `review` is gone) and events (keeper to review, one
-//! JSON `Event` per line). The keeper launches nothing before `g`, so `review`
+//! stdio setup cannot overwrite them, whose numbers are in the spec: control (hrafnar to keeper: `g` go, `i` interrupt, `t`
+//! terminate; EOF means `hrafnar` is gone) and events (keeper to hrafnar, one
+//! JSON `Event` per line). The keeper launches nothing before `g`, so `hrafnar`
 //! can record the keeper's identity first. Its own stdio is the harness's and
 //! it never writes to it.
 

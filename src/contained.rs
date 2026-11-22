@@ -25,10 +25,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            // The running `review` is its own keeper; `main` dispatches on
+            // The running `hrafnar` is its own keeper; `main` dispatches on
             // `keeper::ARG` before anything else. `/proc/self/exe` rather than
             // the path it was started from: exec'd in the forked child, it is
-            // the image this `review` is running, so a binary replaced
+            // the image this `hrafnar` is running, so a binary replaced
             // mid-run (an install while runs are in flight) cannot hand later
             // launches a keeper speaking another version of the protocol.
             keeper: PathBuf::from("/proc/self/exe"),
@@ -453,7 +453,7 @@ pub struct Finished {
 }
 
 impl Contained {
-    /// The keeper's pid: what the in-flight marker records and `review
+    /// The keeper's pid: what the in-flight marker records and `hrafnar
     /// interrupt` signals.
     pub fn pid(&self) -> u32 {
         self.keeper_pid

@@ -114,7 +114,7 @@ impl Lifecycle {
             .lock()
             .map_err(|_| anyhow::anyhow!("keeper registry unavailable"))?;
         if registry.closed {
-            anyhow::bail!("not launched: review was signalled to stop");
+            anyhow::bail!("not launched: hrafnar was signalled to stop");
         }
         let child = cmd.spawn().context("failed to spawn the keeper")?;
         if let Some(pid) = child.id() {
@@ -233,20 +233,20 @@ impl Drop for Unrecorded {
 /// once a `SignalKind::terminate()` stream has been created, the default
 /// "terminate the process" behaviour is gone for the rest of the run, even after
 /// the stream is dropped. Installing it per-run would therefore have left
-/// `review` quietly ignoring every `SIGTERM` after its first codex invocation,
+/// `hrafnar` quietly ignoring every `SIGTERM` after its first codex invocation,
 /// i.e. *harder* to kill than before - the opposite of the intent.
 ///
 /// With codex or claude runs in flight the first signal is a graceful stop: each run ends
-/// its turn as `review interrupt` would, records its session, and only then does
-/// `review` exit. The signal is most often an orchestrating agent stopping the
-/// background task it launched `review` as - asked to "interrupt the agent",
-/// Claude reaches for its own task-stop tool, not for `review interrupt` - and
+/// its turn as `hrafnar interrupt` would, records its session, and only then does
+/// `hrafnar` exit. The signal is most often an orchestrating agent stopping the
+/// background task it launched `hrafnar` as - asked to "interrupt the agent",
+/// Claude reaches for its own task-stop tool, not for `hrafnar interrupt` - and
 /// the old kill-and-exit left a fresh session with no sidecar row, so it could
 /// never be resumed. A second signal, or `GRACEFUL_STOP` passing, falls through
 /// to the kill below, which forfeits the digest and the row; the rollout
-/// transcript is on disk regardless, for `review sessions <id>`.
+/// transcript is on disk regardless, for `hrafnar sessions <id>`.
 ///
-/// Either way `review` then terminates every keeper still running (grok runs,
+/// Either way `hrafnar` then terminates every keeper still running (grok runs,
 /// and whatever the graceful stop did not end), waits for their teardowns up to
 /// `contained::Settings::terminate_bound`, and reports anything left running or
 /// unaccounted for before it exits. A keeper still tearing down at that bound

@@ -1,6 +1,6 @@
-//! Combining the local and global layers into one `ReviewConfig`. Every
+//! Combining the local and global layers into one `HrafnarConfig`. Every
 //! resolved value is `Sourced` (layer and table), and each profile records
-//! its layer and table, so `review list --all` can show where it came from.
+//! its layer and table, so `hrafnar list --all` can show where it came from.
 //! The tests are in `resolve/tests.rs`.
 //!
 //! The rules, and why:
@@ -13,9 +13,9 @@
 //!   project than everywhere else, and a field of a run could come from a
 //!   table that never mentioned it.
 //! - `[_audit]` is always the project's, because the audit id identifies the
-//!   project. A `.review.toml` holding only `[_audit]` is a complete config.
+//!   project. A `.hrafnar.toml` holding only `[_audit]` is a complete config.
 
-use super::{ConfigFile, ConfigFiles, Layer, ProfileDef, ReviewConfig, Sourced};
+use super::{ConfigFile, ConfigFiles, HrafnarConfig, Layer, ProfileDef, Sourced};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -42,7 +42,7 @@ pub fn resolve(
     global: Option<ConfigFile>,
     hostname: &str,
     files: ConfigFiles,
-) -> super::Result<ReviewConfig> {
+) -> super::Result<HrafnarConfig> {
     let project_root = files
         .local
         .as_deref()
@@ -58,7 +58,7 @@ fn resolve_inner(
     hostname: &str,
     files: ConfigFiles,
     project_root: Option<crate::project::ProjectRoot>,
-) -> Result<ReviewConfig> {
+) -> Result<HrafnarConfig> {
     let audit = local.audit.clone();
     let mut layers: Vec<(Layer, ConfigFile)> = vec![(Layer::Local, local)];
     if let Some(g) = global {
@@ -140,7 +140,7 @@ fn resolve_inner(
         }
     }
 
-    Ok(ReviewConfig {
+    Ok(HrafnarConfig {
         archetypes,
         audit,
         profile,

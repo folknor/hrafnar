@@ -1,6 +1,6 @@
 //! Which of a profile's harness entries a run uses. Pure: availability is a
 //! closure, so every branch is testable without `PATH`. The run and
-//! `review list` both call this, so the harness `review list` marks is the one
+//! `hrafnar list` both call this, so the harness `hrafnar list` marks is the one
 //! a plain `-p <name>` launches.
 
 use super::{Harness, ProfileDef};
@@ -111,7 +111,7 @@ mod tests {
         let d = def(&[Codex, Claude, Maki]);
         // grok is preferred but not defined; codex is defined but not installed.
         let got = choose_harness(
-            "review",
+            "hrafnar",
             &d,
             None,
             &[Grok, Codex, Maki, Claude],

@@ -120,7 +120,7 @@ pub struct InheritedSettings {
 }
 
 impl InheritedSettings {
-    /// What a `review resume` launches with comes from the session's last
+    /// What a `hrafnar resume` launches with comes from the session's last
     /// recorded run: permissions, writable roots, model and effort, because they
     /// are properties of the session, not of the invocation driving it. A resume
     /// carries no profile, so without this a `workspace-write` session would
@@ -170,7 +170,7 @@ mod tests {
             "effort": "high", "sandbox": "workspace-write",
             "writable_roots": ["/cache"], "env_keys": ["SECRET"],
             "codex_home": "/saved/codex", "operator_prompt": "p",
-            "assembled_prompt": "p", "review_version": "0.0.0",
+            "assembled_prompt": "p", "hrafnar_version": "0.0.0",
             "profile_origin": {"layer": "global", "table": "[codex.old]"}
         }))
         .expect("historical row")

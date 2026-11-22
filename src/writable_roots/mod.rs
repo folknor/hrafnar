@@ -22,12 +22,12 @@
 //!   build that has to fetch a crate dies before compiling, naming the
 //!   registry cache rather than the sandbox.
 //!
-//! Requiring each `.review.toml` to restate those paths would put a
+//! Requiring each `.hrafnar.toml` to restate those paths would put a
 //! machine-shaped fact in every project file, and get it wrong on the hosts
-//! that were not in front of whoever edited them. So `review` derives them.
+//! that were not in front of whoever edited them. So `hrafnar` derives them.
 //!
 //! Roots are derived against the project root, not the process cwd: the
-//! harness runs with the project root as its cwd, and `.review.toml`
+//! harness runs with the project root as its cwd, and `.hrafnar.toml`
 //! discovery allows launching from a descendant, whose `target` is not the
 //! build's.
 //!

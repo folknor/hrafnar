@@ -85,7 +85,7 @@ mod tests {
             "timestamp":"2026-01-01T00:00:00Z","hostname":"old-host","audit_id":"old",
             "provider":"codex","archetype":"bare","session_id":"session",
             "project":root, "operator_prompt":"request", "assembled_prompt":"request",
-            "review_version":"0.1.0", "codex_home":home,
+            "hrafnar_version":"0.1.0", "codex_home":home,
         }))
         .expect("historical row with saved home");
         assert_eq!(session_artifacts(&record).final_answer(), Some("answer"));

@@ -1,4 +1,4 @@
-//! Which harness a run talks to, and the facts about it that `review` decides
+//! Which harness a run talks to, and the facts about it that `hrafnar` decides
 //! by harness rather than by run.
 //!
 //! A harness matched as a string with `_ =>` fallbacks lets a new name compile
@@ -10,7 +10,7 @@
 //!
 //! Persisted rows (the sidecar, the in-flight markers, the audit log) keep the
 //! harness as the string they were written with: a row naming a harness that
-//! `review` no longer drives must still be readable by `review sessions`. It is
+//! `hrafnar` no longer drives must still be readable by `hrafnar sessions`. It is
 //! parsed at the point a row is acted on, and a name that does not parse is
 //! refused there.
 //!
@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-/// A harness `review` can run. The canonical spelling (`as_str`) is the one
+/// A harness `hrafnar` can run. The canonical spelling (`as_str`) is the one
 /// written in config tables, on the command line and in every recorded row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum)]
 pub enum Harness {
@@ -69,7 +69,7 @@ impl Harness {
     /// `reference/codex.md`, `reference/claude.md` and `reference/maki.md`);
     /// grok has no such lever.
     ///
-    /// The one answer read by `review interrupt`, `review message` and the
+    /// The one answer read by `hrafnar interrupt`, `hrafnar message` and the
     /// signal supervisor's wait for unrecorded runs (`Unrecorded`), so they
     /// cannot disagree. Answering `true` here is a promise the
     /// runner must keep - offer its keeper's pid, observe the stop channel,
@@ -82,7 +82,7 @@ impl Harness {
         }
     }
 
-    /// How long since a session was last touched before `review message`
+    /// How long since a session was last touched before `hrafnar message`
     /// refuses to resume it, because the harness's prompt cache has gone cold.
     /// The lifetime is set by whoever serves the model, not by the harness.
     /// For claude and codex that host is fixed; maki's depends on the
@@ -152,7 +152,7 @@ impl std::fmt::Display for Harness {
     }
 }
 
-/// A name that is not one of `review`'s harnesses.
+/// A name that is not one of `hrafnar`'s harnesses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownHarness(pub String);
 

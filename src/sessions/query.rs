@@ -55,7 +55,7 @@ impl<'a> Session<'a> {
 }
 pub fn not_found(id: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "no record of session {id} on this host\n  `review sessions` lists the sessions this host's review runs created."
+        "no record of session {id} on this host\n  `hrafnar sessions` lists the sessions this host's hrafnar runs created."
     )
 }
 pub fn assert_project(
@@ -150,7 +150,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "timestamp": "t", "epoch_secs": epoch, "project": "/p", "hostname": "h",
             "audit_id": "a", "provider": "codex", "archetype": "bare", "session_id": "s",
-            "operator_prompt": prompt, "assembled_prompt": prompt, "review_version": "0",
+            "operator_prompt": prompt, "assembled_prompt": prompt, "hrafnar_version": "0",
         }))
         .expect("row")
     }

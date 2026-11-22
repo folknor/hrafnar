@@ -89,28 +89,28 @@ pub const VERSION_PROBE: Duration = Duration::from_secs(30);
 
 pub const KEEPER_STARTUP: Duration = Duration::from_secs(30);
 
-/// How long a keeper's final report may take to drain to `review`.
+/// How long a keeper's final report may take to drain to `hrafnar`.
 pub const KEEPER_FLUSH: Duration = Duration::from_secs(2);
 
-/// How long a signalled `review` waits for its codex runs to end their turns and
+/// How long a signalled `hrafnar` waits for its codex runs to end their turns and
 /// be recorded before falling back to killing them.
 ///
 /// A signal is usually an orchestrating agent stopping its background task,
 /// not an operator abandoning the work, so the session is kept resumable: each
-/// turn is ended the way `review interrupt` ends one. codex winds a turn down in
+/// turn is ended the way `hrafnar interrupt` ends one. codex winds a turn down in
 /// seconds; this only bounds a codex that will not. A second signal skips it.
 pub const GRACEFUL_STOP: Duration = Duration::from_secs(15);
 
 /// How often the signal supervisor checks whether those runs are recorded.
 pub const GRACEFUL_STOP_POLL: Duration = Duration::from_millis(100);
 
-/// How long since a session was last touched before `review resume` refuses to
+/// How long since a session was last touched before `hrafnar resume` refuses to
 /// resume it, for harnesses without a cutoff of their own.
 ///
 /// Past this the harness's prompt cache is cold (Anthropic's is 5 min by
 /// default, ~1h with the right env vars, so ~55 min is the realistic cap), and
 /// resuming means reprocessing the whole session prefix at full cost.
-/// `review resume` is the *warm* follow-up path; a cold resume should be a
+/// `hrafnar resume` is the *warm* follow-up path; a cold resume should be a
 /// fresh run instead.
 pub const STALE_SESSION: Duration = Duration::from_secs(55 * 60);
 
@@ -120,24 +120,24 @@ pub const STALE_SESSION_CODEX: Duration = Duration::from_secs(27 * 60);
 
 // Which harness gets which cutoff is `harness::Harness::stale_cutoff`.
 
-/// How often `review interrupt` checks whether the interrupted run has been
+/// How often `hrafnar interrupt` checks whether the interrupted run has been
 /// recorded. codex winds a turn down in seconds, so this only sets how promptly
 /// the resume command is printed.
 pub const INTERRUPT_POLL: Duration = Duration::from_millis(500);
 
-/// How long `review interrupt` waits for a run in flight to offer its pid - which
+/// How long `hrafnar interrupt` waits for a run in flight to offer its pid - which
 /// it does once the harness has printed its first output, a second or two after
-/// launch. `review message` meets this window every time a second message
+/// launch. `hrafnar message` meets this window every time a second message
 /// follows a first: its launch lock hands over the moment the first run
 /// spawns. Past this the harness is taken to be stuck before output, and the
 /// interrupt refused.
 pub const INTERRUPT_PID_WAIT: Duration = Duration::from_secs(60);
 
-/// How often `review interrupt` looks for that pid.
+/// How often `hrafnar interrupt` looks for that pid.
 pub const INTERRUPT_PID_POLL: Duration = Duration::from_millis(100);
 
 /// How long a fresh run holds the host-wide launch lock after launching, so
-/// that `review` calls fired together on one host reach their harnesses spaced
+/// that `hrafnar` calls fired together on one host reach their harnesses spaced
 /// apart rather than all at once, to avoid rate limits. Released early if the
 /// run ends first. Not tunable, because no caller has needed another value.
 pub const LAUNCH_SPACING: Duration = Duration::from_secs(30);

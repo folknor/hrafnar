@@ -165,7 +165,7 @@ impl Grok {
     /// - a store grok cannot parse (it would trust nothing and cancel at the
     ///   first edit), or a symlinked one (grok refuses to load it);
     /// - a grok-managed `-w` worktree, whose key grok resolves through its own
-    ///   registry, which `review` cannot read - guessing wrong could let the
+    ///   registry, which `hrafnar` cannot read - guessing wrong could let the
     ///   grant land on a declined source repo.
     ///
     /// A missing store is `Undecided`: `--trust` creates it.
@@ -197,7 +197,7 @@ impl Grok {
             .is_some_and(|home| canonical.starts_with(home.join("worktrees")))
         {
             anyhow::bail!(
-                "{} is a grok-managed worktree; review cannot model its trust key - \
+                "{} is a grok-managed worktree; hrafnar cannot model its trust key - \
                  trust it from grok",
                 dir.display()
             );
@@ -220,7 +220,7 @@ impl Grok {
         let path = self.home.join("trusted_folders.toml");
         if decision == Trust::Declined {
             anyhow::bail!(
-                "{} is explicitly untrusted in {} - review will not override that; \
+                "{} is explicitly untrusted in {} - hrafnar will not override that; \
                  change it there if you mean to",
                 key.display(),
                 path.display()

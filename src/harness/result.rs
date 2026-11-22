@@ -114,11 +114,15 @@ pub struct DigestSummary {
     /// Forensic-bundle directory for a suspicious run (see `incident.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident_path: Option<String>,
-    /// Why `review` killed codex, when it did. Persisted so the hang class is
+    /// Why `hrafnar` killed codex, when it did. Persisted so the hang class is
     /// greppable after the fact:
-    /// `jq 'select(.digest.terminated_by_review != null)'`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminated_by_review: Option<String>,
+    /// `jq 'select(.digest.terminated_by_hrafnar != null)'`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "terminated_by_review"
+    )]
+    pub terminated_by_hrafnar: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,10 +132,14 @@ pub struct DigestSummary {
     /// with the hang class: `jq 'select(.digest.turn_error != null)'`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_error: Option<String>,
-    /// Review could not verify the run, even if it captured an answer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_error: Option<String>,
-    /// Ended by `review interrupt`: `jq 'select(.digest.interrupted)'`.
+    /// hrafnar could not verify the run, even if it captured an answer.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "review_error"
+    )]
+    pub hrafnar_error: Option<String>,
+    /// Ended by `hrafnar interrupt`: `jq 'select(.digest.interrupted)'`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
 }
@@ -163,14 +171,14 @@ impl Digest {
                 .incident_path
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
-            terminated_by_review: outcome.termination().map(ToString::to_string),
+            terminated_by_hrafnar: outcome.termination().map(ToString::to_string),
             quiet_secs: self.codex().and_then(|c| c.quiet_secs),
             last_rollout_event: self
                 .codex()
                 .and_then(|c| c.last_rollout_event.as_ref())
                 .map(ToString::to_string),
             turn_error: outcome.stated.clone(),
-            review_error: outcome.unverified.clone(),
+            hrafnar_error: outcome.unverified.clone(),
             interrupted: matches!(outcome.ended_by, EndedBy::Interrupted(_)),
         }
     }
@@ -249,7 +257,7 @@ pub struct HarnessResult {
     pub writable_roots: Vec<String>,
     /// The model and reasoning effort this run launched with, recorded for the
     /// same reason `permissions` is: they are properties of the *run*, and a
-    /// `review resume` that cannot see them silently falls back to whatever
+    /// `hrafnar resume` that cannot see them silently falls back to whatever
     /// the harness defaults to. `None` means "we passed nothing and the
     /// harness chose", which since `--ignore-user-config` means codex's
     /// built-in default rather than the operator's configured one.
@@ -279,7 +287,7 @@ pub struct HarnessResult {
 /// The two are different names, not two spellings of one: grok's `-m grok-4.7`
 /// is served as `grok-4.7-build`, and `-m grok-4.7-build` is refused as an
 /// unknown model id. So this is recorded but **never** inherited by a
-/// `review resume` - feeding it back to `-m` would fail the launch. Grok and
+/// `hrafnar resume` - feeding it back to `-m` would fail the launch. Grok and
 /// claude report it, from their result objects; empty for codex. It and
 /// `cost_usd` are record-only: the row stores them and nothing reads them back.
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -300,7 +308,7 @@ impl Served {
     }
 
     /// The same facts with `secret` replaced wherever it appears in a model
-    /// name, for a run whose child held a credential review supplied.
+    /// name, for a run whose child held a credential hrafnar supplied.
     pub(super) fn scrubbed(self, secret: &str, with: &str) -> Self {
         Self {
             models: self

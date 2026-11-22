@@ -15,9 +15,9 @@ pub enum SearchBoundary {
 impl fmt::Display for SearchBoundary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Exact(root) => write!(f, "no .review.toml in {}\n\nRun `review -C <project> init` to create one.", root.display()),
-            Self::GitRoot(root) => write!(f, "no .review.toml found (searched up to git root: {})\n\nRun `review init` to create one.", root.display()),
-            Self::FilesystemRoot(_) => f.write_str("no .review.toml found in current or parent directories\n\nRun `review init` to create one."),
+            Self::Exact(root) => write!(f, "no .hrafnar.toml in {}\n\nRun `hrafnar -C <project> init` to create one.", root.display()),
+            Self::GitRoot(root) => write!(f, "no .hrafnar.toml found (searched up to git root: {})\n\nRun `hrafnar init` to create one.", root.display()),
+            Self::FilesystemRoot(_) => f.write_str("no .hrafnar.toml found in current or parent directories\n\nRun `hrafnar init` to create one."),
         }
     }
 }

@@ -5,7 +5,7 @@ The evidence behind `run_claude`'s environment (`reference/claude.md`, "Shell
 commands stay in the foreground"). Re-run after a Claude Code upgrade: each
 probe costs a real turn, and the long ones take a minute or more.
 
-Each probe launches claude the way `review` does (fresh --session-id, --print,
+Each probe launches claude the way `hrafnar` does (fresh --session-id, --print,
 --permission-mode dontAsk, prompt on stdin, cwd = this repo) but, by default,
 with --output-format stream-json so every event is visible with its arrival
 time. The background commands are `python3 -c ...` rather than `sleep` so that
@@ -22,13 +22,13 @@ Usage: claude_background_probe.py <probe> [--format=text|json|stream-json]
            [--tag=T] [--signal=INT|TERM] [KEY=VALUE ...] [extra claude args...]
 
 --signal sends that signal to the claude process (not its group) once the
-probe's command is running, the way `review interrupt` and a signalled `review`
+probe's command is running, the way `hrafnar interrupt` and a signalled `hrafnar`
 do; resume the printed session afterwards to check it survived.
 
 --format picks claude's --output-format (default stream-json, which adds
---verbose). KEY=VALUE pairs are set in claude's environment - `review` sets
+--verbose). KEY=VALUE pairs are set in claude's environment - `hrafnar` sets
 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 and BASH_DEFAULT_TIMEOUT_MS /
-BASH_MAX_TIMEOUT_MS, so pass those to reproduce a `review` run and leave them
+BASH_MAX_TIMEOUT_MS, so pass those to reproduce a `hrafnar` run and leave them
 out to see claude's own defaults. --tag names the output directory, so variants
 of one probe do not collide.
 

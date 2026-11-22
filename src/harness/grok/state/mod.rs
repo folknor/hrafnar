@@ -1,4 +1,4 @@
-//! `review`'s dealings with grok's own state directory (`$GROK_HOME`, else
+//! `hrafnar`'s dealings with grok's own state directory (`$GROK_HOME`, else
 //! `~/.grok`): what a `workspace-write` run needs set up there, and the event
 //! log that explains a run grok reports only as `stopReason: cancelled`.
 //!
@@ -9,7 +9,7 @@
 //! sandbox level (observed, see `reference/grok.md`). A write run therefore
 //! launches with
 //! grok's own (hidden) `--trust` flag, which records the grant under grok's own
-//! key and lock - `review` does not write this file. What `review` does here is
+//! key and lock - `hrafnar` does not write this file. What `hrafnar` does here is
 //! read it: to refuse a folder the operator explicitly declined (grok's grant
 //! would overwrite that), to refuse a store grok cannot parse (grok then trusts
 //! nothing, fail-closed), and to explain a cancelled turn.
@@ -17,7 +17,7 @@
 //! **Writable roots** (`sandbox.toml`). Grok's `workspace` profile writes only
 //! to the workspace, the grok home and temp; the brokkr lock and the cargo
 //! home are outside it, so a build fails before compiling. The only surface
-//! grok offers for more is a named profile, so `review` creates one per
+//! grok offers for more is a named profile, so `hrafnar` creates one per
 //! distinct root set, named for its content (`profile_name`, `ensure_profile`)
 //! and never modified after. That write copies grok's own discipline for its
 //! trust store (`xai-grok-workspace/src/trust.rs`): an exclusive `flock` on
@@ -32,7 +32,7 @@
 //! copy grok's serde definitions field for field, because grok deserializes each
 //! file **whole**: one malformed entry anywhere and grok drops the entire file.
 //! For the trust store that means nothing is trusted; for the sandbox file it
-//! means the global definition of `review`'s profile vanishes and a checked-out
+//! means the global definition of `hrafnar`'s profile vanishes and a checked-out
 //! repo's `.grok/sandbox.toml` may define the name instead. Validating only our
 //! own table would miss both.
 //!
@@ -59,7 +59,7 @@ pub(in crate::harness) use sandbox::{ProfileName, RootSet};
 pub(super) use trust::{Trust, trust_failures};
 
 /// Grok's environment as the *child* will see it. A profile `env` redirects
-/// only the child, so reading `review`'s own environment would set up - and
+/// only the child, so reading `hrafnar`'s own environment would set up - and
 /// judge trust against - the wrong home: the `CODEX_HOME`/`data_root` trap.
 #[derive(Debug, Clone)]
 pub(super) struct Grok {

@@ -1,4 +1,4 @@
-//! `review interrupt <ID>`: stop a codex, claude or maki run mid-turn and hand back
+//! `hrafnar interrupt <ID>`: stop a codex, claude or maki run mid-turn and hand back
 //! its session.
 //!
 //! # Why a verb
@@ -16,12 +16,12 @@
 //! # How
 //!
 //! 1. The run's in-flight marker names its keeper's pid (see `keeper`), the
-//!    owning `review`'s child and leader of its own process group - offered
+//!    owning `hrafnar`'s child and leader of its own process group - offered
 //!    only once the harness has produced output, so the harness is never too
 //!    young to handle the signal (for codex, a node wrapper that would die on
 //!    it).
 //! 2. An interrupt request is written beside the marker *before* the signal, so
-//!    the owning `review` can tell this apart from a death once codex exits.
+//!    the owning `hrafnar` can tell this apart from a death once codex exits.
 //! 3. `SIGINT` goes to the keeper, which forwards one SIGINT to the harness
 //!    alone, through a pidfd - on a codex npm install the node wrapper, which
 //!    forwards it to the native binary once. Signalling the whole group would
@@ -52,7 +52,7 @@ pub async fn run(session_id: &str) -> Result<()> {
         // owner's output.
         println!(
             "the run ended before the interrupt took effect - see its output, or \
-             `review sessions {session_id}`"
+             `hrafnar sessions {session_id}`"
         );
     }
     Ok(())
@@ -78,10 +78,10 @@ pub async fn interrupt(session_id: &str, data_root: Option<&Path>) -> Result<Out
             bail!("session {session_id}: ambiguous live-run observation; retry shortly")
         }
         query::State::Queued(_) => bail!(
-            "a message to session {session_id} is waiting to launch, so there is no turn to interrupt yet\n  retry once it has launched, or send your own `review message`, which waits for it and then interrupts it"
+            "a message to session {session_id} is waiting to launch, so there is no turn to interrupt yet\n  retry once it has launched, or send your own `hrafnar message`, which waits for it and then interrupts it"
         ),
         query::State::Idle(_) | query::State::Unknown => bail!(
-            "no run of session {session_id} is in flight on this host\n  `review sessions --all` lists the ones that are"
+            "no run of session {session_id} is in flight on this host\n  `hrafnar sessions --all` lists the ones that are"
         ),
     };
     interrupt_observed(session_id, marker, data_root).await
@@ -112,7 +112,7 @@ pub(crate) async fn interrupt_observed(
     // completion receipt. Refuse before changing a turn we cannot hand back.
     anyhow::ensure!(
         marker.protocol == handoff::PROTOCOL,
-        "session {session_id}: this run was launched by an older review without result handoff support; wait for it to finish"
+        "session {session_id}: this run was launched by an older hrafnar without result handoff support; wait for it to finish"
     );
     let run_id: handoff::RunId = marker.run_id.clone().try_into()?;
     if pending {
@@ -142,7 +142,7 @@ pub(crate) async fn interrupt_observed(
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "session {session_id} cannot be interrupted: {harness} has produced no output in {}s (review pid {})",
+            "session {session_id} cannot be interrupted: {harness} has produced no output in {}s (hrafnar pid {})",
             crate::timings::INTERRUPT_PID_WAIT.as_secs(),
             owner.pid()
         );
@@ -217,7 +217,7 @@ async fn wait_handoff(
                 return handoff_outcome(session_id, marker, harness, &done);
             }
             bail!(
-                "the owning review (pid {}) exited without recording a handoff for session {session_id}",
+                "the owning hrafnar (pid {}) exited without recording a handoff for session {session_id}",
                 marker.owner.pid()
             );
         }
@@ -225,14 +225,14 @@ async fn wait_handoff(
     }
 }
 
-/// Why nothing may launch on, or interrupt, a session whose owning `review` is
-/// gone while its keeper still tears the run down. Shared with `review
+/// Why nothing may launch on, or interrupt, a session whose owning `hrafnar` is
+/// gone while its keeper still tears the run down. Shared with `hrafnar
 /// message`.
 // This wording is CLI policy: the store reports liveness, while message
 // imports the interrupt verb's explanation rather than teaching storage prose.
 pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Live) -> String {
     format!(
-        "session {session_id}: the review that ran it (pid {}) is gone and its processes are \
+        "session {session_id}: the hrafnar that ran it (pid {}) is gone and its processes are \
          still being torn down (keeper pid {}); retry shortly",
         marker.owner.pid(),
         marker
@@ -243,7 +243,7 @@ pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Live)
 
 /// Whether a recorded run of `harness` (a marker's string) can be ended
 /// mid-turn and resumed: `Harness::interruptible`, which the signal
-/// supervisor's `Unrecorded` reads too. A name `review` does not drive is not.
+/// supervisor's `Unrecorded` reads too. A name `hrafnar` does not drive is not.
 pub(crate) fn interruptible(harness: &str) -> bool {
     harness
         .parse::<crate::harness::Harness>()
@@ -279,7 +279,7 @@ mod handoff_tests {
         let mut row: crate::sessions::SessionRow = serde_json::from_value(serde_json::json!({
             "timestamp": "old", "epoch_secs": 1, "project": "/p", "hostname": "h", "audit_id": "a",
             "provider": "grok", "archetype": "bare", "session_id": sid.as_str(),
-            "operator_prompt": "old", "assembled_prompt": "old", "review_version": "0",
+            "operator_prompt": "old", "assembled_prompt": "old", "hrafnar_version": "0",
         }))
         .expect("row");
         assert!(crate::sessions::append(&data, &scope, &row));

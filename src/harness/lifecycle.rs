@@ -12,7 +12,7 @@
 //!    already requested refuses the launch, the keeper is spawned and recorded
 //!    on the in-flight marker before anything launches.
 //! 3. `Run::launch`: the keeper starts the harness; the launch signal fires
-//!    (the marker for a known session is already up, which `review message`'s
+//!    (the marker for a known session is already up, which `hrafnar message`'s
 //!    launch lock relies on); the prompt writer starts.
 //! 4. `Run::wait`: harness exit, an optional adapter kill arm (codex's
 //!    watchdog) and the graceful-stop arm, then the keeper's teardown with the
@@ -41,7 +41,7 @@ pub enum Stdin {
 
 /// The process an adapter launches: program, full argv (the command prefix's
 /// leading arguments included), working directory and the environment
-/// overrides applied on top of `review`'s own environment.
+/// overrides applied on top of `hrafnar`'s own environment.
 ///
 /// The overrides are layered in one fixed order, because the order is policy:
 /// adapter defaults first, so a profile can restate them (`RUST_BACKTRACE`,
@@ -49,10 +49,10 @@ pub enum Stdin {
 /// values a profile must not undo (isolation a harness needs, which no current
 /// adapter has); and `PWD` last, set to the working directory for every
 /// harness, because a process that takes its directory from `PWD` rather than
-/// from its cwd would otherwise run wherever `review` was started.
+/// from its cwd would otherwise run wherever `hrafnar` was started.
 ///
 /// `env` is the effective overrides, not the complete environment: the child
-/// also inherits whatever `review` inherited.
+/// also inherits whatever `hrafnar` inherited.
 pub struct ProcessSpec {
     pub program: String,
     pub args: Vec<String>,
@@ -260,7 +260,7 @@ impl Lease {
     }
 
     /// Whether this harness's pid is ever offered on the marker. Only an
-    /// interruptible harness's turn can be ended by `review interrupt`.
+    /// interruptible harness's turn can be ended by `hrafnar interrupt`.
     fn offers_pid(&self) -> bool {
         self.0.harness.interruptible()
     }
@@ -435,7 +435,7 @@ pub struct Ended {
     /// report it. Forensics only: no adapter classifies by it.
     pub status: crate::process::Exit,
     pub leftovers: crate::contained::Leftovers,
-    /// An operator interrupt request was consumed, or `review` was signalled
+    /// An operator interrupt request was consumed, or `hrafnar` was signalled
     /// and ended the turn. Whether it counts is the outcome's call.
     pub interrupt_requested: bool,
     pub stopped_by_signal: bool,
@@ -493,7 +493,7 @@ impl Run {
             }
         }
         // A request left over from an earlier run of this session (its
-        // `review` killed before consuming it) is not aimed at this one, and
+        // `hrafnar` killed before consuming it) is not aimed at this one, and
         // would mark this run as interrupted. A fresh session is new.
         if let SessionStart::Resume(id) = session {
             let _ = crate::inflight::take_interrupt_request_in(id.as_str(), &runtime.data);
@@ -505,7 +505,7 @@ impl Run {
         // locked gate, which closes the race. An already admitted keeper may
         // still reach harness `go` after stop; wait/escalation handle that run.
         if runtime.lifecycle.stop_requested() {
-            anyhow::bail!("not launched: review was signalled to stop");
+            anyhow::bail!("not launched: hrafnar was signalled to stop");
         }
         let stdin_cfg = match spec.stdin {
             Stdin::Pipe(_) => std::process::Stdio::piped(),
@@ -585,7 +585,7 @@ impl Run {
         Ok(())
     }
 
-    /// The graceful stop for `review` being signalled: an interruptible
+    /// The graceful stop for `hrafnar` being signalled: an interruptible
     /// harness that has shown it can take a SIGINT gets one and ends its turn
     /// with its session recorded; before that a SIGINT could kill it with
     /// nothing written (claude without a handler, codex's node wrapper

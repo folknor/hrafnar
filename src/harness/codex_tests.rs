@@ -36,15 +36,15 @@ fn read_only_selects_a_permissions_profile_instead_of_the_sandbox_flag() {
     );
     assert!(
         args.iter()
-            .any(|a| a == r#"permissions.review-read-only.extends=":read-only""#)
+            .any(|a| a == r#"permissions.hrafnar-read-only.extends=":read-only""#)
     );
     assert!(
         args.iter()
-            .any(|a| a == "permissions.review-read-only.network.enabled=true")
+            .any(|a| a == "permissions.hrafnar-read-only.network.enabled=true")
     );
     assert!(
         args.iter()
-            .any(|a| a == r#"default_permissions="review-read-only""#)
+            .any(|a| a == r#"default_permissions="hrafnar-read-only""#)
     );
 }
 

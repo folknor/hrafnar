@@ -8,7 +8,7 @@ interrupt handling and reference/maki.md rest on the result.
 
 Python rather than sh on purpose: a non-interactive shell starts a background
 job with SIGINT ignored, maki keeps an inherited ignored signal ignored, and
-the probe then shows a turn that shrugs SIGINT off. review's keeper starts
+the probe then shows a turn that shrugs SIGINT off. hrafnar's keeper starts
 maki with default dispositions, as this does.
 
 Every wait is bounded, so a maki that never prints `init` or ignores the

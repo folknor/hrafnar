@@ -5,8 +5,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// How a reaped process ended, decoded once from its raw wait status. The
 /// keeper's wire keeps the raw `i32` (a keeper can be a different build than
-/// the `review` reading it, when the binary is replaced mid-run, and the raw
-/// status is the most stable encoding); this is what `review` reasons over.
+/// the `hrafnar` reading it, when the binary is replaced mid-run, and the raw
+/// status is the most stable encoding); this is what `hrafnar` reasons over.
 /// Forensics only: no runner classifies a turn by it, since opencode exits 130
 /// on a clean SIGINT and maki 0 on a failed turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

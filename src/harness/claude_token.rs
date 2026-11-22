@@ -4,7 +4,7 @@
 //! Why it exists: an operator who authenticates claude by exporting
 //! `CLAUDE_CODE_OAUTH_TOKEN` from a login shell has a claude that works from
 //! any terminal, but Claude Code does not pass that variable to the shells it
-//! runs. A `review` launched from inside a Claude Code session therefore
+//! runs. A `hrafnar` launched from inside a Claude Code session therefore
 //! starts a claude with no token, which falls back to its saved login and, if
 //! that is stale, fails after about 30s with "OAuth session expired and could
 //! not be refreshed".
@@ -17,7 +17,7 @@
 //!
 //! The token goes only into the environment of that claude process, after
 //! the profile's `env`, and is never printed, recorded, or kept past the
-//! `review` process: the adapter replaces it in claude's stdout and stderr
+//! `hrafnar` process: the adapter replaces it in claude's stdout and stderr
 //! before either is interpreted. The helper's own stderr reaches the terminal
 //! unfiltered, so the helper can explain a failure to the operator.
 
@@ -57,7 +57,7 @@ impl std::fmt::Debug for ClaudeToken {
 }
 
 /// The configured command and, once run, its result, shared by every claude
-/// run in one `review` process so it runs at most once per process.
+/// run in one `hrafnar` process so it runs at most once per process.
 #[derive(Debug)]
 pub struct TokenSource {
     command: String,

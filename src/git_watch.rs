@@ -12,7 +12,7 @@
 //! Preventing that inside the sandbox is not on offer: git rewrites `config`
 //! by renaming `config.lock` over it, so a read-only `config` also breaks
 //! ordinary branch tracking, and the unsandboxed harnesses would need the
-//! check anyway. So review snapshots those files at launch and, at the end of
+//! check anyway. So hrafnar snapshots those files at launch and, at the end of
 //! the run, warns about each one that changed. It reports paths and the kind of
 //! change only - config can carry credentials, and hook bodies are untrusted
 //! output. What it could not check is reported too, rather than passing as
@@ -32,7 +32,7 @@
 //! may have been made by anything, not only the run. Not watched: the `config`
 //! and hooks of nested git directories (`modules/`, `worktrees/`), git's
 //! global and system config, and anything that ran git unsandboxed while the
-//! run was still live. A review process killed outright never reaches the
+//! run was still live. A hrafnar process killed outright never reaches the
 //! comparison.
 
 use std::collections::{BTreeMap, BTreeSet};

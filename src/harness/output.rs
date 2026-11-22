@@ -33,12 +33,12 @@ pub fn print_result(result: &HarnessResult) {
 }
 
 /// How to continue an interrupted session, and by when - shared by the run's
-/// own output and `review interrupt`, so both say the same thing.
+/// own output and `hrafnar interrupt`, so both say the same thing.
 pub fn resume_hint(harness: Harness, session_id: &str) -> String {
     let cutoff = harness.stale_cutoff().as_secs() / 60;
     format!(
         "interrupted - continue within {cutoff}m with:\n  \
-         echo \"<message>\" | review message {session_id}"
+         echo \"<message>\" | hrafnar message {session_id}"
     )
 }
 
@@ -61,7 +61,7 @@ fn print_digest(outcome: &Outcome, d: &Digest) {
 }
 
 /// Print a persisted `DigestSummary` (from the sidecar) in the same shape as the
-/// inline post-mortem, so `review sessions <id>` reads like a live run.
+/// inline post-mortem, so `hrafnar sessions <id>` reads like a live run.
 pub(crate) fn print_digest_summary(d: &super::DigestSummary) {
     print_status(
         d.exit_code,

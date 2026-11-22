@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 /// Generate a random id: 128 bits from the system, as 32 lowercase hex
-/// characters. The audit id (`review init`, and the first run of a project
+/// characters. The audit id (`hrafnar init`, and the first run of a project
 /// without one) and the incident bundle suffix use it. Fallible so a missing
 /// entropy source surfaces through the caller's error path, never a panic.
 pub fn try_generate_short_id() -> Result<String> {

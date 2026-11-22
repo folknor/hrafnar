@@ -4,13 +4,13 @@
 //!
 //! The sidecar log (`sessions.rs`) is written *after* a run returns, so a run
 //! that is still going - or one that is wedged and will never return - is
-//! completely invisible to `review sessions`, which would show a long codex
+//! completely invisible to `hrafnar sessions`, which would show a long codex
 //! turn at its last touch with the *previous* turn's response: exactly what
 //! "nothing is happening" looks like. The touch count only increments on
 //! detected completion, so it cannot tell working from wedged.
 //!
 //! A marker file is written as soon as the session id is known and retained
-//! through recording and handoff publication, which gives `review sessions` a third state to report:
+//! through recording and handoff publication, which gives `hrafnar sessions` a third state to report:
 //! "turn in flight since <time>".
 //!
 //! Each marker is `SESSION.RUN_ID.json`, one per invocation, carrying the
@@ -31,7 +31,7 @@
 //! # Staleness
 //!
 //! Removal is best-effort: `Drop` covers normal returns, errors and panics, but
-//! not `SIGKILL` of `review` itself. Each marker therefore records the `review`
+//! not `SIGKILL` of `hrafnar` itself. Each marker therefore records the `hrafnar`
 //! that owns it (pid and start time, so a reused pid is not mistaken for it),
 //! and readers treat a marker whose owner is gone as stale rather than as a
 //! live turn - unless the run's keeper is still alive, tearing down what the
@@ -174,18 +174,18 @@ impl Live {
 
 /// Where markers live. `data_root` overrides the real XDG location and exists so
 /// the test harness cannot leave stub markers in the operator's actual
-/// `~/.local/share/review/inflight` - redirecting `CODEX_HOME` only redirects
-/// the *child*, not the paths `review` itself resolves.
+/// `~/.local/share/hrafnar/inflight` - redirecting `CODEX_HOME` only redirects
+/// the *child*, not the paths `hrafnar` itself resolves.
 fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
     crate::data::DataDir::from_override(data_root).inflight()
 }
 
 /// Is `id` safe to use as a path component for a session?
 ///
-/// The session id reaches here straight from `review resume <id>` on the command
+/// The session id reaches here straight from `hrafnar resume <id>` on the command
 /// line or historical evidence. Launches use checked SessionId values, but
 /// these string-facing forensic APIs must also reject unsafe input. Using it
-/// unchecked as a path component let `review resume ../foo` escape the marker
+/// unchecked as a path component let `hrafnar resume ../foo` escape the marker
 /// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
 /// under the data dir.
 ///
@@ -355,7 +355,7 @@ impl Marker {
 
 /// Write a marker via a rename, so a concurrent reader never sees it
 /// half-written - a marker that briefly failed to parse would read as "no run
-/// in flight" to `review interrupt`. The temporary file's extension keeps it out
+/// in flight" to `hrafnar interrupt`. The temporary file's extension keeps it out
 /// of `read_live`.
 fn write_marker(path: &Path, marker: &Marker) -> std::io::Result<()> {
     let json = serde_json::to_string(marker).map_err(std::io::Error::other)?;
@@ -469,12 +469,12 @@ fn mark_checked(
     Guard(Some((path, marker)), false)
 }
 
-/// Every currently-live in-flight marker. Markers whose owning `review` process
+/// Every currently-live in-flight marker. Markers whose owning `hrafnar` process
 /// and keeper are established gone are stale and cleaned up here. Unknown
 /// process observations preserve the marker. Requests are never swept from an
 /// observation snapshot: a concurrent marker may have been missed.
 ///
-/// `data_root` is `None` everywhere but tests: `review sessions` and `review
+/// `data_root` is `None` everywhere but tests: `hrafnar sessions` and `hrafnar
 /// interrupt` are operator-facing and read the real location.
 pub fn read_live(data_root: Option<&Path>) -> Vec<Live> {
     let Some(dir) = dir(data_root) else {
@@ -541,7 +541,7 @@ pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Live> {
     matching.next().is_none().then_some(first)
 }
 
-/// Held by `review message` from before it checks whether the session has a turn
+/// Held by `hrafnar message` from before it checks whether the session has a turn
 /// in flight until its own run has launched - by which point that run's
 /// in-flight marker exists (every runner writes it before spawning when the
 /// session id is known). Released by dropping it.
@@ -550,9 +550,9 @@ pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Live> {
 /// flight and both launch a turn on the same session at once: codex's session
 /// lock fails the second, but claude has none, so both run. And a message
 /// waiting behind the global lock would be invisible to every other verb, with
-/// no marker until it launched; holding this lock is what `review sessions`
+/// no marker until it launched; holding this lock is what `hrafnar sessions`
 /// shows as `[queued]`. With it, a second message waits for the first to
-/// launch, then finds its marker and interrupts it, as `review message`
+/// launch, then finds its marker and interrupts it, as `hrafnar message`
 /// promises. The whole sequence is in `reference/steering.md`.
 pub struct LaunchLock {
     /// Held only so the lock lives as long as this value: closing it releases
@@ -626,7 +626,7 @@ fn launch_lock_held(path: &Path) -> bool {
 }
 
 /// Session ids whose launch lock is held right now: messages waiting to launch,
-/// which have no in-flight marker yet. For `review sessions`.
+/// which have no in-flight marker yet. For `hrafnar sessions`.
 pub fn pending_launches(data_root: Option<&Path>) -> Vec<String> {
     let Some(dir) = dir(data_root) else {
         return Vec::new();
@@ -702,7 +702,7 @@ fn interrupt_path_in(
 
 /// Record that the operator asked for `session_id`'s run to be interrupted.
 ///
-/// Written *before* the signal is sent, so the owning `review` - which checks
+/// Written *before* the signal is sent, so the owning `hrafnar` - which checks
 /// for it once codex has exited - can tell an interrupt it must honour from a
 /// mid-turn death it should auto-resume past. The two look identical from the
 /// exit status alone.
@@ -745,7 +745,7 @@ mod tests {
     #[test]
     fn an_interrupt_request_is_consumed_exactly_once() {
         let root = scratch_root();
-        std::fs::create_dir_all(root.join("review/inflight")).expect("scratch dir");
+        std::fs::create_dir_all(root.join("hrafnar/inflight")).expect("scratch dir");
         let sid = "019fefb0-227c-7c83-a398-380011b8e66a";
 
         assert!(
@@ -947,7 +947,7 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal() {
-        // `review resume ../sessions` would otherwise write and then delete a file
+        // `hrafnar resume ../sessions` would otherwise write and then delete a file
         // outside the marker directory.
         assert!(!is_safe_session_id("../sessions"));
         assert!(!is_safe_session_id("../../etc/passwd"));

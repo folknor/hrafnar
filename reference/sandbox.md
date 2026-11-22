@@ -20,9 +20,9 @@ is what the next resume launches with:
    `workspace-write` only), adds the codex `.git` grant, and holds the
    effective paths. Codex renders them as
    `-c sandbox_workspace_write.writable_roots=[...]` before profile
-   `config`. Grok gets them through a generated `review-ws-*` sandbox
+   `config`. Grok gets them through a generated `hrafnar-ws-*` sandbox
    profile.
-3. The sidecar row records the effective result: `sandbox` in review's
+3. The sidecar row records the effective result: `sandbox` in hrafnar's
    vocabulary, `provider_sandbox` with grok's exact selector, and
    `writable_roots` only when non-empty. A row with the field is a row that
    widened something.
@@ -36,7 +36,7 @@ permission facts, because its effective grants are unavailable.
 
 ## What a resume inherits
 
-A `review resume` takes no profile, so permissions, model and effort come
+A `hrafnar resume` takes no profile, so permissions, model and effort come
 from the session's last sidecar row (`InheritedSettings::from_record`),
 because they belong to the session, not the invocation. Each resume records
 what it launched with, so the chain carries forward. The parts that only
@@ -47,7 +47,7 @@ line up across modules:
 - `Permissions::restore` reads the native record. Codex roots go back in as
   profile roots, so they pass the `writable_roots` filters again and are
   re-derived against this host: the build lock belongs to the machine the
-  resume runs on. A restored grok `review-ws-*` profile keeps its recorded
+  resume runs on. A restored grok `hrafnar-ws-*` profile keeps its recorded
   root set verbatim instead (see [grok.md](grok.md#writable-roots)).
 - A row with no selector restores codex as `read-only`. Grok passes no
   override, runs on the session's saved profile, and records no level.
@@ -86,7 +86,7 @@ registry/cache/...: Read-only file system (os error 30)`.
 Brokkr's lock is a CPU-contention gate, taken by `check`, `test`, `clippy`
 and `bench` but not `fmt`. Cargo's own target-directory locking protects
 build state, so a partitioned brokkr lock costs contention and noisy
-benchmarks, both recoverable. For the same reason `review` must not hold the
+benchmarks, both recoverable. For the same reason `hrafnar` must not hold the
 lock around a run: model latency dominates a run, and holding a CPU gate
 across it blocks other work while the CPU is idle.
 

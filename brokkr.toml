@@ -1,8 +1,8 @@
-project = "review"
+project = "hrafnar"
 
 [test]
 debug = true
-default_package = "review"
+default_package = "hrafnar"
 
 # The documentation rules from AGENTS.md ("Document folders") and the prose
 # guide `docs/` and `reference/` follow: no history outside CHANGELOG.md, no

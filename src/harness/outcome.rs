@@ -2,10 +2,10 @@
 //! observed it, read by every decision and rendering that follows.
 //!
 //! The facts are a product, not a sum. An answer, a reason the harness
-//! stated, a failure `review` diagnosed itself and `review` ending the process
+//! stated, a failure `hrafnar` diagnosed itself and `hrafnar` ending the process
 //! are independent observations, and every combination of them occurs: codex
 //! can record a stated stream error and still capture an answer, a watchdog
-//! kill can follow a recovered answer, grok can state a failure that `review`
+//! kill can follow a recovered answer, grok can state a failure that `hrafnar`
 //! then also fails to verify. A sum type forced a precedence onto those and
 //! lost one fact each time, so the policy questions (did it answer, did it
 //! fail, may it be retried, was it interrupted) are methods over the facts
@@ -16,7 +16,7 @@
 //! `HarnessResult::output`, never an outcome with nothing set. A turn that
 //! ran and produced nothing is the opposite: an `Ok` turn whose outcome says
 //! so. Collapsing it into `Err` would drop the session id (the cut-off turn is
-//! the one most worth resuming) and leave `review message`'s cold-cache clock
+//! the one most worth resuming) and leave `hrafnar message`'s cold-cache clock
 //! stale after a turn that warmed the cache.
 
 use super::{Digest, DigestSummary};
@@ -32,27 +32,27 @@ pub enum Answer {
     Recovered,
 }
 
-/// Whether `review` ended the harness process rather than letting it exit.
+/// Whether `hrafnar` ended the harness process rather than letting it exit.
 /// Interrupted versus killed is policy (an answer wins over an interrupt);
 /// the `Termination` is the cause, and is never used to infer which.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndedBy {
     Natural,
-    /// An interrupt request (`review interrupt`, `review message`, or a signal
-    /// to `review`) ended a turn that had no answer. The cause says which.
+    /// An interrupt request (`hrafnar interrupt`, `hrafnar message`, or a signal
+    /// to `hrafnar`) ended a turn that had no answer. The cause says which.
     Interrupted(Termination),
-    /// `review` killed the process for its own reason (the codex watchdog).
+    /// `hrafnar` killed the process for its own reason (the codex watchdog).
     Killed(Termination),
 }
 
-/// Why `review` ended a harness process. Persisted as its `Display` text in
-/// `terminated_by_review` (the row schema is a flat string, and stays one), so
+/// Why `hrafnar` ended a harness process. Persisted as its `Display` text in
+/// `terminated_by_hrafnar` (the row schema is a flat string, and stays one), so
 /// the text of each cause is fixed: rows and greps depend on it exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Termination {
-    /// `review` itself was signalled to stop.
+    /// `hrafnar` itself was signalled to stop.
     Signal,
-    /// `review interrupt` or `review message`.
+    /// `hrafnar interrupt` or `hrafnar message`.
     OperatorInterrupt,
     Watchdog(WatchdogTermination),
     /// A persisted reason that is not one of the canonical texts, kept
@@ -68,8 +68,8 @@ pub enum WatchdogTermination {
     Stalled { quiet_secs: u64 },
 }
 
-const SIGNAL_TEXT: &str = "review was signalled to stop";
-const OPERATOR_TEXT: &str = "operator interrupt (`review interrupt`)";
+const SIGNAL_TEXT: &str = "hrafnar was signalled to stop";
+const OPERATOR_TEXT: &str = "operator interrupt (`hrafnar interrupt`)";
 const STRANDED_TEXT: &str = "watchdog: stranded completion";
 
 impl std::fmt::Display for Termination {
@@ -119,7 +119,7 @@ pub struct Outcome {
     /// limit, an API error). Kept even beside an answer: it is evidence, and
     /// the retry policy filters it (`stated_failure`), not the record.
     pub stated: Option<String>,
-    /// A failure `review` diagnosed itself: a result it could not classify,
+    /// A failure `hrafnar` diagnosed itself: a result it could not classify,
     /// background results it could not verify. Fails the run even beside an
     /// answer.
     pub unverified: Option<String>,
@@ -171,10 +171,10 @@ impl Outcome {
         self
     }
 
-    /// Settle how `review` ended the run, once for every runner. An answer
+    /// Settle how `hrafnar` ended the run, once for every runner. An answer
     /// wins over an interrupt request: the harness can finish between the
     /// request and the signal, and calling that interrupted would report a
-    /// completed run as cut short. A kill `review` made for its own reason is
+    /// completed run as cut short. A kill `hrafnar` made for its own reason is
     /// kept as the stated termination either way, so an interrupt landing on a
     /// watchdog kill does not erase what the watchdog saw.
     pub fn ended(
@@ -202,7 +202,7 @@ impl Outcome {
         self.answer != Answer::None
     }
 
-    /// The exit-status verdict: no answer, or an answer `review` could not
+    /// The exit-status verdict: no answer, or an answer `hrafnar` could not
     /// vouch for. A non-zero exit after an answer does not fail a run.
     pub fn failed(&self) -> bool {
         self.unverified.is_some() || !self.has_answer()
@@ -225,7 +225,7 @@ impl Outcome {
         matches!(self.ended_by, EndedBy::Interrupted(_))
     }
 
-    /// Why `review` ended the process, if it did.
+    /// Why `hrafnar` ended the process, if it did.
     pub fn termination(&self) -> Option<&Termination> {
         match &self.ended_by {
             EndedBy::Natural => None,
@@ -261,7 +261,7 @@ impl Outcome {
         } else {
             Answer::None
         };
-        let ended_by = match (d.interrupted, d.terminated_by_review.clone()) {
+        let ended_by = match (d.interrupted, d.terminated_by_hrafnar.clone()) {
             (true, why) => EndedBy::Interrupted(
                 why.as_deref()
                     .map_or(Termination::OperatorInterrupt, Termination::parse),
@@ -272,7 +272,7 @@ impl Outcome {
         Self {
             answer,
             stated: d.turn_error.clone(),
-            unverified: d.review_error.clone(),
+            unverified: d.hrafnar_error.clone(),
             ended_by,
             auth: None,
         }
@@ -295,9 +295,9 @@ impl Outcome {
     }
 
     /// The outcome lines of a digest, live or persisted, in reading order: what
-    /// was stated, what `review` diagnosed, the status note, who ended the run,
+    /// was stated, what `hrafnar` diagnosed, the status note, who ended the run,
     /// and how the missing answer (if any) should be read. The one renderer, so
-    /// `review sessions` says what the run printed.
+    /// `hrafnar sessions` says what the run printed.
     pub fn lines(&self, f: &StatusFacts<'_>) -> Vec<String> {
         let mut out = vec![format!("captured: {}", self.answer == Answer::Captured)];
         // Ahead of everything else: the harness said why the turn ended,
@@ -306,7 +306,7 @@ impl Outcome {
             out.push(format!("turn failed: {msg}"));
         }
         if let Some(msg) = &self.unverified {
-            out.push(format!("review failed: {msg}"));
+            out.push(format!("hrafnar failed: {msg}"));
         }
         if self.has_answer() && f.exit_code.is_none() && !f.signaled {
             out.push("note: answer captured; process exit status could not be confirmed".into());
@@ -314,7 +314,7 @@ impl Outcome {
         // Before the notes below: it reframes the exit code and signal, which
         // otherwise read as the harness dying on its own.
         if let Some(why) = self.termination() {
-            out.push(format!("terminated by review: {why}"));
+            out.push(format!("terminated by hrafnar: {why}"));
             if let Some(secs) = f.quiet_secs {
                 out.push(format!("  rollout silent for: {secs}s"));
             }
@@ -339,7 +339,7 @@ impl Outcome {
                     "note: interrupted before a final answer; the text below is whatever \
                      it had produced by then"
                 } else if self.termination().is_some() {
-                    "note: review terminated the run; the text below is whatever it \
+                    "note: hrafnar terminated the run; the text below is whatever it \
                      had produced by then"
                 } else if f.exit_code != Some(0) || f.signaled {
                     "note: run died without a final answer; the text below is the last \

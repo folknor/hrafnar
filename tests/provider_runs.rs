@@ -1,8 +1,8 @@
 //! End-to-end tests for all harness runners, driven by stub harnesses.
 //!
 //! An integration test rather than a unit test because every harness runs
-//! under a keeper, and the keeper is the built `review` binary: Cargo hands an
-//! integration test its path (`CARGO_BIN_EXE_review`) and gives a unit test
+//! under a keeper, and the keeper is the built `hrafnar` binary: Cargo hands an
+//! integration test its path (`CARGO_BIN_EXE_hrafnar`) and gives a unit test
 //! nothing of the kind, so only here do the runners run under exactly the
 //! keeper that ships.
 //!
@@ -33,7 +33,7 @@
 //!
 //! `HarnessRuntime::data` is also redirected there, and that is load-bearing
 //! rather than tidiness: `CODEX_HOME` only redirects the *child*, so without
-//! it `review`'s own data paths resolve from the test process's real
+//! it `hrafnar`'s own data paths resolve from the test process's real
 //! `HOME`/`XDG_DATA_HOME` and stub incident bundles land in the operator's
 //! real incident directory.
 //!
@@ -55,7 +55,7 @@
 mod fixtures;
 
 use anyhow::Result;
-use review::harness::{
+use hrafnar::harness::{
     Digest, Harness, HarnessCommand, HarnessCommands, HarnessResult, HarnessRuntime, invoke,
 };
 use std::collections::BTreeMap;
@@ -65,10 +65,10 @@ use std::path::{Path, PathBuf};
 /// Assertion fields may be moved independently; the owner stays in this scope.
 struct FixtureRun {
     text: String,
-    outcome: review::harness::Outcome,
+    outcome: hrafnar::harness::Outcome,
     session_id: Option<String>,
     digest: Option<Digest>,
-    leftovers: review::contained::Leftovers,
+    leftovers: hrafnar::contained::Leftovers,
     owner: HarnessResult,
 }
 
@@ -89,7 +89,7 @@ fn fixture_run(mut owner: HarnessResult) -> Result<FixtureRun> {
 
 /// The flat persisted form of a run: its outcome over its forensics (or
 /// none), which is what the assertions below read the outcome facts from.
-fn summary_of(run: &FixtureRun) -> review::harness::DigestSummary {
+fn summary_of(run: &FixtureRun) -> hrafnar::harness::DigestSummary {
     match &run.digest {
         Some(d) => d.summary(&run.outcome),
         None => Digest::default().summary(&run.outcome),
@@ -121,7 +121,7 @@ impl Scratch {
     fn new() -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-scratch")
-            .join(review::config::generate_uuid());
+            .join(hrafnar::config::generate_uuid());
         std::fs::create_dir_all(root.join("codex-home")).expect("create scratch dirs");
         std::fs::create_dir_all(root.join("project")).expect("create project dir");
         Self {
@@ -146,10 +146,10 @@ impl Scratch {
 
     /// Isolated XDG data root for in-flight markers and incident bundles.
     ///
-    /// Redirecting `CODEX_HOME` only redirects the *child process*; `review`'s
+    /// Redirecting `CODEX_HOME` only redirects the *child process*; `hrafnar`'s
     /// own data paths resolve from this process's real `HOME`/`XDG_DATA_HOME`.
     /// Without this override the suite wrote stub incident bundles straight into
-    /// the operator's real `~/.local/share/review/incidents`.
+    /// the operator's real `~/.local/share/hrafnar/incidents`.
     fn data_root(&self) -> PathBuf {
         self.root.join("data")
     }
@@ -166,7 +166,7 @@ impl Scratch {
 
     /// Incident bundles written by a run under this scratch root.
     fn incident_dirs(&self) -> Vec<PathBuf> {
-        let base = self.data_root().join("review").join("incidents");
+        let base = self.data_root().join("hrafnar").join("incidents");
         match std::fs::read_dir(base) {
             Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
             Err(_) => Vec::new(),
@@ -244,7 +244,7 @@ fn stub_preamble() -> String {
 # Record our own pid so a test that deliberately leaves this process unreaped
 # can kill its process group afterwards.
 printf '%s\n' "$$" > "$CODEX_HOME/pid"
-# Drain the prompt so review's stdin write completes rather than seeing EPIPE.
+# Drain the prompt so hrafnar's stdin write completes rather than seeing EPIPE.
 cat > /dev/null
 ROLL_DIR="$CODEX_HOME/sessions/2026/01/01"
 mkdir -p "$ROLL_DIR"
@@ -266,7 +266,7 @@ rollout_started
 fn fast_runtime(scratch: &Scratch) -> HarnessRuntime {
     HarnessRuntime {
         claude_token: None,
-        run_id: review::sessions::handoff::RunId::default(),
+        run_id: hrafnar::sessions::handoff::RunId::default(),
         reservation: None,
         predecessor: None,
         // Execute the stable system shell, not the fixture file another test
@@ -283,7 +283,7 @@ fn fast_runtime(scratch: &Scratch) -> HarnessRuntime {
             );
             commands
         },
-        timings: review::watchdog::Timings {
+        timings: hrafnar::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
             // Mirrors the production ordering (3 min vs 15 min) for realism.
@@ -294,10 +294,10 @@ fn fast_runtime(scratch: &Scratch) -> HarnessRuntime {
             stall_grace: Some(std::time::Duration::from_millis(600)),
         },
         drain_grace: std::time::Duration::from_millis(300),
-        data: review::data::DataDir::at(scratch.data_root()),
-        log_family: review::data::LogFamily::Public,
+        data: hrafnar::data::DataDir::at(scratch.data_root()),
+        log_family: hrafnar::data::LogFamily::Public,
         // One domain per fixture, shared by its turns and version probes.
-        lifecycle: review::supervisor::Lifecycle::default(),
+        lifecycle: hrafnar::supervisor::Lifecycle::default(),
         teardown: fast_teardown(),
     }
 }
@@ -305,10 +305,10 @@ fn fast_runtime(scratch: &Scratch) -> HarnessRuntime {
 /// The real keeper, paced for tests: graces short enough to keep the suite
 /// fast, long enough that a cooperative process still gets a real chance to
 /// honour SIGTERM first.
-fn fast_teardown() -> review::contained::Settings {
-    review::contained::Settings {
-        keeper: PathBuf::from(env!("CARGO_BIN_EXE_review")),
-        schedule: review::keeper::TeardownSchedule {
+fn fast_teardown() -> hrafnar::contained::Settings {
+    hrafnar::contained::Settings {
+        keeper: PathBuf::from(env!("CARGO_BIN_EXE_hrafnar")),
+        schedule: hrafnar::keeper::TeardownSchedule {
             leftover_grace: std::time::Duration::from_millis(200),
             terminate_grace: std::time::Duration::from_millis(400),
             kill_phase: std::time::Duration::from_millis(600),
@@ -362,7 +362,7 @@ async fn run_codex_stub(
     script: &str,
     runtime: &HarnessRuntime,
     resume: Option<&str>,
-    launched: Option<review::harness::LaunchSignal>,
+    launched: Option<hrafnar::harness::LaunchSignal>,
 ) -> Result<FixtureRun> {
     let shim = scratch.root.join("codex-argv.sh");
     std::fs::write(&shim, format!("{CODEX_STUB_ARGS}\n. \"$STUB_BODY\"\n"))
@@ -395,23 +395,23 @@ async fn run_codex_stub(
         ),
     ]);
     let start = match resume {
-        Some(id) => review::harness::SessionStart::Resume(review::harness::SessionId::parse(id)?),
-        None => review::harness::SessionStart::Fresh { id: None },
+        Some(id) => hrafnar::harness::SessionStart::Resume(hrafnar::harness::SessionId::parse(id)?),
+        None => hrafnar::harness::SessionStart::Fresh { id: None },
     };
     fixture_run(
         invoke(
-            review::harness::LaunchSpec {
+            hrafnar::harness::LaunchSpec {
                 harness: Harness::Codex,
                 start,
                 settings: fixture_settings(
                     Harness::Codex,
-                    review::config::Profile {
+                    hrafnar::config::Profile {
                         env: Some(env),
                         ..Default::default()
                     },
                 ),
                 prompt: if resume.is_some() {
-                    "continue review"
+                    "continue hrafnar"
                 } else {
                     "review this"
                 }
@@ -497,11 +497,11 @@ sleep 3600
     );
     assert!(
         summary
-            .terminated_by_review
+            .terminated_by_hrafnar
             .as_deref()
             .is_some_and(|why| why.contains("watchdog")),
         "digest must record the watchdog kill, got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
     assert_eq!(
         run.session_id.as_deref(),
@@ -541,7 +541,7 @@ sleep 3600
         assert!(!summary.interrupted);
         assert!(
             summary
-                .terminated_by_review
+                .terminated_by_hrafnar
                 .as_deref()
                 .is_some_and(|why| why.contains("stranded"))
         );
@@ -588,7 +588,7 @@ sleep 3600
     let summary = summary_of(&run);
 
     assert!(run.digest.is_some(), "digest");
-    let why = summary.terminated_by_review.unwrap_or_default();
+    let why = summary.terminated_by_hrafnar.unwrap_or_default();
     assert!(
         why.contains("stranded"),
         "an answered run must be stranded, not stalled; got {why:?}"
@@ -627,11 +627,11 @@ sleep 3600
     let digest = run.digest.expect("digest");
     assert!(
         summary
-            .terminated_by_review
+            .terminated_by_hrafnar
             .as_deref()
             .is_some_and(|why| why.contains("stall timeout")),
         "the stall timeout must be what ended this run, got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
     // The whole point of the answer gate: nothing was produced, so nothing may
     // be reported as a result.
@@ -860,9 +860,9 @@ exit 0
 
     let digest = run.digest.expect("digest");
     assert!(
-        summary.terminated_by_review.is_none(),
+        summary.terminated_by_hrafnar.is_none(),
         "an active run must never be killed even once its answer exists, got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
     assert_eq!(
         digest.exit.code(),
@@ -904,7 +904,7 @@ printf '%s\n' 'ERROR: codex log line before the hang'
 # can clean it up instead of leaking it into the rest of the suite.
 sleep 30 &
 echo $! > "$LINGER_PID"
-# Parent exits at once: review reaps it while the pipe is still held open.
+# Parent exits at once: hrafnar reaps it while the pipe is still held open.
 exit 0
 "#,
         preamble = stub_preamble()
@@ -1007,11 +1007,11 @@ sleep 300
     assert!(run.digest.is_some(), "digest");
     assert!(
         summary
-            .terminated_by_review
+            .terminated_by_hrafnar
             .as_deref()
             .is_some_and(|why| why.contains("watchdog")),
         "the watchdog must be what ended this run, got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
 
     // The keeper is reaped only after its teardown, so the descendant is gone
@@ -1105,7 +1105,7 @@ exit 1
 
     // A refusal is still suspicious enough to bundle - the evidence is worth
     // keeping - but the bundle now carries the reason on its face, so
-    // `review incidents` can say what happened instead of guessing "died".
+    // `hrafnar incidents` can say what happened instead of guessing "died".
     let dirs = scratch.incident_dirs();
     assert_eq!(dirs.len(), 1, "a refused run still writes one bundle");
     let meta = std::fs::read_to_string(dirs[0].join("meta.json")).expect("meta.json");
@@ -1132,7 +1132,7 @@ while :; do sleep 0.05; done
 }
 
 /// Run `stub` as the owner and `interrupt_cmd::interrupt` against it, the way
-/// `review interrupt` would from another process. The owner's sidecar row -
+/// `hrafnar interrupt` would from another process. The owner's sidecar row -
 /// which `invoke` does not write itself - is appended when its run
 /// returns, as the fan-out task does.
 fn publish_stub_handoff(runtime: &HarnessRuntime, run: &FixtureRun) {
@@ -1141,13 +1141,13 @@ fn publish_stub_handoff(runtime: &HarnessRuntime, run: &FixtureRun) {
     // polling closure; app recording itself has an injected-domain test.
     let path = runtime
         .data
-        .sessions(review::data::LogFamily::Public)
+        .sessions(hrafnar::data::LogFamily::Public)
         .expect("sessions path");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let row = serde_json::json!({
         "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
         "audit_id": "a", "provider": run.owner.harness.as_str(), "archetype": "bare",
-        "session_id": run.session_id, "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
+        "session_id": run.session_id, "operator_prompt": "", "assembled_prompt": "", "hrafnar_version": "0",
     });
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -1157,10 +1157,10 @@ fn publish_stub_handoff(runtime: &HarnessRuntime, run: &FixtureRun) {
         .expect("log")
         .write_all(format!("{row}\n").as_bytes())
         .expect("append");
-    review::sessions::handoff::publish(
+    hrafnar::sessions::handoff::publish(
         &runtime.data,
-        &review::sessions::handoff::Handoff {
-            schema: review::sessions::handoff::PROTOCOL,
+        &hrafnar::sessions::handoff::Handoff {
+            schema: hrafnar::sessions::handoff::PROTOCOL,
             requested: run.owner.run_id.clone().expect("invoke run id"),
             interrupted: run.outcome.interrupted(),
             final_session: run.session_id.clone(),
@@ -1173,7 +1173,7 @@ fn publish_stub_handoff(runtime: &HarnessRuntime, run: &FixtureRun) {
 async fn interrupt_stub(
     scratch: &Scratch,
     stub: &str,
-) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<hrafnar::interrupt_cmd::Outcome>) {
     let mut runtime = fast_runtime(scratch);
     // The stub is silent while it waits to be interrupted; the stall timeout
     // must not be what ends it.
@@ -1188,12 +1188,12 @@ async fn interrupt_stub(
         run
     };
     let interrupter = async {
-        // `review interrupt` refuses a run whose pid is not offered yet, so
+        // `hrafnar interrupt` refuses a run whose pid is not offered yet, so
         // wait for it the way an operator would retry.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while review::inflight::live_marker(STUB_SESSION, Some(&data_root))
+        while hrafnar::inflight::live_marker(STUB_SESSION, Some(&data_root))
             .filter(|m| m.signal_ready)
-            .and_then(|m| m.keeper.map(review::process::ProcessIdentity::pid))
+            .and_then(|m| m.keeper.map(hrafnar::process::ProcessIdentity::pid))
             .is_none()
         {
             assert!(
@@ -1202,12 +1202,12 @@ async fn interrupt_stub(
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        review::interrupt_cmd::interrupt(STUB_SESSION, Some(&data_root)).await
+        hrafnar::interrupt_cmd::interrupt(STUB_SESSION, Some(&data_root)).await
     };
     tokio::join!(owner, interrupter)
 }
 
-/// `review interrupt` end to end, against a run that has no answer yet. From
+/// `hrafnar interrupt` end to end, against a run that has no answer yet. From
 /// the exit status alone this is a mid-turn death; the request is what must
 /// turn it into an interrupt: flagged on the digest (so the fan-out does not
 /// auto-resume past it), no incident bundle, the request consumed, and the verb
@@ -1226,11 +1226,11 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
     assert!(summary.interrupted, "and persist it");
     assert!(
         summary
-            .terminated_by_review
+            .terminated_by_hrafnar
             .as_deref()
             .is_some_and(|why| why.contains("operator interrupt")),
         "got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
     assert_eq!(digest.exit.code(), Some(1));
     assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
@@ -1239,13 +1239,13 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
         "an interrupt is explained, so it is not an incident"
     );
     assert!(
-        !review::inflight::take_interrupt_request(STUB_SESSION, Some(&scratch.data_root())),
+        !hrafnar::inflight::take_interrupt_request(STUB_SESSION, Some(&scratch.data_root())),
         "the run consumed the request"
     );
 }
 
-/// A signalled `review` (an orchestrator stopping its background task) ends the
-/// turn the way `review interrupt` does instead of killing codex: the run comes
+/// A signalled `hrafnar` (an orchestrator stopping its background task) ends the
+/// turn the way `hrafnar interrupt` does instead of killing codex: the run comes
 /// back interrupted, with its session id, so it can be recorded and continued.
 #[tokio::test]
 async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
@@ -1259,9 +1259,9 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
         // As in production, the SIGINT path is only taken once codex has
         // spoken; before that the group is killed instead.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while review::inflight::live_marker(STUB_SESSION, Some(&data_root))
+        while hrafnar::inflight::live_marker(STUB_SESSION, Some(&data_root))
             .filter(|m| m.signal_ready)
-            .and_then(|m| m.keeper.map(review::process::ProcessIdentity::pid))
+            .and_then(|m| m.keeper.map(hrafnar::process::ProcessIdentity::pid))
             .is_none()
         {
             assert!(
@@ -1285,11 +1285,11 @@ async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
     );
     assert!(
         summary
-            .terminated_by_review
+            .terminated_by_hrafnar
             .as_deref()
             .is_some_and(|why| why.contains("signalled")),
         "got {:?}",
-        summary.terminated_by_review
+        summary.terminated_by_hrafnar
     );
     assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
     assert!(scratch.incident_dirs().is_empty());
@@ -1316,7 +1316,7 @@ async fn a_run_that_already_answered_is_not_marked_interrupted() {
     assert!(run.digest.is_some(), "digest");
     assert!(summary.captured, "the answer was written before the signal");
     assert!(!summary.interrupted, "so the run is not an interrupt");
-    assert!(summary.terminated_by_review.is_none());
+    assert!(summary.terminated_by_hrafnar.is_none());
     assert_eq!(run.text, "THE ANSWER");
     assert!(
         !outcome.expect("the verb succeeds").interrupted,
@@ -1452,19 +1452,19 @@ async fn run_compat_stub(
     );
     fixture_run(
         invoke(
-            review::harness::LaunchSpec {
+            hrafnar::harness::LaunchSpec {
                 harness,
                 start: {
                     match resume {
-                        Some(id) => review::harness::SessionStart::Resume(
-                            review::harness::SessionId::parse(id)?,
+                        Some(id) => hrafnar::harness::SessionStart::Resume(
+                            hrafnar::harness::SessionId::parse(id)?,
                         ),
-                        None => review::harness::SessionStart::Fresh { id: None },
+                        None => hrafnar::harness::SessionStart::Fresh { id: None },
                     }
                 },
                 settings: fixture_settings(
                     harness,
-                    review::config::Profile {
+                    hrafnar::config::Profile {
                         env: Some(env.clone()),
                         ..Default::default()
                     },
@@ -1494,13 +1494,13 @@ async fn a_claude_resume_reports_the_session_id_it_was_given() {
 }
 
 /// The session id of the one `harness` run in flight under `scratch`, once
-/// its pid is offered for signalling - which is what `review interrupt` waits
+/// its pid is offered for signalling - which is what `hrafnar interrupt` waits
 /// for.
 async fn compat_signalable(harness: Harness, scratch: &Scratch) -> String {
     let data_root = scratch.data_root();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if let Some(m) = review::inflight::read_live(Some(&data_root))
+        if let Some(m) = hrafnar::inflight::read_live(Some(&data_root))
             .into_iter()
             .find(|m| m.harness == harness.as_str() && m.signal_ready)
         {
@@ -1514,26 +1514,26 @@ async fn compat_signalable(harness: Harness, scratch: &Scratch) -> String {
     }
 }
 
-/// Run `body` as the owner and `review interrupt` against it from "another
+/// Run `body` as the owner and `hrafnar interrupt` against it from "another
 /// process", appending the owner's sidecar row when its run returns, as the
 /// fan-out task does. The interrupt is sent once the harness's pid is offered.
 async fn compat_interrupt_stub(
     harness: Harness,
     scratch: &Scratch,
     body: &str,
-) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<hrafnar::interrupt_cmd::Outcome>) {
     compat_interrupt_stub_at(harness, scratch, body, true).await
 }
 
 /// As `compat_interrupt_stub`, but `after_pid: false` sends the interrupt as
 /// soon as the run is marked in flight - before the first event, as a second
-/// `review message` does when its launch lock hands over.
+/// `hrafnar message` does when its launch lock hands over.
 async fn compat_interrupt_stub_at(
     harness: Harness,
     scratch: &Scratch,
     body: &str,
     after_pid: bool,
-) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
+) -> (FixtureRun, Result<hrafnar::interrupt_cmd::Outcome>) {
     let runtime = fast_runtime(scratch);
     let data_root = scratch.data_root();
     let owner = async {
@@ -1549,7 +1549,7 @@ async fn compat_interrupt_stub_at(
         } else {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                if let Some(m) = review::inflight::read_live(Some(&data_root)).pop() {
+                if let Some(m) = hrafnar::inflight::read_live(Some(&data_root)).pop() {
                     assert!(!m.signal_ready, "the stub has not spoken yet");
                     break m.session_id.clone();
                 }
@@ -1557,7 +1557,7 @@ async fn compat_interrupt_stub_at(
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         };
-        review::interrupt_cmd::interrupt(&sid, Some(&data_root)).await
+        hrafnar::interrupt_cmd::interrupt(&sid, Some(&data_root)).await
     };
     tokio::join!(owner, interrupter)
 }
@@ -1593,9 +1593,9 @@ async fn a_claude_run_launches_with_background_off_and_reports_its_answer() {
         assert!(env.lines().any(|l| l == var), "{var} must reach claude");
     }
     assert!(
-        review::inflight::read_live(Some(&scratch.data_root()))
+        hrafnar::inflight::read_live(Some(&scratch.data_root()))
             .iter()
-            .all(|m| m.phase == review::inflight::Phase::HandoffPending),
+            .all(|m| m.phase == hrafnar::inflight::Phase::HandoffPending),
         "invoke retains pending evidence until recording or result drop"
     );
 }
@@ -1626,11 +1626,11 @@ async fn review_interrupt_ends_a_claude_compatible_turn_and_keeps_its_session() 
         );
         assert!(
             summary
-                .terminated_by_review
+                .terminated_by_hrafnar
                 .as_deref()
                 .is_some_and(|why| why.contains("operator interrupt")),
             "{harness}: got {:?}",
-            summary.terminated_by_review
+            summary.terminated_by_hrafnar
         );
         assert!(
             run.text.contains("interrupted"),
@@ -1639,7 +1639,7 @@ async fn review_interrupt_ends_a_claude_compatible_turn_and_keeps_its_session() 
         );
         let sid = run.session_id.expect("the session survives the interrupt");
         assert!(
-            !review::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
+            !hrafnar::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
             "{harness}: the run consumed the request"
         );
     }
@@ -1647,7 +1647,7 @@ async fn review_interrupt_ends_a_claude_compatible_turn_and_keeps_its_session() 
 
 #[tokio::test]
 async fn review_interrupt_waits_for_a_claude_compatible_run_that_has_not_spoken_yet() {
-    // A second `review message` meets a run in the second after it launched,
+    // A second `hrafnar message` meets a run in the second after it launched,
     // before the first event offers its pid. Refusing then lost the message;
     // the verb waits for the pid instead.
     for harness in CLAUDE_COMPAT {
@@ -1710,7 +1710,7 @@ async fn a_stop_signal_ends_a_started_claude_compatible_turn_as_an_interrupt() {
         );
         assert!(
             summary
-                .terminated_by_review
+                .terminated_by_hrafnar
                 .as_deref()
                 .is_some_and(|why| why.contains("signalled")),
             "{harness}"
@@ -1739,7 +1739,7 @@ async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session
             // The marker goes up at spawn; the stub never speaks, so no pid is
             // offered.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while review::inflight::read_live(Some(&data_root)).is_empty() {
+            while hrafnar::inflight::read_live(Some(&data_root)).is_empty() {
                 assert!(std::time::Instant::now() < deadline, "no marker");
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
@@ -1758,7 +1758,7 @@ async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session
             err.to_string().contains(harness.as_str()),
             "{harness}: {err}"
         );
-        assert!(review::inflight::read_live(Some(&data_root)).is_empty());
+        assert!(hrafnar::inflight::read_live(Some(&data_root)).is_empty());
     }
 }
 
@@ -1811,13 +1811,13 @@ async fn output_before_init_is_not_a_claude_compatible_start() {
 
 #[tokio::test]
 async fn a_stale_interrupt_request_does_not_mark_a_claude_compatible_resume_interrupted() {
-    // Left by a `review` killed before it consumed it. A resume that then fails
+    // Left by a `hrafnar` killed before it consumed it. A resume that then fails
     // for its own reason must report that reason, not an interrupt.
     for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let sid = "0c1a0000-0000-4000-8000-000000000001";
-        std::fs::create_dir_all(scratch.data_root().join("review/inflight")).expect("dir");
-        review::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
+        std::fs::create_dir_all(scratch.data_root().join("hrafnar/inflight")).expect("dir");
+        hrafnar::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
         let body = format!(
             "{CLAUDE_STUB_INIT}\n{}\nexit 1",
             stub_failure(harness, "rate limited")
@@ -1876,7 +1876,7 @@ async fn a_maki_error_result_with_exit_zero_is_a_stated_failure() {
 
 #[tokio::test]
 async fn a_maki_cancelled_by_someone_else_is_a_stated_cancellation() {
-    // A SIGTERM delivered to maki directly, not through review: maki prints a
+    // A SIGTERM delivered to maki directly, not through hrafnar: maki prints a
     // `cancelled` result and exits 143. With no interrupt request, that is
     // maki's stated cancellation, not an interrupt by the operator.
     let scratch = Scratch::new();
@@ -1946,7 +1946,7 @@ async fn a_truncated_maki_answer_is_not_an_answer() {
 }
 
 /// Whether `session_id`'s marker is readable once this task sees `launched`
-/// fire. `review message` releases its session launch lock on that signal, so
+/// fire. `hrafnar message` releases its session launch lock on that signal, so
 /// a marker written any later leaves a window in which a second message sees
 /// no turn in flight and launches beside this one.
 ///
@@ -1963,7 +1963,7 @@ async fn marked_at_launch(
     data_root: &std::path::Path,
 ) -> bool {
     launched.await.expect("the run signals its launch");
-    review::inflight::live_marker(session_id, Some(data_root)).is_some()
+    hrafnar::inflight::live_marker(session_id, Some(data_root)).is_some()
 }
 
 #[tokio::test]
@@ -1990,17 +1990,17 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let data_root = scratch.data_root();
     let project = scratch.project();
-    let start = review::harness::SessionStart::Resume(
-        review::harness::SessionId::parse(sid).expect("test id"),
+    let start = hrafnar::harness::SessionStart::Resume(
+        hrafnar::harness::SessionId::parse(sid).expect("test id"),
     );
     let selection =
-        review::harness::ModelSpec::new(review::harness::Harness::Claude, None, None, &[]);
-    let launch = review::harness::LaunchSpec {
+        hrafnar::harness::ModelSpec::new(hrafnar::harness::Harness::Claude, None, None, &[]);
+    let launch = hrafnar::harness::LaunchSpec {
         harness: Harness::Claude,
         start: start.clone(),
         settings: fixture_settings(
             Harness::Claude,
-            review::config::Profile {
+            hrafnar::config::Profile {
                 model: selection.model().map(str::to_owned),
                 effort: selection.effort().map(str::to_owned),
                 env: Some(env.clone()),
@@ -2038,8 +2038,8 @@ async fn a_codex_resume_is_marked_in_flight_before_it_launches() {
 
 /// The ticket's case: the agent started a hung script in a session of its own
 /// (codex's sandbox runs bwrap with `--new-session`), and codex finished. The
-/// script escaped every process group `review` knew about, so without the
-/// keeper it would run for hours after `review` reported the run over. The keeper adopts it as a
+/// script escaped every process group `hrafnar` knew about, so without the
+/// keeper it would run for hours after `hrafnar` reported the run over. The keeper adopts it as a
 /// subreaper and ends it - SIGKILL, since it ignores SIGTERM - before the run
 /// returns, and the record names it.
 #[tokio::test]
@@ -2062,7 +2062,7 @@ exit 0
     // the SIGKILL rounds), and must not read as codex refusing to exit.
     let summary = summary_of(&run);
     assert!(run.digest.is_some(), "codex digest");
-    assert_eq!(summary.terminated_by_review, None);
+    assert_eq!(summary.terminated_by_hrafnar, None);
     assert!(
         scratch.incident_dirs().is_empty(),
         "a clean run is no incident"
@@ -2201,7 +2201,7 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
     assert!(summary.captured);
     assert_eq!(digest.exit.code(), Some(7));
     assert!(summary.turn_error.is_none());
-    assert!(summary.review_error.is_none());
+    assert!(summary.hrafnar_error.is_none());
     assert!(!run.outcome.failed());
     assert_eq!(digest.turns, 2);
     assert_eq!(digest.usage.total_input, 28);
@@ -2210,7 +2210,7 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
 
 #[tokio::test]
 async fn model_selection_arguments_and_record_share_the_prepared_spec() {
-    use review::harness::{Harness, SessionStart};
+    use hrafnar::harness::{Harness, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(&format!(
         "{CLAUDE_STUB_PREAMBLE}\n{CLAUDE_STUB_INIT}\n{}",
@@ -2228,13 +2228,13 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
         "STUB_DIR".into(),
         scratch.root.to_string_lossy().into_owned(),
     )]);
-    let result = review::harness::invoke(
-        review::harness::LaunchSpec {
+    let result = hrafnar::harness::invoke(
+        hrafnar::harness::LaunchSpec {
             harness: Harness::Claude,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
                 Harness::Claude,
-                review::config::Profile {
+                hrafnar::config::Profile {
                     model: Some("chosen-model".into()),
                     effort: Some("high".into()),
                     env: Some(env.clone()),
@@ -2261,15 +2261,15 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
 
 #[tokio::test]
 async fn invalid_model_selection_is_refused_before_a_session_launches() {
-    use review::harness::{Harness, SessionStart};
+    use hrafnar::harness::{Harness, SessionStart};
     let scratch = Scratch::new();
-    let result = review::harness::invoke(
-        review::harness::LaunchSpec {
+    let result = hrafnar::harness::invoke(
+        hrafnar::harness::LaunchSpec {
             harness: Harness::Codex,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
                 Harness::Codex,
-                review::config::Profile {
+                hrafnar::config::Profile {
                     model: Some("chosen".into()),
                     effort: Some("high".into()),
                     env: None,
@@ -2352,12 +2352,12 @@ exit 1
     );
     let run = fixture_run(
         invoke(
-            review::harness::LaunchSpec {
+            hrafnar::harness::LaunchSpec {
                 harness: Harness::Codex,
-                start: review::harness::SessionStart::Fresh { id: None },
+                start: hrafnar::harness::SessionStart::Fresh { id: None },
                 settings: fixture_settings(
                     Harness::Codex,
-                    review::config::Profile {
+                    hrafnar::config::Profile {
                         env: Some(BTreeMap::from([(
                             "CODEX_HOME".into(),
                             scratch.codex_home().to_string_lossy().into_owned(),
@@ -2429,7 +2429,7 @@ async fn empty_command_program_fails_to_launch() {
 
 #[tokio::test]
 async fn grok_prefix_drives_fresh_resume_and_stated_failure_through_invoke() {
-    use review::harness::{SessionId, SessionStart};
+    use hrafnar::harness::{SessionId, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(r#"
 [ "$1" = 'prefix with spaces' ] || exit 71
@@ -2531,8 +2531,8 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
             "prompt removed on return"
         );
         assert!(
-            review::inflight::live_marker(expected_sid, Some(&scratch.data_root()))
-                .is_some_and(|m| m.phase == review::inflight::Phase::HandoffPending),
+            hrafnar::inflight::live_marker(expected_sid, Some(&scratch.data_root()))
+                .is_some_and(|m| m.phase == hrafnar::inflight::Phase::HandoffPending),
             "provider return keeps handoff pending until the app records and publishes"
         );
     };
@@ -2556,13 +2556,13 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
         ),
     ] {
         env.insert("STUB_STOP".into(), stop.into());
-        let result = review::harness::invoke(
-            review::harness::LaunchSpec {
+        let result = hrafnar::harness::invoke(
+            hrafnar::harness::LaunchSpec {
                 harness: Harness::Grok,
                 start,
                 settings: fixture_settings(
                     Harness::Grok,
-                    review::config::Profile {
+                    hrafnar::config::Profile {
                         model: Some("chosen-model".into()),
                         effort: Some("high".into()),
                         env: Some(env.clone()),
@@ -2595,7 +2595,7 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
                     .contains("cancelled")
             );
             assert!(
-                summary.review_error.is_none(),
+                summary.hrafnar_error.is_none(),
                 "background verification succeeded"
             );
         } else {
@@ -2628,15 +2628,15 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
     env.insert("STUB_WAKE".into(), "1".into());
     env.insert("STUB_STOP".into(), "end_turn".into());
     let wake_sid = "grok-wake-session";
-    let result = review::harness::invoke(
-        review::harness::LaunchSpec {
+    let result = hrafnar::harness::invoke(
+        hrafnar::harness::LaunchSpec {
             harness: Harness::Grok,
             start: SessionStart::Fresh {
                 id: Some(SessionId::parse(wake_sid).expect("id")),
             },
             settings: fixture_settings(
                 Harness::Grok,
-                review::config::Profile {
+                hrafnar::config::Profile {
                     model: Some("chosen-model".into()),
                     effort: Some("high".into()),
                     env: Some(env.clone()),
@@ -2675,14 +2675,14 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
 // Fixture settings go through the same profile constructor as production.
 fn fixture_settings(
     harness: Harness,
-    profile: review::config::Profile,
-) -> review::harness::RunSettings {
-    review::harness::RunSettings::from_profile(
+    profile: hrafnar::config::Profile,
+) -> hrafnar::harness::RunSettings {
+    hrafnar::harness::RunSettings::from_profile(
         harness,
-        Some(&review::config::HarnessEntry {
+        Some(&hrafnar::config::HarnessEntry {
             harness,
             profile,
-            layer: review::config::Layer::Local,
+            layer: hrafnar::config::Layer::Local,
             table: "[fixture]".into(),
         }),
     )
@@ -2692,7 +2692,7 @@ fn fixture_settings(
 /// a pre-turn error. A merely requested or process-local grant is never a fact.
 #[tokio::test]
 async fn grok_prepared_trust_is_verified_even_after_returned_error() {
-    use review::harness::{LaunchSpec, SessionStart};
+    use hrafnar::harness::{LaunchSpec, SessionStart};
     for durable in [false, true] {
         let scratch = Scratch::new();
         let base = std::fs::canonicalize(&scratch.root).expect("canonical scratch");
@@ -2730,14 +2730,14 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
             ("TRUST_KEY".into(), key.to_string_lossy().into_owned()),
             ("DURABLE".into(), if durable { "1" } else { "0" }.into()),
         ]);
-        let result = review::harness::invoke(
+        let result = hrafnar::harness::invoke(
             LaunchSpec {
                 harness: Harness::Grok,
                 start: SessionStart::Fresh { id: None },
                 settings: fixture_settings(
                     Harness::Grok,
-                    review::config::Profile {
-                        sandbox: Some(review::config::SandboxLevel::WorkspaceWrite),
+                    hrafnar::config::Profile {
+                        sandbox: Some(hrafnar::config::SandboxLevel::WorkspaceWrite),
                         env: Some(env),
                         ..Default::default()
                     },
@@ -2766,7 +2766,7 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
                 .expect("prepared permissions")
                 .native_to_record()
                 .expect("native selector")
-                .starts_with("review-ws-")
+                .starts_with("hrafnar-ws-")
         );
         assert!(home.join("sandbox.toml").exists());
     }
@@ -2774,15 +2774,15 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
 
 #[tokio::test]
 async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
-    use review::harness::{LaunchSpec, SessionStart};
+    use hrafnar::harness::{LaunchSpec, SessionStart};
     let scratch = Scratch::new();
-    let result = review::harness::invoke(
+    let result = hrafnar::harness::invoke(
         LaunchSpec {
             harness: Harness::Grok,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
                 Harness::Grok,
-                review::config::Profile {
+                hrafnar::config::Profile {
                     env: Some(BTreeMap::from([(
                         "GROK_HOME".into(),
                         "relative-home".into(),
@@ -2822,9 +2822,9 @@ fn protocol_fixture(
     scratch: &Scratch,
     harness: Harness,
     resume: bool,
-    level: Option<review::config::SandboxLevel>,
+    level: Option<hrafnar::config::SandboxLevel>,
     mode: &str,
-) -> (review::harness::LaunchSpec, HarnessRuntime) {
+) -> (hrafnar::harness::LaunchSpec, HarnessRuntime) {
     let protocol = match harness {
         Harness::Codex => {
             r#"
@@ -2950,18 +2950,18 @@ fi
         Harness::Maki => None,
         Harness::Codex | Harness::Claude | Harness::Grok => Some("high".into()),
     };
-    let launch = review::harness::LaunchSpec {
+    let launch = hrafnar::harness::LaunchSpec {
         harness,
         start: if resume {
-            review::harness::SessionStart::Resume(
-                review::harness::SessionId::parse(STUB_SESSION).expect("id"),
+            hrafnar::harness::SessionStart::Resume(
+                hrafnar::harness::SessionId::parse(STUB_SESSION).expect("id"),
             )
         } else {
-            review::harness::SessionStart::Fresh { id: None }
+            hrafnar::harness::SessionStart::Fresh { id: None }
         },
         settings: fixture_settings(
             harness,
-            review::config::Profile {
+            hrafnar::config::Profile {
                 model: Some("chosen-model".into()),
                 effort,
                 sandbox: level,
@@ -3005,7 +3005,7 @@ fn normalized_args(scratch: &Scratch, result: &HarnessResult) -> Vec<String> {
 
 #[tokio::test]
 async fn codex_launch_argv_table_covers_permissions_overrides_and_resume_output() {
-    use review::config::SandboxLevel;
+    use hrafnar::config::SandboxLevel;
     for requested in std::iter::once(None).chain(SandboxLevel::NAMED.into_iter().map(Some)) {
         let level = requested.clone().unwrap_or_default();
         for resume in [false, true] {
@@ -3058,11 +3058,11 @@ async fn codex_launch_argv_table_covers_permissions_overrides_and_resume_output(
                 SandboxLevel::ReadOnly => expected.extend(
                     [
                         "-c",
-                        "permissions.review-read-only.extends=\":read-only\"",
+                        "permissions.hrafnar-read-only.extends=\":read-only\"",
                         "-c",
-                        "permissions.review-read-only.network.enabled=true",
+                        "permissions.hrafnar-read-only.network.enabled=true",
                         "-c",
-                        "default_permissions=\"review-read-only\"",
+                        "default_permissions=\"hrafnar-read-only\"",
                     ]
                     .into_iter()
                     .map(str::to_owned),
@@ -3131,7 +3131,7 @@ async fn codex_launch_argv_table_covers_permissions_overrides_and_resume_output(
 #[tokio::test]
 async fn claude_launch_argv_table_keeps_permissions_and_session_modes_explicit() {
     for requested in
-        std::iter::once(None).chain(review::config::SandboxLevel::NAMED.into_iter().map(Some))
+        std::iter::once(None).chain(hrafnar::config::SandboxLevel::NAMED.into_iter().map(Some))
     {
         for resume in [false, true] {
             let scratch = Scratch::new();
@@ -3180,7 +3180,7 @@ async fn claude_launch_argv_table_keeps_permissions_and_session_modes_explicit()
 #[tokio::test]
 async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
     for requested in
-        std::iter::once(None).chain(review::config::SandboxLevel::NAMED.into_iter().map(Some))
+        std::iter::once(None).chain(hrafnar::config::SandboxLevel::NAMED.into_iter().map(Some))
     {
         for resume in [false, true] {
             let scratch = Scratch::new();
@@ -3197,7 +3197,7 @@ async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
             assert!(result.writable_roots.is_empty());
             assert_eq!(
                 result.served,
-                review::harness::Served::default(),
+                hrafnar::harness::Served::default(),
                 "an unpriced zero and the requested model are not served facts"
             );
             let expected: Vec<_> = [
@@ -3223,7 +3223,7 @@ async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
 
 #[tokio::test]
 async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
-    use review::config::SandboxLevel;
+    use hrafnar::config::SandboxLevel;
     for requested in std::iter::once(None).chain(SandboxLevel::NAMED.into_iter().map(Some)) {
         let level = requested.clone().unwrap_or_default();
         for resume in [false, true] {
@@ -3250,7 +3250,7 @@ async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
                     assert!(result.writable_roots.is_empty());
                 }
                 SandboxLevel::WorkspaceWrite => {
-                    assert!(selector.starts_with("review-ws-"));
+                    assert!(selector.starts_with("hrafnar-ws-"));
                     let automatic = std::fs::canonicalize(scratch.root.join("automatic target"))
                         .expect("automatic grant");
                     assert!(
@@ -3340,7 +3340,7 @@ async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
 
 #[tokio::test]
 async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
-    use review::config::SandboxLevel;
+    use hrafnar::config::SandboxLevel;
     for harness in Harness::all() {
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
@@ -3353,9 +3353,9 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let observer = async {
             rx.await.expect("launch handshake");
-            let marker = review::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
+            let marker = hrafnar::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
                 .expect("resume marked by launch notification");
-            assert_eq!(marker.phase, review::inflight::Phase::Running);
+            assert_eq!(marker.phase, hrafnar::inflight::Phase::Running);
             std::fs::write(scratch.root.join("release"), "go").expect("release fixture");
         };
         let (result, ()) = tokio::join!(invoke(launch, Some(tx), &runtime, None), observer);
@@ -3368,13 +3368,13 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
                 .failed(),
             "{harness}"
         );
-        let marker = review::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
+        let marker = hrafnar::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
             .expect("pending");
         assert_eq!(
             marker.run_id,
             result.run_id.as_ref().expect("run id").as_str()
         );
-        assert_eq!(marker.phase, review::inflight::Phase::HandoffPending);
+        assert_eq!(marker.phase, hrafnar::inflight::Phase::HandoffPending);
         for file in ["pwd", "cwd"] {
             assert_eq!(
                 std::fs::read_to_string(scratch.root.join(file))
@@ -3392,7 +3392,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         assert!(result.leftovers.is_clean());
         assert!(runtime.lifecycle.unresolved().is_empty());
         drop(result);
-        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+        assert!(hrafnar::inflight::read_live(Some(&scratch.data_root())).is_empty());
 
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
@@ -3412,7 +3412,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         assert!(rx.await.is_err());
         assert!(!scratch.root.join("child-pid").exists());
         drop(result);
-        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+        assert!(hrafnar::inflight::read_live(Some(&scratch.data_root())).is_empty());
 
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
@@ -3444,7 +3444,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         }
         assert!(runtime.lifecycle.unresolved().is_empty());
         drop(result);
-        assert!(review::inflight::read_live(Some(&scratch.data_root())).is_empty());
+        assert!(hrafnar::inflight::read_live(Some(&scratch.data_root())).is_empty());
     }
 }
 
@@ -3455,7 +3455,7 @@ async fn codex_derived_roots_reach_both_the_process_and_record_projection() {
         &scratch,
         Harness::Codex,
         false,
-        Some(review::config::SandboxLevel::WorkspaceWrite),
+        Some(hrafnar::config::SandboxLevel::WorkspaceWrite),
         "derived",
     );
     let result = invoke(launch, None, &runtime, None).await;

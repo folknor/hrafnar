@@ -2,7 +2,7 @@
 //!
 //! `config::parse`'s own `mod tests` covers parsing a single file; everything here
 //! is about how two files combine: which one wins, whether a winner replaces or
-//! merges, and whether the provenance (`layer`, `table`) that `review list --all`
+//! merges, and whether the provenance (`layer`, `table`) that `hrafnar list --all`
 //! reports is the provenance of the value actually used.
 
 #[allow(clippy::unwrap_used)]
@@ -18,7 +18,7 @@ mod layering {
         parse_file(raw, "global.toml", Layer::Global).unwrap()
     }
 
-    fn layered(local_raw: &str, global_raw: &str) -> Result<ReviewConfig> {
+    fn layered(local_raw: &str, global_raw: &str) -> Result<HrafnarConfig> {
         Ok(resolve(
             local(local_raw),
             Some(global(global_raw)),
@@ -27,7 +27,7 @@ mod layering {
         )?)
     }
 
-    fn entry<'a>(cfg: &'a ReviewConfig, profile: &str) -> &'a ProfileDef {
+    fn entry<'a>(cfg: &'a HrafnarConfig, profile: &str) -> &'a ProfileDef {
         &cfg.profiles[profile]
     }
 
@@ -71,16 +71,16 @@ mod layering {
                 Some(global("[profiles.deep.codex]\nmodel = \"g\"\n")),
                 "h",
                 ConfigFiles {
-                    local: Some("/p/.review.toml".into()),
-                    global: Some("/home/u/.config/review/config.toml".into()),
+                    local: Some("/p/.hrafnar.toml".into()),
+                    global: Some("/home/u/.config/hrafnar/config.toml".into()),
                     global_loaded: true,
                 },
             )
             .unwrap_err()
             .to_string();
             assert!(err.contains("profile 'deep' is defined in both"), "{err}");
-            assert!(err.contains("/p/.review.toml"), "{err}");
-            assert!(err.contains("/home/u/.config/review/config.toml"), "{err}");
+            assert!(err.contains("/p/.hrafnar.toml"), "{err}");
+            assert!(err.contains("/home/u/.config/hrafnar/config.toml"), "{err}");
             assert!(err.contains("pick another name"), "{err}");
         }
         // Without known paths the layers are still named.
@@ -169,7 +169,7 @@ mod layering {
     #[test]
     fn defaults_are_none_when_no_layer_sets_them() {
         // Nothing is built in: an unset key stays unset rather than acquiring
-        // a value `review list --all` would have to attribute to no file.
+        // a value `hrafnar list --all` would have to attribute to no file.
         let cfg = layered("[_defaults]\n", "[_defaults]\n").unwrap();
         assert!(cfg.profile.is_none());
         assert!(cfg.stall_timeout_secs.is_none());
@@ -296,28 +296,28 @@ model = \"m\"
         // Error messages about an undefined archetype/profile quote this, so
         // the operator can see the global file was looked for but not found.
         let files = ConfigFiles {
-            local: Some("/p/.review.toml".into()),
-            global: Some("/home/u/.config/review/config.toml".into()),
+            local: Some("/p/.hrafnar.toml".into()),
+            global: Some("/home/u/.config/hrafnar/config.toml".into()),
             global_loaded: false,
         };
         let mut files = files;
         let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
         assert_eq!(
             cfg.searched(),
-            "/p/.review.toml, /home/u/.config/review/config.toml (absent)"
+            "/p/.hrafnar.toml, /home/u/.config/hrafnar/config.toml (absent)"
         );
         files.global_loaded = true;
         let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
         assert_eq!(
             cfg.searched(),
-            "/p/.review.toml, /home/u/.config/review/config.toml"
+            "/p/.hrafnar.toml, /home/u/.config/hrafnar/config.toml"
         );
         files.global = None;
         let cfg = resolve(local(""), None, "h", files.clone()).unwrap();
-        assert_eq!(cfg.searched(), "/p/.review.toml");
+        assert_eq!(cfg.searched(), "/p/.hrafnar.toml");
         files.local = None;
         let cfg = resolve(local(""), None, "h", files).unwrap();
-        assert_eq!(cfg.searched(), "(no .review.toml)");
+        assert_eq!(cfg.searched(), "(no .hrafnar.toml)");
     }
 
     #[test]

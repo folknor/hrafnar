@@ -1,16 +1,16 @@
-//! Finding and reading the config files. The project's `.review.toml` is found
+//! Finding and reading the config files. The project's `.hrafnar.toml` is found
 //! by walking up from the selected directory (or taken exactly from a `-C`
 //! root) and is required for a run, because it carries the audit id; the
-//! global file is optional. `load_optional` serves `review list`, which
+//! global file is optional. `load_optional` serves `hrafnar list`, which
 //! outside a project shows the global layer alone; `project_root` locates a
-//! project without parsing it, for `review sessions`. Loading is strict: a
+//! project without parsing it, for `hrafnar sessions`. Loading is strict: a
 //! file that exists but does not parse is an error, never treated as absent,
-//! because `review message` reads `[_audit].private` from it, and a silent
+//! because `hrafnar message` reads `[_audit].private` from it, and a silent
 //! fallback would file a private project's rows in the public log.
 
 use super::{
-    CONFIG_FILENAME, ConfigFile, ConfigFiles, Layer, ReviewConfig, Selection, hostname, parse_file,
-    resolve,
+    CONFIG_FILENAME, ConfigFile, ConfigFiles, HrafnarConfig, Layer, Selection, hostname,
+    parse_file, resolve,
 };
 use super::{ConfigError, Result, SearchBoundary};
 use crate::project::ProjectRoot;
@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// Where the operator's global config lives: `$XDG_CONFIG_HOME/review/config.toml`,
-/// else `$HOME/.config/review/config.toml`.
+/// Where the operator's global config lives: `$XDG_CONFIG_HOME/hrafnar/config.toml`,
+/// else `$HOME/.config/hrafnar/config.toml`.
 pub fn global_config_path() -> Option<PathBuf> {
     global_config_path_from(
         std::env::var_os("XDG_CONFIG_HOME"),
@@ -30,7 +30,7 @@ pub fn global_config_path() -> Option<PathBuf> {
 
 /// A relative `XDG_CONFIG_HOME` or `HOME` is ignored, as the XDG spec requires
 /// for the former - either would otherwise resolve against whatever directory
-/// `review` was launched from, making the global config a per-directory one.
+/// `hrafnar` was launched from, making the global config a per-directory one.
 fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
     let base = match xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
         Some(p) => p,
@@ -39,12 +39,12 @@ fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Opt
             .filter(|h| h.is_absolute())?
             .join(".config"),
     };
-    Some(base.join("review").join("config.toml"))
+    Some(base.join("hrafnar").join("config.toml"))
 }
 
-/// Load the project's `.review.toml` (required: it carries the audit id) and
+/// Load the project's `.hrafnar.toml` (required: it carries the audit id) and
 /// the global config (optional), and resolve them for this host.
-pub fn load(sel: &Selection) -> Result<ReviewConfig> {
+pub fn load(sel: &Selection) -> Result<HrafnarConfig> {
     let local_path = match locate_config(sel)? {
         Located::Found(path) => path,
         Located::Missing(boundary) => return Err(ConfigError::NotFound { boundary }),
@@ -52,12 +52,12 @@ pub fn load(sel: &Selection) -> Result<ReviewConfig> {
     load_layers(Some(local_path))
 }
 
-/// Like `load`, but a missing `.review.toml` is not an error: the config is the
+/// Like `load`, but a missing `.hrafnar.toml` is not an error: the config is the
 /// global layer alone and the project root is `None`. A file that exists but
 /// does not parse still is - callers use this to decide things like whether a
 /// run's logs are private, and silently treating a broken config as an absent
 /// one would downgrade a private project to the public log.
-pub fn load_optional(sel: &Selection) -> Result<ReviewConfig> {
+pub fn load_optional(sel: &Selection) -> Result<HrafnarConfig> {
     match locate_config(sel)? {
         Located::Found(path) => load_layers(Some(path)),
         // An exact root was chosen as the project; showing the global layer
@@ -69,7 +69,7 @@ pub fn load_optional(sel: &Selection) -> Result<ReviewConfig> {
     }
 }
 
-/// The project root - the directory holding `.review.toml` - without parsing
+/// The project root - the directory holding `.hrafnar.toml` - without parsing
 /// anything, for callers that only need to know which project they are in.
 pub fn project_root(sel: &Selection) -> Result<Option<ProjectRoot>> {
     match locate_config(sel)? {
@@ -78,7 +78,7 @@ pub fn project_root(sel: &Selection) -> Result<Option<ProjectRoot>> {
     }
 }
 
-fn load_layers(local_path: Option<PathBuf>) -> Result<ReviewConfig> {
+fn load_layers(local_path: Option<PathBuf>) -> Result<HrafnarConfig> {
     let local = match local_path {
         Some(ref p) => {
             let raw = std::fs::read_to_string(p).map_err(|source| ConfigError::Read {
@@ -291,10 +291,13 @@ mod tests {
     #[test]
     fn global_config_path_prefers_absolute_xdg() {
         let p = global_config_path_from(Some("/x/cfg".into()), Some("/home/u".into()));
-        assert_eq!(p, Some(PathBuf::from("/x/cfg/review/config.toml")));
+        assert_eq!(p, Some(PathBuf::from("/x/cfg/hrafnar/config.toml")));
         // Relative XDG_CONFIG_HOME is ignored per the XDG spec.
         let p = global_config_path_from(Some("rel".into()), Some("/home/u".into()));
-        assert_eq!(p, Some(PathBuf::from("/home/u/.config/review/config.toml")));
+        assert_eq!(
+            p,
+            Some(PathBuf::from("/home/u/.config/hrafnar/config.toml"))
+        );
         assert_eq!(global_config_path_from(None, None), None);
         assert_eq!(global_config_path_from(None, Some("".into())), None);
         // A relative HOME would make the global config depend on the launch

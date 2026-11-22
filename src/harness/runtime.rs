@@ -78,13 +78,13 @@ pub struct HarnessRuntime {
     /// How long a pipe reader gets to finish after the child is reaped before
     /// it is aborted and we take whatever it buffered.
     pub drain_grace: std::time::Duration,
-    /// Review-owned storage, shared by markers, incidents and orphan outcomes.
+    /// Hrafnar-owned storage, shared by markers, incidents and orphan outcomes.
     pub data: crate::data::DataDir,
     pub log_family: crate::data::LogFamily,
     /// Shared command domain; default constructs an isolated one for tests.
     pub lifecycle: crate::supervisor::Lifecycle,
     /// The keeper binary and teardown pacing (see `contained`). Tests point the
-    /// keeper at the built `review` and shorten the graces.
+    /// keeper at the built `hrafnar` and shorten the graces.
     pub teardown: crate::contained::Settings,
     /// The global `claude_token_command`, shared by every claude run in this
     /// process so it is run at most once. `None` when unconfigured.

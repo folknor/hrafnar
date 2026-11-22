@@ -89,7 +89,7 @@ session, so maki uses the general one.
 
 ## Upstream patches worth sending
 
-These maki changes would fix gaps `review` works around or can't report:
+These maki changes would fix gaps `hrafnar` works around or can't report:
 
 1. `--effort` sets the session's thinking level, and a resumed headless
    session takes its stored level unless `--effort` overrides it.

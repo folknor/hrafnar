@@ -1,4 +1,4 @@
-//! `review list`: what a run here can use. By default only the archetypes and
+//! `hrafnar list`: what a run here can use. By default only the archetypes and
 //! the profiles with an installed harness; `--projects` the `-C` registry;
 //! `--all` the effective configuration and where each value came from.
 //!
@@ -6,9 +6,9 @@
 //! available; the full resolved view (file paths, sources, env names, every
 //! default) buries that answer.
 //!
-//! `.review.toml` alone does not say which archetypes, harnesses and profiles
+//! `.hrafnar.toml` alone does not say which archetypes, harnesses and profiles
 //! exist: a profile may come from
-//! `~/.config/review/config.toml`, and which harness it runs on depends on
+//! `~/.config/hrafnar/config.toml`, and which harness it runs on depends on
 //! `[_defaults].prefer` and what this host has installed - so
 //! this command is the single source of truth. It renders what the resolver
 //! produced, i.e. exactly what a run would use; it never re-parses TOML, because
@@ -23,7 +23,7 @@
 //! availability map), so it is testable without `PATH` or files; `run` only
 //! loads, probes and prints.
 
-use crate::config::{self, Harness, Profile, ProfileDef, ReviewConfig};
+use crate::config::{self, Harness, HrafnarConfig, Profile, ProfileDef};
 use anyhow::Result;
 use std::fmt::Write as _;
 
@@ -34,7 +34,7 @@ pub type Availability<'a> = &'a dyn Fn(Harness) -> bool;
 /// How much of an archetype's first prompt line the human view shows.
 const PRIME_PREVIEW_CHARS: usize = 72;
 
-/// Which view `review list` prints.
+/// Which view `hrafnar list` prints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     /// What can be run here: archetypes and runnable profiles.
@@ -45,7 +45,7 @@ pub enum View {
     All,
 }
 
-/// Works outside a project too: with no `.review.toml` it shows the global
+/// Works outside a project too: with no `.hrafnar.toml` it shows the global
 /// layer, which is what an orchestrator needs before it has picked a project.
 pub fn run(sel: &config::Selection, view: View) -> Result<()> {
     let cfg = config::load_optional(sel)?;
@@ -66,13 +66,13 @@ pub fn run(sel: &config::Selection, view: View) -> Result<()> {
 /// marked `*`, and the first line of its comment; settings are left to
 /// `--all`. Profiles with no installed harness are hidden but named, so one an
 /// agent was told to use does not just vanish.
-pub fn render_list(cfg: &ReviewConfig, avail: Availability) -> String {
+pub fn render_list(cfg: &HrafnarConfig, avail: Availability) -> String {
     let mut out = String::new();
     let _ = write_list(&mut out, cfg, avail);
     out
 }
 
-fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std::fmt::Result {
+fn write_list(out: &mut String, cfg: &HrafnarConfig, avail: Availability) -> std::fmt::Result {
     writeln!(out, "archetypes:")?;
     if cfg.archetypes.is_empty() {
         writeln!(out, "  (none)")?;
@@ -163,10 +163,10 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     writeln!(out)?;
     writeln!(
         out,
-        "steer a running agent: echo \"<new info>\" | review message <ID>; \
-         stop one: review interrupt <ID>. Never kill `review` itself."
+        "steer a running agent: echo \"<new info>\" | hrafnar message <ID>; \
+         stop one: hrafnar interrupt <ID>. Never kill `hrafnar` itself."
     )?;
-    writeln!(out, "Everything, with sources: review list --all")?;
+    writeln!(out, "Everything, with sources: hrafnar list --all")?;
     Ok(())
 }
 
@@ -174,7 +174,7 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 /// from the same function the run uses; `None` when that choice is ambiguous
 /// or nothing it could pick is installed.
 fn plain_pick(
-    cfg: &ReviewConfig,
+    cfg: &HrafnarConfig,
     name: &str,
     def: &ProfileDef,
     avail: Availability,
@@ -197,8 +197,8 @@ fn harness_names(harnesses: impl Iterator<Item = Harness>) -> String {
         .join(", ")
 }
 
-/// `review list --projects`: this host's `-C` registry.
-pub fn render_projects(cfg: &ReviewConfig) -> String {
+/// `hrafnar list --projects`: this host's `-C` registry.
+pub fn render_projects(cfg: &HrafnarConfig) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -224,7 +224,7 @@ fn env_keys(p: &Profile) -> Vec<&str> {
 }
 
 /// The terminal view: compact, no colours, one block per section.
-pub fn render_text(cfg: &ReviewConfig, avail: Availability) -> String {
+pub fn render_text(cfg: &HrafnarConfig, avail: Availability) -> String {
     let mut out = String::new();
     // Writing into a `String` cannot fail; the `fmt::Result` plumbing exists
     // only so the body can use `?` instead of discarding each `writeln!`.
@@ -232,7 +232,7 @@ pub fn render_text(cfg: &ReviewConfig, avail: Availability) -> String {
     out
 }
 
-fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std::fmt::Result {
+fn write_text(out: &mut String, cfg: &HrafnarConfig, avail: Availability) -> std::fmt::Result {
     writeln!(out, "files:")?;
     match cfg.files().local {
         Some(ref l) => writeln!(out, "  local:   {}", l.display())?,
@@ -375,9 +375,9 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         None => writeln!(out, "claude_token_command: unset")?,
     }
 
-    // Printed on every call because everyone runs `review list` before using
+    // Printed on every call because everyone runs `hrafnar list` before using
     // the tool, and an orchestrating agent told to "interrupt the agent" will
-    // otherwise stop its own background task - killing `review`, not the turn.
+    // otherwise stop its own background task - killing `hrafnar`, not the turn.
     writeln!(out)?;
     writeln!(out, "{}", steering())?;
     Ok(())
@@ -388,9 +388,9 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 fn steering() -> String {
     format!(
         "steering a running agent:
-  echo \"<new info>\" | review message <ID>   ends a {} turn in flight, then sends the message
-  review interrupt <ID>                     ends the turn without a message
-  Do not stop or kill the `review` process to interrupt an agent.",
+  echo \"<new info>\" | hrafnar message <ID>   ends a {} turn in flight, then sends the message
+  hrafnar interrupt <ID>                     ends the turn without a message
+  Do not stop or kill the `hrafnar` process to interrupt an agent.",
         Harness::interruptible_names()
     )
 }
@@ -543,7 +543,7 @@ claude = { model = \"opus\" }
 maki = { model = \"openrouter/qwen\" }
 ";
 
-    fn cfg() -> ReviewConfig {
+    fn cfg() -> HrafnarConfig {
         let local = parse_file(LOCAL, "local", Layer::Local).unwrap();
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
         resolve(
@@ -551,7 +551,7 @@ maki = { model = \"openrouter/qwen\" }
             Some(global),
             "host",
             config::ConfigFiles {
-                local: Some("/proj/.review.toml".into()),
+                local: Some("/proj/.hrafnar.toml".into()),
                 ..Default::default()
             },
         )
@@ -762,8 +762,8 @@ maki = { model = \"openrouter/qwen\" }
         ] {
             assert!(!t.contains(absent), "{absent}: {t}");
         }
-        assert!(t.contains("review message <ID>"), "{t}");
-        assert!(t.contains("review list --all"), "{t}");
+        assert!(t.contains("hrafnar message <ID>"), "{t}");
+        assert!(t.contains("hrafnar list --all"), "{t}");
     }
 
     #[test]
@@ -834,9 +834,9 @@ maki = { model = \"openrouter/qwen\" }
     #[test]
     fn steering_advice_is_always_shown() {
         let t = text(true);
-        assert!(t.contains("review message <ID>"), "{t}");
+        assert!(t.contains("hrafnar message <ID>"), "{t}");
         assert!(
-            t.contains("Do not stop or kill the `review` process"),
+            t.contains("Do not stop or kill the `hrafnar` process"),
             "{t}"
         );
     }

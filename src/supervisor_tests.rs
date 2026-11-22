@@ -72,7 +72,7 @@ async fn stopping_refuses_spawn_in_the_same_domain_only() {
     lifecycle.request_stop();
     // The nonexistent executable distinguishes admission refusal from exec
     // failure without starting any uncontained test process.
-    let mut command = Command::new("/review-nonexistent-test-command");
+    let mut command = Command::new("/hrafnar-nonexistent-test-command");
     let error = lifecycle
         .spawn(&mut command, &ctl, std::time::Duration::from_secs(7))
         .expect_err("refused");
@@ -146,7 +146,7 @@ async fn poisoned_registry_refuses_admission_and_preserves_accounting() {
     }));
     let error = lifecycle
         .spawn(
-            &mut Command::new("/review-nonexistent-test-command"),
+            &mut Command::new("/hrafnar-nonexistent-test-command"),
             &ctl,
             std::time::Duration::from_secs(7),
         )

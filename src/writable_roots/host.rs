@@ -59,10 +59,10 @@ mod tests {
     #[test]
     fn the_real_host_treats_an_empty_variable_as_unset() {
         // SAFETY: single-threaded test, and the variable is removed after.
-        unsafe { std::env::set_var("REVIEW_EMPTY_PROBE", "") };
-        assert_eq!(RealHost.var("REVIEW_EMPTY_PROBE"), None);
-        unsafe { std::env::set_var("REVIEW_EMPTY_PROBE", "x") };
-        assert_eq!(RealHost.var("REVIEW_EMPTY_PROBE").as_deref(), Some("x"));
-        unsafe { std::env::remove_var("REVIEW_EMPTY_PROBE") };
+        unsafe { std::env::set_var("HRAFNAR_EMPTY_PROBE", "") };
+        assert_eq!(RealHost.var("HRAFNAR_EMPTY_PROBE"), None);
+        unsafe { std::env::set_var("HRAFNAR_EMPTY_PROBE", "x") };
+        assert_eq!(RealHost.var("HRAFNAR_EMPTY_PROBE").as_deref(), Some("x"));
+        unsafe { std::env::remove_var("HRAFNAR_EMPTY_PROBE") };
     }
 }

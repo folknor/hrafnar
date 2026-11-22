@@ -107,7 +107,7 @@ impl std::fmt::Display for LookupError {
             Self::Expand { raw, source } => write!(f, "registered path {raw}: {source}"),
             Self::NotAbsolute { raw } => write!(
                 f,
-                "registered path {raw} is not absolute; a registry entry cannot depend on the directory review was started from"
+                "registered path {raw} is not absolute; a registry entry cannot depend on the directory hrafnar was started from"
             ),
         }
     }
@@ -240,7 +240,7 @@ pub fn same_project(recorded: &str, root: &Path) -> bool {
     rec == root || ProjectRoot::observe(rec) == ProjectRoot::observe(root)
 }
 
-/// Where to look for the project's `.review.toml`.
+/// Where to look for the project's `.hrafnar.toml`.
 ///
 /// The two cases are kept apart because they permit different things, and a
 /// bare directory would lose which one applies. `Discover` is the ambient
@@ -257,7 +257,7 @@ pub enum Selection {
 }
 
 impl Selection {
-    /// The invoking directory, walked up as `review` always has.
+    /// The invoking directory, walked up as `hrafnar` always has.
     pub fn cwd() -> Result<Self> {
         let dir = std::env::current_dir()
             .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;

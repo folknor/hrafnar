@@ -1,12 +1,12 @@
 # TODO
 
-## `review add`
+## `hrafnar add`
 
-Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.review.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
+Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.hrafnar.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
 
 ## Subsume the pbfhogg spec-loop scripts
 
-`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). The absorption is complete; a codex self-review (dogfood) then surfaced a batch of bugs in the new code, all since fixed (unique `-o` temp file, digest preserved on no-message runs, per-turn transcript reset, completion-time sidecar stamping, `--session`/`--profile` guard, reserved subcommand names, resume-recording conditions, profile `CODEX_HOME` in forensics).
+`hrafnar` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-hrafnar.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). The absorption is complete; a codex self-hrafnar (dogfood) then surfaced a batch of bugs in the new code, all since fixed (unique `-o` temp file, digest preserved on no-message runs, per-turn transcript reset, completion-time sidecar stamping, `--session`/`--profile` guard, reserved subcommand names, resume-recording conditions, profile `CODEX_HOME` in forensics).
 
 Non-goals (considered and dropped):
 - **Usage in the sidecar.** Token usage/turns are in the printed digest; persisting them only helps after-the-fact spend aggregation, which we don't need. Skipped.
@@ -41,7 +41,7 @@ requires_openai_auth = true          # reuses auth.json / ChatGPT login
 
 Or inline via two `-c` overrides (`-c model_provider="openai-http" -c model_providers.openai-http='{ ... }'`). Tradeoff: loses websocket latency optimizations. Weaker levers (retry/timeout knobs; failure-surfacing) don't help a 401.
 
-**Applied in `review` via a profile `config` passthrough** (each string -> `codex exec -c ...`, scoped per-profile in `.review.toml`). The passthrough works and is committed.
+**Applied in `hrafnar` via a profile `config` passthrough** (each string -> `codex exec -c ...`, scoped per-profile in `.hrafnar.toml`). The passthrough works and is committed.
 
 ### Outcome (2026-07-17): HTTP workaround blocked by account scopes - reverted
 
@@ -49,7 +49,7 @@ Forcing HTTP on this account (plantasjen) does switch transport - the `wss://...
 
 Conclusion: the underlying issue is **auth scope**, not transport (websocket 401 <-> HTTP 403 are two faces of it). The HTTP override is a net regression here (intermittent 401 -> hard 403), so it's reverted from the profile; the passthrough mechanism stays for future use. Websocket is the working transport; the intermittent 401 deaths are handled (not prevented) by recover + auto-resume + incident bundles.
 
-To actually *prevent* the deaths, the auth must be fixed outside `review`: re-login with ChatGPT OAuth (`codex login`) or grant the API key the missing scopes (`api.model.read` + responses). (Evidence: `core/src/client.rs:930-938,1786-1823`; `model-provider-info/src/lib.rs:139-141,362,498`; `config/src/config_toml.rs:61-66,160,898-918`; `model-provider/src/provider.rs:286-320`.)
+To actually *prevent* the deaths, the auth must be fixed outside `hrafnar`: re-login with ChatGPT OAuth (`codex login`) or grant the API key the missing scopes (`api.model.read` + responses). (Evidence: `core/src/client.rs:930-938,1786-1823`; `model-provider-info/src/lib.rs:139-141,362,498`; `config/src/config_toml.rs:61-66,160,898-918`; `model-provider/src/provider.rs:286-320`.)
 
 ## Self-review findings (dogfood, 2026-07-17)
 
@@ -58,7 +58,7 @@ A codex self-review of the digest/recovery/incident/auto-resume work surfaced th
 - [x] **[P1] Stale-answer recovery.** A resume that dies before a new `task_started` leaves the prior turn's `final_answer` in the transcript; recovery returns it as the new answer. `transcript.rs`, `provider.rs:509,534`
 - [x] **[P1] Dead run exits 0.** `run_codex_json` returns `Ok` on exit-1/no-answer, and `main` treats only `output.is_err()` as failure, so an all-dead run (incl. failed auto-resume) exits 0. `provider.rs:578`, `main.rs`
 - [x] **[P1] Global lock released too early.** Parent sleeps one `stagger` before dropping the lock, but tasks launch at `stagger * i`; with 3+ launches the lock drops before later launches. `main.rs`
-- [x] **[P1] `review.lock` opened unsafely.** `File::create` truncates + follows symlinks (clobber risk on shared /tmp) and `0644` blocks a second user from opening for write. `main.rs`
+- [x] **[P1] `hrafnar.lock` opened unsafely.** `File::create` truncates + follows symlinks (clobber risk on shared /tmp) and `0644` blocks a second user from opening for write. `main.rs`
 - [x] **[P2] Failed manual resume refreshes warm-cache clock.** `run_session_resume` records a touch on `output.is_ok()`, but codex failures are `Ok`-with-digest. `main.rs`
 - [x] **[P2] Auto-resume loses one invocation's forensics.** Only the returned result is persisted; the other (initial death or failed retry) digest/incident/nudge is dropped. `main.rs`
 - [x] **[P2] Incident scan inherits prior turn's completion.** `scan_transcript` doesn't reset `final_answer_present` on `task_started`, mislabeling a frozen resumed turn as "completed". `incident.rs`
@@ -70,21 +70,21 @@ A codex self-review of the digest/recovery/incident/auto-resume work surfaced th
 
 ## Audit log phase 2: git sync
 
-Phase 1 (done) writes audit entries to `~/.local/share/review/<project>/audit.jsonl`. Phase 2 adds optional git sync to a central audit repository.
+Phase 1 (done) writes audit entries to `~/.local/share/hrafnar/<project>/audit.jsonl`. Phase 2 adds optional git sync to a central audit repository.
 
 ### Design
 
-A global config at `~/.local/share/review/config.toml` with:
+A global config at `~/.local/share/hrafnar/config.toml` with:
 
 ```toml
 [audit]
-repo = "folknor/review-audit"
+repo = "folknor/hrafnar-audit"
 ```
 
 When configured and `gh` is authenticated:
 
-1. On first use, clone the repo to `~/.local/share/review/audit-repo/`
-2. After each review invocation, copy the updated `audit.jsonl` into the repo under `<project>/audit.jsonl`
+1. On first use, clone the repo to `~/.local/share/hrafnar/audit-repo/`
+2. After each hrafnar invocation, copy the updated `audit.jsonl` into the repo under `<project>/audit.jsonl`
 3. Commit and push with an automated message like "audit: <project> <archetype> <timestamp>"
 
 ### Requirements
@@ -97,6 +97,6 @@ When configured and `gh` is authenticated:
 ### Open questions
 
 - Should the audit repo be private by default? (yes, probably)
-- Should `review init` offer to set up the audit repo?
-- Should there be a `review audit` subcommand to inspect/manage the log?
+- Should `hrafnar init` offer to set up the audit repo?
+- Should there be a `hrafnar audit` subcommand to inspect/manage the log?
 - How to handle multiple machines pushing to the same repo - just append and let git merge, or use per-host branches?

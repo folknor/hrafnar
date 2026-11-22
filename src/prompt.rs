@@ -13,7 +13,7 @@
 ///
 /// There is deliberately no slash-command handling: a command such as `/goal`
 /// works in an interactive session but does nothing sent headless through
-/// `review`, so a `/goal ` prime is an ordinary prime.
+/// `hrafnar`, so a `/goal ` prime is an ordinary prime.
 ///
 /// The prompt reaches most harnesses on a stdin pipe rather than as an
 /// argument, so its length is never bounded by the argument limit; grok takes

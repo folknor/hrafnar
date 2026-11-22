@@ -1,8 +1,8 @@
 # Profiles
 
-A profile is a named tier of work, such as a standard review, an
+A profile is a named tier of work, such as a standard hrafnar, an
 implementation that must build, or a cheap mechanical edit. You select one
-with `-p NAME`, and `review` launches one of its harness entries. This page
+with `-p NAME`, and `hrafnar` launches one of its harness entries. This page
 explains how a run picks the profile and the entry, how profiles layer across
 config files, and every field an entry takes, under "Profile fields". The
 table of refusals is at the end.
@@ -35,7 +35,7 @@ env = { RUST_LOG = "info" }
 grok = {}
 
 [_defaults]
-profile = "review"
+profile = "hrafnar"
 prefer  = ["codex", "claude", "maki"]
 ```
 
@@ -44,10 +44,10 @@ defaults.
 
 ## Finding the profiles you can use
 
-Run `review list` before choosing a profile for a role. It lists the profiles
+Run `hrafnar list` before choosing a profile for a role. It lists the profiles
 a run here can use, each with its installed harnesses, and marks with `*` the
 harness a plain `-p NAME` picks. It also names each profile it hides because
-none of that profile's harnesses is installed. `review list --all` adds the
+none of that profile's harnesses is installed. `hrafnar list --all` adds the
 file each profile comes from and every entry's settings.
 
 ## How a run picks the profile and harness
@@ -57,7 +57,7 @@ names, or without `-p`, `[_defaults].profile`. A run with neither fails before
 anything launches, and so does a run naming a profile no file defines. The
 error names every file searched and the profiles that exist.
 
-`review` then picks the harness, in this order:
+`hrafnar` then picks the harness, in this order:
 
 1. `--harness NAME`, if given. The profile must have an entry for that
    harness, or the run fails listing the harnesses the profile has.
@@ -72,21 +72,21 @@ Anything else fails: several installed entries with no preference asks for
 asks you to install one or pick another profile. A chosen harness that isn't
 installed fails the run before anything launches; `--dry-run` only warns.
 
-`review message` takes no profile. To learn what a resumed session keeps from
-its entry, see `review man message`.
+`hrafnar message` takes no profile. To learn what a resumed session keeps from
+its entry, see `hrafnar man message`.
 
 ## Profiles across config files
 
-Each profile is defined in exactly one file. A project's `.review.toml` can
+Each profile is defined in exactly one file. A project's `.hrafnar.toml` can
 add profiles of its own, but it can't define a profile name the global config
 already defines: loading fails, naming both files. Give the project's profile
 another name.
 
 We refuse the redefinition so that a checked-out repository can't change what
-`-p review` means for whoever runs `review` in it, for example by swapping the
-model, widening the sandbox or adding env. Nothing is overridden, so nothing
-is merged: every field of a run comes from the one entry `review list --all`
-shows.
+`-p review` means for whoever runs `hrafnar` in it, for example by swapping
+the model, widening the sandbox or adding env. Nothing is overridden, so
+nothing is merged: every field of a run comes from the one entry
+`hrafnar list --all` shows.
 
 ## Profile fields
 
@@ -95,7 +95,8 @@ A `[profiles.NAME]` table takes only `comment` and harness names (`claude`,
 no harness entry:
 
 - **`comment`**: free text for whoever picks the profile, never sent to a
-  harness. `review list` shows its first line, `review list --all` all of it.
+  harness. `hrafnar list` shows its first line, `hrafnar list --all` all of
+  it.
 
 ### Entry fields
 
@@ -114,27 +115,27 @@ every harness:
   thinking fields.
 - **`sandbox`**: what the run may modify, `read-only` when omitted. Codex and
   grok entries take it; claude and maki entries must omit it, so configure
-  those harnesses' own permissions instead. See `review man sandbox` for what
+  those harnesses' own permissions instead. See `hrafnar man sandbox` for what
   each level means per harness.
 - **`writable_roots`**: extra paths a `workspace-write` run may write, added
-  to the roots `review` derives for builds. `~`, `$VAR` and `${VAR}` expand.
+  to the roots `hrafnar` derives for builds. `~`, `$VAR` and `${VAR}` expand.
   A non-empty list needs `sandbox = "workspace-write"` on codex or grok (grok
   also accepts its native `workspace`). Claude and maki entries must omit it.
-  See `review man sandbox` for which entries are dropped at launch.
+  See `hrafnar man sandbox` for which entries are dropped at launch.
 - **`config`**: codex only. Each string goes to codex verbatim as a `-c`
-  override, after `review`'s own, so an entry can restate one of them on
+  override, after `hrafnar`'s own, so an entry can restate one of them on
   purpose, including the settings behind the sandbox guarantees. Codex runs
   ignore your own codex `config.toml`, so anything an override refers to,
   such as a custom `model_provider`, must be defined by overrides here too.
 - **`env`**: environment variables set for the harness process. They override
-  the defaults `review` sets, except `PWD`, which is always the project root
-  the harness runs in. `review list --all` shows only their names, since
+  the defaults `hrafnar` sets, except `PWD`, which is always the project root
+  the harness runs in. `hrafnar list --all` shows only their names, since
   values can be secrets.
 
 ### Codex model and effort precedence
 
 A codex entry can set the model and effort both through `model` and `effort`
-and through raw `config` entries. `review` records the selector codex uses:
+and through raw `config` entries. `hrafnar` records the selector codex uses:
 
 - **Model**: `model` wins over any raw `model` override; without it, the last
   raw `model` override is used.
@@ -143,7 +144,7 @@ and through raw `config` entries. `review` records the selector codex uses:
 
 The final raw override for either key must be a TOML string. If neither a
 field nor a raw override sets a selector, the harness chooses. What each
-session records is covered in `review man sessions`.
+session records is covered in `hrafnar man sessions`.
 
 ## Refusals and the fix
 

@@ -1,9 +1,9 @@
-//! `review` as a library, so the integration tests can drive the harness
+//! `hrafnar` as a library, so the integration tests can drive the harness
 //! runners against stub harnesses with the real binary as their keeper (see
 //! `keeper`). Cargo hands an integration test the built binary's path
-//! (`CARGO_BIN_EXE_review`) and gives a unit test nothing of the kind, which is
+//! (`CARGO_BIN_EXE_hrafnar`) and gives a unit test nothing of the kind, which is
 //! the whole reason for the split; nothing here is a public API. `main.rs`
-//! has two personalities: `review __keep <fd>` becomes a keeper before any
+//! has two personalities: `hrafnar __keep <fd>` becomes a keeper before any
 //! tokio runtime exists, and anything else goes to `app::run`.
 //!
 //! # Layers
@@ -58,8 +58,8 @@
 //!   `config_cmd`.
 //! - **Every run starts a fresh session**: the archetype's prime, if any, then
 //!   stdin. Reviving a long-lived session on a cold cache reprocesses its whole
-//!   history, while a fresh one costs about one review's tokens and cannot act
-//!   on stale context. Follow-ups go through `review message` while the cache
+//!   history, while a fresh one costs about one hrafnar's tokens and cannot act
+//!   on stale context. Follow-ups go through `hrafnar message` while the cache
 //!   is warm.
 //!
 //! # Tests

@@ -1,6 +1,6 @@
 //! The session log: one append-only JSONL sidecar per log family (public and
-//! private), one `SessionRow` per invocation. It is what `review message`
-//! inherits a session's harness and settings from, what `review sessions`
+//! private), one `SessionRow` per invocation. It is what `hrafnar message`
+//! inherits a session's harness and settings from, what `hrafnar sessions`
 //! lists, and what the stale-cache gate reads. Rows are historical evidence:
 //! they keep their fields as strings and defaults, so old rows, and rows
 //! naming a removed harness, still read. `query` resolves a session's state
@@ -152,7 +152,8 @@ pub struct SessionRow {
     pub assembled_prompt: String,
     pub response: Option<String>,
     pub error: Option<String>,
-    pub review_version: String,
+    #[serde(alias = "review_version")]
+    pub hrafnar_version: String,
     /// Served facts are evidence only. InheritedSettings selects request fields
     /// explicitly; these must never become model selectors or permissions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,7 +312,7 @@ mod compatibility_tests {
             "timestamp": "t", "project": "/p", "hostname": "h", "audit_id": "opaque / id",
             "provider": "codex", "archetype": "bare", "session_id": "../historical",
             "model": "requested", "operator_prompt": "operator", "assembled_prompt": "assembled",
-            "review_version": "0.1", "served_model": "served-build", "cost_usd": 1.25,
+            "hrafnar_version": "0.1", "served_model": "served-build", "cost_usd": 1.25,
             "grok_trust": "/trusted", "kind": "future-kind",
         });
         let mut row: SessionRow = serde_json::from_value(legacy).expect("historical row");

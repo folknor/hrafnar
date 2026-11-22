@@ -13,7 +13,7 @@ Do not use your Memory functionality. Durable context belongs in CLAUDE.md or th
 - One Bash() invocation === one command.
 - Never chain commands with `&&`.
 - Never chain commands with `;`.
-- Never chain/pipe commands with `|`. Exception: piping into `review` is allowed.
+- Never chain/pipe commands with `|`. Exception: piping into `hrafnar` is allowed.
 - Never capture stdout into env vars (`UUID=$(...)`).
 - Keep `git commit -m` messages free of zsh metacharacters - braces `{}`, brackets `[]`, parens `()`, angle brackets `<>`, `#`. They trip the permission matcher and block the commit. Spell lists out (`syntax, vm, data and runner`, not `{syntax,vm,data,runner}`), write `5.1 per bar` not `5.1/bar`, name attributes in prose not `#[attr]`.
 - Waiting on a long command: just run it and stop. It wakes you on exit. Never

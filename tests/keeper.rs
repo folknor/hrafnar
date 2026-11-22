@@ -1,9 +1,9 @@
 //! The keeper driven directly over its protocol, for what no runner test can
-//! reach: `review` itself disappearing mid-run. Its control pipe then closes,
+//! reach: `hrafnar` itself disappearing mid-run. Its control pipe then closes,
 //! and the keeper must tear the run down on its own and leave its outcome in
 //! the orphan log, since nobody is left to read its events.
 
-use review::keeper::{self, Control, Event};
+use hrafnar::keeper::{self, Control, Event};
 use std::io::{BufRead, Write};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 fn scratch() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target/test-scratch")
-        .join(review::config::generate_uuid());
+        .join(hrafnar::config::generate_uuid());
     std::fs::create_dir_all(&root).expect("scratch dir");
     root
 }
@@ -32,7 +32,7 @@ fn launcher(script: &str, orphan_log: Option<PathBuf>) -> keeper::Launcher {
         flush: std::time::Duration::from_millis(500),
     };
     keeper::Launcher::new(
-        std::path::Path::new(env!("CARGO_BIN_EXE_review")),
+        std::path::Path::new(env!("CARGO_BIN_EXE_hrafnar")),
         launch,
         schedule,
         std::time::Duration::from_secs(10),
@@ -81,7 +81,7 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
             .ok()
             .and_then(|s| s.trim().parse().ok())
         {
-            let pidfd = match review::process::pidfd_open(pid) {
+            let pidfd = match hrafnar::process::pidfd_open(pid) {
                 Ok(pidfd) => Some(pidfd),
                 Err(err) if err.raw_os_error() == Some(libc::ESRCH) => None,
                 Err(err) => panic!("open detached pidfd: {err}"),
@@ -92,19 +92,19 @@ fn a_keeper_whose_owner_vanishes_tears_down_and_logs_the_outcome() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
 
-    // `review` vanishes: both its pipe ends close.
+    // `hrafnar` vanishes: both its pipe ends close.
     drop(control);
     drop(events);
     let status = child.wait().expect("keeper exits");
     assert!(status.success(), "{status}");
     let gone = detached_pidfd
         .as_ref()
-        .is_none_or(review::process::pidfd_exited);
+        .is_none_or(hrafnar::process::pidfd_exited);
     if let Some(pidfd) = detached_pidfd
         .as_ref()
-        .filter(|pidfd| !review::process::pidfd_exited(pidfd))
+        .filter(|pidfd| !hrafnar::process::pidfd_exited(pidfd))
     {
-        let _ = review::process::pidfd_signal(pidfd, libc::SIGKILL);
+        let _ = hrafnar::process::pidfd_signal(pidfd, libc::SIGKILL);
     }
     assert!(
         gone,
@@ -172,7 +172,7 @@ fn run_launch(launch: keeper::Launch) -> (std::process::Output, Vec<Event>) {
         events,
         inherited,
     } = keeper::Launcher::new(
-        std::path::Path::new(env!("CARGO_BIN_EXE_review")),
+        std::path::Path::new(env!("CARGO_BIN_EXE_hrafnar")),
         launch,
         keeper::TeardownSchedule::default(),
         std::time::Duration::from_secs(5),
@@ -306,7 +306,7 @@ fn a_death_before_exec_is_acknowledged_and_reported_as_the_death_it_was() {
         events,
         inherited,
     } = keeper::Launcher::new(
-        std::path::Path::new(env!("CARGO_BIN_EXE_review")),
+        std::path::Path::new(env!("CARGO_BIN_EXE_hrafnar")),
         launch,
         keeper::TeardownSchedule::default(),
         std::time::Duration::from_secs(10),

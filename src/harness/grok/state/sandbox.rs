@@ -6,15 +6,15 @@ use crate::fsutil::locked_update;
 impl Grok {
     /// Make sure the profile named by `roots` exists in `<home>/sandbox.toml` granting exactly
     /// `roots`, returning whether this call created it. Locked because
-    /// concurrent `review` calls launch several grok runs at once and two creating the same
+    /// concurrent `hrafnar` calls launch several grok runs at once and two creating the same
     /// profile unlocked would race (grok never writes `sandbox.toml`, so the
-    /// lock serializes `review` against itself); renamed into place so a grok starting
+    /// lock serializes `hrafnar` against itself); renamed into place so a grok starting
     /// concurrently never reads a half-written file.
     pub(in crate::harness::grok) fn ensure_profile(&self, roots: &RootSet) -> anyhow::Result<bool> {
         let path = self.home.join("sandbox.toml");
         if has_symlink_component(&path) {
             anyhow::bail!(
-                "{} is reached through a symlink - grok refuses to load it, so review will not write it",
+                "{} is reached through a symlink - grok refuses to load it, so hrafnar will not write it",
                 path.display()
             );
         }
@@ -28,7 +28,7 @@ impl Grok {
     }
 }
 
-/// Prefix of the grok sandbox profiles `review` creates for write runs.
+/// Prefix of the grok sandbox profiles `hrafnar` creates for write runs.
 ///
 /// Grok's built-in `workspace` profile grants writes to the workspace, the grok
 /// home and the temp dirs only, and grok offers no CLI flag or environment
@@ -36,7 +36,7 @@ impl Grok {
 /// profile in `~/.grok/sandbox.toml` (or a project `.grok/sandbox.toml`, which
 /// would put a host-specific generated file into every repo). So the roots
 /// `writable_roots` derives - the brokkr lock, the cargo home, a shared target -
-/// reach grok through a profile `review` creates in the operator's global
+/// reach grok through a profile `hrafnar` creates in the operator's global
 /// sandbox file. Without it a grok build fails at `lock: failed to open lock
 /// file` before compiling, and a model working around that by moving `HOME`
 /// under `target/` silently bypasses the host's build-contention lock.
@@ -45,18 +45,18 @@ impl Grok {
 /// (`profile_name`), never one shared profile. A shared profile has to be
 /// union-only (rewriting it to one run's roots would strip a concurrent run's
 /// between the write and that grok starting), and union-only means a root one
-/// project's `.review.toml` adds becomes writable to every later grok write run
+/// project's `.hrafnar.toml` adds becomes writable to every later grok write run
 /// on the host - broader than codex, where each run gets exactly its own roots.
 /// Content-addressed profiles give grok the codex property: a run gets exactly
 /// its set, a profile is created once and never modified, and concurrent runs
 /// with different sets touch different entries. Nothing needs pruning; the
 /// cost is one entry per distinct set in the operator's `sandbox.toml`.
-pub(in crate::harness::grok) const PROFILE_PREFIX: &str = "review-ws-";
+pub(in crate::harness::grok) const PROFILE_PREFIX: &str = "hrafnar-ws-";
 
-const PROFILE_BANNER: &str = "\n# Created by `review` for grok write runs whose writable roots are exactly\n\
+const PROFILE_BANNER: &str = "\n# Created by `hrafnar` for grok write runs whose writable roots are exactly\n\
 # the list below (derived per host - brokkr lock, cargo home, shared target -\n\
 # plus any profile extras). The name is a hash of the list: never edit it;\n\
-# delete the profile and review recreates it. Other profiles are left alone.\n";
+# delete the profile and hrafnar recreates it. Other profiles are left alone.\n";
 
 /// A lexical set of already selected paths, not filesystem canonicalization
 /// or proof of a grant: no path expansion, resolution or host derivation.
@@ -77,7 +77,7 @@ impl RootSet {
         &self.0
     }
 
-    /// `review-ws-` plus 16 lowercase hex digits of FNV-1a, with a NUL after
+    /// `hrafnar-ws-` plus 16 lowercase hex digits of FNV-1a, with a NUL after
     /// each path. Never DefaultHasher, which is not stable across Rust
     /// releases: recorded profiles must survive compiler changes. A collision is
     /// refused by the create-only writer's content check.
@@ -93,7 +93,7 @@ impl RootSet {
     }
 }
 
-/// Only review-generated profile syntax; other names starting `review-ws-`
+/// Only hrafnar-generated profile syntax; other names starting `hrafnar-ws-`
 /// stay native grok profiles. Parsing a recorded name does not prove matching
 /// roots; preparation checks that before the writer runs. Fresh custom
 /// selectors remain opaque native names, even with this syntax.
@@ -183,7 +183,7 @@ pub(in crate::harness::grok) fn merge_profile(
         if !base_ok || RootSet::new(&p.read_write) != *roots {
             anyhow::bail!(
                 "grok sandbox profile `{name}` does not match the roots it is named for - \
-                 it was edited; delete it and review will recreate it"
+                 it was edited; delete it and hrafnar will recreate it"
             );
         }
         return Ok((None, false));
@@ -242,27 +242,27 @@ mod tests {
         // Order and duplicates do not change the set, so not the name.
         let a_shuffled = roots(&["/home/u/.cargo", "/home/u/.brokkr", "/home/u/.cargo"]);
         assert_eq!(profile_name(&a), profile_name(&a_shuffled));
-        assert_eq!(profile_name(&a), "review-ws-a4924c479efe6e4c");
+        assert_eq!(profile_name(&a), "hrafnar-ws-a4924c479efe6e4c");
         // A different set is a different profile - no widening across sets.
         let b = roots(&["/home/u/.brokkr", "/home/u/.cargo", "/srv/fixtures"]);
         assert_ne!(profile_name(&a), profile_name(&b));
         // Pinned: the name must survive toolchain upgrades, or every recorded
         // session's profile would be orphaned. FNV-1a, not `DefaultHasher`.
-        assert_eq!(profile_name(&roots(&[])), "review-ws-cbf29ce484222325");
+        assert_eq!(profile_name(&roots(&[])), "hrafnar-ws-cbf29ce484222325");
     }
 
     #[test]
     fn generated_name_parsing_preserves_only_the_historical_exact_shape() {
-        let name = "review-ws-cbf29ce484222325";
+        let name = "hrafnar-ws-cbf29ce484222325";
         assert_eq!(
             ProfileName::from_record(name).expect("historical").as_str(),
             name
         );
         for native in [
-            "review-ws-",
-            "review-ws-mine",
-            "review-ws-CBF29CE484222325",
-            "review-ws-cbf29ce4842223250",
+            "hrafnar-ws-",
+            "hrafnar-ws-mine",
+            "hrafnar-ws-CBF29CE484222325",
+            "hrafnar-ws-cbf29ce4842223250",
             "workspace",
         ] {
             assert!(ProfileName::from_record(native).is_none(), "{native}");
@@ -276,7 +276,7 @@ mod tests {
         let (text, created) = merge_profile("", &set).expect("empty file");
         let text = text.expect("created");
         assert!(created);
-        assert!(text.contains("Created by `review`"), "{text}");
+        assert!(text.contains("Created by `hrafnar`"), "{text}");
         let parsed: toml::Table = text.parse().expect("valid toml");
         let p = &parsed["profiles"][name.as_str()];
         assert_eq!(p["extends"].as_str(), Some("workspace"));

@@ -284,7 +284,7 @@ mod tests {
 
     /// `$HOME` itself is never the grant - only the dedicated subdirectory. A
     /// bare lock file at the home root would need the home directory writable,
-    /// handing over every repo, `~/.ssh` and review's own logs.
+    /// handing over every repo, `~/.ssh` and hrafnar's own logs.
     #[test]
     fn the_build_lock_grant_is_never_the_home_directory() {
         let host = FakeHost::new().var("HOME", "/home/dev");

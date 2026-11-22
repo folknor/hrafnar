@@ -47,7 +47,7 @@ Upstream facts the trust code models, from grok's source:
   before spawn shrinks that window to grok's startup.
 - A grok-managed `-w` worktree is keyed through grok's sqlite registry,
   consulted only for paths under `$GROK_HOME/worktrees`
-  (`worktree_record_for_cwd_in`). That is exactly the set `review` refuses.
+  (`worktree_record_for_cwd_in`). That is exactly the set `hrafnar` refuses.
 - A failed grant (`KeyMoved`, `Unreadable`, a process-local fallback) is
   printed only to stderr, and success prints nothing
   (`folder_trust::report_cli_trust_grant`).
@@ -56,7 +56,7 @@ The grant spans three steps in `mod.rs`: `prepare` announces a grant only
 for an undecided key, `run_grok_turn` re-checks that key right before spawn,
 and `Prepared::verify_trust` re-reads the store after the run. Only a
 trusted entry on the announced key reaches the sidecar as `grok_trust`, so
-`jq 'select(.grok_trust)'` lists every grant `review` made.
+`jq 'select(.grok_trust)'` lists every grant `hrafnar` made.
 
 ## Writable roots
 
@@ -77,7 +77,7 @@ Grok lists `sandbox.toml` among its trust-boundary files and refuses to
 load one through a symlink (`resolve_trust_boundary_sources`,
 `ensure_grok_trust_boundary_slots`). It deserializes the global file whole
 and drops it on one bad entry, after which a checked-out repo's project
-file may define a `review-ws-*` name: a project profile loses only to a
+file may define a `hrafnar-ws-*` name: a project profile loses only to a
 loaded global one of the same name.
 
 On resume grok fixes a session's profile for its lifetime and refuses an
@@ -86,7 +86,7 @@ explicit `--sandbox` that differs (`resolve_startup_sandbox` returns
 across three places. The sidecar stores the exact native name in
 `provider_sandbox` beside the normalized `sandbox` level, and resume
 prefers `provider_sandbox`. `Permissions::restore` keeps that native name
-untranslated. A generated `review-ws-*` name maps to `GrokWrite::Resume`
+untranslated. A generated `hrafnar-ws-*` name maps to `GrokWrite::Resume`
 with the roots recorded alongside, `workspace` to
 `GrokWrite::BuiltinWorkspace`, and no recorded level to no `--sandbox` and
 no write setup.

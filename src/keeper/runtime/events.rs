@@ -42,7 +42,7 @@ impl Keeper {
 
     /// The outcome with the child's secret environment values removed from
     /// every recorded command line. A hook or wrapper can pass a credential
-    /// `review` injected (a `claude_token_command` token) to a process as an
+    /// `hrafnar` injected (a `claude_token_command` token) to a process as an
     /// argument; both the event stream and the orphan log, which is written
     /// with nobody left to scrub it, take this form.
     fn scrubbed(&self, outcome: &Outcome) -> Outcome {
@@ -110,7 +110,7 @@ impl Keeper {
                 }
                 Err(_) => {
                     if last_error().kind() != std::io::ErrorKind::WouldBlock {
-                        // EPIPE: nobody is reading, so `review` is gone.
+                        // EPIPE: nobody is reading, so `hrafnar` is gone.
                         self.events = None;
                         self.pending.clear();
                         self.owner_gone();
@@ -121,7 +121,7 @@ impl Keeper {
         }
     }
 
-    /// `review` is gone, so the outcome goes to the orphan log: one line, one
+    /// `hrafnar` is gone, so the outcome goes to the orphan log: one line, one
     /// write call. Best-effort - nothing reads it back.
     fn log_orphaned(&self, outcome: &Outcome) {
         let Some(path) = &self.spec.orphan_log else {

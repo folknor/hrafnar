@@ -1,6 +1,6 @@
 # How message and interrupt coordinate on a session
 
-This page explains how `review message` and `review interrupt` act on one
+This page explains how `hrafnar message` and `hrafnar interrupt` act on one
 session without two turns running beside each other. The answer spans
 `app::message`, `interrupt_cmd`, `inflight`, `sessions::query`,
 `sessions::handoff` and `app::launch`, so it lives here; each piece's own rule
@@ -17,7 +17,7 @@ party:
   stale-cache gate.
 - **In-flight marker**: one file per invocation (`inflight::Guard`), written
   before the harness spawns whenever the session id is known. It names the
-  owning `review`, the keeper pid once there is one, the run id, and its
+  owning `hrafnar`, the keeper pid once there is one, the run id, and its
   phase: `Running`, then `HandoffPending` once the harness has exited and the
   run is recovering and recording.
 - **Readiness**: the marker's `signal_ready` flag, set once the harness has
@@ -33,12 +33,12 @@ party:
   was written.
 
 The **launch lock** is a sixth file, `<session>.launch` beside the marker,
-held by `review message` and never by a fresh run. `review sessions` shows a
+held by `hrafnar message` and never by a fresh run. `hrafnar sessions` shows a
 held one as `[queued]`.
 
 ## What a message does
 
-`review message <ID>` runs these steps in order:
+`hrafnar message <ID>` runs these steps in order:
 
 1. Reads stdin, so a missing message never costs the turn in flight.
 2. Takes the session's launch lock, waiting while another message holds it.

@@ -93,7 +93,7 @@ fn new_output_file() -> Result<String> {
 fn new_temp_file(tag: &str) -> Result<String> {
     let dir = std::env::temp_dir();
     for _ in 0..8 {
-        let path = dir.join(format!("review-{tag}-{}.txt", crate::ids::generate_uuid()));
+        let path = dir.join(format!("hrafnar-{tag}-{}.txt", crate::ids::generate_uuid()));
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -110,7 +110,7 @@ fn new_temp_file(tag: &str) -> Result<String> {
 }
 
 /// Caps on how much harness output we buffer in memory. Generous - real reviews
-/// are far under these; the cap only stops a runaway stream from OOMing review.
+/// are far under these; the cap only stops a runaway stream from OOMing hrafnar.
 const STDOUT_CAPTURE_CAP: usize = 64 << 20; // 64 MiB
 const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
 
@@ -447,7 +447,7 @@ fn report_git_changes(harness: Harness, changes: &[String]) {
 /// plainly where it did not.
 ///
 /// Split out from `invoke` because the defect this replaced was invisible in
-/// review: the announcement read from the derived set while the run used the
+/// hrafnar: the announcement read from the derived set while the run used the
 /// effective one, so the two could disagree with nothing failing. A pure
 /// function over both sets is the only shape that can be tested.
 fn announcement_lines(

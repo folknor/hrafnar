@@ -161,6 +161,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hrafnar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gethostname",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "which",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,22 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "review"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gethostname",
- "libc",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "toml_edit",
- "which",
 ]
 
 [[package]]

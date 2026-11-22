@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-/// The hidden first argument that turns a `review` process into a keeper.
+/// The hidden first argument that turns a `hrafnar` process into a keeper.
 pub(super) const SPEC_MAX: usize = 16 << 20;
 
 pub const ARG: &str = "__keep";
@@ -13,7 +13,7 @@ pub const ARG: &str = "__keep";
 /// capped: the ticket's requirement is that every one is named.
 pub const KILLED_MAX: usize = 64;
 
-/// A byte in the review-to-keeper control pipe.
+/// A byte in the hrafnar-to-keeper control pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Control {
@@ -40,7 +40,7 @@ impl Control {
     }
 }
 
-/// What `review` asks the keeper to run, and how patiently to tear it down.
+/// What `hrafnar` asks the keeper to run, and how patiently to tear it down.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Spec {
     pub launch: super::Launch,
@@ -48,7 +48,7 @@ pub struct Spec {
     pub events_fd: RawFd,
     pub schedule: super::TeardownSchedule,
     pub startup: std::time::Duration,
-    /// Appended to (one JSON line) when `review` is gone and the outcome has
+    /// Appended to (one JSON line) when `hrafnar` is gone and the outcome has
     /// nobody to go to.
     pub orphan_log: Option<PathBuf>,
     /// What this run is, for that log line.
@@ -91,7 +91,7 @@ pub enum Event {
         reason: String,
     },
     /// The harness itself has exited and been reaped; the teardown of what it
-    /// left follows. Lets `review` stop watching the harness (the watchdog,
+    /// left follows. Lets `hrafnar` stop watching the harness (the watchdog,
     /// interrupts) without waiting out the teardown.
     Exited {
         status: i32,
