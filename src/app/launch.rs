@@ -1,4 +1,4 @@
-//! Fan-out invocations, automatic recovery, and recording.
+//! A run's invocations, automatic recovery, and recording.
 
 use crate::{audit, provider, sessions};
 
@@ -13,7 +13,7 @@ fn outcome_of(r: &provider::ProviderResult) -> Option<&provider::Outcome> {
     r.output.as_ref().ok().map(|turn| &turn.outcome)
 }
 
-/// What one fan-out task needs to record its runs.
+/// What a run needs to record its invocations.
 pub(super) struct RecordCtx {
     pub(super) project_root: std::path::PathBuf,
     pub(super) data: crate::data::DataDir,
@@ -183,7 +183,6 @@ impl RecordCtx {
 pub(super) struct Launch {
     pub(super) spec: provider::LaunchSpec,
     pub(super) runtime: provider::ProviderRuntime,
-    pub(super) delay: std::time::Duration,
 }
 
 impl Launch {
@@ -198,7 +197,8 @@ impl Launch {
             prompt: prompt.to_owned(),
             ..self.spec.clone()
         };
-        // Fan-out stagger and internal retries do not need a launch handshake.
+        // The run holds the launch lock for its spacing rather than until spawn,
+        // and internal retries hold none, so no launch handshake is needed.
         provider::invoke(spec, None, &self.runtime, predecessor).await
     }
 }
@@ -426,7 +426,7 @@ async fn claude_auth_retry(
         ..launch.spec.clone()
     };
     // A launch of its own, so it takes the host's launch lock like any other
-    // and releases it once spawned (the fan-out's may be long gone).
+    // and releases it once spawned (the run's own may be long gone).
     let lock = tokio::task::spawn_blocking(|| {
         let file = crate::lock::open_lock_file(&std::env::temp_dir().join("review.lock"))?;
         crate::lock::acquire_blocking(&file)?;
@@ -478,13 +478,12 @@ async fn claude_auth_retry(
     })
 }
 
-/// One fan-out task: launch, maybe auto-resume, then record.
+/// One run: launch, maybe auto-resume, then record.
 ///
-/// Recorded within each fan-out task, after any recovery, rather than after
-/// every sibling task has finished: `review resume` needs the sidecar row, and `review interrupt` waits for
-/// it, so a run must not stay unresumable until its slowest sibling finishes.
-/// Rows are written in launch order, so the most recent invocation also wins a
-/// same-second timestamp tie.
+/// Recorded here, after any recovery, as soon as the run ends: `review message`
+/// needs the sidecar row, and `review interrupt` waits for it. Rows are written
+/// in launch order, so the most recent invocation also wins a same-second
+/// timestamp tie.
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
     // Held until the rows below are written, so a signalled `review` does not
     // exit with this session unrecorded (see `supervisor::install_signal_supervisor`).
@@ -492,9 +491,6 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
         .runtime
         .lifecycle
         .unrecorded_for(launch.spec.provider);
-    if !launch.delay.is_zero() {
-        tokio::time::sleep(launch.delay).await;
-    }
     let prov = launch.spec.provider;
     let first = launch
         .invoke(

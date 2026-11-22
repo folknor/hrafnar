@@ -30,11 +30,8 @@ absent.
 security = "You are a security expert. Read the codebase."
 bugs = "You hunt for edge cases and correctness bugs."
 
-[_groups]
-sweep = ["security", "bugs"]
-
 [_defaults]
-providers = ["claude", "codex"]
+provider = "codex"
 # Seconds of silence after which a codex run counts as stalled. 0 disables;
 # omitted uses the built-in default. Codex only.
 stall_timeout_secs = 900
@@ -60,9 +57,11 @@ bz = "~/Programs/bz"
 
 - `[archetypes]`: name to priming prompt. The prompt owns the session's role
   and whether it should modify files; `review` adds nothing of its own.
-- `[_groups]`: name to a non-empty list of archetypes, without duplicates.
-- `[_defaults]`: `providers` (the list used without `--provider`),
+- `[_defaults]`: `provider` (the one used without `--provider`),
   `stall_timeout_secs`, and, in the global file only, `claude_token_command`.
+  The retired `providers` list and `[_groups]` table are errors that say what
+  replaced them: a run launches one session, so several opinions are several
+  `review` calls.
 - `[_audit]`: `id` names the project's audit trail. `review init` creates a
   32-character hex id; a missing or empty id gets one before the first launch.
   Existing nonempty ids remain opaque strings, unchanged.
@@ -77,14 +76,9 @@ bz = "~/Programs/bz"
 
 ## How the two files combine
 
-- **Archetypes and groups** are a union; for a name both define, the project
-  wins. That holds even between a group and an archetype of the same name, so a
-  group added to the global file cannot break a project with an archetype of
-  that name. Within one file such a clash is an error.
-- A **project group** may name a global archetype. A **global group** may name
-  only global archetypes, since the global file is read in every project.
-- **`providers` and `stall_timeout_secs`** come from the first layer that sets
-  them, each on its own. An explicit empty list counts as set.
+- **Archetypes** are a union; for a name both define, the project wins.
+- **`provider` and `stall_timeout_secs`** come from the first layer that sets
+  them, each on its own.
 - **Profiles** resolve to their first definition and win whole, never merged
   field by field (see `review man profiles`).
 - **`[_audit]`** is the project's alone and is an error in the global file.
@@ -136,13 +130,12 @@ to your terminal unfiltered.
 
 ## Reserved words
 
-An archetype or group may not use the names below. Reserved command names come
+An archetype may not use the names below. Reserved command names come
 from the CLI itself, including hidden migration commands and aliases; this table
 is checked against that vocabulary.
 
 | Reserved word | Why |
 |---|---|
-| `all` | the `-a` keyword for every configured archetype except `bare` |
 | `message` | a subcommand |
 | `resume` | a subcommand (hidden alias of `message`) |
 | `interrupt` | a subcommand |
@@ -159,7 +152,7 @@ Subcommand names are reserved because the legacy positional archetype form
 `bare` is a special selector: `-a bare` and the legacy `review bare` mean "no
 archetype", whether or not `[archetypes].bare` exists. Existing `bare = ""`
 definitions remain valid, but a non-empty prompt is refused because the
-selector cannot prime. No group may be named `bare`.
+selector cannot prime.
 
 Config discovery propagates filesystem inspection errors; it never treats them
 as a missing file and falls back to another project or the global layer. A

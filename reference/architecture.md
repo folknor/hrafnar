@@ -21,7 +21,7 @@ From the operator's command line down to the process a provider runs in:
 
 | Layer | Modules | Owns |
 |---|---|---|
-| Command | `cli`, `app` (`launch`, `message`, `history`), `interrupt_cmd`, `config_cmd`, `man`, `exit` | Parsing, the fan-out, the verbs, exit status |
+| Command | `cli`, `app` (`launch`, `message`, `history`), `interrupt_cmd`, `config_cmd`, `man`, `exit` | Parsing, the run, the verbs, exit status |
 | Config | `config` (`parse`, `resolve`, `load`, `profile`, `sandbox`, `error`), `project`, `path_expansion`, `config_write` | Layered config, `-C` project selection, the audit id |
 | Provider | `provider` (`kind`, `launch`, `prepare`, `permissions`, `model`, `session`, `lifecycle`, `stream`, `outcome`, `result`, `output`), one adapter per wire protocol: `claude_compat` (claude and maki, decoded by `claude_stream`), `codex/`, `grok/` | Turning a launch request into a classified result |
 | Containment | `contained`, `keeper/`, `supervisor`, `process`, `report` | Running each provider under its own keeper and proving its tree empty |
@@ -40,15 +40,15 @@ the same way: no provider's behaviour reaches them, only a `ProcessSpec`.
 1. `app::run` parses (`Cli::parse_checked`, which also refuses run flags beside
    a subcommand), installs the process-wide signal supervisor around one
    `supervisor::Lifecycle`, and resolves the project (`project::select`) and
-   config (`config::load`). Archetypes, providers and the profile are validated
-   and every provider must be installed before anything launches.
+   config (`config::load`). The archetype, provider and profile are validated
+   and the provider must be installed before anything launches.
 2. Under the host launch lock (`lock`), `config_write::ensure_audit_id` fixes
    the project's audit id, which selects the log family (`data::LogScope`).
-3. For each archetype and provider, `prompt::assemble` builds the prompt and
-   `app::launch::run_launch` is spawned with a `provider::LaunchSpec`: the
-   provider, a fresh `SessionStart`, the profile's `RunSettings`, the prompt
-   and the root. Launches are staggered, and the lock is released once they
-   have all fired.
+3. `prompt::assemble` builds the prompt and `app::launch::run_launch` is
+   spawned with a `provider::LaunchSpec`: the provider, a fresh
+   `SessionStart`, the profile's `RunSettings`, the prompt and the root. The
+   lock is released after `timings::LAUNCH_SPACING`, or when the run ends if
+   that is sooner.
 4. `provider::invoke` prepares the adapter (`prepare::Prepared`: permissions,
    writable roots, model arguments, a caller-minted session id where the
    provider accepts one) and calls the adapter's runner.

@@ -361,8 +361,8 @@ pub(super) async fn run_message(
     };
 
     // Global lock: serialize the *launch* against other `review` invocations,
-    // matching what the fan-out path does (it releases the lock once its
-    // staggered launches have fired, not when the runs finish).
+    // as a fresh run does (it releases the lock after its launch spacing, not
+    // when the run finishes).
     //
     // It is deliberately NOT held across the run. The lock exists to space out
     // provider launches, and a resume launches exactly one thing, so there is
@@ -485,8 +485,8 @@ pub(super) async fn run_message(
 
     // A stalled or dead resume comes back as `Ok` (so its session id, digest and
     // incident survive), but it is a failure for exit-code purposes - exiting 0
-    // on a wedged run lies to scripts and CI, exactly as it did on the fan-out
-    // path before this was fixed there. Anything left running outranks it.
+    // on a wedged run lies to scripts and CI, as it would on a fresh run.
+    // Anything left running outranks it.
     Ok(crate::exit::CommandExit::of_runs(
         run_failed(&result),
         left_running,

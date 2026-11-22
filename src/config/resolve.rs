@@ -8,7 +8,7 @@ use super::{
     ConfigFile, ConfigFiles, Layer, ProfileDef, ProfileEntry, Provider, ReviewConfig, Sourced,
     toml_key,
 };
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::BTreeMap;
 
 /// Resolve the local and (optional) global layers for `hostname`.
@@ -46,8 +46,7 @@ fn resolve_inner(
     }
 
     let mut archetypes: BTreeMap<String, Sourced<String>> = BTreeMap::new();
-    let mut groups: BTreeMap<String, Sourced<Vec<String>>> = BTreeMap::new();
-    let mut providers: Option<Sourced<Vec<Provider>>> = None;
+    let mut provider: Option<Sourced<Provider>> = None;
     let mut stall_timeout_secs: Option<Sourced<super::StallTimeout>> = None;
     let mut claude_token_command: Option<String> = None;
     let mut defs: BTreeMap<Provider, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
@@ -68,17 +67,10 @@ fn resolve_inner(
                 table: "[archetypes]".into(),
             });
         }
-        for (name, members) in file.groups {
-            groups.entry(name).or_insert_with(|| Sourced {
-                value: members,
-                layer,
-                table: "[_groups]".into(),
-            });
-        }
-        if providers.is_none()
-            && let Some(p) = file.defaults.providers
+        if provider.is_none()
+            && let Some(p) = file.defaults.provider
         {
-            providers = Some(Sourced {
+            provider = Some(Sourced {
                 value: p,
                 layer,
                 table: "[_defaults]".into(),
@@ -135,51 +127,6 @@ fn resolve_inner(
         }
     }
 
-    let clashes: Vec<String> = groups
-        .keys()
-        .filter(|n| archetypes.contains_key(*n))
-        .cloned()
-        .collect();
-    let mut hidden = std::collections::BTreeSet::new();
-    // A same-file clash has no layer winner. Across files the project value
-    // wins, whether that means hiding the global group or archetype, so that
-    // adding a group to the global file cannot break a project that happens
-    // to have an archetype of that name.
-    for name in clashes {
-        let (g, a) = (groups[&name].layer, archetypes[&name].layer);
-        if g == a {
-            bail!(
-                "group '{name}' conflicts with an archetype of the same name ({} config)",
-                g.as_str()
-            );
-        }
-        if g == Layer::Global {
-            groups.remove(&name);
-        } else {
-            archetypes.remove(&name);
-        }
-        hidden.insert(name);
-    }
-
-    // The resolved maps are disjoint, so the app's group-first lookup cannot
-    // override an archetype with a same-name group.
-
-    for (name, group) in &groups {
-        for member in &group.value {
-            if !archetypes.contains_key(member) {
-                let why = if hidden.contains(member) {
-                    " (a project group of that name hides the global archetype)"
-                } else {
-                    ""
-                };
-                bail!(
-                    "group '{name}' ({} config) references unknown archetype '{member}'{why}",
-                    group.layer.as_str()
-                );
-            }
-        }
-    }
-
     let profiles = defs
         .into_iter()
         .map(|(prov, by_name)| {
@@ -203,9 +150,8 @@ fn resolve_inner(
 
     Ok(ReviewConfig {
         archetypes,
-        groups,
         audit,
-        providers,
+        provider,
         stall_timeout_secs,
         claude_token_command,
         profiles,

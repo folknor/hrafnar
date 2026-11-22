@@ -1,5 +1,5 @@
 //! Parsing one config file. The reserved sections (`[archetypes]`,
-//! `[_groups]`, `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a
+//! `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a
 //! `toml::Table`; what remains is profiles. A top-level table named after a
 //! known provider is a hostless `[<provider>.<profile>]` table, and any other
 //! is a legacy `[<host>.<provider>.<profile>]` host table, still parsed so old
@@ -20,9 +20,7 @@ fn unknown_provider_hint() -> String {
 }
 
 /// Parse one config file. `origin` names it in errors. Checks everything that
-/// can be checked within the file alone; cross-file checks (group members,
-/// group/archetype name clashes) happen in `resolve`, because a project's group
-/// may name a global archetype. Host-scoped `[_projects]` names are checked
+/// can be checked within the file alone. Host-scoped `[_projects]` names are checked
 /// later, once the current host is known, by `resolve` or `global_projects`.
 pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> super::Result<ConfigFile> {
     parse_file_inner(raw, origin, layer).map_err(|source| super::ConfigError::InvalidFile {
@@ -39,12 +37,22 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     let mut table: toml::Table =
         toml::from_str(raw).map_err(|e| anyhow::anyhow!("failed to parse {origin}: {e}"))?;
 
-    let groups: BTreeMap<String, Vec<String>> = match table.remove("_groups") {
-        Some(v) => v
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("[_groups] in {origin}: {e}"))?,
-        None => BTreeMap::new(),
-    };
+    // Retired with fan-out. Refused rather than ignored, so a config written
+    // for the old behaviour says why it no longer does what it says.
+    if table.contains_key("_groups") {
+        bail!(
+            "[_groups] in {origin}: archetype groups were removed - a run takes one \
+             archetype, so launch one `review -a <name>` per member instead"
+        );
+    }
+    if let Some(toml::Value::Table(d)) = table.get("_defaults")
+        && d.contains_key("providers")
+    {
+        bail!(
+            "[_defaults].providers in {origin}: a run launches one provider now - \
+             write `provider = \"<name>\"` instead"
+        );
+    }
     let audit: AuditConfig = match table.remove("_audit") {
         Some(_) if layer == Layer::Global => bail!(
             "[_audit] in {origin}: the audit block identifies a project, so it belongs \
@@ -126,36 +134,11 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
             );
         }
     }
-    for (name, members) in &groups {
-        if reserved_names().contains(name) || name == BARE {
-            bail!("'{name}' is a reserved name and cannot be used as a group in {origin}");
-        }
-        if members.is_empty() {
-            bail!("group '{name}' is empty in {origin}");
-        }
-        let mut seen = std::collections::HashSet::new();
-        for member in members {
-            if !seen.insert(member) {
-                bail!("group '{name}' contains duplicate archetype '{member}' in {origin}");
-            }
-            // A global group may only name global archetypes. The global file
-            // is read in every project, so a group leaning on one project's
-            // archetype would be an error everywhere else - and a global group
-            // shadowed by a project group is checked here or nowhere.
-            if layer == Layer::Global && !archetypes.contains_key(member) {
-                bail!(
-                    "group '{name}' references archetype '{member}', which {origin} does not \
-                     define\n  A global group may only name global archetypes."
-                );
-            }
-        }
-    }
-    // `[_defaults].providers` was validated as it was deserialized: each entry
-    // is a `Provider`, whose parse error names the supported list.
+    // `[_defaults].provider` was validated as it was deserialized: it is a
+    // `Provider`, whose parse error names the supported list.
 
     Ok(ConfigFile {
         archetypes,
-        groups,
         audit,
         defaults,
         profiles,
@@ -317,7 +300,7 @@ sandbox = \"read-only\"
         let cfg = local_only("", "h").unwrap();
         assert!(cfg.archetypes.is_empty());
         assert!(cfg.profiles.is_empty());
-        assert!(cfg.providers.is_none());
+        assert!(cfg.provider.is_none());
     }
 
     #[test]
@@ -334,16 +317,21 @@ model = \"whatever\"
     }
 
     #[test]
-    fn parses_defaults_providers() {
-        let raw = "\
-[_defaults]
-providers = [\"claude\", \"codex\"]
-";
-        let cfg = local_only(raw, "h").unwrap();
-        assert_eq!(
-            cfg.default_providers().unwrap(),
-            &[Provider::Claude, Provider::Codex]
-        );
+    fn parses_defaults_provider() {
+        let cfg = local_only("[_defaults]\nprovider = \"claude\"\n", "h").unwrap();
+        assert_eq!(cfg.default_provider(), Some(Provider::Claude));
+    }
+
+    #[test]
+    fn retired_fan_out_keys_are_refused_by_name() {
+        let err = local_only("[_defaults]\nproviders = [\"claude\"]\n", "h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider = "), "{err}");
+        let err = local_only("[archetypes]\na = \"a\"\n[_groups]\ng = [\"a\"]\n", "h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("groups were removed"), "{err}");
     }
 
     #[test]
@@ -371,56 +359,15 @@ providers = [\"claude\", \"codex\"]
     }
 
     #[test]
-    fn parses_groups() {
-        let raw = "\
-[archetypes]
-security = \"a\"
-bugs = \"b\"
-
-[_groups]
-sweep = [\"security\", \"bugs\"]
-";
-        let cfg = local_only(raw, "h").unwrap();
-        assert_eq!(cfg.groups.len(), 1);
-        assert_eq!(cfg.groups["sweep"].value, vec!["security", "bugs"]);
-    }
-
-    #[test]
-    fn group_with_unknown_member_errors() {
-        let raw = "\
-[archetypes]
-security = \"a\"
-
-[_groups]
-sweep = [\"security\", \"nonexistent\"]
-";
-        let err = local_only(raw, "h").unwrap_err().to_string();
-        assert!(err.contains("nonexistent"), "{err}");
-    }
-
-    #[test]
-    fn group_name_conflicts_with_archetype() {
-        let raw = "\
-[archetypes]
-security = \"a\"
-
-[_groups]
-security = [\"security\"]
-";
-        let err = local_only(raw, "h").unwrap_err().to_string();
-        assert!(err.contains("conflicts"), "{err}");
-    }
-
-    #[test]
     fn reserved_archetype_name_errors() {
-        let err = local_only("[archetypes]\nall = \"a\"\n", "h")
+        let err = local_only("[archetypes]\nhelp = \"a\"\n", "h")
             .unwrap_err()
             .to_string();
         assert!(err.contains("reserved"), "{err}");
     }
 
     #[test]
-    fn subcommand_names_are_reserved_as_archetype_and_group_names() {
+    fn subcommand_names_are_reserved_as_archetype_names() {
         // `-a` cannot collide with a subcommand, but the legacy positional form
         // can: `review sessions` runs the subcommand, silently, instead of the
         // archetype.
@@ -428,9 +375,6 @@ security = [\"security\"]
             let as_archetype = format!("[archetypes]\n{name} = \"x\"\n");
             let err = local_only(&as_archetype, "h").unwrap_err().to_string();
             assert!(err.contains("reserved"), "{name} as archetype: {err}");
-            let as_group = format!("[archetypes]\nx = \"x\"\n[_groups]\n{name} = [\"x\"]\n");
-            let err = local_only(&as_group, "h").unwrap_err().to_string();
-            assert!(err.contains("reserved"), "{name} as group: {err}");
         }
     }
 
@@ -443,9 +387,5 @@ security = [\"security\"]
             .unwrap_err()
             .to_string();
         assert!(err.contains("bare"), "{err}");
-        let err = local_only("[archetypes]\nx = \"x\"\n[_groups]\nbare = [\"x\"]\n", "h")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("reserved"), "{err}");
     }
 }

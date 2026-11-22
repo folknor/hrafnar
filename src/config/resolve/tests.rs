@@ -227,7 +227,7 @@ model = \"global-host\"
         }
     }
 
-    // ---- archetypes and groups ------------------------------------------
+    // ---- archetypes -----------------------------------------------------
 
     #[test]
     fn archetypes_union_across_layers_and_local_wins_per_name() {
@@ -247,81 +247,6 @@ model = \"global-host\"
     }
 
     #[test]
-    fn a_local_group_may_reference_a_global_archetype() {
-        // Validation has to happen after merging: a project composing its own
-        // sweep out of the operator's generic archetypes is the normal case.
-        let cfg = layered(
-            "[archetypes]\nperf = \"p\"\n[_groups]\nsweep = [\"perf\", \"security\"]\n",
-            "[archetypes]\nsecurity = \"s\"\n",
-            "h",
-        )
-        .unwrap();
-        let sweep = &cfg.groups["sweep"];
-        assert_eq!(sweep.value, vec!["perf", "security"]);
-        assert_eq!(sweep.layer, Layer::Local);
-        assert_eq!(sweep.table, "[_groups]");
-    }
-
-    #[test]
-    fn groups_union_across_layers_and_a_local_group_replaces_the_global_list() {
-        // Lists replace, never merge: the local sweep is exactly what the
-        // project wrote, not the global members plus its own.
-        let cfg = layered(
-            "[_groups]\nsweep = [\"bugs\"]\n",
-            "[archetypes]\nbugs = \"b\"\nsecurity = \"s\"\n\
-             [_groups]\nsweep = [\"security\", \"bugs\"]\nall-sec = [\"security\"]\n",
-            "h",
-        )
-        .unwrap();
-        assert_eq!(cfg.groups["sweep"].value, vec!["bugs"]);
-        assert_eq!(cfg.groups["sweep"].layer, Layer::Local);
-        assert_eq!(cfg.groups["all-sec"].value, vec!["security"]);
-        assert_eq!(cfg.groups["all-sec"].layer, Layer::Global);
-    }
-
-    #[test]
-    fn a_group_member_no_layer_defines_errors_and_names_the_groups_layer() {
-        let err = layered(
-            "[_groups]\nsweep = [\"bugs\", \"ghost\"]\n",
-            "[archetypes]\nbugs = \"b\"\n",
-            "h",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("'ghost'"), "{err}");
-        assert!(err.contains("local config"), "{err}");
-    }
-
-    #[test]
-    fn a_global_group_may_not_lean_on_a_project_archetype() {
-        // The global file is read in every project. A global group naming an
-        // archetype only this project defines would resolve here and be an
-        // error in every other project, so it is refused at parse time.
-        let err = parse_file(
-            "[_groups]\nsweep = [\"bugs\"]\n",
-            "global.toml",
-            Layer::Global,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("'bugs'"), "{err}");
-        assert!(err.contains("global.toml"), "{err}");
-    }
-
-    #[test]
-    fn a_shadowed_global_group_is_still_validated() {
-        // Resolution only checks the winning group. The global file must be
-        // valid on its own regardless, or it breaks the first project that
-        // does not happen to shadow the broken group.
-        let result = parse_file(
-            "[archetypes]\nbugs = \"b\"\n[_groups]\nsweep = [\"ghost\"]\n",
-            "global.toml",
-            Layer::Global,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn a_misspelled_profile_key_is_an_error() {
         // A profile wins whole, so a typo that parsed as an empty profile would
         // silently discard the global definition it shadows.
@@ -332,63 +257,7 @@ model = \"global-host\"
     }
 
     #[test]
-    fn a_local_archetype_beats_a_global_group_of_the_same_name() {
-        // The project wins across files for every name. Adding a group to the
-        // global file must not break a project that already has an archetype
-        // of that name.
-        let cfg = layered(
-            "[archetypes]\nsweep = \"a\"\n",
-            "[archetypes]\nbugs = \"b\"\n[_groups]\nsweep = [\"bugs\"]\n",
-            "h",
-        )
-        .unwrap();
-        assert_eq!(cfg.archetype("sweep"), Some("a"));
-        assert!(!cfg.groups.contains_key("sweep"));
-    }
-
-    #[test]
-    fn a_local_group_beats_a_global_archetype_of_the_same_name() {
-        let cfg = layered(
-            "[archetypes]\nbugs = \"b\"\n[_groups]\nsweep = [\"bugs\"]\n",
-            "[archetypes]\nsweep = \"a\"\n",
-            "h",
-        )
-        .unwrap();
-        assert_eq!(cfg.groups["sweep"].layer, Layer::Local);
-        assert!(cfg.archetype("sweep").is_none());
-    }
-
-    #[test]
-    fn a_group_and_archetype_clash_within_one_file_errors() {
-        // Within one file there is no layer to pick a winner by.
-        let err = layered(
-            "",
-            "[archetypes]\nsweep = \"a\"\nbugs = \"b\"\n[_groups]\nsweep = [\"bugs\"]\n",
-            "h",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("conflicts"), "{err}");
-        assert!(err.contains("(global config)"), "{err}");
-    }
-
-    #[test]
-    fn a_global_group_naming_an_archetype_a_project_group_hides_explains_why() {
-        // The project group `bugs` hides the global archetype `bugs`, which the
-        // global group `sweep` still names. The generic "unknown archetype"
-        // message would point at a name that is plainly in the global file.
-        let err = layered(
-            "[archetypes]\nx = \"x\"\n[_groups]\nbugs = [\"x\"]\n",
-            "[archetypes]\nbugs = \"b\"\n[_groups]\nsweep = [\"bugs\"]\n",
-            "h",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("hides the global archetype"), "{err}");
-    }
-
-    #[test]
-    fn reserved_names_error_as_archetype_or_group_in_the_global_layer_too() {
+    fn reserved_names_error_as_archetypes_in_the_global_layer_too() {
         for name in reserved_names() {
             let raw = format!("[archetypes]\n{name} = \"x\"\n");
             let err = parse_file(&raw, "global.toml", Layer::Global)
@@ -396,79 +265,48 @@ model = \"global-host\"
                 .to_string();
             assert!(err.contains("reserved"), "{name}: {err}");
             assert!(err.contains("global.toml"), "{name}: {err}");
-
-            let raw = format!("[archetypes]\nbugs = \"x\"\n[_groups]\n{name} = [\"bugs\"]\n");
-            let err = parse_file(&raw, "global.toml", Layer::Global)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("reserved"), "{name}: {err}");
-        }
-    }
-
-    #[test]
-    fn every_reserved_name_errors_as_a_local_group() {
-        for name in reserved_names() {
-            let raw = format!("[archetypes]\nbugs = \"x\"\n[_groups]\n{name} = [\"bugs\"]\n");
-            let err = parse_file(&raw, "local.toml", Layer::Local)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("reserved"), "{name}: {err}");
         }
     }
 
     // ---- defaults -------------------------------------------------------
 
     #[test]
-    fn a_local_provider_list_replaces_the_global_one() {
+    fn a_local_provider_replaces_the_global_one() {
         let cfg = layered(
-            "[_defaults]\nproviders = [\"grok\"]\n",
-            "[_defaults]\nproviders = [\"claude\", \"codex\"]\n",
+            "[_defaults]\nprovider = \"grok\"\n",
+            "[_defaults]\nprovider = \"claude\"\n",
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Grok]);
-        let p = cfg.providers.as_ref().unwrap();
+        assert_eq!(cfg.default_provider(), Some(Provider::Grok));
+        let p = cfg.provider.as_ref().unwrap();
         assert_eq!(p.layer, Layer::Local);
         assert_eq!(p.table, "[_defaults]");
     }
 
     #[test]
-    fn an_explicitly_empty_local_provider_list_still_wins() {
-        // `providers = []` is the project saying "always pass --provider",
-        // which must not be read as "unset" and filled from the global list.
-        let cfg = layered(
-            "[_defaults]\nproviders = []\n",
-            "[_defaults]\nproviders = [\"codex\"]\n",
-            "h",
-        )
-        .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &[] as &[Provider]);
-        assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Local);
-    }
-
-    #[test]
     fn defaults_fall_through_key_by_key_not_table_by_table() {
         // A local `[_defaults]` that sets only stall_timeout_secs must not
-        // blank the global provider list, and vice versa.
+        // blank the global provider, and vice versa.
         let cfg = layered(
             "[_defaults]\nstall_timeout_secs = 0\n",
-            "[_defaults]\nproviders = [\"codex\"]\nstall_timeout_secs = 900\n",
+            "[_defaults]\nprovider = \"codex\"\nstall_timeout_secs = 900\n",
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Codex]);
-        assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Global);
+        assert_eq!(cfg.default_provider(), Some(Provider::Codex));
+        assert_eq!(cfg.provider.as_ref().unwrap().layer, Layer::Global);
         // 0 means "disabled", which is a setting, not an absence.
         assert_eq!(cfg.stall_timeout(), Some(crate::config::StallTimeout::Off));
         assert_eq!(cfg.stall_timeout_secs.as_ref().unwrap().layer, Layer::Local);
 
         let cfg = layered(
-            "[_defaults]\nproviders = [\"claude\"]\n",
+            "[_defaults]\nprovider = \"claude\"\n",
             "[_defaults]\nstall_timeout_secs = 600\n",
             "h",
         )
         .unwrap();
-        assert_eq!(cfg.default_providers().unwrap(), &[Provider::Claude]);
+        assert_eq!(cfg.default_provider(), Some(Provider::Claude));
         assert_eq!(
             cfg.stall_timeout(),
             Some(crate::config::StallTimeout::from(600))
@@ -483,14 +321,14 @@ model = \"global-host\"
         // Nothing is built in: an unset key stays unset rather than acquiring
         // a value `review config` would have to attribute to no file.
         let cfg = layered("[_defaults]\n", "[_defaults]\n", "h").unwrap();
-        assert!(cfg.providers.is_none());
+        assert!(cfg.provider.is_none());
         assert!(cfg.stall_timeout_secs.is_none());
     }
 
     #[test]
     fn an_unknown_provider_in_global_defaults_errors() {
         let err = parse_file(
-            "[_defaults]\nproviders = [\"codex\", \"kilo\"]\n",
+            "[_defaults]\nprovider = \"kilo\"\n",
             "global.toml",
             Layer::Global,
         )
@@ -598,7 +436,7 @@ model = \"global-host\"
 [archetypes]
 bugs = \"b\"
 [_defaults]
-providers = [\"codex\"]
+provider = \"codex\"
 [codex.deep]
 model = \"m\"
 ";
@@ -607,7 +445,7 @@ model = \"m\"
             resolve(local(raw), Some(global("")), "h", ConfigFiles::default()).unwrap();
         for cfg in [&without, &with_empty] {
             assert_eq!(cfg.archetypes["bugs"].layer, Layer::Local);
-            assert_eq!(cfg.providers.as_ref().unwrap().layer, Layer::Local);
+            assert_eq!(cfg.provider.as_ref().unwrap().layer, Layer::Local);
             let e = entry(cfg, "codex", "deep");
             assert_eq!(e.effective.layer, Layer::Local);
             assert!(e.shadowed.is_empty());

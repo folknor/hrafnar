@@ -1,4 +1,4 @@
-//! The `review` command itself: argument handling, the fan-out and the verbs.
+//! The `review` command itself: argument handling, the run and the verbs.
 //! `main.rs` only dispatches between this and the keeper.
 
 use anyhow::{Result, bail};
@@ -15,7 +15,7 @@ mod launch;
 mod message;
 
 use history::{run_incidents, run_session_show, run_sessions};
-use launch::{Launch, RecordCtx, TaskOutcome, run_launch};
+use launch::{Launch, RecordCtx, run_launch};
 use message::run_message;
 
 /// Format the wall-clock runtime printed when `review` returns: sub-minute runs
@@ -162,9 +162,8 @@ pub async fn run() -> Result<CommandExit> {
     // text. Read before the config so this works outside a project too. With any
     // flag given the operator meant to run something, so a missing stdin falls
     // through to `read_stdin`'s error, which says what is missing, rather than
-    // answering with help that silently ignores the flags.
-    // `Cli` loses whether its defaulted `--stagger` was explicitly supplied,
-    // so argv presence preserves the rule that any argument requests a run.
+    // answering with help that silently ignores the flags. Argv presence, not
+    // parsed fields, so any argument at all requests a run.
     let early_stdin = if archetype_arg.is_none() && std::env::args_os().len() == 1 {
         match input::read_stdin_optional()? {
             Some(s) => Some(s),
@@ -189,77 +188,48 @@ pub async fn run() -> Result<CommandExit> {
         eprintln!("hostname: {}", cfg.hostname);
     }
 
-    let archetypes_to_run = cfg.select_archetypes(archetype_arg)?;
+    let (arch_name, prime) = cfg.select_archetype(archetype_arg)?;
 
-    // Provider list: --provider wins, otherwise [_defaults].providers from the
-    // first layer that sets it.
-    // Both are typed where they were parsed (clap, the config files), so there
-    // is no unknown name left to reject here.
-    let providers_to_run: Vec<provider::Provider> =
-        match cli.provider.as_ref().filter(|v| !v.is_empty()) {
-            Some(v) => v.clone(),
-            None => match cfg.default_providers() {
-                Some(p) if !p.is_empty() => p.to_vec(),
-                _ => bail!(
-                    "no providers to run: pass --provider <name> or set [_defaults].providers \
-                 (looked in {})",
-                    cfg.searched()
-                ),
-            },
-        };
+    // --provider wins, otherwise [_defaults].provider from the first layer
+    // that sets it. Both are typed where they were parsed (clap, the config
+    // files), so there is no unknown name left to reject here.
+    let Some(prov_name) = cli.provider.or_else(|| cfg.default_provider()) else {
+        bail!(
+            "no provider to run: pass --provider <name> or set [_defaults].provider \
+             (looked in {})",
+            cfg.searched()
+        );
+    };
 
-    // If a profile was requested, every launched provider must have it in some
-    // layer. Validate up front so we fail before spawning.
+    // A requested profile must exist for the provider; fail before spawning.
     if let Some(ref profile) = cli.profile {
-        for prov in &providers_to_run {
-            cfg.require_profile(*prov, profile)?;
-        }
+        cfg.require_profile(prov_name, profile)?;
     }
 
-    let missing: Vec<&str> = providers_to_run
-        .iter()
-        .filter(|p| !provider::is_available(**p))
-        .map(|p| p.as_str())
-        .collect();
+    let installed = provider::is_available(prov_name);
+    let assembled = prompt::assemble(&prime, &stdin_instructions);
 
-    // Dry run: print what would be sent and exit
+    // Dry run: print what would be sent and exit. It launches nothing, so a
+    // missing provider only warns.
     if cli.dry_run {
-        if !missing.is_empty() {
-            eprintln!(
-                "warning: not installed on this host: {} - a real run would fail",
-                missing.join(", ")
-            );
+        if !installed {
+            eprintln!("warning: {prov_name} is not installed on this host - a real run would fail");
         }
-        for (arch_name, prime) in &archetypes_to_run {
-            let prompt = prompt::assemble(prime, &stdin_instructions);
-            if archetypes_to_run.len() > 1 {
-                println!("=== {arch_name} ===\n");
-            }
-            println!("{prompt}");
-            if archetypes_to_run.len() > 1 {
-                println!();
-            }
-        }
+        println!("{assembled}");
         return Ok(CommandExit::Success);
     }
 
-    // Every provider must be installed here, checked before anything launches.
-    // With host-scoped config gone, one config reaches every machine, including
-    // ones missing a harness; skipping it would quietly run a narrower fan-out
-    // than was asked for, so it fails instead. A dry run launches nothing, so it
-    // only warns.
-    if !missing.is_empty() {
+    // One config reaches every machine, including ones missing a harness, so
+    // this is checked before anything launches.
+    if !installed {
         bail!(
-            "not installed on this host (not found on PATH): {}\n  \
-             Nothing was launched. Install it, or choose providers with --provider.",
-            missing.join(", ")
+            "{prov_name} is not installed on this host (not found on PATH)\n  \
+             Nothing was launched. Install it, or choose another with --provider."
         );
     }
 
-    // Fan-out orchestration stays here: the operator-owned host launch lock
-    // belongs at this site, and scheduling/collection form its one command path.
     // Provider execution and recording live in launch; views live in history.
-    // Global lock
+    // The host-wide launch lock spaces out `review` calls fired together.
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
@@ -287,151 +257,91 @@ pub async fn run() -> Result<CommandExit> {
         &scope,
     );
 
-    // Spawn all providers with staggered launches to avoid rate limits
-    let stagger = std::time::Duration::from_secs(cli.stagger);
-    struct PendingResult {
-        provider: provider::Provider,
-        ctx: std::sync::Arc<RecordCtx>,
-        prompt: String,
-        handle: tokio::task::JoinHandle<TaskOutcome>,
-    }
-    struct ArchetypeRun<T> {
-        name: String,
-        launches: Vec<T>,
-    }
-    let mut pending = Vec::new();
-    let mut launch_count = 0u32;
+    // Profile overrides (validated above to exist when --profile is set).
+    let definition = cli
+        .profile
+        .as_ref()
+        .and_then(|name| cfg.profiles.get(&prov_name)?.get(name))
+        .map(|entry| &entry.effective);
+    let settings = provider::RunSettings::from_profile(prov_name, definition);
+    let ctx = std::sync::Arc::new(RecordCtx {
+        project_root: project_root.clone(),
+        data: data.clone(),
+        scope: scope.clone(),
+        archetype: arch_name,
+        env_keys: settings.env_keys(),
+        profile_origin: settings.origin().cloned(),
+        operator_prompt: stdin_instructions,
+    });
+    let launch = Launch {
+        spec: provider::LaunchSpec {
+            provider: prov_name,
+            start: provider::SessionStart::Fresh { id: None },
+            settings,
+            prompt: assembled.clone(),
+            root: project_root,
+        },
+        runtime: provider_runtime,
+    };
+    let mut handle = tokio::spawn(run_launch(launch, std::sync::Arc::clone(&ctx)));
 
-    for (arch_name, prime) in &archetypes_to_run {
-        let assembled = prompt::assemble(prime, &stdin_instructions);
-        let mut group = ArchetypeRun {
-            name: arch_name.clone(),
-            launches: Vec::new(),
-        };
-
-        for &prov_name in &providers_to_run {
-            // Profile overrides (validated above to exist when --profile is set).
-            let definition = cli
-                .profile
-                .as_ref()
-                .and_then(|name| cfg.profiles.get(&prov_name)?.get(name))
-                .map(|entry| &entry.effective);
-            let settings = provider::RunSettings::from_profile(prov_name, definition);
-            let env_keys = settings.env_keys();
-            let profile_origin = settings.origin().cloned();
-            let launch = Launch {
-                spec: provider::LaunchSpec {
-                    provider: prov_name,
-                    start: provider::SessionStart::Fresh { id: None },
-                    settings,
-                    prompt: assembled.clone(),
-                    root: project_root.clone(),
-                },
-                runtime: provider_runtime.clone(),
-                delay: stagger * launch_count,
-            };
-            let ctx = std::sync::Arc::new(RecordCtx {
-                project_root: project_root.clone(),
-                data: data.clone(),
-                scope: scope.clone(),
-                archetype: arch_name.clone(),
-                env_keys,
-                profile_origin,
-                operator_prompt: stdin_instructions.clone(),
-            });
-            group.launches.push(PendingResult {
-                provider: prov_name,
-                prompt: assembled.clone(),
-                ctx: std::sync::Arc::clone(&ctx),
-                handle: tokio::spawn(run_launch(launch, ctx)),
-            });
-            launch_count += 1;
-        }
-        pending.push(group);
-    }
-
-    // Hold the lock until every staggered launch has fired, plus one interval,
-    // so a queued invocation can't start launching concurrently with our later
-    // tasks. Task i launches at `stagger * i` (last at `stagger*(launch_count-1)`),
-    // so we wait `stagger * launch_count` to cover the last launch and a trailing
-    // gap before the next invocation's first launch.
-    if launch_count > 0 && !stagger.is_zero() {
-        tokio::time::sleep(stagger * launch_count).await;
-    }
+    // Hold the lock for the launch spacing, so the next queued `review` on this
+    // host launches that much later. A run that is over sooner releases it
+    // then: it is no longer talking to its provider, and its result should not
+    // wait on the spacing.
+    let joined = tokio::select! {
+        joined = &mut handle => Some(joined),
+        () = tokio::time::sleep(crate::timings::LAUNCH_SPACING) => None,
+    };
     drop(lock_file);
+    let joined = match joined {
+        Some(joined) => joined,
+        None => handle.await,
+    };
 
-    // Collect results
-    let mut results = Vec::new();
-    for group in pending {
-        let mut completed = ArchetypeRun {
-            name: group.name,
-            launches: Vec::new(),
-        };
-        for p in group.launches {
-            // A finished task has already recorded its runs; only a panicked one
-            // (which never got the chance) is recorded here.
-            let result = match p.handle.await {
-                Ok(outcome) => outcome.into_result(),
-                Err(err) => {
-                    let result = provider::ProviderResult {
-                        credential: None,
-                        run_id: None,
-                        _reservation: None,
-                        provider: p.provider,
-                        output: Err(anyhow::anyhow!("task panicked: {err}")),
-                        session_id: None,
-                        codex_home: None,
-                        digest: None,
-                        completed_epoch: provider::now_epoch_secs(),
-                        // A task can panic after spawning. Its effective launch
-                        // facts are unavailable here; do not replace them with
-                        // requested permissions and claim they were granted.
-                        permissions: None,
-                        writable_roots: Vec::new(),
-                        model: None,
-                        effort: None,
-                        served: provider::Served::default(),
-                        grok_trust: None,
-                        // Whatever it had launched is in the ledger, which the
-                        // exit status reads.
-                        leftovers: contained::Leftovers::default(),
-                    };
-                    p.ctx.record(&result, &p.prompt);
-                    result
-                }
+    // A finished task has already recorded its runs; only a panicked one
+    // (which never got the chance) is recorded here.
+    let result = match joined {
+        Ok(outcome) => outcome.into_result(),
+        Err(err) => {
+            let result = provider::ProviderResult {
+                credential: None,
+                run_id: None,
+                _reservation: None,
+                provider: prov_name,
+                output: Err(anyhow::anyhow!("task panicked: {err}")),
+                session_id: None,
+                codex_home: None,
+                digest: None,
+                completed_epoch: provider::now_epoch_secs(),
+                // A task can panic after spawning. Its effective launch facts
+                // are unavailable here; do not replace them with requested
+                // permissions and claim they were granted.
+                permissions: None,
+                writable_roots: Vec::new(),
+                model: None,
+                effort: None,
+                served: provider::Served::default(),
+                grok_trust: None,
+                // Whatever it had launched is in the ledger, which the exit
+                // status reads.
+                leftovers: contained::Leftovers::default(),
             };
+            ctx.record(&result, &assembled);
+            result
+        }
+    };
 
-            completed.launches.push(result);
-        }
-        results.push(completed);
-    }
-
-    // Print results
-    let multi = archetypes_to_run.len() > 1;
-    for (index, group) in results.iter().enumerate() {
-        if multi {
-            if index > 0 {
-                println!();
-            }
-            println!("=== {} ===\n", group.name);
-        }
-        for result in &group.launches {
-            provider::print_result(result);
-        }
-    }
+    provider::print_result(&result);
     let left_running = print_left_running(&lifecycle);
 
     println!("\nruntime: {}", format_runtime(started.elapsed()));
 
     // A codex run that died without a final answer returns Ok (so its session
     // id + digest survive), but it is a failure for exit-code purposes - a dead
-    // review that exits 0 lies to scripts and CI. Count it as failed.
-    //
-    // Leftovers are a separate verdict across every invocation, and outrank
-    // it: one provider's answer cannot excuse another's processes still
-    // running.
-    let all_failed = results.iter().flat_map(|g| &g.launches).all(run_failed);
-    Ok(CommandExit::of_runs(all_failed, left_running))
+    // review that exits 0 lies to scripts and CI. Leftovers are a separate
+    // verdict that outranks it.
+    Ok(CommandExit::of_runs(run_failed(&result), left_running))
 }
 
 /// Print what is still running, or may be, from every invocation this
@@ -472,8 +382,8 @@ mod tests {
 
     #[test]
     fn the_archetype_flag_is_taken_as_given() {
-        let got = resolve_archetype_arg(Some("security,bugs"), None).expect("ok");
-        assert_eq!(got.as_deref(), Some("security,bugs"));
+        let got = resolve_archetype_arg(Some("security"), None).expect("ok");
+        assert_eq!(got.as_deref(), Some("security"));
         assert_eq!(resolve_archetype_arg(None, None).expect("ok"), None);
     }
 

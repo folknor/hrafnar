@@ -31,10 +31,10 @@ messages have no profile origin.
 
 ## Selecting one
 
-`-p implement` looks the name up separately for each launched provider. Every
-launched provider must have it, or the run fails before anything launches,
-naming every file searched. Without `-p`, each provider runs on its own
-defaults with the `read-only` sandbox.
+`-p implement` looks the name up for the run's provider. The provider must
+have it, or the run fails before anything launches, naming every file
+searched. Without `-p`, the provider runs on its own defaults with the
+`read-only` sandbox.
 
 A resume (`review message`) takes no profile. The session keeps the sandbox,
 model and effort recorded for it, but **not** the profile's `env` or `config`,

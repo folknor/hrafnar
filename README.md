@@ -1,12 +1,12 @@
 # review
 
-A Rust CLI that sends a prompt to fresh AI sessions across multiple providers (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
+A Rust CLI that sends a prompt to a fresh AI session on one of several providers (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
 ## How it works
 
-You pipe your instructions via stdin. The tool starts a **fresh session** on each provider and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
+You pipe your instructions via stdin. The tool starts one **fresh session** on one provider and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
 
 Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. Every provider prints the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
 
@@ -21,13 +21,13 @@ review init
 
 ### 2. Configure
 
-Settings shared by every project - default providers, and the profiles naming
-which model serves which tier - go once in the global
+Settings shared by every project - the default provider, and the profiles
+naming which model serves which tier - go once in the global
 `~/.config/review/config.toml`:
 
 ```toml
 [_defaults]
-providers = ["codex"]
+provider = "codex"
 
 [codex.deep]
 model = "gpt-6-luna"
@@ -52,14 +52,13 @@ bugs = "You hunt for edge cases and correctness bugs."
 echo "what does the retry loop guarantee?" | review -p deep
 echo "look for auth boundary violations" | review -a security
 echo "check for edge cases in the parsing module" | review -a bugs -p deep
-echo "full review please" | review -a all
-echo "how should we handle polygon clipping?" | review -a competitors
+echo "second opinion please" | review -a bugs --provider claude
 ```
 
 ## Usage
 
 ```
-echo "<instructions>" | review [-a ARCHETYPE[,...]] [-p PROFILE] [--provider P,...] [--dry-run] [--stagger N]
+echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--provider NAME] [--dry-run]
 echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
 review config
 review sessions [ID] [--all] [--limit N]
@@ -67,34 +66,26 @@ review incidents [--limit N]
 review init
 ```
 
-Instructions are piped via stdin (required, 20KB limit). Without `-a`, stdin is sent unchanged - no priming prompt. Multiple archetypes and groups can be comma-separated:
+Instructions are piped via stdin (required, 20KB limit). Without `-a`, stdin is sent unchanged - no priming prompt.
 
-```
-echo "review please" | review -a security,bugs,arch
-echo "review please" | review -a bugs,competitors
-```
-
-Duplicates are removed automatically (e.g. if a group overlaps with an explicit archetype).
+One run is one session. For several perspectives or providers, launch several `review` calls side by side; launches on one host are spaced apart automatically (see [Rate limits](#rate-limits)).
 
 All output is plain text, for people and agents alike. There is no JSON mode.
 
 ### Archetypes
 
-Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except reserved names, which fail to parse: `all`, the subcommand names (`message`, `resume`, `interrupt`, `config`, `sessions`, `incidents`, `init`, `man`, `help`), and `bare` for a group or any non-empty prompt. `bare` is the special no-prime selector: `-a bare` works even without a config entry, and an archetype definition is allowed only as `bare = ""`.
-
-Use `-a all` to fan out to every configured archetype except the special `bare` entry, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
+Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except reserved names, which fail to parse: the subcommand names (`message`, `resume`, `interrupt`, `config`, `sessions`, `incidents`, `init`, `man`, `help`), and `bare` with any non-empty prompt. `bare` is the special no-prime selector: `-a bare` works even without a config entry, and an archetype definition is allowed only as `bare = ""`.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `-a, --archetype <name>` | Archetype(s) to prime with: a name, a group, a comma-separated list, `all` (every configured archetype except `bare`), or `bare` (one unprimed run, even without a config entry). Omit to send stdin unchanged. |
-| `-p, --profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved per launched provider from `[<provider>.<profile>]`, project config first, then global. |
-| `--provider <list>` | Limit to specific providers (comma-separated) |
+| `-a, --archetype <name>` | Archetype to prime with, or `bare` (an unprimed run, even without a config entry). Omit to send stdin unchanged. |
+| `-p, --profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved for the provider from `[<provider>.<profile>]`, project config first, then global. |
+| `--provider <name>` | The provider to run, overriding `[_defaults].provider` |
 | `--dry-run` | Print what would be sent instead of sending it |
-| `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The provider comes from `--provider`, or `[_defaults].provider` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
 
 How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every provider captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
@@ -332,20 +323,6 @@ truncated)`, or `suspicious`, and the codex version is recorded because deaths
 have been version-specific. The bundle path is also printed on the digest of
 the run that produced it.
 
-When using `all` or groups, archetype headers are added:
-
-```
-=== security ===
-
---- claude ---
-<review content>
-
-=== bugs ===
-
---- claude ---
-<review content>
-```
-
 ## Configuration
 
 Settings resolve like a standard command-line tool: the command line, then the project's `.review.toml`, then the global config. Nothing is built in.
@@ -365,12 +342,8 @@ tilemaker = "You are a tilemaker maintainer weighing tradeoffs."
 tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 
 [_defaults]
-providers = ["claude", "codex"]    # used when --provider is omitted
+provider = "codex"                 # used when --provider is omitted
 stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
-
-[_groups]
-sweep = ["security", "bugs"]
-competitors = ["tilemaker", "tippecanoe"]
 
 # Named profiles: per-provider model/effort/sandbox/env overrides, applied via
 # -p/--profile. Scoped by provider . profile.
@@ -386,19 +359,23 @@ effort = "high"
 
 How the layers combine:
 
-- **Archetypes and groups** are the union of both files; the project wins on a name clash, including a project archetype against a global group of the same name. Within one file, a group and an archetype may not share a name. A project group may name a global archetype; a global group may only name global archetypes, since the global file is read in every project.
-- **`[_defaults]` keys** come from the first file that sets them. An explicit `providers = []` in the project counts as set.
+- **Archetypes** are the union of both files; the project wins on a name clash.
+- **`[_defaults]` keys** come from the first file that sets them.
 - **Profiles** come from the first definition found, and win whole. Lookup order: the project's host-scoped table, its hostless table, then the same two in the global file.
 
 ### `review config`
 
-Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, the default providers and whether each provider is installed on this machine, every archetype and group with its source, and every profile with the table it came from and any definitions it shadows. Env vars show by name only.
+Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, the default provider and whether each provider is installed on this machine, every archetype with its source, and every profile with the table it came from and any definitions it shadows. Env vars show by name only.
 
 Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer and provider availability on their own.
 
 ### Upgrading existing files
 
-Existing `.review.toml` files keep working, including legacy host tables, with one exception that now fails to parse: a profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
+Existing `.review.toml` files keep working, including legacy host tables, with these exceptions that now fail to parse:
+
+- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
+- `[_defaults].providers = [...]`: write `provider = "<name>"` instead.
+- `[_groups]`: remove it. Launch one `review -a <name>` per member.
 
 ### Providers
 
@@ -409,47 +386,26 @@ Existing `.review.toml` files keep working, including legacy host tables, with o
 | grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
 | maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
 
-Use `--provider` to limit which providers run:
+Use `--provider` to pick a provider other than the default:
 
 ```
-echo "just claude" | review -a bugs --provider claude
-echo "claude and codex" | review -a bugs --provider claude,codex
+echo "ask claude" | review -a bugs --provider claude
 ```
 
-### Groups
+## Rate limits
 
-Groups fan out to multiple archetypes with a single command:
-
-```
-echo "how to handle clipping?" | review -a competitors
-echo "full sweep" | review -a sweep
-```
-
-Define groups in the `[_groups]` table. Within one file, group names must not conflict with archetype names. `all` is reserved and selects every configured archetype except `bare`.
-
-## Rate limits and staggering
-
-Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. a group of 5 claude sessions) will trigger RPM limits.
+Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. 5 claude sessions) will trigger RPM limits.
 
 A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once - enough to blow past most RPM budgets.
 
-To avoid this, provider launches are staggered by default. The first provider starts immediately; each subsequent one waits 30 seconds. All run concurrently once launched.
-
-```
-echo "review" | review -a sweep                 # 30s stagger (default)
-echo "review" | review -a sweep --stagger 10    # 10s stagger
-echo "review" | review -a sweep --stagger 0     # no stagger (risk rate limits)
-```
-
-If you're hitting rate limits, increase the stagger. If you're only running 1-2 providers, `--stagger 0` is fine.
+To avoid this, `review` calls fired together on one host are spaced apart automatically: each fresh run holds the host launch lock for a fixed spacing after launching (or until it ends, if sooner), so the next queued call launches that much later. All run concurrently once launched.
 
 ## Concurrency
 
 A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
-whole runs. An invocation holds it until its providers have been spawned (the
-fan-out path through its staggered launches, a `review resume` through the
-single spawn), then releases it and lets the runs proceed concurrently.
-Additional invocations queue and wait for the launch window only.
+whole runs. A fresh run holds it for its launch spacing, a `review message`
+until its single spawn, then releases it and lets the runs proceed
+concurrently. Additional invocations queue and wait for the launch window only.
 
 That distinction is deliberate. Holding the lock for a run's full duration
 meant one wedged provider froze every other `review` on the machine

@@ -51,7 +51,7 @@ impl std::fmt::Debug for ClaudeToken {
 }
 
 /// The configured command and, once run, its result, shared by every claude
-/// run in one `review` process so a fan-out runs it at most once.
+/// run in one `review` process so it runs at most once per process.
 #[derive(Debug)]
 pub struct TokenSource {
     command: String,

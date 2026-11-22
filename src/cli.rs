@@ -22,9 +22,11 @@ use clap::{CommandFactory, Parser, Subcommand};
 const AFTER_HELP_TEMPLATE: &str = "\
 Instructions come on stdin. With no archetype they are sent unchanged; with
 -a, the archetype's priming prompt is prepended. `-a bare` also sends stdin
-unchanged, whether or not `bare` is in the config. Every run starts a fresh
-session on each provider, and the session ID is printed above the response so
-you can follow up with `review message <ID>` while the cache is warm.
+unchanged, whether or not `bare` is in the config. Every run starts one fresh
+session on one provider, and the session ID is printed above the response so
+you can follow up with `review message <ID>` while the cache is warm. For
+several opinions, launch several `review` calls; launches on one host are
+spaced apart automatically to avoid rate limits.
 
 Steering a running agent: `echo \"<new info>\" | review message <ID>`. It ends
 the {INTERRUPTIBLE} turn in flight and continues the session with your message. Do not
@@ -51,7 +53,7 @@ never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
 {PROJECT_REFUSALS} refuse -C.
 
-Providers: {PROVIDERS}, from --provider or [_defaults].providers. A
+Providers: {PROVIDERS}, from --provider or [_defaults].provider. A
 provider that is not installed fails the run before anything launches.
 
 Profiles (-p): a profile resolves to its first definition, looking in the
@@ -70,8 +72,8 @@ any run that changes git hooks or config is warned about at exit, by path
 may fail to authenticate, since Claude Code does not pass CLAUDE_CODE_OAUTH_TOKEN
 on; a global [_defaults].claude_token_command fixes that (`review man config`).
 
-Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
-then the response. Codex and grok runs also print a digest between the session
+Output: a `--- <provider> ---` header, then `session: <ID>`, then the
+response. Codex and grok runs also print a digest between the session
 line and the response:
   exit / signal     the provider process's exit status
   captured          true if a final answer was captured; false means the text
@@ -85,9 +87,9 @@ line and the response:
   turns / usage     turn count and token usage (input, cached, output, reasoning)
   transcript        codex's rollout file and its last events
   incident          a forensic bundle for the run (see `review incidents`)
-The output ends with a `runtime:` line. The exit status is 1 when no provider
-produced an answer, including runs that died, stalled or were interrupted, or
-every answer came with `review failed`.
+The output ends with a `runtime:` line. The exit status is 1 when the run
+produced no answer, including runs that died, stalled or were interrupted, or
+an answer that came with `review failed`.
 
 When a run ends, whatever its agent left running (background commands, daemons,
 shells in sessions of their own) is ended before `review` reports. That is
@@ -100,10 +102,7 @@ more work there.
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
-  echo \"full sweep\" | review -a security,bugs          Several archetypes
-  echo \"how to handle X?\" | review -a competitors      A group of archetypes
-  echo \"everything\" | review -a all                    Every configured archetype (bare omitted)
-  echo \"just claude\" | review --provider claude        Only one provider
+  echo \"ask claude\" | review --provider claude         A provider other than the default
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
@@ -192,15 +191,15 @@ This is the authoritative view of what a run in this directory will use. It
 merges the project's .review.toml with the global config, so reading
 .review.toml alone gives an incomplete and often wrong answer: profiles and
 archetypes may live in the global file, and legacy host tables may shadow them.
-Lists the files consulted, the default providers and whether each is installed
-on this host, archetypes, groups, and profiles, each with its source and any
+Lists the files consulted, the default provider and whether each is installed
+on this host, archetypes, and profiles, each with its source and any
 definition it shadows. Env vars are listed by name only, never by value.
 Outside a project it shows the global layer alone.";
 
 #[derive(Parser)]
 #[command(
     name = "review",
-    about = "Send a prompt to fresh AI sessions across providers",
+    about = "Send a prompt to a fresh AI session on one of several providers",
     override_usage = "echo <instructions> | review [OPTIONS]\n       review <COMMAND>",
     after_help = AFTER_HELP.as_str(),
     // Without this a subcommand name after a flag (`review -C bz config`) is
@@ -223,31 +222,24 @@ pub struct Cli {
 #[derive(clap::Args)]
 #[group(multiple = true)]
 pub struct RunArgs {
-    /// Archetype(s) to prime with: a name, a group, a comma-separated list, or
-    /// "all". "bare" selects an unprimed run even when absent from config.
-    /// Omit to send stdin unchanged.
+    /// Archetype to prime with. "bare" selects an unprimed run even when absent
+    /// from config. Omit to send stdin unchanged.
     #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 
-    /// Named profile (model/effort/sandbox/env), resolved per launched provider
+    /// Named profile (model/effort/sandbox/env), resolved for the provider
     /// from [<provider>.<profile>]. The first definition found wins whole;
     /// sandbox defaults to read-only; claude profiles must omit it (see below)
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Limit to specific providers (comma-separated, e.g. claude,codex)
-    #[arg(long, value_delimiter = ',')]
-    pub provider: Option<Vec<crate::provider::Provider>>,
+    /// The provider to run, overriding [_defaults].provider
+    #[arg(long, value_name = "NAME")]
+    pub provider: Option<crate::provider::Provider>,
 
     /// Print the assembled prompt instead of sending it
     #[arg(long)]
     pub dry_run: bool,
-
-    /// Seconds between provider launches, to avoid rate limits (0 disables)
-    // Default sourced from `timings` so every production timing value has one
-    // home; clap needs a `&'static str`, hence the const rather than the literal.
-    #[arg(long, default_value = crate::timings::STAGGER_SECS_STR)]
-    pub stagger: u64,
 
     /// Migration: the archetype used to be positional (`review security`). Still
     /// accepted, with a warning, so orchestration procedures written against
@@ -285,8 +277,8 @@ impl Cli {
     /// `args_conflicts_with_subcommands` did this until `-C` arrived, but it
     /// makes no exception for a global flag - `review -C bz config` became a run
     /// primed with an archetype named `config` - and `conflicts_with` cannot name
-    /// a subcommand. So it is checked here, on explicit presence: `--stagger`
-    /// has a default and would otherwise always look supplied.
+    /// a subcommand. So it is checked here, on explicit presence, so that a
+    /// defaulted run argument never looks supplied.
     pub fn try_parse_checked<I, T>(args: I) -> Result<Self, clap::Error>
     where
         I: IntoIterator<Item = T>,
@@ -515,9 +507,9 @@ mod tests {
 
     #[test]
     fn a_run_takes_its_archetype_and_profile_as_flags() {
-        let cli = parsed(&["-a", "security,bugs", "-p", "deep", "--dry-run"]);
+        let cli = parsed(&["-a", "security", "-p", "deep", "--dry-run"]);
         assert!(cli.command.is_none());
-        assert_eq!(cli.archetype.as_deref(), Some("security,bugs"));
+        assert_eq!(cli.archetype.as_deref(), Some("security"));
         assert_eq!(cli.profile.as_deref(), Some("deep"));
         assert!(cli.dry_run);
         assert!(cli.legacy_archetype.is_none());
@@ -562,13 +554,22 @@ mod tests {
             &["-p", "deep", "resume", "abc"],
             &["-a", "bugs", "resume", "abc"],
             &["--provider", "claude", "resume", "abc"],
-            &["--stagger", "0", "message", "abc"],
-            &["--stagger", crate::timings::STAGGER_SECS_STR, "config"],
+            &["--provider", "codex", "message", "abc"],
             &["-p", "deep", "config"],
             &["--session", "abc", "sessions"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should be refused");
         }
+    }
+
+    #[test]
+    fn provider_takes_one_name() {
+        assert_eq!(
+            parsed(&["--provider", "codex"]).provider,
+            Some(crate::provider::Provider::Codex)
+        );
+        assert!(parse(&["--provider", "claude,codex"]).is_err());
+        assert!(parse(&["--stagger", "0"]).is_err(), "retired with fan-out");
     }
 
     #[test]

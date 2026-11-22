@@ -11,7 +11,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandExit {
     Success,
-    /// Every launched run failed: no turn, no answer, or an answer `review`
+    /// The run failed: no turn, no answer, or an answer `review`
     /// could not verify. Also any error before or instead of a run.
     Failed,
     /// Asked to do nothing it could do: a bare `review` with nothing on stdin

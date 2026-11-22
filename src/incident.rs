@@ -169,7 +169,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     let timestamp = crate::audit::chrono_now();
     let stamp = timestamp.replace(':', "-");
     let sid = inc.session_id.unwrap_or("no-session");
-    // A random suffix keeps two same-second failures (e.g. two `--stagger 0`
+    // A random suffix keeps two same-second failures (e.g. two concurrent
     // deaths before `thread.started`, both "no-session") from colliding on the
     // same dir and overwriting each other's artifacts. It is the audit id's
     // generator (32 hex characters), but this path is best-effort: without

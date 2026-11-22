@@ -97,13 +97,9 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # [archetypes]
 # security = \"You are a security expert for this project. Read the codebase.\"
 #
-# Providers to fan out to when --provider is omitted:
+# The provider a run uses when --provider is omitted:
 # [_defaults]
-# providers = [\"codex\"]
-#
-# Groups fan out to multiple archetypes:
-# [_groups]
-# sweep = [\"security\", \"bugs\"]
+# provider = \"codex\"
 #
 # Named profiles, selected with --profile, as [<provider>.<profile>]. A profile
 # here replaces a global profile of the same name entirely.

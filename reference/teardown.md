@@ -34,7 +34,7 @@ for two reasons:
 
 **`review` as one child subreaper for all its runs.** Orphans would reparent
 to `review` instead of init, but they could no longer be attributed: with
-several runs in one `review` (a fan-out, an auto-resume beside other runs), a
+several runs in one `review` (a run and its auto-resume or retry), a
 worker that a still-running codex backgrounded and whose
 shell then exited is an adopted orphan exactly like a finished run's leftover.
 Sweeping orphans when a run ends kills live work belonging to another run.
@@ -202,7 +202,7 @@ line, and the command exits 3, which outranks the 1 of a run with no answer
 auto-resumed.
 
 `app::run` creates one `supervisor::Lifecycle`, shared through ProviderRuntime
-by fan-out attempts, automatic retries, Grok wakes, messages and incident version
+by fresh runs, automatic retries, Grok wakes, messages and incident version
 probes. It owns stop notification, the initialized keeper registry/admission gate,
 the recording obligations and the ledger. A fresh default runtime creates an
 independent domain for tests; cloning a runtime preserves its owner. Contained

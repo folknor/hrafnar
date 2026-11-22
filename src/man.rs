@@ -31,7 +31,7 @@ struct Topic {
 const TOPICS: &[Topic] = &[
     Topic {
         name: "run",
-        summary: "a fresh run: archetypes, fan-out, dry runs, auto-resume, exit status",
+        summary: "a fresh run: archetype, provider, dry runs, auto-resume, exit status",
         path: "docs/run.md",
         content: include_str!("../docs/run.md"),
     },

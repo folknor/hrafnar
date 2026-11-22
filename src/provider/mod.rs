@@ -118,11 +118,11 @@ const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
 /// Root sets already announced this process, so an identical set is printed once
 /// while a *different* one always prints.
 ///
-/// A fan-out today runs one profile in one directory, so every invocation
-/// derives the same set and a plain "have we announced?" flag would do. Keying
-/// on the set instead costs nothing and removes the trap: the moment roots can
-/// differ between invocations - per-archetype profiles being the obvious next
-/// config change - a flag would leave the *wider* run unannounced while the
+/// A run and its automatic retries or resumes share one profile in one
+/// directory, so every invocation derives the same set and a plain "have we
+/// announced?" flag would do. Keying on the set instead costs nothing and
+/// removes the trap: the moment roots can differ between invocations, a flag
+/// would leave the *wider* run unannounced while the
 /// operator had seen only the narrower block, which is precisely the invisible
 /// permission this announcement exists to prevent.
 static ROOTS_ANNOUNCED: std::sync::Mutex<Option<std::collections::HashSet<Vec<String>>>> =
@@ -305,9 +305,9 @@ pub async fn invoke(
     let resumes_profile = plan.uses_recorded_roots();
     let root_paths = &plan.paths;
     let granted_roots = &plan.granted;
-    // Announced once per distinct root set, not once per invocation: a fan-out
-    // launches the same profile against several archetypes and would otherwise
-    // repeat an identical block per run.
+    // Announced once per distinct root set, not once per invocation: an
+    // automatic retry or resume relaunches the same profile and would
+    // otherwise repeat an identical block.
     //
     // What is announced is the *effective* set, not the derived one. Keying
     // either the guard or the loop on `granted_roots` broke the "every grant is

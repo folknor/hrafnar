@@ -1,8 +1,8 @@
 # A fresh run
 
-`echo "<instructions>" | review [-a ARCHETYPES] [-p PROFILE] [--provider LIST]`
+`echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE] [--provider NAME]`
 
-Every run starts a **fresh session** on each provider it launches. Nothing
+Every run starts one **fresh session** on one provider. Nothing
 carries over from an earlier run: if the new session needs context, the
 instructions have to state it. To continue a session instead, use
 `review message <ID>` while its cache is warm (see `review man message`).
@@ -24,49 +24,45 @@ prints its help and exits 2.
 
 ## Archetypes
 
-`-a` names what to prime each session with. An archetype is a name mapped to a
+`-a` names what to prime the session with. An archetype is a name mapped to a
 prompt in the config, prepended to stdin with a blank line between.
 
 - no `-a`: stdin is sent unchanged, recorded under the archetype label `bare`.
-- `-a bare`: one unprimed run, whether or not `bare` is in the config.
-- `-a security`: one archetype.
-- `-a security,bugs`: several, comma-separated.
-- `-a sweep`: a group, which expands to its member archetypes.
-- `-a all`: every configured archetype except the special `bare` entry.
+- `-a bare`: an unprimed run, whether or not `bare` is in the config.
+- `-a security`: the `security` archetype.
 
-Names can be mixed (`-a sweep,perf`) and duplicates are dropped. An unknown
-name is an error listing what is configured. The old positional form
-(`review security`) still works with a warning.
+`-a` takes one name; a comma-separated list is refused. An unknown name is an
+error listing what is configured. The old positional form (`review security`)
+still works with a warning.
 
-## Fan-out
+## Provider
 
-Each archetype runs on each provider: two archetypes on two providers are four
-independent sessions. Providers come from `--provider claude,codex`, else from
-`[_defaults].providers` in the config. Every provider is checked before
-anything launches: one that is unknown or not installed on this host fails the
-whole run, rather than quietly running a narrower fan-out than was asked for.
-`review config` shows which are installed.
+The provider comes from `--provider codex`, else from `[_defaults].provider`
+in the config. One that is not installed on this host fails the run before
+anything launches; `review config` shows which are installed. A profile (`-p`)
+must be defined for that provider, or the run errors before launching (see
+`review man profiles`).
 
-Launches are spaced by `--stagger` seconds to avoid rate limits; `review --help`
-shows the default, and `0` disables it. Runs on the same host also queue behind one host-wide launch lock;
-it is released once the launches have fired, not when the runs finish, so a
-long run never blocks other `review` calls.
+## Several sessions
 
-A profile (`-p`) must be defined for every launched provider, or the run errors
-before launching anything (see `review man profiles`).
+One run is one session. For several archetypes, providers or profiles, launch
+several `review` calls side by side, each with the same stdin. Runs on one host
+queue behind a host-wide launch lock, which each holds for a fixed spacing
+after launching (or until it ends, if sooner), so calls fired together reach
+their providers spaced apart rather than all at once. A long run never blocks
+other `review` calls beyond that spacing.
 
 ## Dry run
 
-`--dry-run` prints the assembled prompt for each archetype and launches
-nothing. It warns, rather than fails, about providers that are not installed.
+`--dry-run` prints the assembled prompt and launches nothing. It warns, rather
+than fails, when the provider is not installed.
 
 ## Output
 
-Each provider prints a `--- <provider> ---` block: the `session: <ID>` line,
-any digest, then the response. `review --help` lists the digest fields. With
-several archetypes, results are grouped under `=== <archetype> ===`. The output
-ends with a `runtime:` line, which is wall clock including the wait for stdin
-and the launch lock.
+A `--- <provider> ---` header, the `session: <ID>` line, any digest, then the
+response. `review --help` lists the digest fields. The output ends with a
+`runtime:` line, which is wall clock including the wait for stdin and the
+launch lock.
 
 ## Auto-resume
 
@@ -80,10 +76,10 @@ a run that was interrupted, are never auto-resumed (see `review man failures`).
 
 ## Exit status
 
-`0` when at least one run produced an answer and nothing any run started is
-still running, and for a `--dry-run`. `1` when no run produced an answer -
-including runs that died, stalled, stated a failure or were interrupted - and
-on any error before launch. `3` when anything a run started was left running,
+`0` when the run produced an answer and nothing it started is still running,
+and for a `--dry-run`. `1` when it produced no answer - including a run that
+died, stalled, stated a failure or was interrupted - and on any error before
+launch. `3` when anything a run started was left running,
 or its teardown could not be confirmed, whatever the answers were (see
 `review man failures`): it outranks `1`, because those processes may still be
 changing the tree and need checking first. `2` for invalid arguments, and

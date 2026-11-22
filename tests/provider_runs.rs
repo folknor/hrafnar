@@ -1718,8 +1718,8 @@ async fn a_stop_signal_ends_a_started_claude_compatible_turn_as_an_interrupt() {
         );
         assert!(run.session_id.is_some(), "{provider}");
 
-        // Once stopped, nothing new launches - a run waiting on its stagger
-        // or the lock must not start only to be killed.
+        // Once stopped, nothing new launches - a run waiting on the launch
+        // lock must not start only to be killed.
         let refused = run_compat_stub(provider, &scratch, &body, &runtime, None).await;
         assert!(
             refused.is_err_and(|e| e.to_string().contains("not launched")),

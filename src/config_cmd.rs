@@ -91,20 +91,12 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 
     writeln!(out)?;
     writeln!(out, "providers:")?;
-    let defaults = cfg.default_providers().unwrap_or_default();
-    match cfg.providers {
+    let default = cfg.default_provider();
+    match cfg.provider {
         Some(ref s) => writeln!(
             out,
             "  default: {}  ({})",
-            if s.value.is_empty() {
-                "(empty list)".to_string()
-            } else {
-                s.value
-                    .iter()
-                    .map(|p| p.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
+            s.value,
             source(s.layer.as_str(), &s.table, None)
         )?,
         None => writeln!(out, "  default: none set (a run needs --provider)")?,
@@ -114,12 +106,12 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         .map(|p| p.as_str().len())
         .max()
         .unwrap_or(0);
-    let mut missing_defaults = Vec::new();
+    let mut missing_default = None;
     for &provider in Provider::all() {
-        let is_default = defaults.contains(&provider);
+        let is_default = default == Some(provider);
         let ok = avail(provider);
         if is_default && !ok {
-            missing_defaults.push(provider);
+            missing_default = Some(provider);
         }
         let provider = provider.as_str();
         let status = if ok { "installed" } else { "NOT INSTALLED" };
@@ -127,7 +119,7 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         let line = format!("  {provider:<pw$}  {status:<13}{mark}");
         writeln!(out, "{}", line.trim_end())?;
     }
-    for provider in missing_defaults {
+    if let Some(provider) = missing_default {
         writeln!(
             out,
             "  warning: default provider '{provider}' is not installed on this host - \
@@ -147,21 +139,6 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
             "  {name:<aw$}  {:<6}  {}",
             s.layer.as_str(),
             prime_preview(&s.value)
-        )?;
-    }
-
-    writeln!(out)?;
-    writeln!(out, "groups:")?;
-    if cfg.groups.is_empty() {
-        writeln!(out, "  (none)")?;
-    }
-    let gw = cfg.groups.keys().map(String::len).max().unwrap_or(0);
-    for (name, s) in &cfg.groups {
-        writeln!(
-            out,
-            "  {name:<gw$}  {:<6}  {}",
-            s.layer.as_str(),
-            s.value.join(", ")
         )?;
     }
 
@@ -326,10 +303,7 @@ security = \"You are a security expert.\\nRead the codebase.\"
 goal = \"\"
 
 [_defaults]
-providers = [\"codex\"]
-
-[_groups]
-sweep = [\"security\", \"bugs\"]
+provider = \"codex\"
 
 [host.codex.deep]
 model = \"stale-model\"
@@ -343,7 +317,7 @@ bugs = \"You hunt for edge cases.\"
 security = \"global security prime\"
 
 [_defaults]
-providers = [\"claude\"]
+provider = \"claude\"
 stall_timeout_secs = 600
 
 [codex.deep]
@@ -398,7 +372,6 @@ model = \"opus\"
         assert!(t.contains("security  local"), "{t}");
         assert!(t.contains("bugs      global"), "{t}");
         assert!(!t.contains("global security prime"), "{t}");
-        assert!(t.contains("sweep  local   security, bugs"), "{t}");
         assert!(t.contains("default: codex  (local [_defaults])"), "{t}");
         assert!(
             t.contains("stall_timeout_secs: 600  (global [_defaults])"),

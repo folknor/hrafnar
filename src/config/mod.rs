@@ -33,8 +33,7 @@ pub fn reserved_names() -> &'static std::collections::BTreeSet<String> {
             use clap::CommandFactory;
             let mut command = crate::cli::Cli::command();
             command.build();
-            let mut names =
-                std::collections::BTreeSet::from(["all".to_string(), "help".to_string()]);
+            let mut names = std::collections::BTreeSet::from(["help".to_string()]);
             for sub in command.get_subcommands() {
                 names.insert(sub.get_name().to_string());
                 names.extend(sub.get_all_aliases().map(str::to_string));
@@ -87,8 +86,8 @@ pub struct AuditConfig {
 /// through to the next layer while a present one - even an empty list - wins.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultsConfig {
-    /// The provider list used when `--provider` is omitted.
-    pub providers: Option<Vec<Provider>>,
+    /// The provider used when `--provider` is omitted.
+    pub provider: Option<Provider>,
     /// Seconds of rollout silence, with no final answer written, after which a
     /// codex run is treated as stalled: killed, bundled, and reported as a
     /// failure. `0` disables the check; omitted uses the built-in default
@@ -195,7 +194,6 @@ type ProfileTables = BTreeMap<Provider, BTreeMap<String, Profile>>;
 #[derive(Debug, Default)]
 pub struct ConfigFile {
     pub archetypes: BTreeMap<String, String>,
-    pub groups: BTreeMap<String, Vec<String>>,
     pub audit: AuditConfig,
     pub defaults: DefaultsConfig,
     /// `[<provider>.<profile>]`.
@@ -257,10 +255,9 @@ pub struct ConfigFiles {
 #[derive(Debug)]
 pub struct ReviewConfig {
     pub archetypes: BTreeMap<String, Sourced<String>>,
-    pub groups: BTreeMap<String, Sourced<Vec<String>>>,
     /// Always the project's: an audit id identifies a project.
     pub audit: AuditConfig,
-    pub providers: Option<Sourced<Vec<Provider>>>,
+    pub provider: Option<Sourced<Provider>>,
     pub stall_timeout_secs: Option<Sourced<StallTimeout>>,
     /// Global layer only, so never a project's choice.
     pub claude_token_command: Option<String>,
@@ -286,74 +283,38 @@ impl ReviewConfig {
         self.project_root().ok_or(ConfigError::ProjectRequired)
     }
 
-    /// Expand names, groups and the synthetic bare selector in selection order.
-    /// `bare` is a selector, not a configured prime: all excludes its legacy
-    /// empty definition, and explicit bare works without any such definition.
-    pub(crate) fn select_archetypes(
+    /// The archetype a run is primed with, as `(name, prime)`. No selector and
+    /// `bare` both mean no prime: `bare` is a selector, not a configured
+    /// prompt, so it works without any definition. One run is one session, so
+    /// there is exactly one archetype; several are several `review` calls.
+    pub(crate) fn select_archetype(
         &self,
         selector: Option<&str>,
-    ) -> anyhow::Result<Vec<(String, String)>> {
-        use anyhow::bail;
-        let mut archetypes_to_run: Vec<(String, String)> = Vec::new();
-        match selector {
-            None => archetypes_to_run.push((BARE.to_string(), String::new())),
-            Some(arg) => {
-                for name in arg.split(',') {
-                    if name == BARE {
-                        // The legacy positional form has always meant this without
-                        // consulting config; keep the explicit flag equivalent.
-                        archetypes_to_run.push((BARE.to_string(), String::new()));
-                    } else if name == "all" {
-                        archetypes_to_run.extend(
-                            self.archetypes
-                                .iter()
-                                .filter(|(n, _)| n.as_str() != BARE)
-                                .map(|(n, p)| (n.clone(), p.value.clone())),
-                        );
-                    } else if let Some(group) = self.groups.get(name) {
-                        // Config resolution removes cross-layer losers and rejects
-                        // same-layer clashes, so group-first lookup is not precedence.
-                        for member in &group.value {
-                            // Resolution checked every member exists.
-                            let prime = self.archetype(member).ok_or_else(|| {
-                                anyhow::anyhow!("group member {member} has no archetype")
-                            })?;
-                            archetypes_to_run.push((member.clone(), prime.to_string()));
-                        }
-                    } else if let Some(prime) = self.archetype(name) {
-                        archetypes_to_run.push((name.to_string(), prime.to_string()));
-                    } else {
-                        let mut available: Vec<&str> =
-                            self.archetypes.keys().map(String::as_str).collect();
-                        available.extend(self.groups.keys().map(String::as_str));
-                        bail!(
-                            "'{name}' not found in {}\n  \
-                         configured: {}",
-                            self.searched(),
-                            if available.is_empty() {
-                                "(none)".to_string()
-                            } else {
-                                available.join(", ")
-                            }
-                        );
-                    }
-                }
-            }
-        }
-
-        // Deduplicate (e.g. "all" + a specific archetype, or overlapping groups)
-        let mut seen = std::collections::HashSet::new();
-        archetypes_to_run.retain(|(name, _)| seen.insert(name.clone()));
-
-        if archetypes_to_run.is_empty() {
-            bail!(
-                "no priming archetypes configured in {}\n  \
-             Use -a bare or omit -a to send stdin unchanged, or add one under [archetypes].",
-                self.searched()
+    ) -> anyhow::Result<(String, String)> {
+        let name = match selector {
+            None => return Ok((BARE.to_string(), String::new())),
+            Some(name) if name == BARE => return Ok((BARE.to_string(), String::new())),
+            Some(name) => name,
+        };
+        if name.contains(',') {
+            anyhow::bail!(
+                "-a takes one archetype, not a list ('{name}')\n  \
+                 Each run is one session: launch one `review` per archetype."
             );
         }
-
-        Ok(archetypes_to_run)
+        if let Some(prime) = self.archetype(name) {
+            return Ok((name.to_string(), prime.to_string()));
+        }
+        let available: Vec<&str> = self.archetypes.keys().map(String::as_str).collect();
+        anyhow::bail!(
+            "'{name}' not found in {}\n  configured: {}",
+            self.searched(),
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        )
     }
 
     /// The effective profile for `provider`, if any layer defines it.
@@ -404,8 +365,8 @@ impl ReviewConfig {
         self.archetypes.get(name).map(|s| s.value.as_str())
     }
 
-    pub fn default_providers(&self) -> Option<&[Provider]> {
-        self.providers.as_ref().map(|s| s.value.as_slice())
+    pub fn default_provider(&self) -> Option<Provider> {
+        self.provider.as_ref().map(|s| s.value)
     }
 
     pub fn stall_timeout(&self) -> Option<StallTimeout> {
@@ -477,16 +438,10 @@ mod selection_tests {
             global.require_project_root(),
             Err(ConfigError::ProjectRequired)
         ));
-        let local =
-            parse_file("[_groups]\ng=['missing']", "fixture", Layer::Local).expect("parse local");
-        assert!(matches!(
-            resolve(local, None, "host", ConfigFiles::default()),
-            Err(ConfigError::Resolve { .. })
-        ));
     }
 
     #[test]
-    fn bare_is_synthetic_and_all_excludes_it_with_or_without_a_definition() {
+    fn bare_is_synthetic_with_or_without_a_definition() {
         for definition in ["", "bare = ''\n", "bare = '  '\n"] {
             let cfg = resolve(
                 parse_file(
@@ -501,16 +456,12 @@ mod selection_tests {
             )
             .expect("resolve");
             assert_eq!(
-                cfg.select_archetypes(Some("bare")).expect("bare"),
-                cfg.select_archetypes(None).expect("implicit bare")
-            );
-            assert_eq!(
-                cfg.select_archetypes(Some("all")).expect("all"),
-                vec![("a".into(), "prime".into())]
+                cfg.select_archetype(Some("bare")).expect("bare"),
+                cfg.select_archetype(None).expect("implicit bare")
             );
             assert_eq!(
                 crate::prompt::assemble(
-                    &cfg.select_archetypes(Some("bare")).expect("bare")[0].1,
+                    &cfg.select_archetype(Some("bare")).expect("bare").1,
                     "  raw\n"
                 ),
                 "  raw\n"
@@ -519,9 +470,9 @@ mod selection_tests {
     }
 
     #[test]
-    fn selection_expands_groups_deduplicates_and_keeps_bare_unprimed() {
-        let raw = "[archetypes]\na = 'prime'\nb = 'second'\nbare = ''\n[_groups]\ng = ['b', 'a']\n";
-        let mut cfg = resolve(
+    fn selection_takes_exactly_one_archetype() {
+        let raw = "[archetypes]\na = 'prime'\nb = 'second'\n";
+        let cfg = resolve(
             parse_file(raw, "fixture", Layer::Local).expect("parse"),
             None,
             "host",
@@ -529,19 +480,18 @@ mod selection_tests {
         )
         .expect("resolve");
         assert_eq!(
-            cfg.select_archetypes(Some("g,a,bare")).expect("select"),
-            vec![
-                ("b".into(), "second".into()),
-                ("a".into(), "prime".into()),
-                ("bare".into(), String::new())
-            ]
+            cfg.select_archetype(Some("a")).expect("select"),
+            ("a".into(), "prime".into())
         );
         assert_eq!(
-            cfg.select_archetypes(None).expect("bare"),
-            vec![("bare".into(), String::new())]
+            cfg.select_archetype(None).expect("bare"),
+            ("bare".into(), String::new())
         );
-        assert!(cfg.select_archetypes(Some("unknown")).is_err());
-        cfg.archetypes.remove("b");
-        assert!(cfg.select_archetypes(Some("g")).is_err());
+        assert!(cfg.select_archetype(Some("unknown")).is_err());
+        let err = cfg
+            .select_archetype(Some("a,b"))
+            .expect_err("a list")
+            .to_string();
+        assert!(err.contains("one archetype"), "{err}");
     }
 }

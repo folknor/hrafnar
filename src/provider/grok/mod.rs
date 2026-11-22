@@ -285,7 +285,7 @@ struct GrokTurn {
 impl GrokTurn {
     /// Fold in the next wake turn of the *same* run. Sequential-continuation
     /// rules, which is why this is grok's and not a general `RunOutput`
-    /// operation (a fan-out or an automatic recovery has other identity and
+    /// operation (an automatic recovery has other identity and
     /// outcome rules): the wake's text, outcome and digest replace the
     /// earlier turn's whole - an outcome is never assembled from two turns -
     /// the session id stays the first turn's (a wake resumes that session),

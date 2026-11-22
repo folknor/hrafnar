@@ -140,14 +140,11 @@ pub const INTERRUPT_PID_WAIT: Duration = Duration::from_secs(60);
 /// How often `review interrupt` looks for that pid.
 pub const INTERRUPT_PID_POLL: Duration = Duration::from_millis(100);
 
-/// Default seconds between provider launches, to avoid rate limits. Overridable
-/// with `--stagger`; `0` disables.
-///
-/// Clap's `default_value` needs a `&'static str`, so this is declared as a
-/// string rather than a `Duration`. It lives here anyway: the point of this
-/// module is that no production timing default is declared anywhere else, and a
-/// literal buried in a clap attribute is exactly the kind that drifts unnoticed.
-pub const STAGGER_SECS_STR: &str = "30";
+/// How long a fresh run holds the host-wide launch lock after launching, so
+/// that `review` calls fired together on one host reach their providers spaced
+/// apart rather than all at once, to avoid rate limits. Not tunable: nobody
+/// ever set the old `--stagger` flag.
+pub const LAUNCH_SPACING: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {

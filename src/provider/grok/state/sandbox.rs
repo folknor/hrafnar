@@ -5,8 +5,8 @@ use crate::fsutil::locked_update;
 
 impl Grok {
     /// Make sure the profile named by `roots` exists in `<home>/sandbox.toml` granting exactly
-    /// `roots`, returning whether this call created it. Locked because a
-    /// fan-out launches several grok runs at once and two creating the same
+    /// `roots`, returning whether this call created it. Locked because
+    /// concurrent `review` calls launch several grok runs at once and two creating the same
     /// profile unlocked would race; renamed into place so a grok starting
     /// concurrently never reads a half-written file.
     pub(in crate::provider::grok) fn ensure_profile(

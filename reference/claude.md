@@ -247,7 +247,7 @@ record its session before exiting. A run that had produced no first event is
 torn down by its keeper instead, and reported as never started,
 with no session ID: claude cannot have written one, and recording it would
 print a resume command that fails. A run that has not spawned yet when `review`
-is told to stop - still waiting on the lock or its stagger - is not launched at
+is told to stop - still waiting on the launch lock - is not launched at
 all. An interrupted run keeps its session ID even if claude printed no result,
 is flagged `interrupted` rather than carrying claude's complaint about the abort
 as a `turn_error`, and is not retried. If claude answers before the signal
