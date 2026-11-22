@@ -838,6 +838,7 @@ async fn run_codex_json(
         turns,
         usage,
         incident_path,
+        denials: super::Denials::default(),
         harness: Some(super::HarnessForensics::Codex(super::CodexForensics {
             log_lines,
             transcript,

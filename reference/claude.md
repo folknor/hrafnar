@@ -35,6 +35,18 @@ denied every call that passed its own `timeout` (the probe's model tried
 200s), so the default is the limit that binds. With both timeout variables
 raised to 20 minutes, a 150-second command ran to completion.
 
+## Refused calls
+
+Unverified: no captured stream in this repo shows a refusal. `denials_in`
+assumes the `result` object carries a `permission_denials` array of
+`{tool_name, tool_use_id, tool_input}`, the Agent SDK's
+`SDKPermissionDenial`; maki's SDK mode writes the same key in imitation
+(`research/maki/src/sdk_mode.rs`), which corroborates the key, not the
+entry shape. What the refused call's own `tool_result` text says isn't
+known either, so it isn't read. A probe of a `dontAsk` run that is refused
+a command would settle both; until one has, a claude run whose result lacks
+the array reports no denials rather than failing.
+
 ## Stopping a run
 
 A claude turn ends cleanly on `SIGINT`. Probed on Claude Code 2.1.284 with a

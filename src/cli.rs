@@ -84,8 +84,9 @@ may fail to authenticate, since Claude Code does not pass CLAUDE_CODE_OAUTH_TOKE
 on; a global [_defaults].claude_token_command fixes that (`hrafnar man config`).
 
 Output: a `--- <harness> ---` header, then `session: <ID>`, then the
-response. Codex and grok runs, and any run that did not end cleanly, also
-print a digest between the session line and the response:
+response. Codex and grok runs, claude and maki runs whose permission gate
+refused a tool call, and any run that did not end cleanly, also print a
+digest between the session line and the response:
   exit / signal     the harness process's exit status
   captured          true if a final answer was captured; false means the text
                     below is an interim note, not a conclusion
@@ -95,6 +96,9 @@ print a digest between the session line and the response:
   terminated by hrafnar
                     the stall watchdog killed a codex run that went silent
   recovered         the final answer was restored from codex's transcript
+  permission denied how many tool calls claude's or maki's permission gate
+                    refused, and the first few; an answer beside it stands,
+                    but was reached without those calls
   turns / usage     turn count and token usage (input, cached, output, reasoning)
   transcript        codex's rollout file and its last events
   incident          a forensic bundle for the run (see `hrafnar incidents`)

@@ -691,3 +691,142 @@ fn a_subagent_auth_error_is_not_the_runs() {
 fn an_ordinary_api_error_is_not_an_auth_failure() {
     assert_eq!(auth_of(&[AUTH_INIT, AUTH_RESULT], true), None);
 }
+
+use crate::harness::claude_stream::{Denial, denials_in};
+
+fn denial(id: &str, description: &str) -> Denial {
+    Denial {
+        id: Some(id.into()),
+        description: description.into(),
+    }
+}
+
+/// claude's result lists refused calls in `permission_denials`. The entry
+/// shape is the Agent SDK's `SDKPermissionDenial`, not yet captured from a
+/// real dontAsk run.
+const CLAUDE_DENIED_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","num_turns":2,"permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_1","tool_input":{"command":"rm -rf\n build","timeout":5000}},{"tool_name":"Write","tool_use_id":"toolu_2","tool_input":{"file_path":"/etc/x","content":"y"}},{"tool_name":"WebSearch","tool_use_id":"toolu_3","tool_input":{"query":"q"}}]}"#;
+
+/// maki 0.7.3's stream-json `user` event for a refused call: the tool result
+/// is the gate's message, flagged as an error.
+const MAKI_DENIED_USER: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Permission denied for `bash` (head -3): deny rule `head *` for `bash`. Do not retry. Try a different approach or ask the user for guidance.","is_error":true},{"type":"tool_result","tool_use_id":"t2","content":"ok"}]},"session_id":"s"}"#;
+
+#[test]
+fn claude_permission_denials_are_decoded_from_the_result() {
+    assert_eq!(
+        denials_in(Dialect::Claude, CLAUDE_DENIED_RESULT.as_bytes()),
+        vec![
+            denial("toolu_1", "Bash (rm -rf build)"),
+            denial("toolu_2", "Write (/etc/x)"),
+            denial("toolu_3", "WebSearch"),
+        ]
+    );
+    // An entry in an unknown shape still counts.
+    let odd = r#"{"type":"result","permission_denials":["Bash"]}"#;
+    assert_eq!(
+        denials_in(Dialect::Claude, odd.as_bytes()),
+        vec![Denial {
+            id: None,
+            description: "Bash".into()
+        }]
+    );
+    // Only a result carries the list, and an empty one is no denial.
+    let empty = r#"{"type":"result","permission_denials":[]}"#;
+    let elsewhere = r#"{"type":"assistant","permission_denials":[{"tool_name":"Bash"}]}"#;
+    for line in [empty, elsewhere, CLAUDE_OK] {
+        assert!(
+            denials_in(Dialect::Claude, line.as_bytes()).is_empty(),
+            "{line}"
+        );
+    }
+    // maki's marker means nothing to claude.
+    assert!(denials_in(Dialect::Claude, MAKI_DENIED_USER.as_bytes()).is_empty());
+}
+
+#[test]
+fn maki_permission_denials_are_decoded_from_tool_results() {
+    assert_eq!(
+        denials_in(Dialect::Maki, MAKI_DENIED_USER.as_bytes()),
+        vec![denial("t1", "bash (head -3)")]
+    );
+    // The marker in a result that is not an error, or in model text, is not
+    // a refusal.
+    let not_error = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"Permission denied for `bash` (ls): x."}]}}"#;
+    let text = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Permission denied for `bash` (ls): x."}]}}"#;
+    for line in [not_error, text] {
+        assert!(
+            denials_in(Dialect::Maki, line.as_bytes()).is_empty(),
+            "{line}"
+        );
+    }
+    // A message after the prefix in another shape is shown as it reads.
+    let other = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t9","content":"Permission denied for plugin call\nsecond line","is_error":true}]}}"#;
+    assert_eq!(
+        denials_in(Dialect::Maki, other.as_bytes()),
+        vec![denial("t9", "plugin call second line")]
+    );
+    assert!(denials_in(Dialect::Maki, CLAUDE_DENIED_RESULT.as_bytes()).is_empty());
+}
+
+/// Denials are counted once per call across every result, bounded in what
+/// is shown, and leave the answer standing.
+#[test]
+fn denials_are_counted_once_and_bounded_beside_an_answer() {
+    let mut metrics = ClaudeMetrics::new(Dialect::Claude);
+    metrics.record_line(CLAUDE_DENIED_RESULT.as_bytes());
+    // A later result repeating the list adds nothing.
+    metrics.record_line(CLAUDE_DENIED_RESULT.as_bytes());
+    assert_eq!(metrics.denials.count, 3);
+    let many: Vec<String> = (0..9)
+        .map(|i| {
+            format!(
+                r#"{{"tool_name":"Bash","tool_use_id":"m{i}","tool_input":{{"command":"c{i}"}}}}"#
+            )
+        })
+        .collect();
+    let line = format!(
+        r#"{{"type":"result","permission_denials":[{}]}}"#,
+        many.join(",")
+    );
+    metrics.record_line(line.as_bytes());
+    assert_eq!(metrics.denials.count, 12);
+    assert_eq!(metrics.denials.shown.len(), Denials::SHOWN);
+    let rendered = metrics.denials.line().expect("a denial line");
+    assert!(
+        rendered.starts_with("permission denied: 12 tool calls: Bash (rm -rf build); "),
+        "{rendered}"
+    );
+    assert!(rendered.ends_with("(+7 more)"), "{rendered}");
+
+    let mut maki = ClaudeMetrics::new(Dialect::Maki);
+    maki.record_line(MAKI_DENIED_USER.as_bytes());
+    assert_eq!(
+        maki.denials.line().as_deref(),
+        Some("permission denied: 1 tool call: bash (head -3)")
+    );
+
+    // The outcome is decided by the result alone.
+    let outcome =
+        interpret_claude_output(Dialect::Claude, CLAUDE_DENIED_RESULT, "").expect("result");
+    assert!(
+        matches!(outcome, ClaudeOutcome::Answered { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn denials_survive_the_persisted_digest() {
+    let mut denials = Denials::default();
+    denials.push("Bash (ls)");
+    let digest = Digest {
+        denials: denials.clone(),
+        ..Digest::default()
+    };
+    let summary = digest.summary(&Outcome::answered(Answer::Captured));
+    assert_eq!(summary.permission_denials, 1);
+    let row = serde_json::to_value(&summary).expect("row");
+    let back: DigestSummary = serde_json::from_value(row).expect("read back");
+    assert_eq!(back.denials(), denials);
+    // A run with none writes neither field, so old rows read unchanged.
+    let none = serde_json::to_value(Digest::default().summary(&Outcome::no_answer())).expect("row");
+    assert!(none.get("permission_denials").is_none() && none.get("denied").is_none());
+}

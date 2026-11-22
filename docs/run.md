@@ -95,7 +95,8 @@ A run prints these, in order:
 
 1. A `--- HARNESS ---` header.
 2. `session: ID`, when the harness created a session.
-3. A digest, for codex and grok runs and for any run that didn't end
+3. A digest, for codex and grok runs, for claude and maki runs whose
+   permission gate refused a tool call, and for any run that didn't end
    cleanly. `hrafnar --help` lists its fields.
 4. The response.
 5. For an interrupted run, the `hrafnar message` command that continues it.

@@ -156,7 +156,8 @@ The fields of a row are:
 - **`operator_prompt`**, **`assembled_prompt`**: the two prompts
 - **`response`**, **`error`**: the answer, or why there was none
 - **`digest`**: the flat run summary, absent for a clean answer with nothing
-  else to record
+  else to record. Its `permission_denials` counts the tool calls claude's or
+  maki's permission gate refused, and `denied` describes the first few
 - **`served_model`**, **`cost_usd`**, **`grok_trust`**, **`leftovers`**:
   what the harness reported serving, and what the run left running
 - **`credential`**: `token_command` when claude authenticated with the

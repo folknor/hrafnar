@@ -39,7 +39,7 @@ pub use outcome::{
 pub use output::{print_result, resume_hint};
 pub use permissions::Permissions;
 pub use result::{
-    CodexForensics, Digest, DigestSummary, HarnessForensics, HarnessResult, Served, Usage,
+    CodexForensics, Denials, Digest, DigestSummary, HarnessForensics, HarnessResult, Served, Usage,
     now_epoch_secs,
 };
 pub use runtime::{HarnessCommand, HarnessCommands, HarnessRuntime};

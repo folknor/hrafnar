@@ -36,6 +36,18 @@ Headless maki still applies a saved trust answer and the operator's
 allow `write`, `edit`, `multiedit` and `edit_lines` inside the working
 directory and `task` everywhere.
 
+A refused call goes back to the model as a tool result, and nothing else in
+the stream records it: the `-p` `result` has no denial list (only SDK mode's
+does, and it is always empty). Under stream-json each batch of tool results
+is a `user` event, `message.content` holding maki's own `ContentBlock`s
+verbatim (`print.rs`, `ToolResultsSubmitted`), so a refusal is a
+`tool_result` block with `is_error: true` whose string `content` is the
+gate's message: `Permission denied for`, the tool name in backticks, the
+scope in parentheses, a colon and the reason. The prefix is
+`PERMISSION_DENIED_PREFIX` in `maki-agent/src/permissions.rs`, which maki's
+tests assert on. Source only: no probe has captured one.
+`denials_in` reads these.
+
 ## Reading the run
 
 The first line is
@@ -102,3 +114,10 @@ These maki changes would fix gaps `hrafnar` works around or can't report:
    `{}` and the tool runs with empty arguments; it should go back to the
    model as an error. This hits open models hardest.
 4. A flag on the cost saying whether every turn was priced.
+5. Honour `--settings` (accepted and ignored today) for its
+   `permissions.allow` and `permissions.deny` lists, mapping `Bash(cmd *)`
+   onto `bash` rules for that run only. Every place maki reads permission
+   rules from is a file in the operator's config or the checkout, so
+   `hrafnar` cannot grant a run the commands it needs without writing one.
+6. A denial list on the `-p` `result`, so refused calls need not be read
+   out of tool-result text.

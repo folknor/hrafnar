@@ -49,6 +49,7 @@ fn print_digest(outcome: &Outcome, d: &Digest) {
         outcome,
         &d.status_facts(),
     );
+    print_denials(&d.denials);
     print_usage(d.turns, &d.usage);
     if let Some(evidence) = &d.harness {
         match evidence {
@@ -69,6 +70,7 @@ pub(crate) fn print_digest_summary(d: &super::DigestSummary) {
         &Outcome::interpret_summary(d),
         &d.status_facts(),
     );
+    print_denials(&d.denials());
     if let Some(false) = d.task_complete {
         println!("task_complete: false");
     }
@@ -103,6 +105,14 @@ fn print_status(
         println!("signal: {signal}");
     }
     for line in outcome.lines(facts) {
+        println!("{line}");
+    }
+}
+
+/// Right after the outcome lines: a refused gate is the first thing an
+/// orchestrator needs to see, even beside a captured answer.
+fn print_denials(denials: &Denials) {
+    if let Some(line) = denials.line() {
         println!("{line}");
     }
 }

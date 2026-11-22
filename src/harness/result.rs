@@ -67,8 +67,58 @@ pub struct Digest {
     /// Directory of the forensic bundle written for a suspicious run (stderr,
     /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
     pub incident_path: Option<std::path::PathBuf>,
+    /// Tool calls the harness's permission gate refused during the run.
+    /// Evidence beside the outcome, never part of it: a run with denials that
+    /// answered is still an answer.
+    pub denials: Denials,
 
     pub harness: Option<HarnessForensics>,
+}
+
+/// Refused tool calls, bounded: the total count, and a short description of
+/// the first few (`Denials::SHOWN`, each at most `Denials::DESCRIPTION_MAX`
+/// characters), so a run that hammers a closed gate cannot grow the digest without
+/// bound.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub struct Denials {
+    pub count: u32,
+    pub shown: Vec<String>,
+}
+
+impl Denials {
+    pub const SHOWN: usize = 5;
+    pub const DESCRIPTION_MAX: usize = 200;
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Count one refused call, keeping its description while there is room.
+    pub fn push(&mut self, description: &str) {
+        self.count += 1;
+        if self.shown.len() < Self::SHOWN {
+            self.shown
+                .push(super::truncate(description.trim(), Self::DESCRIPTION_MAX));
+        }
+    }
+
+    /// The digest line, `None` when nothing was refused.
+    pub fn line(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let noun = if self.count == 1 { "call" } else { "calls" };
+        let mut line = format!(
+            "permission denied: {} tool {noun}: {}",
+            self.count,
+            self.shown.join("; ")
+        );
+        let hidden = (self.count as usize).saturating_sub(self.shown.len());
+        if hidden > 0 {
+            line.push_str(&format!(" (+{hidden} more)"));
+        }
+        Some(line)
+    }
 }
 
 /// Harness evidence is optional; harnesses without extra artifacts have no block.
@@ -142,6 +192,17 @@ pub struct DigestSummary {
     /// Ended by `hrafnar interrupt`: `jq 'select(.digest.interrupted)'`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub interrupted: bool,
+    /// Tool calls the permission gate refused (claude and maki):
+    /// `jq 'select(.digest.permission_denials > 0)'`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub permission_denials: u32,
+    /// The first few refused calls, described (`Denials`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied: Vec<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Digest {
@@ -180,6 +241,8 @@ impl Digest {
             turn_error: outcome.stated.clone(),
             hrafnar_error: outcome.unverified.clone(),
             interrupted: matches!(outcome.ended_by, EndedBy::Interrupted(_)),
+            permission_denials: self.denials.count,
+            denied: self.denials.shown.clone(),
         }
     }
 
@@ -202,6 +265,13 @@ impl Digest {
 }
 
 impl DigestSummary {
+    pub fn denials(&self) -> Denials {
+        Denials {
+            count: self.permission_denials,
+            shown: self.denied.clone(),
+        }
+    }
+
     pub fn status_facts(&self) -> super::outcome::StatusFacts<'_> {
         super::outcome::StatusFacts {
             exit_code: self.exit_code,

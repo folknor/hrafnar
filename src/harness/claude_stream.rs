@@ -26,6 +26,11 @@
 //! keys are unioned into the served model, and cost, usage and turn counts
 //! are summed. maki writes no `modelUsage`, and the model in its other events
 //! is the one it requested, so nothing is recorded as served for maki.
+//!
+//! Tool calls the permission gate refused are collected from the same lines
+//! (`denials_in`) and reported in the digest beside the outcome. They never
+//! decide it: a run that hit a closed gate and still answered keeps its
+//! answer, since discarding it would throw away real work.
 use super::*;
 
 const CLAUDE_DETAIL_MAX: usize = 2000;
@@ -69,6 +74,124 @@ pub(super) struct ClaudeMetrics {
     models: std::collections::BTreeSet<String>,
     cost_usd: Option<f64>,
     auth: AuthEvidence,
+    pub(super) denials: Denials,
+    /// `tool_use_id`s already counted, so a refusal reported twice (a later
+    /// `result` repeating an earlier one's list) is counted once.
+    denied_ids: std::collections::BTreeSet<String>,
+}
+
+/// The text maki returns to the model for a call its permission gate refused
+/// (`PERMISSION_DENIED_PREFIX` in maki-agent's `permissions.rs`), followed by
+/// ``" `<tool>` (<scope>): <reason>."``. maki's own tests assert on it.
+const MAKI_DENIED_PREFIX: &str = "Permission denied for";
+
+/// One refused call: its `tool_use_id` when the stream gave one, and a short
+/// description (the tool, and the command or path it was refused for).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Denial {
+    pub(super) id: Option<String>,
+    pub(super) description: String,
+}
+
+/// The refused tool calls one stream line reports. Pure, so each dialect's
+/// shape is tested from fixture lines.
+///
+/// - claude: the `result` object's `permission_denials` array, entries
+///   `{tool_name, tool_use_id, tool_input}`.
+/// - maki: a `user` event's `tool_result` block with `is_error: true` whose
+///   text starts with `MAKI_DENIED_PREFIX`. maki's `result` carries no
+///   denial list, so the tool results are the only record.
+pub(super) fn denials_in(dialect: Dialect, line: &[u8]) -> Vec<Denial> {
+    // Cheap rejection first: almost no line mentions a denial, and every
+    // line of the run passes through here.
+    let marker: &[u8] = match dialect {
+        Dialect::Claude => b"permission_denials",
+        Dialect::Maki => MAKI_DENIED_PREFIX.as_bytes(),
+    };
+    if !line.windows(marker.len()).any(|w| w == marker) {
+        return Vec::new();
+    }
+    let Ok(event) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let kind = event.get("type").and_then(|t| t.as_str());
+    match dialect {
+        Dialect::Claude if kind == Some("result") => event
+            .get("permission_denials")
+            .and_then(|d| d.as_array())
+            .map(|entries| entries.iter().map(claude_denial).collect())
+            .unwrap_or_default(),
+        Dialect::Maki if kind == Some("user") => event
+            .pointer("/message/content")
+            .and_then(|c| c.as_array())
+            .map(|blocks| blocks.iter().filter_map(maki_denial).collect())
+            .unwrap_or_default(),
+        Dialect::Claude | Dialect::Maki => Vec::new(),
+    }
+}
+
+/// The input field that says what a refused call would have touched, in the
+/// order a reader most wants it.
+const DENIAL_SUBJECT_KEYS: [&str; 5] = ["command", "file_path", "path", "url", "pattern"];
+
+fn claude_denial(entry: &serde_json::Value) -> Denial {
+    let id = entry
+        .get("tool_use_id")
+        .and_then(|i| i.as_str())
+        .map(str::to_string);
+    let Some(tool) = entry.get("tool_name").and_then(|t| t.as_str()) else {
+        // An entry in a shape this does not know is still a denial: count
+        // it, and show what it said.
+        let description = match entry.as_str() {
+            Some(s) => s.to_string(),
+            None => entry.to_string(),
+        };
+        return Denial { id, description };
+    };
+    let subject = entry.get("tool_input").and_then(|input| {
+        DENIAL_SUBJECT_KEYS
+            .iter()
+            .find_map(|key| input.get(*key).and_then(|v| v.as_str()))
+    });
+    let description = match subject {
+        Some(subject) => format!("{tool} ({})", one_line(subject)),
+        None => tool.to_string(),
+    };
+    Denial { id, description }
+}
+
+fn maki_denial(block: &serde_json::Value) -> Option<Denial> {
+    if block.get("type").and_then(|t| t.as_str()) != Some("tool_result")
+        || block.get("is_error").and_then(serde_json::Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    let text = block.get("content").and_then(|c| c.as_str())?;
+    let rest = text.strip_prefix(MAKI_DENIED_PREFIX)?.trim_start();
+    // "`bash` (head -3): deny rule ..." -> "bash (head -3)". Anything else
+    // after the prefix is shown as its first line.
+    let parsed = rest.strip_prefix('`').and_then(|r| {
+        let (tool, after) = r.split_once('`')?;
+        let scope = after
+            .strip_prefix(" (")
+            .and_then(|s| s.split_once("): "))
+            .map(|(scope, _)| scope);
+        Some(match scope {
+            Some(scope) => format!("{tool} ({})", one_line(scope)),
+            None => tool.to_string(),
+        })
+    });
+    let description = parsed.unwrap_or_else(|| one_line(rest));
+    let id = block
+        .get("tool_use_id")
+        .and_then(|i| i.as_str())
+        .map(str::to_string);
+    Some(Denial { id, description })
+}
+
+/// A multi-line command or reason folded onto the digest's one line.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What the stream showed about a credential failure, for deciding whether the
@@ -232,6 +355,7 @@ impl ClaudeMetrics {
         if self.dialect == Dialect::Claude {
             self.record_activity(line);
         }
+        self.record_denials(line);
         let Ok(event) = serde_json::from_slice::<ClaudeMetricEvent>(line) else {
             return;
         };
@@ -258,6 +382,19 @@ impl ClaudeMetrics {
         }
         if let Some(cost) = self.dialect.reported_cost(event.total_cost_usd) {
             self.cost_usd = Some(self.cost_usd.unwrap_or_default() + cost);
+        }
+    }
+
+    /// Count each refused call once, by `tool_use_id` where the stream gave
+    /// one. Denials never touch the outcome: they are reported beside it.
+    fn record_denials(&mut self, line: &[u8]) {
+        for denial in denials_in(self.dialect, line) {
+            if let Some(id) = denial.id
+                && !self.denied_ids.insert(id)
+            {
+                continue;
+            }
+            self.denials.push(&denial.description);
         }
     }
 

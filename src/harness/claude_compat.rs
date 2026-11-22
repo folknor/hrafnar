@@ -366,16 +366,36 @@ pub(super) async fn run_claude_compat(
     let auth_failure = metrics.auth_failure();
     let turns = metrics.turns;
     let usage = metrics.usage;
+    let denials = match &launch.settings.claude_token {
+        // The descriptions quote tool input from the stream, which was read
+        // before it was scrubbed.
+        Some(token) => Denials {
+            shown: metrics
+                .denials
+                .shown
+                .iter()
+                .map(|d| d.replace(token.value(), "<redacted claude token>"))
+                .collect(),
+            ..metrics.denials
+        },
+        None => metrics.denials,
+    };
     let with_usage = |digest: Digest| Digest {
         turns,
         usage: usage.clone(),
+        denials: denials.clone(),
         ..digest
     };
     // An abnormal end always keeps its observed status; a clean answer with a
-    // clean exit records no digest, as for grok.
+    // clean exit records no digest, as for grok - unless the permission gate
+    // refused a call, which the orchestrator must see even beside an answer.
     let forensics = |outcome: &Outcome| {
         if outcome.is_clean() {
-            answered_status_digest(status).map(with_usage)
+            match answered_status_digest(status) {
+                Some(digest) => Some(with_usage(digest)),
+                None if !denials.is_empty() => Some(with_usage(status_digest(status))),
+                None => None,
+            }
         } else {
             Some(with_usage(status_digest(status)))
         }

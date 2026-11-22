@@ -31,6 +31,12 @@ exists and you can inspect it or message it. Read the digest top down:
   is reported but doesn't fail the run. When the exit status is unknown and
   no signal was seen, a note says the answer was captured but the exit status
   could not be confirmed.
+- **`permission denied: N tool calls: ...`**: claude's or maki's permission
+  gate refused that many tool calls, the first few named with the command or
+  path each was refused for. This doesn't fail the run: an answer beside it
+  is kept, but it was reached without those calls, so check whether it
+  depended on them. A refused call that the run needed means the profile's
+  permissions are too narrow for the task (see `hrafnar man sandbox`).
 
 `hrafnar sessions ID` shows the same digest later (see
 `hrafnar man sessions`).

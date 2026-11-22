@@ -71,3 +71,9 @@ output. Each entry says what to do if you relied on the old behaviour.
 
 - `--harness NAME` to run a specific harness entry of the profile.
 - `[_defaults].prefer`, an ordered list of preferred harnesses.
+- A `permission denied:` digest line for claude and maki runs, with the
+  number of tool calls the permission gate refused and the first few named.
+  Such a run now prints a digest even beside a clean answer, and its row
+  records `digest.permission_denials` and `digest.denied`. The answer and
+  exit status are unchanged; check the line before trusting an answer that
+  needed the refused calls.
