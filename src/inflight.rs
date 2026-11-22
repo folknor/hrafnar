@@ -17,7 +17,7 @@
 //!
 //! # Why a file rather than a sidecar row
 //!
-//! The row would have to be written from `provider`, which has the session id
+//! The row would have to be written from `harness`, which has the session id
 //! but none of the audit metadata (`audit_id`, `private`, archetype) that a
 //! sidecar row requires - threading all of it down just to mark liveness is a
 //! lot of plumbing for a fact that is worthless once the run ends. A marker file
@@ -58,7 +58,9 @@ pub enum Phase {
 #[serde(try_from = "MarkerWire")]
 pub struct Marker {
     pub session_id: String,
-    pub provider: String,
+    /// On disk as `provider`, so live markers from older builds still read.
+    #[serde(rename = "provider")]
+    pub harness: String,
     pub project: String,
     pub started_epoch: u64,
     pub owner: crate::process::ProcessIdentity,
@@ -74,7 +76,8 @@ pub struct Marker {
 #[derive(Deserialize)]
 struct MarkerWire {
     session_id: String,
-    provider: String,
+    #[serde(rename = "provider")]
+    harness: String,
     project: String,
     started_epoch: u64,
     #[serde(default)]
@@ -130,7 +133,7 @@ impl TryFrom<MarkerWire> for Marker {
         };
         Ok(Self {
             session_id: w.session_id,
-            provider: w.provider,
+            harness: w.harness,
             project: w.project,
             started_epoch: w.started_epoch,
             owner,
@@ -182,15 +185,15 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
 /// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
 /// under the data dir.
 ///
-/// Provider session ids are opaque, so allow ASCII alphanumerics, dashes and
+/// Harness session ids are opaque, so allow ASCII alphanumerics, dashes and
 /// underscores while excluding `/`, `.` and anything else that could traverse.
 /// An allowlist rather than a "reject `..`" denylist because only the former is
 /// safe by construction.
 pub(crate) fn is_safe_session_id(id: &str) -> bool {
-    crate::provider::SessionId::is_safe(id)
+    crate::harness::SessionId::is_safe(id)
 }
 
-/// Reserve the invocation namespace before a provider can launch, including a
+/// Reserve the invocation namespace before a harness can launch, including a
 /// fresh Codex run whose session is not known until output arrives. Reservation
 /// collisions fail launch; there is never a fallback to a shared marker path.
 pub struct Reservation {
@@ -330,7 +333,7 @@ impl Guard {
 }
 impl Marker {
     pub(crate) fn request_path(&self, data: &crate::data::DataDir) -> Option<PathBuf> {
-        let sid = crate::provider::SessionId::parse(&self.session_id).ok()?;
+        let sid = crate::harness::SessionId::parse(&self.session_id).ok()?;
         let run: crate::sessions::handoff::RunId = self.run_id.clone().try_into().ok()?;
         Some(
             data.inflight()?
@@ -359,16 +362,16 @@ fn write_marker(path: &Path, marker: &Marker) -> std::io::Result<()> {
 
 /// Record that `session_id` is running now. Returns a guard that removes the
 /// marker when dropped. Late marker IO failures degrade visibility; invocation
-/// namespace reservation is checked independently before provider launch.
+/// namespace reservation is checked independently before harness launch.
 pub fn mark(
     session_id: &str,
-    provider: crate::provider::Provider,
+    harness: crate::harness::Harness,
     project: &str,
     data_root: Option<&Path>,
 ) -> Guard {
     mark_in(
         session_id,
-        provider,
+        harness,
         project,
         &crate::data::DataDir::from_override(data_root),
     )
@@ -376,17 +379,17 @@ pub fn mark(
 
 pub(crate) fn mark_in(
     session_id: &str,
-    provider: crate::provider::Provider,
+    harness: crate::harness::Harness,
     project: &str,
     data: &crate::data::DataDir,
 ) -> Guard {
-    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+    let Ok(id) = crate::harness::SessionId::parse(session_id) else {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
         return Guard(None, false);
     };
     mark_checked(
         &id,
-        provider,
+        harness,
         project,
         data,
         &crate::sessions::handoff::RunId::default(),
@@ -395,19 +398,19 @@ pub(crate) fn mark_in(
 }
 
 pub(crate) fn mark_for(
-    session_id: &crate::provider::SessionId,
-    provider: crate::provider::Provider,
+    session_id: &crate::harness::SessionId,
+    harness: crate::harness::Harness,
     project: &str,
     data: &crate::data::DataDir,
     run_id: &crate::sessions::handoff::RunId,
     predecessor: Option<&crate::sessions::handoff::RunId>,
 ) -> Guard {
-    mark_checked(session_id, provider, project, data, run_id, predecessor)
+    mark_checked(session_id, harness, project, data, run_id, predecessor)
 }
 
 fn mark_checked(
-    session_id: &crate::provider::SessionId,
-    provider: crate::provider::Provider,
+    session_id: &crate::harness::SessionId,
+    harness: crate::harness::Harness,
     project: &str,
     data: &crate::data::DataDir,
     run_id: &crate::sessions::handoff::RunId,
@@ -425,9 +428,9 @@ fn mark_checked(
     let path = dir.join(format!("{session_id}.{}.json", run_id.as_str()));
     let marker = Marker {
         session_id: session_id.to_owned(),
-        provider: provider.as_str().to_owned(),
+        harness: harness.as_str().to_owned(),
         project: project.to_owned(),
-        started_epoch: crate::provider::now_epoch_secs(),
+        started_epoch: crate::harness::now_epoch_secs(),
         owner: crate::process::ProcessIdentity::observe(std::process::id())
             .expect("own positive pid"),
         keeper: None,
@@ -525,7 +528,7 @@ pub fn read_live(data_root: Option<&Path>) -> Vec<Live> {
 
 /// The live marker for `session_id`, if a run of it is in flight on this host.
 pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Live> {
-    let id = crate::provider::SessionId::parse(session_id).ok()?;
+    let id = crate::harness::SessionId::parse(session_id).ok()?;
     let session_id = id.as_str();
     let mut matching = read_live(data_root)
         .into_iter()
@@ -670,19 +673,19 @@ pub fn interrupt_pending(session_id: &str, data_root: Option<&Path>) -> bool {
 
 /// Path of `session_id`'s interrupt request, beside its marker.
 fn interrupt_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBuf> {
-    let id = crate::provider::SessionId::parse(session_id).ok()?;
+    let id = crate::harness::SessionId::parse(session_id).ok()?;
     interrupt_path_checked(&id, data_root)
 }
 
 fn interrupt_path_checked(
-    session_id: &crate::provider::SessionId,
+    session_id: &crate::harness::SessionId,
     data_root: Option<&Path>,
 ) -> Option<PathBuf> {
     interrupt_path_in(session_id, &crate::data::DataDir::from_override(data_root))
 }
 
 fn interrupt_path_in(
-    session_id: &crate::provider::SessionId,
+    session_id: &crate::harness::SessionId,
     data: &crate::data::DataDir,
 ) -> Option<PathBuf> {
     Some(
@@ -717,7 +720,7 @@ pub fn take_interrupt_request(session_id: &str, data_root: Option<&Path>) -> boo
 }
 
 pub(crate) fn take_interrupt_request_in(session_id: &str, data: &crate::data::DataDir) -> bool {
-    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+    let Ok(id) = crate::harness::SessionId::parse(session_id) else {
         return false;
     };
     interrupt_path_in(&id, data).is_some_and(|path| std::fs::remove_file(path).is_ok())
@@ -760,11 +763,11 @@ mod tests {
         let root = scratch_root();
         let data = crate::data::DataDir::at(root.clone());
         let sid = "same-session";
-        let checked = crate::provider::SessionId::parse(sid).expect("id");
+        let checked = crate::harness::SessionId::parse(sid).expect("id");
         let id = crate::sessions::handoff::RunId::default();
         let first = mark_for(
             &checked,
-            crate::provider::Provider::Claude,
+            crate::harness::Harness::Claude,
             "/p",
             &data,
             &id,
@@ -772,7 +775,7 @@ mod tests {
         );
         let collision = mark_for(
             &checked,
-            crate::provider::Provider::Claude,
+            crate::harness::Harness::Claude,
             "/p",
             &data,
             &id,
@@ -780,7 +783,7 @@ mod tests {
         );
         assert!(collision.collision());
         drop(collision);
-        let second = mark(sid, crate::provider::Provider::Claude, "/p", Some(&root));
+        let second = mark(sid, crate::harness::Harness::Claude, "/p", Some(&root));
         assert_eq!(read_live(Some(&root)).len(), 2);
         drop(first);
         assert_eq!(read_live(Some(&root)).len(), 1);
@@ -878,7 +881,7 @@ mod tests {
         let write = |sid: &str, keeper: Option<u32>| {
             let marker = Marker {
                 session_id: sid.to_string(),
-                provider: "codex".to_string(),
+                harness: "codex".to_string(),
                 project: "/p".to_string(),
                 started_epoch: 0,
                 // Our own pid with a start time that is not ours: an owner
@@ -931,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_provider_session_ids() {
+    fn accepts_harness_session_ids() {
         assert!(is_safe_session_id("019fefb0-227c-7c83-a398-380011b8e66a"));
         assert!(is_safe_session_id("abc_123-DEF"));
     }
@@ -964,10 +967,10 @@ mod exact_run_tests {
             .join("target/test-scratch")
             .join(crate::ids::generate_uuid());
         let data = crate::data::DataDir::at(root.clone());
-        let sid = crate::provider::SessionId::parse("session").expect("id");
+        let sid = crate::harness::SessionId::parse("session").expect("id");
         let first = mark_for(
             &sid,
-            crate::provider::Provider::Claude,
+            crate::harness::Harness::Claude,
             "/p",
             &data,
             &crate::sessions::handoff::RunId::default(),
@@ -975,7 +978,7 @@ mod exact_run_tests {
         );
         let second = mark_for(
             &sid,
-            crate::provider::Provider::Claude,
+            crate::harness::Harness::Claude,
             "/p",
             &data,
             &crate::sessions::handoff::RunId::default(),

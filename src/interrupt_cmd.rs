@@ -17,18 +17,18 @@
 //!
 //! 1. The run's in-flight marker names its keeper's pid (see `keeper`), the
 //!    owning `review`'s child and leader of its own process group - offered
-//!    only once the provider has produced output, so the provider is never too
+//!    only once the harness has produced output, so the harness is never too
 //!    young to handle the signal (for codex, a node wrapper that would die on
 //!    it).
 //! 2. An interrupt request is written beside the marker *before* the signal, so
 //!    the owning `review` can tell this apart from a death once codex exits.
-//! 3. `SIGINT` goes to the keeper, which forwards one SIGINT to the provider
+//! 3. `SIGINT` goes to the keeper, which forwards one SIGINT to the harness
 //!    alone, through a pidfd - on a codex npm install the node wrapper, which
 //!    forwards it to the native binary once. Signalling the whole group would
 //!    hand the native binary a second copy. codex answers `SIGINT` with a
 //!    `turn/interrupt`, so the turn ends cleanly and the session lock is freed;
 //!    claude ends the turn, kills its running command and prints its result.
-//! 4. We wait for the owner to consume the request (the provider has been reaped),
+//! 4. We wait for the owner to consume the request (the harness has been reaped),
 //!    then for its exact run handoff, published after recovery and recording.
 //!    Printing the resume command any earlier would hand the operator a command
 //!    that fails.
@@ -45,7 +45,7 @@ pub async fn run(session_id: &str) -> Result<()> {
     if outcome.interrupted {
         println!(
             "{}",
-            crate::provider::resume_hint(outcome.provider, session_id)
+            crate::harness::resume_hint(outcome.harness, session_id)
         );
     } else {
         // The run finished before the signal took effect; its answer is in the
@@ -63,7 +63,7 @@ pub async fn run(session_id: &str) -> Result<()> {
 pub struct Outcome {
     pub interrupted: bool,
     pub project: String,
-    pub provider: crate::provider::Provider,
+    pub harness: crate::harness::Harness,
 }
 
 /// Target one observed invocation, never a row position or a replacement run.
@@ -100,12 +100,12 @@ pub(crate) async fn interrupt_observed(
     if marker.cleanup_pending() {
         bail!("{}", cleanup_pending_message(session_id, marker));
     }
-    let provider = match marker.provider.parse::<crate::provider::Provider>() {
+    let harness = match marker.harness.parse::<crate::harness::Harness>() {
         Ok(p) if pending || p.interruptible() => p,
         _ => bail!(
             "session {session_id} is a {} run; only {} runs can be interrupted",
-            marker.provider,
-            crate::provider::Provider::interruptible_names()
+            marker.harness,
+            crate::harness::Harness::interruptible_names()
         ),
     };
     // Older markers have run_id too; only the explicit protocol promises a
@@ -116,14 +116,14 @@ pub(crate) async fn interrupt_observed(
     );
     let run_id: handoff::RunId = marker.run_id.clone().try_into()?;
     if pending {
-        return wait_handoff(session_id, marker, provider, &data, &run_id).await;
+        return wait_handoff(session_id, marker, harness, &data, &run_id).await;
     }
     let owner = marker.owner;
     let mut current = marker.clone();
     let deadline = std::time::Instant::now() + crate::timings::INTERRUPT_PID_WAIT;
     while !current.signal_ready {
         if let Some(done) = handoff::read(&data, &run_id)? {
-            return handoff_outcome(session_id, marker, provider, &done);
+            return handoff_outcome(session_id, marker, harness, &done);
         }
         let observed = query::Observation::capture(data_root);
         match observed.state(session_id, &empty) {
@@ -132,17 +132,17 @@ pub(crate) async fn interrupt_observed(
             }
             query::State::CleanupPending(m) => bail!("{}", cleanup_pending_message(session_id, m)),
             query::State::InFlight(m) if m.run_id == marker.run_id => current = m.clone(),
-            _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+            _ => return wait_handoff(session_id, marker, harness, &data, &run_id).await,
         }
         if current.signal_ready {
             break;
         }
         if owner.is_gone() {
-            return wait_handoff(session_id, marker, provider, &data, &run_id).await;
+            return wait_handoff(session_id, marker, harness, &data, &run_id).await;
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "session {session_id} cannot be interrupted: {provider} has produced no output in {}s (review pid {})",
+            "session {session_id} cannot be interrupted: {harness} has produced no output in {}s (review pid {})",
             crate::timings::INTERRUPT_PID_WAIT.as_secs(),
             owner.pid()
         );
@@ -162,14 +162,14 @@ pub(crate) async fn interrupt_observed(
         {
             m
         }
-        _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+        _ => return wait_handoff(session_id, marker, harness, &data, &run_id).await,
     };
     let keeper = current
         .keeper
         .ok_or_else(|| anyhow::anyhow!("session {session_id}: keeper is not recorded"))?;
     let pinned = match keeper.pin() {
         Ok(p) if p.is_keeper_of(owner) => p,
-        _ => return wait_handoff(session_id, marker, provider, &data, &run_id).await,
+        _ => return wait_handoff(session_id, marker, harness, &data, &run_id).await,
     };
     // Exact request paths make even a late request harmless to later runs.
     marker.request(&data)?;
@@ -177,16 +177,16 @@ pub(crate) async fn interrupt_observed(
         eprintln!("keeper signal failed ({e}); waiting for this run's handoff");
     } else {
         eprintln!(
-            "interrupt sent to {provider} through its keeper (pid {}); waiting for the run to wind down",
+            "interrupt sent to {harness} through its keeper (pid {}); waiting for the run to wind down",
             keeper.pid()
         );
     }
-    wait_handoff(session_id, marker, provider, &data, &run_id).await
+    wait_handoff(session_id, marker, harness, &data, &run_id).await
 }
 fn handoff_outcome(
     session_id: &str,
     marker: &crate::inflight::Live,
-    provider: crate::provider::Provider,
+    harness: crate::harness::Harness,
     done: &handoff::Handoff,
 ) -> Result<Outcome> {
     anyhow::ensure!(
@@ -196,25 +196,25 @@ fn handoff_outcome(
     Ok(Outcome {
         interrupted: done.interrupted,
         project: marker.project.clone(),
-        provider,
+        harness,
     })
 }
 async fn wait_handoff(
     session_id: &str,
     marker: &crate::inflight::Live,
-    provider: crate::provider::Provider,
+    harness: crate::harness::Harness,
     data: &crate::data::DataDir,
     run_id: &handoff::RunId,
 ) -> Result<Outcome> {
     loop {
         if let Some(done) = handoff::read(data, run_id)? {
-            return handoff_outcome(session_id, marker, provider, &done);
+            return handoff_outcome(session_id, marker, harness, &done);
         }
         if marker.owner.is_gone() {
             // Publication may race the liveness observation. A final read is
             // mandatory before declaring the handoff incomplete.
             if let Some(done) = handoff::read(data, run_id)? {
-                return handoff_outcome(session_id, marker, provider, &done);
+                return handoff_outcome(session_id, marker, harness, &done);
             }
             bail!(
                 "the owning review (pid {}) exited without recording a handoff for session {session_id}",
@@ -241,13 +241,13 @@ pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Live)
     )
 }
 
-/// Whether a recorded run of `provider` (a marker's string) can be ended
-/// mid-turn and resumed: `Provider::interruptible`, which the signal
+/// Whether a recorded run of `harness` (a marker's string) can be ended
+/// mid-turn and resumed: `Harness::interruptible`, which the signal
 /// supervisor's `Unrecorded` reads too. A name `review` does not drive is not.
-pub(crate) fn interruptible(provider: &str) -> bool {
-    provider
-        .parse::<crate::provider::Provider>()
-        .is_ok_and(crate::provider::Provider::interruptible)
+pub(crate) fn interruptible(harness: &str) -> bool {
+    harness
+        .parse::<crate::harness::Harness>()
+        .is_ok_and(crate::harness::Harness::interruptible)
 }
 
 #[cfg(test)]
@@ -263,15 +263,9 @@ mod handoff_tests {
         let reserved = crate::inflight::reserve(&data, &id)
             .expect("reserve")
             .expect("storage");
-        let sid = crate::provider::SessionId::parse("pending-session").expect("session");
-        let mut guard = crate::inflight::mark_for(
-            &sid,
-            crate::provider::Provider::Grok,
-            "/p",
-            &data,
-            &id,
-            None,
-        );
+        let sid = crate::harness::SessionId::parse("pending-session").expect("session");
+        let mut guard =
+            crate::inflight::mark_for(&sid, crate::harness::Harness::Grok, "/p", &data, &id, None);
         reserved.register(&guard);
         guard.handoff();
         drop(guard);

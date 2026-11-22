@@ -6,46 +6,46 @@ use super::{format_runtime, print_left_running, run_failed, selected_root};
 // Interrupt remains a separate verb owner; message composes its signalling
 // and wording without duplicating it or moving storage policy into the app.
 use crate::{
-    config, config_write, inflight, input, interrupt_cmd, lock, project, provider, sessions,
+    config, config_write, harness, inflight, input, interrupt_cmd, lock, project, sessions,
 };
 
-/// The provider a `review resume` talks to: the one the sidecar recorded for the
+/// The harness a `review resume` talks to: the one the sidecar recorded for the
 /// session.
 ///
-/// A session belongs to exactly one provider, and the only place an operator
+/// A session belongs to exactly one harness, and the only place an operator
 /// gets a session ID from is `review`'s own output, whose run wrote that record.
-/// So there is nothing to ask for: no `--provider`, and no scanning provider
+/// So there is nothing to ask for: no `--harness`, and no scanning harness
 /// session stores. No record means the session is not one this host's `review`
-/// created - another host's (whose provider store is not here either), one made
+/// created - another host's (whose harness store is not here either), one made
 /// outside `review`, or a lost log - and that is an error, not a guess.
 ///
-/// A recorded provider is still parsed, so a row naming a removed provider
+/// A recorded harness is still parsed, so a row naming a removed harness
 /// (kilo/opencode) cannot turn into an unrunnable invocation.
 ///
 /// Recognising the name is not the same as the current runner understanding
 /// the session. Today every recognised name has only ever had one integration,
-/// so the two coincide. They stop coinciding the moment a removed provider's
+/// so the two coincide. They stop coinciding the moment a removed harness's
 /// name is driven again (opencode is the expected case): rows the old
 /// integration wrote would parse as the new one. The stale-session gate does
 /// not cover that - rows with no usable epoch bypass it - so re-adding a name
 /// must come with a compatibility check here, a minimum `review_version` per
-/// provider below which rows are refused, with the crate version bumped past
+/// harness below which rows are refused, with the crate version bumped past
 /// every build of the old integration (rows record `CARGO_PKG_VERSION`), and
 /// a missing or malformed version refused.
 fn resume_record(
     session_id: &str,
     record: Option<sessions::SessionRecord>,
-) -> Result<(sessions::SessionRecord, provider::Provider)> {
+) -> Result<(sessions::SessionRecord, harness::Harness)> {
     let record = record.ok_or_else(|| sessions::query::not_found(session_id))?;
-    let Ok(provider) = record.provider.parse::<provider::Provider>() else {
+    let Ok(harness) = record.harness.parse::<harness::Harness>() else {
         bail!(
-            "session {session_id} was recorded for provider '{}', which review no \
+            "session {session_id} was recorded for harness '{}', which review no \
              longer supports\n  supported: {}",
-            record.provider,
-            provider::Provider::supported()
+            record.harness,
+            harness::Harness::supported()
         );
     };
-    Ok((record, provider))
+    Ok((record, harness))
 }
 
 /// The project a message to `session_id` runs in, with its config: the one
@@ -129,7 +129,7 @@ fn message_target(
 }
 
 /// `review message <id>`: deliver stdin to a session whatever it is doing. A
-/// turn in flight on an interruptible provider is ended first, exactly as `review interrupt`
+/// turn in flight on an interruptible harness is ended first, exactly as `review interrupt`
 /// ends it, and the message then continues the session as a resume.
 ///
 /// The verb exists for its name. Steering a running agent used to be
@@ -157,12 +157,12 @@ fn session_uses_token_command(
     snapshot.find(&record.session_id).is_some_and(|session| {
         session.rows.iter().any(|row| {
             row.kind == sessions::SessionKind::Run
-                && row.provider == provider::Provider::Claude.as_str()
+                && row.harness == harness::Harness::Claude.as_str()
                 && row.hostname == host
                 && row.audit_id == record.audit_id
                 && crate::project::same_project(&row.project, project_root)
                 && row.credential.as_deref()
-                    == Some(provider::claude_token::CREDENTIAL_TOKEN_COMMAND)
+                    == Some(harness::claude_token::CREDENTIAL_TOKEN_COMMAND)
         })
     })
 }
@@ -176,7 +176,7 @@ pub(super) async fn run_message(
 ) -> Result<crate::exit::CommandExit> {
     // Reject unsafe executable identities before locks or interruption. Rows
     // remain permissive historical evidence and are not changed on disk.
-    let validated_id = provider::SessionId::parse(session_id)?;
+    let validated_id = harness::SessionId::parse(session_id)?;
     // Read before interrupting anything: a missing message must not cost the
     // turn in flight.
     let instructions = input::read_stdin()?;
@@ -248,12 +248,12 @@ pub(super) async fn run_message(
             );
         }
         if marker.phase == inflight::Phase::Running
-            && !interrupt_cmd::interruptible(&marker.provider)
+            && !interrupt_cmd::interruptible(&marker.harness)
         {
             bail!(
                 "session {session_id} has a {} turn in flight, which cannot be interrupted\n  \
                  send the message once it has finished",
-                marker.provider
+                marker.harness
             );
         }
         if marker.phase == inflight::Phase::HandoffPending {
@@ -271,8 +271,8 @@ pub(super) async fn run_message(
         }
     }
     // Looked up once and reused by the cache-age gate and inheritance below.
-    let (record, provider_name) = resume_record(session_id, snapshot.latest(session_id).cloned())?;
-    eprintln!("provider: {provider_name} (from the session record)");
+    let (record, harness_name) = resume_record(session_id, snapshot.latest(session_id).cloned())?;
+    eprintln!("harness: {harness_name} (from the session record)");
     let archetype = record.archetype.as_str();
 
     let stdin_instructions = instructions;
@@ -304,12 +304,12 @@ pub(super) async fn run_message(
         return Ok(crate::exit::CommandExit::Success);
     }
 
-    if !provider::is_available(provider_name) {
-        bail!("'{provider_name}' not found on PATH");
+    if !harness::is_available(harness_name) {
+        bail!("'{harness_name}' not found on PATH");
     }
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
-    // last ended; past the provider's cutoff (`Provider::stale_cutoff`: 27 min
+    // last ended; past the harness's cutoff (`Harness::stale_cutoff`: 27 min
     // for codex, whose prompt cache lasts ~30 min, ~55 min otherwise) the cache
     // is cold, and resuming means reprocessing the whole session prefix at full
     // cost. Resuming is the *warm* follow-up path, so a cold resume is refused:
@@ -317,7 +317,7 @@ pub(super) async fn run_message(
     // timestamp leaves the age unknown, and the resume proceeds rather than blocks.
     let age = sessions::Age::since_epoch(record.epoch_secs);
     if let Some(elapsed) = age.elapsed_secs() {
-        if elapsed > provider_name.stale_cutoff().as_secs() {
+        if elapsed > harness_name.stale_cutoff().as_secs() {
             bail!(
                 "session last touched {age} - its prompt cache is cold.\n  \
                  Resuming would reprocess the whole session prefix at full cost.\n  \
@@ -333,9 +333,9 @@ pub(super) async fn run_message(
     // here, before the global lock, so a slow helper holds nothing; and a
     // session that needs it but cannot get it is refused before anything is
     // sent, since a failed attempt would leave the prompt in its transcript.
-    let claude_token = if provider_name == provider::Provider::Claude
+    let claude_token = if harness_name == harness::Harness::Claude
         && session_uses_token_command(&snapshot, &record, &project_root)
-        && !provider::claude_token::env_has_token(None)
+        && !harness::claude_token::env_has_token(None)
     {
         let Some(command) = cfg.claude_token_command.clone() else {
             bail!(
@@ -343,7 +343,7 @@ pub(super) async fn run_message(
                  the global config no longer sets\n  Nothing was sent."
             );
         };
-        let source = provider::claude_token::TokenSource::new(command);
+        let source = harness::claude_token::TokenSource::new(command);
         let fetched = tokio::task::spawn_blocking(move || source.fetch())
             .await
             .map_err(|e| anyhow::anyhow!("claude_token_command task failed: {e}"))?;
@@ -365,7 +365,7 @@ pub(super) async fn run_message(
     // when the run finishes).
     //
     // It is deliberately NOT held across the run. The lock exists to space out
-    // provider launches, and a resume launches exactly one thing, so there is
+    // harness launches, and a resume launches exactly one thing, so there is
     // nothing left to serialize once it is running. Holding it for the turn's
     // duration meant a single wedged resume froze all `review` traffic on the
     // host indefinitely - every later invocation sat waiting on the lock
@@ -377,7 +377,7 @@ pub(super) async fn run_message(
     // letting every queued resume through to spawn simultaneously - the rate
     // limiting the lock exists to provide.
     // Held to the end, past the sidecar row: see `run_launch`.
-    let _unrecorded = lifecycle.unrecorded_for(provider_name);
+    let _unrecorded = lifecycle.unrecorded_for(harness_name);
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
@@ -388,7 +388,7 @@ pub(super) async fn run_message(
     let scope = crate::data::LogScope::new(audit_id, cfg.audit.private);
     let data = crate::data::DataDir::process().clone();
     // Prompt/profile settings are inherited; the current stall safety setting is honoured.
-    let provider_runtime = provider::ProviderRuntime::from_config(
+    let harness_runtime = harness::HarnessRuntime::from_config(
         lifecycle.clone(),
         cfg.stall_timeout(),
         cfg.claude_token_command.as_deref(),
@@ -400,11 +400,11 @@ pub(super) async fn run_message(
     // recorded run rather than defaulted (see `InheritedSettings::from_record`). Each is
     // announced, because the failure this replaced was entirely silent: the
     // resume simply ran on a different model and nothing said so.
-    let inherited = provider::InheritedSettings::from_record(Some(&record), provider_name);
+    let inherited = harness::InheritedSettings::from_record(Some(&record), harness_name);
     if let Some(level) = inherited
         .sandbox
         .as_ref()
-        .and_then(provider::Permissions::selector)
+        .and_then(harness::Permissions::selector)
     {
         eprintln!("sandbox: {level} (inherited from the session record)");
     }
@@ -418,26 +418,26 @@ pub(super) async fn run_message(
     // A session created under a profile CODEX_HOME must resume against that
     // same storage directory. Older rows have no saved path and keep using the
     // current process environment/default.
-    let mut settings = provider::RunSettings::from_inherited(provider_name, inherited);
+    let mut settings = harness::RunSettings::from_inherited(harness_name, inherited);
     if let Some(token) = claude_token {
         settings = settings.with_claude_token(token);
     }
-    let spec = provider::LaunchSpec {
-        provider: provider_name,
-        start: provider::SessionStart::Resume(validated_id),
+    let spec = harness::LaunchSpec {
+        harness: harness_name,
+        start: harness::SessionStart::Resume(validated_id),
         settings,
         prompt: stdin_instructions.clone(),
         root: project_root.clone(),
     };
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
-    let invoke = provider::invoke(spec, Some(launched_tx), &provider_runtime, None);
+    let invoke = harness::invoke(spec, Some(launched_tx), &harness_runtime, None);
     tokio::pin!(invoke);
 
     // Release the lock as soon as the process is spawned. `launched_rx` also
     // resolves (as an error) if the sender is dropped without sending, i.e. the
     // spawn failed - which is equally a reason to stop holding the lock. The
-    // `invoke` arm covers a provider that returns before signalling at all.
-    // The session's launch lock goes at the same moment: once the provider has
+    // `invoke` arm covers a harness that returns before signalling at all.
+    // The session's launch lock goes at the same moment: once the harness has
     // spawned, its in-flight marker exists, so a later message to this session
     // sees the turn in flight.
     let result = tokio::select! {
@@ -479,7 +479,7 @@ pub(super) async fn run_message(
              session started with [_defaults].claude_token_command gets the token up front."
         );
     }
-    provider::print_result(&result);
+    harness::print_result(&result);
     let left_running = print_left_running(lifecycle);
     println!("\nruntime: {}", format_runtime(started.elapsed()));
 
@@ -497,14 +497,14 @@ pub(super) async fn run_message(
 mod tests {
     use super::*;
 
-    fn minimal_row(provider: &str) -> sessions::SessionRecord {
+    fn minimal_row(harness: &str) -> sessions::SessionRecord {
         record(serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
             "epoch_secs": 1_767_225_600u64,
             "project": "/w",
             "hostname": "h",
             "audit_id": "a",
-            "provider": provider,
+            "provider": harness,
             "archetype": "security",
             "session_id": "s",
             "operator_prompt": "p",
@@ -514,11 +514,11 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_takes_the_provider_from_the_record() {
+    fn a_resume_takes_the_harness_from_the_record() {
         // The session ID came from review's own output, whose run wrote this
-        // row, so the provider is on record and is never asked for.
-        let (rec, provider) = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
-        assert_eq!(provider, provider::Provider::Codex);
+        // row, so the harness is on record and is never asked for.
+        let (rec, harness) = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
+        assert_eq!(harness, harness::Harness::Codex);
         assert_eq!(rec.archetype, "security");
         assert_eq!(rec.codex_home, None);
     }
@@ -543,22 +543,22 @@ mod tests {
             let mut rec = minimal_row("grok");
             rec.sandbox = Some(native.to_string());
             assert_eq!(
-                provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Grok)
+                harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Grok)
                     .sandbox
                     .as_ref()
-                    .and_then(provider::Permissions::selector),
+                    .and_then(harness::Permissions::selector),
                 Some(native)
             );
-            rec.provider_sandbox = Some(native.to_string());
+            rec.harness_sandbox = Some(native.to_string());
             rec.sandbox =
-                provider::Permissions::restore(provider::Provider::Grok, Some(native), None, &[])
+                harness::Permissions::restore(harness::Harness::Grok, Some(native), None, &[])
                     .recorded_level()
                     .map(str::to_string);
             assert_eq!(
-                provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Grok)
+                harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Grok)
                     .sandbox
                     .as_ref()
-                    .and_then(provider::Permissions::selector),
+                    .and_then(harness::Permissions::selector),
                 Some(native)
             );
         }
@@ -584,11 +584,11 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
+        let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(
             got.sandbox
                 .as_ref()
-                .and_then(provider::Permissions::selector),
+                .and_then(harness::Permissions::selector),
             Some("workspace-write")
         );
         assert_eq!(got.writable_roots, vec!["/home/u/.brokkr", "/srv/cache"]);
@@ -600,7 +600,7 @@ mod tests {
     fn a_row_recording_a_model_but_no_effort_inherits_just_the_model() {
         // Rows written before `effort` was recorded carry a model and nothing
         // else. Inheriting the model is still strictly better than falling back
-        // to the provider's default model, so the absent effort must not
+        // to the harness's default model, so the absent effort must not
         // suppress it.
         let rec = record(serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
@@ -616,7 +616,7 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
+        let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(got.effort, None);
     }
@@ -638,11 +638,11 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
+        let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(
             got.sandbox
                 .as_ref()
-                .and_then(provider::Permissions::selector),
+                .and_then(harness::Permissions::selector),
             Some("read-only")
         );
         assert!(got.writable_roots.is_empty());
@@ -651,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn permissions_are_not_inherited_across_providers() {
-        // `resume_record` takes the provider from the same row, so this cannot
+    fn permissions_are_not_inherited_across_harnesses() {
+        // `resume_record` takes the harness from the same row, so this cannot
         // happen today, but a grok level fed to codex (or vice versa) is a
         // widening nobody asked for, so the guard is here rather than assumed
         // upstream.
@@ -671,17 +671,17 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let got = provider::InheritedSettings::from_record(Some(&rec), provider::Provider::Codex);
+        let got = harness::InheritedSettings::from_record(Some(&rec), harness::Harness::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
-        // The model is provider-scoped too: a grok model name handed to codex
+        // The model is harness-scoped too: a grok model name handed to codex
         // is not a fallback, it is an invocation that cannot start.
         assert_eq!(got.model, None);
     }
 
     #[test]
     fn no_record_inherits_nothing() {
-        let got = provider::InheritedSettings::from_record(None, provider::Provider::Codex);
+        let got = harness::InheritedSettings::from_record(None, harness::Harness::Codex);
         assert_eq!(got.sandbox, None);
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);
@@ -695,8 +695,8 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_provider_review_no_longer_supports_is_refused() {
-        // A row naming a removed provider (kilo/opencode) must not turn into
+    fn a_recorded_harness_review_no_longer_supports_is_refused() {
+        // A row naming a removed harness (kilo/opencode) must not turn into
         // an unrunnable invocation.
         let err = resume_error(Some(minimal_row("opencode")));
         assert!(err.contains("supported"), "{err}");

@@ -3,25 +3,25 @@
 `review` records every run that produced a session ID, on this host only, in
 `sessions.jsonl` under `$XDG_DATA_HOME/review`, else `~/.local/share/review`
 (`sessions-private.jsonl` for a project with `[_audit] private = true`). That record is what `review message` reads to
-find a session's provider, project and settings.
+find a session's harness, project and settings.
 The command snapshots this data location once; sessions, audit, incidents,
-inflight files and teardown logs use it. Provider homes and the host launch
+inflight files and teardown logs use it. Harness homes and the host launch
 lock remain separate. Profile env cannot redirect review's own storage.
 
 ## Listing sessions
 
 `review sessions` lists the current project's sessions, most recently touched
 first (`--limit`, default 20; `--all` for every project). `-C` lists another
-project's. Each entry shows its age, provider, archetype, how many times it was
+project's. Each entry shows its age, harness, archetype, how many times it was
 touched, and the first line of the prompt that opened it.
 Ages use `just now`, `<age> ago`, or `?` when the timestamp is unknown.
 
 Live state entries come before the list:
 
-- `[in flight] <provider> / turn in flight since <age>`: a run is happening
+- `[in flight] <harness> / turn in flight since <age>`: a run is happening
   right now. Its record is only written when it returns, so without this a
   running turn would look like an idle session showing its previous answer.
-- `[recording] <provider> / waiting for the run handoff`: provider teardown has
+- `[recording] <harness> / waiting for the run handoff`: harness teardown has
   ended and recovery or recording is finishing. A message waits for that
   invocation instead of launching from an older row.
 - `[queued] message waiting to launch`: a `review message` that holds the
@@ -38,7 +38,7 @@ predecessor, so its active turn remains interruptible.
 ## One session
 
 `review sessions <ID>` shows a session's last record wherever it was started:
-provider, archetype, project, model, effort, sandbox and writable roots, the
+harness, archetype, project, model, effort, sandbox and writable roots, the
 digest, and the response. A deleted project still shows. With `-C`, the
 session must belong to the selected project.
 Fresh runs are recorded as `run`; resumes, including automatic resumes, are

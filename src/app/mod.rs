@@ -6,8 +6,8 @@ use anyhow::{Result, bail};
 use crate::cli::{self, Cli};
 use crate::exit::CommandExit;
 use crate::{
-    config, config_cmd, config_write, contained, input, interrupt_cmd, lock, man, project, prompt,
-    provider,
+    config, config_cmd, config_write, contained, harness, input, interrupt_cmd, lock, man, project,
+    prompt,
 };
 
 mod history;
@@ -38,7 +38,7 @@ fn format_runtime(d: std::time::Duration) -> String {
 /// `review` could not verify (`Outcome::failed`). Retries are decided
 /// separately: an unverified answer is a failure, but resending the request
 /// would not verify it.
-fn run_failed(r: &provider::ProviderResult) -> bool {
+fn run_failed(r: &harness::HarnessResult) -> bool {
     !r.output.as_ref().is_ok_and(|turn| !turn.outcome.failed())
 }
 
@@ -74,7 +74,7 @@ fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Opt
 pub async fn run() -> Result<CommandExit> {
     // Total wall clock, started before anything else runs. This deliberately
     // includes the stdin read and the global-lock wait: it is what the operator
-    // waited, not just what the providers spent.
+    // waited, not just what the harnesses spent.
     let started = std::time::Instant::now();
     let cli = Cli::parse_checked();
     if !matches!(cli.command, Some(cli::Command::Man { .. })) {
@@ -86,7 +86,7 @@ pub async fn run() -> Result<CommandExit> {
     // codex runs in its own process group (so we can kill it and its children as
     // a unit), which means it no longer receives a terminal Ctrl-C implicitly -
     // without this, killing `review` would leave codex running detached.
-    // Installed once, process-wide, and before any provider can be spawned; see
+    // Installed once, process-wide, and before any harness can be spawned; see
     // `supervisor::install_signal_supervisor` for why it cannot be per-run.
     let lifecycle = crate::supervisor::Lifecycle::default();
     crate::supervisor::install_signal_supervisor(lifecycle.clone());
@@ -155,21 +155,21 @@ pub async fn run() -> Result<CommandExit> {
     // procedure written against the old form keeps working until it is updated.
     if let Some(ref session_id) = cli.session {
         eprintln!("warning: `--session <ID>` is now `review message <ID>`");
-        if cli.profile.is_some() || cli.provider.is_some() {
+        if cli.profile.is_some() || cli.retired_provider.is_some() {
             eprintln!(
                 "warning: --profile/--provider are ignored on a resume - the session \
-                 keeps its own provider and settings"
+                 keeps its own harness and settings"
             );
         }
         return run_message(session_id, cli.dry_run, selector, started, &lifecycle).await;
     }
 
-    // Retired: the provider is part of the profile. Still parsed, so the
+    // Retired: the harness is part of the profile. Still parsed, so the
     // refusal can say what replaced it rather than clap's "unexpected argument".
-    if let Some(ref p) = cli.provider {
+    if let Some(ref p) = cli.retired_provider {
         bail!(
-            "--provider was removed: the provider is part of the profile\n  \
-             Pick a profile whose provider is {p} with -p <name> (`review list` lists them)."
+            "--provider was removed: the harness is part of the profile\n  \
+             Pick a profile whose harness is {p} with -p <name> (`review list` lists them)."
         );
     }
 
@@ -209,7 +209,7 @@ pub async fn run() -> Result<CommandExit> {
 
     let (arch_name, prime) = cfg.select_archetype(archetype_arg)?;
 
-    // The profile names the provider and its settings: -p wins, otherwise
+    // The profile names the harness and its settings: -p wins, otherwise
     // [_defaults].profile from the first layer that sets it. It must exist
     // before anything is spawned.
     let Some(profile_name) = cli.profile.as_deref().or_else(|| cfg.default_profile()) else {
@@ -220,13 +220,13 @@ pub async fn run() -> Result<CommandExit> {
         );
     };
     let definition = cfg.require_profile(profile_name)?.clone();
-    let prov_name = definition.provider;
+    let prov_name = definition.harness;
 
-    let installed = provider::is_available(prov_name);
+    let installed = harness::is_available(prov_name);
     let assembled = prompt::assemble(&prime, &stdin_instructions);
 
     // Dry run: print what would be sent and exit. It launches nothing, so a
-    // missing provider only warns.
+    // missing harness only warns.
     if cli.dry_run {
         if !installed {
             eprintln!("warning: {prov_name} is not installed on this host - a real run would fail");
@@ -240,11 +240,11 @@ pub async fn run() -> Result<CommandExit> {
     if !installed {
         bail!(
             "{prov_name} is not installed on this host (not found on PATH)\n  \
-             Nothing was launched. Install it, or pick a profile for another provider with -p."
+             Nothing was launched. Install it, or pick a profile for another harness with -p."
         );
     }
 
-    // Provider execution and recording live in launch; views live in history.
+    // Harness execution and recording live in launch; views live in history.
     // The host-wide launch lock spaces out `review` calls fired together.
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
@@ -265,7 +265,7 @@ pub async fn run() -> Result<CommandExit> {
     // Codex run settings from project config: today just the stall timeout,
     // which is tunable (and disableable) because it rests on an empirical codex
     // property rather than a documented contract.
-    let provider_runtime = provider::ProviderRuntime::from_config(
+    let harness_runtime = harness::HarnessRuntime::from_config(
         lifecycle.clone(),
         cfg.stall_timeout(),
         cfg.claude_token_command.as_deref(),
@@ -273,7 +273,7 @@ pub async fn run() -> Result<CommandExit> {
         &scope,
     );
 
-    let settings = provider::RunSettings::from_profile(prov_name, Some(&definition));
+    let settings = harness::RunSettings::from_profile(prov_name, Some(&definition));
     let ctx = std::sync::Arc::new(RecordCtx {
         project_root: project_root.clone(),
         data: data.clone(),
@@ -284,20 +284,20 @@ pub async fn run() -> Result<CommandExit> {
         operator_prompt: stdin_instructions,
     });
     let launch = Launch {
-        spec: provider::LaunchSpec {
-            provider: prov_name,
-            start: provider::SessionStart::Fresh { id: None },
+        spec: harness::LaunchSpec {
+            harness: prov_name,
+            start: harness::SessionStart::Fresh { id: None },
             settings,
             prompt: assembled.clone(),
             root: project_root,
         },
-        runtime: provider_runtime,
+        runtime: harness_runtime,
     };
     let mut handle = tokio::spawn(run_launch(launch, std::sync::Arc::clone(&ctx)));
 
     // Hold the lock for the launch spacing, so the next queued `review` on this
     // host launches that much later. A run that is over sooner releases it
-    // then: it is no longer talking to its provider, and its result should not
+    // then: it is no longer talking to its harness, and its result should not
     // wait on the spacing.
     let joined = tokio::select! {
         joined = &mut handle => Some(joined),
@@ -314,16 +314,16 @@ pub async fn run() -> Result<CommandExit> {
     let result = match joined {
         Ok(outcome) => outcome.into_result(),
         Err(err) => {
-            let result = provider::ProviderResult {
+            let result = harness::HarnessResult {
                 credential: None,
                 run_id: None,
                 _reservation: None,
-                provider: prov_name,
+                harness: prov_name,
                 output: Err(anyhow::anyhow!("task panicked: {err}")),
                 session_id: None,
                 codex_home: None,
                 digest: None,
-                completed_epoch: provider::now_epoch_secs(),
+                completed_epoch: harness::now_epoch_secs(),
                 // A task can panic after spawning. Its effective launch facts
                 // are unavailable here; do not replace them with requested
                 // permissions and claim they were granted.
@@ -331,7 +331,7 @@ pub async fn run() -> Result<CommandExit> {
                 writable_roots: Vec::new(),
                 model: None,
                 effort: None,
-                served: provider::Served::default(),
+                served: harness::Served::default(),
                 grok_trust: None,
                 // Whatever it had launched is in the ledger, which the exit
                 // status reads.
@@ -342,7 +342,7 @@ pub async fn run() -> Result<CommandExit> {
         }
     };
 
-    provider::print_result(&result);
+    harness::print_result(&result);
     let left_running = print_left_running(&lifecycle);
 
     println!("\nruntime: {}", format_runtime(started.elapsed()));

@@ -1,4 +1,4 @@
-//! Provider fork/exec and the exec-status handshake.
+//! Harness fork/exec and the exec-status handshake.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -10,7 +10,7 @@ use crate::process::pidfd_open;
 
 impl Keeper {
     pub(super) fn launch(&mut self) {
-        match self.fork_provider() {
+        match self.fork_harness() {
             Ok(()) => self.phase = Phase::Starting,
             Err(reason) => {
                 self.queue(&Event::ExecFailed { reason });
@@ -19,7 +19,7 @@ impl Keeper {
         }
     }
 
-    fn fork_provider(&mut self) -> Result<(), String> {
+    fn fork_harness(&mut self) -> Result<(), String> {
         self.spec.launch.validate().map_err(|e| e.to_string())?;
         let launch = &self.spec.launch;
         let program = std::ffi::OsStr::from_bytes(&launch.program);
@@ -93,7 +93,7 @@ impl Keeper {
                 let mut empty: libc::sigset_t = std::mem::zeroed();
                 libc::sigemptyset(&mut empty);
                 libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
-                // The Rust runtime ignores SIGPIPE; a provider gets the
+                // The Rust runtime ignores SIGPIPE; a harness gets the
                 // default, as it would from `std::process::Command`.
                 libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 if hold {
@@ -125,7 +125,7 @@ impl Keeper {
             }
         }
         drop(status_w);
-        // The provider has its stdio; the keeper's copies would only hold its
+        // The harness has its stdio; the keeper's copies would only hold its
         // pipes open past its exit, delaying `review`'s EOF and its EPIPE on a
         // prompt nobody reads.
         if let Ok(null) = std::fs::OpenOptions::new()
@@ -172,7 +172,7 @@ impl Keeper {
             // immediate death looks the same, so classifying on "already
             // dead when inspected" would judge identical runs by timing.
             // Nothing downstream needs to: `Spawned` only resolves the
-            // launch to a pid, readiness comes from the provider's own
+            // launch to a pid, readiness comes from the harness's own
             // stream, and the true wait status still follows in `Exited` and
             // `Done`. `tests/keeper.rs` holds a child before exec and kills it
             // to keep that so.
@@ -193,7 +193,7 @@ impl Keeper {
         } else {
             // A short or failed read: not proof of an exec either way.
             self.queue(&Event::ExecFailed {
-                reason: "could not read the provider's exec status".to_string(),
+                reason: "could not read the harness's exec status".to_string(),
             });
             self.phase = Phase::TearingDown;
         }

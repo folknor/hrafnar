@@ -81,7 +81,7 @@ pub enum State<'a> {
     CleanupPending(&'a crate::inflight::Live),
     HandoffPending(&'a crate::inflight::Live),
     /// Directory scanning is not atomic. Multiple observed live markers are
-    /// ambiguous evidence, not proof that two providers actually overlapped.
+    /// ambiguous evidence, not proof that two harnesses actually overlapped.
     Ambiguous,
     Queued(Option<&'a SessionRow>),
     Idle(&'a SessionRow),
@@ -137,7 +137,7 @@ fn follows(previous: &crate::inflight::Live, next: &crate::inflight::Live) -> bo
             .is_some_and(|id| id.as_str() == previous.run_id)
         && previous.owner == next.owner
         && previous.session_id == next.session_id
-        && previous.provider == next.provider
+        && previous.harness == next.harness
         && previous.project == next.project
 }
 
@@ -206,7 +206,7 @@ mod tests {
         changed.marker.project = "/other".into();
         rejects(first.clone(), changed);
         let mut changed = second.clone();
-        changed.marker.provider = "claude".into();
+        changed.marker.harness = "claude".into();
         rejects(first.clone(), changed);
         let mut changed = second.clone();
         changed.marker.owner = crate::process::ProcessIdentity::recorded(1, None).expect("owner");

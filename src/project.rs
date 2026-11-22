@@ -2,7 +2,7 @@
 //! the invoking directory is in.
 //!
 //! An orchestrating agent working in one checkout asks for a review of
-//! another. The process never changes directory: providers and writable roots
+//! another. The process never changes directory: harnesses and writable roots
 //! already take the project root explicitly, so only config discovery has to
 //! start somewhere else, and keeping cwd still leaves every relative path the
 //! operator's environment holds (`XDG_DATA_HOME`, `TMPDIR`, `PATH`) meaning what

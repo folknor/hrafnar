@@ -24,12 +24,12 @@ sessions remain readable and can still be continued.
 **Never stop or kill the `review` process to interrupt an agent.** A first
 SIGINT or SIGTERM makes `review` try to end its codex, claude and maki turns
 gracefully and record them, within a bounded wait. A second signal, SIGKILL, or
-a provider that does not stop in time loses that record, and an unrecorded
+a harness that does not stop in time loses that record, and an unrecorded
 session cannot be continued at all. Grok turns are not ended gracefully.
 
 ## What a message sends
 
-Stdin as-is: no archetype prime, no profile. The session keeps the provider,
+Stdin as-is: no archetype prime, no profile. The session keeps the harness,
 sandbox level, model and effort recorded for it, and each is announced
 (`sandbox: workspace-write (inherited from the session record)`). There is no
 `-a` or `-p`. A maki session records no effort, and maki itself
@@ -53,14 +53,14 @@ session was recorded under; if any check fails, nothing is interrupted.
 
 One this host's `review` recorded, or a fresh run of this host's still in
 flight that has not recorded yet (its record is written when it returns, and
-the message waits for it after interrupting). The provider is read from the
+the message waits for it after interrupting). The harness is read from the
 record. An ID with neither is refused; `review sessions` lists what this host
 knows.
 
-A message pays off only while the provider's prompt cache is warm, so a session
+A message pays off only while the harness's prompt cache is warm, so a session
 idle too long is refused:
 
-| Provider | Refused when last touched more than |
+| Harness | Refused when last touched more than |
 |---|---|
 | codex | 27 minutes ago |
 | claude | 55 minutes ago |
@@ -84,7 +84,7 @@ claude or maki it interrupts it, on grok it is refused, and if the first turn ha
 already finished it simply continues the session. While the first message is
 still waiting to launch (behind the host-wide launch lock), `review sessions`
 shows it as `[queued]`. A message arriving just after the first has launched,
-before the provider has reported its process, waits briefly for it rather than
+before the harness has reported its process, waits briefly for it rather than
 failing.
 
 ## Exit status

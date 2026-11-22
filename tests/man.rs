@@ -1,6 +1,6 @@
 //! `review man` must work when nothing else does: it is where an agent goes to
 //! learn how to repair a broken config, so it is dispatched before the project,
-//! the config, stdin or any provider is looked at. Run as a child process
+//! the config, stdin or any harness is looked at. Run as a child process
 //! because the property is about the real dispatch order in `main`.
 
 use std::process::Command;

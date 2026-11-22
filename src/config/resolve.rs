@@ -87,10 +87,10 @@ fn resolve_inner(
         }
         // Pushing in precedence order makes the first definition of each
         // profile the effective one.
-        for (name, (provider, p)) in file.profiles {
+        for (name, (harness, p)) in file.profiles {
             let table = format!("[profiles.{}]", super::toml_key(&name));
             defs.entry(name).or_default().push(ProfileDef {
-                provider,
+                harness,
                 profile: p,
                 layer,
                 table,
@@ -106,15 +106,15 @@ fn resolve_inner(
         };
         let shadowed: Vec<ProfileDef> = list.collect();
         // A project profile may replace a global one of the same name, but not
-        // with another provider: `-p <name>` would then launch a different
-        // provider in this project than everywhere else, with no sign of it.
-        if let Some(other) = shadowed.iter().find(|d| d.provider != effective.provider) {
+        // with another harness: `-p <name>` would then launch a different
+        // harness in this project than everywhere else, with no sign of it.
+        if let Some(other) = shadowed.iter().find(|d| d.harness != effective.harness) {
             bail!(
                 "profile '{name}' runs on {} in the {} config but on {} in the {} config\n  \
-                 A profile names one provider everywhere: rename one of them.",
-                effective.provider,
+                 A profile names one harness everywhere: rename one of them.",
+                effective.harness,
                 effective.layer.as_str(),
-                other.provider,
+                other.harness,
                 other.layer.as_str()
             );
         }

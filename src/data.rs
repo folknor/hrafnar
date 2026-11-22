@@ -1,4 +1,4 @@
-//! Review-owned storage. Provider homes and the host-wide launch lock are separate.
+//! Review-owned storage. Harness homes and the host-wide launch lock are separate.
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(crate::incident::list_recent_in(&data, 1).failures.len(), 1);
         let _guard = crate::inflight::mark_in(
             "unavailable-data-test",
-            crate::provider::Provider::Codex,
+            crate::harness::Harness::Codex,
             "/p",
             &data,
         );

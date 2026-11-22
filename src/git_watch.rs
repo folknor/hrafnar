@@ -11,7 +11,7 @@
 //!
 //! Preventing that inside the sandbox is not on offer: git rewrites `config`
 //! by renaming `config.lock` over it, so a read-only `config` also breaks
-//! ordinary branch tracking, and the unsandboxed providers would need the
+//! ordinary branch tracking, and the unsandboxed harnesses would need the
 //! check anyway. So review snapshots those files at launch and, at the end of
 //! the run, warns about each one that changed. It reports paths and the kind of
 //! change only - config can carry credentials, and hook bodies are untrusted

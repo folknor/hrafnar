@@ -18,7 +18,7 @@ mod teardown;
 /// report by what reached it, never by this code alone), 1 for an unusable
 /// spec or setup, 101 for a panic.
 pub fn main() -> i32 {
-    // stdio belongs to the provider, so a panic must print nothing; an aborted
+    // stdio belongs to the harness, so a panic must print nothing; an aborted
     // keeper is reported by `review` as a keeper failure.
     std::panic::set_hook(Box::new(|_| {}));
     match std::panic::catch_unwind(run_from_args) {
@@ -44,7 +44,7 @@ fn run_from_args() -> std::io::Result<()> {
     let mut payload = Vec::new();
     file.take(super::protocol::SPEC_MAX as u64 + 1)
         .read_to_end(&mut payload)?;
-    // take owns and closes the file before any provider can be created.
+    // take owns and closes the file before any harness can be created.
     if payload.len() > super::protocol::SPEC_MAX {
         return Err(std::io::Error::other("keeper spec too large"));
     }
@@ -126,7 +126,7 @@ struct Member {
 enum Phase {
     /// Waiting for `g`.
     Waiting,
-    /// The provider has been forked; waiting for its exec.
+    /// The harness has been forked; waiting for its exec.
     Starting,
     Running,
     /// Tearing down; never restarted.
@@ -163,7 +163,7 @@ impl Keeper {
         let signals = unsafe { OwnedFd::from_raw_fd(sfd) };
         // SAFETY: plain prctl on ourselves.
         check(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) })?;
-        // Private from here on: the provider inherits neither.
+        // Private from here on: the harness inherits neither.
         for fd in [spec.control_fd, spec.events_fd] {
             set_cloexec(fd)?;
             set_nonblocking(fd)?;
@@ -202,7 +202,7 @@ impl Keeper {
                 // clean outcome (nothing was started), rather than leave the
                 // run's teardown looking unconfirmed.
                 self.queue(&Event::ExecFailed {
-                    reason: "terminated before the provider started".to_string(),
+                    reason: "terminated before the harness started".to_string(),
                 });
                 self.finish(&Outcome {
                     teardown: super::Teardown::observed(true, Vec::new(), 0, Vec::new()),
@@ -217,9 +217,9 @@ impl Keeper {
         while self.phase == Phase::Starting {
             if self.terminate || started.elapsed() >= startup {
                 let reason = if self.terminate {
-                    "terminated before the provider started".to_string()
+                    "terminated before the harness started".to_string()
                 } else {
-                    format!("the provider did not start within {}s", startup.as_secs())
+                    format!("the harness did not start within {}s", startup.as_secs())
                 };
                 if let Some((_, fd)) = &self.leader {
                     let _ = pidfd_signal(fd, libc::SIGKILL);
@@ -250,7 +250,7 @@ impl Keeper {
     }
 
     /// Wait for at most `timeout` (forever if `None`) for something to happen,
-    /// and handle it: signals, control bytes, the provider's exec status, and
+    /// and handle it: signals, control bytes, the harness's exec status, and
     /// draining queued events.
     fn service(&mut self, timeout: Option<Duration>) {
         let mut fds = vec![libc::pollfd {
@@ -383,10 +383,10 @@ impl Keeper {
         self.terminate = true;
     }
 
-    /// Forward the first interrupt to the provider, once, while it runs.
+    /// Forward the first interrupt to the harness, once, while it runs.
     fn interrupt(&mut self) {
         // `interrupted` records successful delivery and suppresses repeats.
-        // Caller intent remains independent. Supported callers wait for provider output
+        // Caller intent remains independent. Supported callers wait for harness output
         // before sending `i` or SIGINT, and terminate before readiness so a
         // pre-exec child is not signalled with its default handler.
         if self.phase != Phase::Running || self.interrupted || self.leader_status.is_some() {
@@ -397,7 +397,7 @@ impl Keeper {
         }
     }
 
-    /// Reap every child that has exited, recording the provider's status.
+    /// Reap every child that has exited, recording the harness's status.
     /// Returns true on `ECHILD`: no children at all.
     fn reap(&mut self) -> bool {
         loop {

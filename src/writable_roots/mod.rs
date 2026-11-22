@@ -31,7 +31,7 @@
 //!
 //! - derivation applies to Codex workspace-write and fresh Grok workspace-write
 //!   launches. Restored generated Grok profiles retain their recorded canonical
-//!   root set instead. Other levels and providers derive nothing;
+//!   root set instead. Other levels and harnesses derive nothing;
 //! - it derives only paths that resolve **identically from every login path**.
 //!   `$CARGO_TARGET_DIR` and the `./target` symlink are cargo facts. The build
 //!   lock is not a fact about Rust at all - it is derived because brokkr locks

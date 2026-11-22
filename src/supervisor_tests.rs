@@ -1,5 +1,5 @@
 use super::*;
-use crate::provider::{Provider, ProviderRuntime};
+use crate::harness::{Harness, HarnessRuntime};
 
 fn control() -> Arc<Control> {
     Arc::new(Control(
@@ -20,9 +20,9 @@ fn unknown() -> Leftovers {
 
 #[test]
 fn runtime_clones_share_a_domain_but_new_runtimes_are_isolated() {
-    let first = ProviderRuntime::default();
+    let first = HarnessRuntime::default();
     let cloned = first.clone();
-    let other = ProviderRuntime::default();
+    let other = HarnessRuntime::default();
     let ctl = control();
     first
         .lifecycle
@@ -45,8 +45,8 @@ fn runtime_clones_share_a_domain_but_new_runtimes_are_isolated() {
 fn recording_guard_survives_completion_and_stop_but_no_new_guard_is_admitted() {
     let lifecycle = Lifecycle::default();
     let cloned = lifecycle.clone();
-    let guard = lifecycle.unrecorded_for(Provider::Codex).expect("guard");
-    assert!(lifecycle.unrecorded_for(Provider::Grok).is_none());
+    let guard = lifecycle.unrecorded_for(Harness::Codex).expect("guard");
+    assert!(lifecycle.unrecorded_for(Harness::Grok).is_none());
     let ctl = control();
     lifecycle.complete("finished before recording", 7, &ctl, &Leftovers::default());
     assert_eq!(
@@ -55,7 +55,7 @@ fn recording_guard_survives_completion_and_stop_but_no_new_guard_is_admitted() {
         "teardown does not release recording"
     );
     lifecycle.request_stop();
-    assert!(cloned.unrecorded_for(Provider::Claude).is_none());
+    assert!(cloned.unrecorded_for(Harness::Claude).is_none());
     assert_eq!(cloned.unrecorded(), 1);
     drop(guard);
     assert_eq!(cloned.unrecorded(), 0);
@@ -179,14 +179,14 @@ fn concurrent_guard_registration_and_stop_leave_no_late_obligations() {
             let start = Arc::clone(&barrier);
             let register = scope.spawn(move || {
                 start.wait();
-                other.unrecorded_for(Provider::Claude)
+                other.unrecorded_for(Harness::Claude)
             });
             barrier.wait();
             lifecycle.request_stop();
             let count_after_stop = lifecycle.unrecorded();
             let guard = register.join().expect("register thread");
             assert_eq!(count_after_stop, usize::from(guard.is_some()));
-            assert!(lifecycle.unrecorded_for(Provider::Claude).is_none());
+            assert!(lifecycle.unrecorded_for(Harness::Claude).is_none());
             drop(guard);
             assert_eq!(lifecycle.unrecorded(), 0);
         });

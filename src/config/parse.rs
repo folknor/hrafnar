@@ -1,15 +1,15 @@
 //! Parsing one config file. The sections (`[archetypes]`, `[profiles]`,
 //! `[_defaults]`, `[_audit]`, `[_projects]`) are peeled off a `toml::Table`,
-//! and anything left over is an error: a retired provider-scoped
-//! `[<provider>.<profile>]` table gets a message saying where it moved, and any
+//! and anything left over is an error: a retired harness-scoped
+//! `[<harness>.<profile>]` table gets a message saying where it moved, and any
 //! other table (a retired legacy host table, a typo) is an unknown section.
-//! Each `[profiles.<name>]` names its provider with a required `provider` key,
+//! Each `[profiles.<name>]` names its harness with a required `harness` key,
 //! which is taken off before the rest is read as a `Profile`, so a misspelled
 //! field is still an error. `[_audit]` in the global file is an error. The
 //! format itself is documented in `docs/config.md`.
 
 use super::{
-    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Layer, Profile, Provider,
+    AuditConfig, BARE, CONFIG_FILENAME, ConfigFile, DefaultsConfig, Harness, Layer, Profile,
     reserved_names, toml_key,
 };
 use anyhow::{Result, bail};
@@ -98,10 +98,10 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     // Nothing else is a section. Both retired profile forms are named, since
     // an existing file is the likeliest source of one.
     if let Some(key) = table.keys().next() {
-        if let Ok(provider) = key.parse::<Provider>() {
+        if let Ok(harness) = key.parse::<Harness>() {
             bail!(
                 "[{key}.*] in {origin}: provider-scoped profile tables were removed - \
-                 move each [{key}.<name>] to [profiles.<name>] with provider = \"{provider}\""
+                 move each [{key}.<name>] to [profiles.<name>] with provider = \"{harness}\""
             );
         }
         bail!(
@@ -134,30 +134,30 @@ fn parse_file_inner(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile>
     })
 }
 
-/// `[profiles.<name>]` tables: each takes its required `provider` off, reads
-/// the rest strictly as a `Profile`, and is validated against that provider.
-fn parse_profiles(t: toml::Table, origin: &str) -> Result<BTreeMap<String, (Provider, Profile)>> {
+/// `[profiles.<name>]` tables: each takes its required `harness` off, reads
+/// the rest strictly as a `Profile`, and is validated against that harness.
+fn parse_profiles(t: toml::Table, origin: &str) -> Result<BTreeMap<String, (Harness, Profile)>> {
     let mut out = BTreeMap::new();
     for (name, v) in t {
         let at = format!("[profiles.{}] in {origin}", toml_key(&name));
         let toml::Value::Table(mut fields) = v else {
             bail!("{at}: expected a table");
         };
-        let provider: Provider = match fields.remove("provider") {
+        let harness: Harness = match fields.remove("provider") {
             Some(p) => p.try_into().map_err(|e| anyhow::anyhow!("{at}: {e}"))?,
             None => bail!(
                 "{at}: missing `provider` - every profile names the provider it runs on \
                  (supported: {})",
-                Provider::supported()
+                Harness::supported()
             ),
         };
         let profile: Profile = toml::Value::Table(fields)
             .try_into()
             .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
         profile
-            .validate(provider)
+            .validate(harness)
             .map_err(|e| anyhow::anyhow!("{at}: {e}"))?;
-        out.insert(name, (provider, profile));
+        out.insert(name, (harness, profile));
     }
     Ok(out)
 }
@@ -210,7 +210,7 @@ bugs = \"find edge cases\"
     }
 
     #[test]
-    fn parses_profiles_with_their_provider() {
+    fn parses_profiles_with_their_harness() {
         let raw = "\
 [profiles.opus]
 provider = \"claude\"
@@ -228,7 +228,7 @@ provider = \"grok\"
 ";
         let cfg = local_only(raw).unwrap();
         let opus = cfg.resolve_profile("opus").unwrap();
-        assert_eq!(opus.provider, Provider::Claude);
+        assert_eq!(opus.harness, Harness::Claude);
         assert_eq!(opus.table, "[profiles.opus]");
         assert_eq!(opus.profile.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(
@@ -236,7 +236,7 @@ provider = \"grok\"
             "http://localhost:8787"
         );
         let implement = cfg.resolve_profile("implement").unwrap();
-        assert_eq!(implement.provider, Provider::Codex);
+        assert_eq!(implement.harness, Harness::Codex);
         assert_eq!(
             implement
                 .profile
@@ -245,15 +245,15 @@ provider = \"grok\"
                 .map(crate::config::SandboxLevel::as_str),
             Some("workspace-write")
         );
-        // A provider alone is a profile: that provider on its own defaults.
+        // A harness alone is a profile: that harness on its own defaults.
         let plain = cfg.resolve_profile("plain").unwrap();
-        assert_eq!(plain.provider, Provider::Grok);
+        assert_eq!(plain.harness, Harness::Grok);
         assert!(plain.profile.model.is_none());
         assert!(cfg.resolve_profile("nope").is_none());
     }
 
     #[test]
-    fn a_profile_must_name_a_known_provider() {
+    fn a_profile_must_name_a_known_harness() {
         let err = local_only("[profiles.x]\nmodel = \"m\"\n")
             .unwrap_err()
             .to_string();
@@ -261,7 +261,7 @@ provider = \"grok\"
         let err = local_only("[profiles.x]\nprovider = \"gpt\"\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unknown provider 'gpt'"), "{err}");
+        assert!(err.contains("unknown harness 'gpt'"), "{err}");
         assert!(err.contains("[profiles.x]"), "{err}");
     }
 

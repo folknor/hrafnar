@@ -68,7 +68,7 @@ pub struct Proc {
 /// What the teardown established.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Outcome<Processes = Vec<Proc>> {
-    /// The provider's raw wait status; `None` when it never ran or could not
+    /// The harness's raw wait status; `None` when it never ran or could not
     /// be reaped.
     pub status: Option<i32>,
     pub teardown: super::Teardown<Processes>,
@@ -79,7 +79,7 @@ pub struct Outcome<Processes = Vec<Proc>> {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    /// The provider's exec-status pipe closed with no errno: a launch
+    /// The harness's exec-status pipe closed with no errno: a launch
     /// acknowledgement, not proof that it exec'd. A child killed by someone
     /// else before its exec reports this too, and only `Exited` carries the
     /// truth. The two can arrive in either order, since the keeper may reap
@@ -90,8 +90,8 @@ pub enum Event {
     ExecFailed {
         reason: String,
     },
-    /// The provider itself has exited and been reaped; the teardown of what it
-    /// left follows. Lets `review` stop watching the provider (the watchdog,
+    /// The harness itself has exited and been reaped; the teardown of what it
+    /// left follows. Lets `review` stop watching the harness (the watchdog,
     /// interrupts) without waiting out the teardown.
     Exited {
         status: i32,

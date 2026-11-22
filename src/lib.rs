@@ -1,5 +1,5 @@
-//! `review` as a library, so the integration tests can drive the provider
-//! runners against stub providers with the real binary as their keeper (see
+//! `review` as a library, so the integration tests can drive the harness
+//! runners against stub harnesses with the real binary as their keeper (see
 //! `keeper`). Cargo hands an integration test the built binary's path
 //! (`CARGO_BIN_EXE_review`) and gives a unit test nothing of the kind, which is
 //! the whole reason for the split; nothing here is a public API.
@@ -15,6 +15,7 @@ pub mod data;
 pub mod exit;
 mod fsutil;
 pub mod git_watch;
+pub mod harness;
 pub mod incident;
 pub mod inflight;
 pub mod input;
@@ -24,7 +25,6 @@ pub mod lock;
 pub mod man;
 pub mod project;
 pub mod prompt;
-pub mod provider;
 pub mod sessions;
 pub mod timings;
 pub mod transcript;

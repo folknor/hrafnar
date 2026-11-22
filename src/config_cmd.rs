@@ -1,15 +1,15 @@
 //! `review list`: what a run here can use. By default only the archetypes and
-//! the profiles whose provider is installed; `--projects` the `-C` registry;
+//! the profiles whose harness is installed; `--projects` the `-C` registry;
 //! `--all` the effective configuration and where each value came from.
 //!
 //! Orchestrators used to parse `.review.toml` directly to learn which
-//! archetypes, providers and profiles exist. With the global layer that file no
+//! archetypes, harnesses and profiles exist. With the global layer that file no
 //! longer tells the whole story - a profile may come from
 //! `~/.config/review/config.toml`, and a stale local one may be hiding it - so
 //! this command is the single source of truth. It renders what the resolver
 //! produced, i.e. exactly what a run would use; it never re-parses TOML, because
 //! a second reader is a second opinion that can disagree with the one that
-//! actually launches providers.
+//! actually launches harnesses.
 //!
 //! Plain text only, for people and agents alike. There is deliberately no JSON
 //! mode: agents read text as reliably as people do, and in practice they switch
@@ -19,13 +19,13 @@
 //! availability map), so it is testable without `PATH` or files; `run` only
 //! loads, probes and prints.
 
-use crate::config::{self, Profile, ProfileDef, ProfileEntry, Provider, ReviewConfig};
+use crate::config::{self, Harness, Profile, ProfileDef, ProfileEntry, ReviewConfig};
 use anyhow::Result;
 use std::fmt::Write as _;
 
-/// Whether a provider's binary is on `PATH` on this host. A function rather
-/// than a map, so no provider can be missing from it and read as absent.
-pub type Availability<'a> = &'a dyn Fn(Provider) -> bool;
+/// Whether a harness's binary is on `PATH` on this host. A function rather
+/// than a map, so no harness can be missing from it and read as absent.
+pub type Availability<'a> = &'a dyn Fn(Harness) -> bool;
 
 /// How much of an archetype's first prompt line the human view shows.
 const PRIME_PREVIEW_CHARS: usize = 72;
@@ -45,7 +45,7 @@ pub enum View {
 /// layer, which is what an orchestrator needs before it has picked a project.
 pub fn run(sel: &config::Selection, view: View) -> Result<()> {
     let cfg = config::load_optional(sel)?;
-    let avail = &crate::provider::is_available;
+    let avail = &crate::harness::is_available;
     print!(
         "{}",
         match view {
@@ -58,8 +58,8 @@ pub fn run(sel: &config::Selection, view: View) -> Result<()> {
 }
 
 /// The default view: what a run here can be primed with and run as. Which
-/// provider serves a profile is left out - it is plumbing, and a provider can
-/// serve another vendor's models. Profiles whose provider is not installed are
+/// harness serves a profile is left out - it is plumbing, and a harness can
+/// serve another vendor's models. Profiles whose harness is not installed are
 /// hidden but counted by name, so one an agent was told to use does not just
 /// vanish.
 pub fn render_list(cfg: &ReviewConfig, avail: Availability) -> String {
@@ -84,7 +84,7 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     let (shown, hidden): (Vec<_>, Vec<_>) = cfg
         .profiles
         .iter()
-        .partition(|(_, e)| avail(e.effective.provider));
+        .partition(|(_, e)| avail(e.effective.harness));
     if shown.is_empty() {
         writeln!(out, "  (none)")?;
     }
@@ -99,7 +99,7 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
         writeln!(
             out,
             "  {name:<pw$}  {}{mark}",
-            terse_settings(def.provider, &def.profile)
+            terse_settings(def.harness, &def.profile)
         )?;
         if let Some(line) = def
             .profile
@@ -113,7 +113,7 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     if !hidden.is_empty() {
         let names: Vec<String> = hidden
             .iter()
-            .map(|(n, e)| format!("{n} ({} not installed)", e.effective.provider))
+            .map(|(n, e)| format!("{n} ({} not installed)", e.effective.harness))
             .collect();
         writeln!(out, "  hidden: {}", names.join(", "))?;
     }
@@ -124,11 +124,11 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
                 out,
                 "  warning: default profile '{name}' is not defined - a run without -p will fail"
             )?,
-            Some(def) if !avail(def.provider) => writeln!(
+            Some(def) if !avail(def.harness) => writeln!(
                 out,
                 "  warning: default profile '{name}' needs {}, which is not installed - \
                  a run without -p will fail",
-                def.provider
+                def.harness
             )?,
             Some(_) => {}
         },
@@ -145,10 +145,10 @@ fn write_list(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
 }
 
 /// `model m, effort e, sandbox`, saying what an unset value means rather
-/// than "unset". A provider with its own permission system shows that.
-fn terse_settings(provider: Provider, p: &Profile) -> String {
+/// than "unset". A harness with its own permission system shows that.
+fn terse_settings(harness: Harness, p: &Profile) -> String {
     let sandbox = match (
-        crate::provider::Permissions::profile(provider, None).selector(),
+        crate::harness::Permissions::profile(harness, None).selector(),
         p.sandbox.as_ref().map(crate::config::SandboxLevel::as_str),
     ) {
         (None, _) => "own permissions".to_string(),
@@ -232,34 +232,34 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     }
 
     writeln!(out)?;
-    writeln!(out, "providers:")?;
-    // The default provider is the default profile's, when it resolves.
+    writeln!(out, "harnesses:")?;
+    // The default harness is the default profile's, when it resolves.
     let default = cfg
         .default_profile()
         .and_then(|name| cfg.resolve_profile(name))
-        .map(|def| def.provider);
-    let pw = Provider::all()
+        .map(|def| def.harness);
+    let pw = Harness::all()
         .iter()
         .map(|p| p.as_str().len())
         .max()
         .unwrap_or(0);
     let mut missing_default = None;
-    for &provider in Provider::all() {
-        let is_default = default == Some(provider);
-        let ok = avail(provider);
+    for &harness in Harness::all() {
+        let is_default = default == Some(harness);
+        let ok = avail(harness);
         if is_default && !ok {
-            missing_default = Some(provider);
+            missing_default = Some(harness);
         }
-        let provider = provider.as_str();
+        let harness = harness.as_str();
         let status = if ok { "installed" } else { "NOT INSTALLED" };
         let mark = if is_default { "  default" } else { "" };
-        let line = format!("  {provider:<pw$}  {status:<13}{mark}");
+        let line = format!("  {harness:<pw$}  {status:<13}{mark}");
         writeln!(out, "{}", line.trim_end())?;
     }
-    if let Some(provider) = missing_default {
+    if let Some(harness) = missing_default {
         writeln!(
             out,
-            "  warning: default provider '{provider}' is not installed on this host - \
+            "  warning: default harness '{harness}' is not installed on this host - \
              a run without -p will fail"
         )?;
     }
@@ -331,7 +331,7 @@ fn write_text(out: &mut String, cfg: &ReviewConfig, avail: Availability) -> std:
     Ok(())
 }
 
-/// The interruptible providers are named from `Provider::interruptible`, so a
+/// The interruptible harnesses are named from `Harness::interruptible`, so a
 /// new one appears here when its runner can be interrupted, and not before.
 fn steering() -> String {
     format!(
@@ -339,15 +339,15 @@ fn steering() -> String {
   echo \"<new info>\" | review message <ID>   ends a {} turn in flight, then sends the message
   review interrupt <ID>                     ends the turn without a message
   Do not stop or kill the `review` process to interrupt an agent.",
-        Provider::interruptible_names()
+        Harness::interruptible_names()
     )
 }
 
 fn write_profile(out: &mut String, name: &str, entry: &ProfileEntry) -> std::fmt::Result {
     let def = &entry.effective;
-    let provider = def.provider;
+    let harness = def.harness;
     let p = &def.profile;
-    writeln!(out, "  {name}  {provider}  ({})", def_source(def))?;
+    writeln!(out, "  {name}  {harness}  ({})", def_source(def))?;
     // Each line of a multi-line comment keeps the block's indent, so it cannot
     // be mistaken for the next profile.
     if let Some(ref c) = p.comment {
@@ -355,7 +355,7 @@ fn write_profile(out: &mut String, name: &str, entry: &ProfileEntry) -> std::fmt
             writeln!(out, "    # {line}")?;
         }
     }
-    writeln!(out, "    {}", settings(provider, p))?;
+    writeln!(out, "    {}", settings(harness, p))?;
     if !p.writable_roots.is_empty() {
         writeln!(out, "    writable_roots: {}", p.writable_roots.join(", "))?;
     }
@@ -371,7 +371,7 @@ fn write_profile(out: &mut String, name: &str, entry: &ProfileEntry) -> std::fmt
             out,
             "    shadows {}: {}",
             def_source(s),
-            settings(provider, &s.profile)
+            settings(harness, &s.profile)
         )?;
     }
     Ok(())
@@ -386,31 +386,31 @@ fn source(layer: &str, table: &str) -> String {
     format!("{layer} {table}")
 }
 
-fn settings(provider: Provider, p: &Profile) -> String {
+fn settings(harness: Harness, p: &Profile) -> String {
     format!(
         "model {}, effort {}, sandbox {}",
         p.model.as_deref().unwrap_or("unset"),
         p.effort.as_deref().unwrap_or("unset"),
         sandbox_text(
-            provider,
+            harness,
             p.sandbox.as_ref().map(crate::config::SandboxLevel::as_str)
         )
     )
 }
 
-/// The human view says what an unset sandbox *means* for the provider, because
+/// The human view says what an unset sandbox *means* for the harness, because
 /// "unset" alone invites the wrong guess: codex and grok runners default to
 /// read-only, while claude has no filesystem sandbox on this axis at all.
 ///
-/// Both answers come from `provider::Permissions::profile`, the function that
+/// Both answers come from `harness::Permissions::profile`, the function that
 /// decides what a run records, so the advertised default is the recorded one.
-fn sandbox_text(provider: Provider, sandbox: Option<&str>) -> String {
+fn sandbox_text(harness: Harness, sandbox: Option<&str>) -> String {
     match (
-        crate::provider::Permissions::profile(provider, None).selector(),
+        crate::harness::Permissions::profile(harness, None).selector(),
         sandbox,
     ) {
-        (None, Some(s)) => format!("{s} (ignored by {provider})"),
-        (None, None) => format!("n/a ({provider} ignores sandbox)"),
+        (None, Some(s)) => format!("{s} (ignored by {harness})"),
+        (None, None) => format!("n/a ({harness} ignores sandbox)"),
         (Some(_), Some(s)) => s.to_string(),
         (Some(default), None) => format!("unset (runner default: {default})"),
     }
@@ -493,11 +493,11 @@ model = \"opus\"
         .unwrap()
     }
 
-    fn avail(codex: bool) -> impl Fn(Provider) -> bool {
+    fn avail(codex: bool) -> impl Fn(Harness) -> bool {
         move |p| match p {
-            Provider::Claude => true,
-            Provider::Codex => codex,
-            Provider::Grok | Provider::Maki => false,
+            Harness::Claude => true,
+            Harness::Codex => codex,
+            Harness::Grok | Harness::Maki => false,
         }
     }
 
@@ -569,7 +569,7 @@ model = \"opus\"
         assert!(text.contains("grok    NOT INSTALLED"), "{text}");
         assert!(text.contains("NOT INSTALLED  default"), "{text}");
         assert!(
-            text.contains("default provider 'codex' is not installed"),
+            text.contains("default harness 'codex' is not installed"),
             "{text}"
         );
 
@@ -604,7 +604,7 @@ model = \"opus\"
     #[test]
     fn outside_a_project_the_global_layer_is_still_shown() {
         // An orchestrator asks before it has picked a project; the global
-        // profiles and provider availability are the answer it needs.
+        // profiles and harness availability are the answer it needs.
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
         let c = resolve(
             config::ConfigFile::default(),
@@ -621,7 +621,7 @@ model = \"opus\"
             "{text}"
         );
         assert!(text.contains("model fresh-model"), "{text}");
-        // The global default profile's provider is the default.
+        // The global default profile's harness is the default.
         assert!(
             text.contains("default: opus  (global [_defaults])"),
             "{text}"
@@ -641,7 +641,7 @@ model = \"opus\"
     }
 
     #[test]
-    fn the_list_shows_runnable_profiles_without_their_provider() {
+    fn the_list_shows_runnable_profiles_without_their_harness() {
         let t = render_list(&cfg(), &avail(true));
         assert!(
             t.contains("deep  stale-model, effort low, read-only  (default)"),
@@ -669,7 +669,7 @@ model = \"opus\"
     }
 
     #[test]
-    fn the_list_names_profiles_hidden_for_a_missing_provider() {
+    fn the_list_names_profiles_hidden_for_a_missing_harness() {
         let t = render_list(&cfg(), &avail(false));
         assert!(!t.contains("stale-model"), "{t}");
         assert!(t.contains("hidden: deep (codex not installed)"), "{t}");

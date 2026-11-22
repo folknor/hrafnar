@@ -1,6 +1,6 @@
-//! End-to-end tests for all provider runners, driven by stub providers.
+//! End-to-end tests for all harness runners, driven by stub harnesses.
 //!
-//! An integration test rather than a unit test because every provider runs
+//! An integration test rather than a unit test because every harness runs
 //! under a keeper, and the keeper is the built `review` binary: Cargo hands an
 //! integration test its path (`CARGO_BIN_EXE_review`) and gives a unit test
 //! nothing of the kind, so only here do the runners run under exactly the
@@ -21,7 +21,7 @@
 //!
 //! # How it stays fast
 //!
-//! `ProviderRuntime` makes the binary, the watchdog timings, the drain grace and
+//! `HarnessRuntime` makes the binary, the watchdog timings, the drain grace and
 //! the keeper's teardown graces injectable, so a hang that takes 3 minutes to
 //! detect and 10 seconds to escalate in production resolves in under a second
 //! here. Nothing about the code path itself changes.
@@ -31,7 +31,7 @@
 //! Scratch files live under `target/test-scratch/<uuid>/` (per the project rule
 //! that data lives in the repo rather than `/tmp`) and are removed on success.
 //!
-//! `ProviderRuntime::data` is also redirected there, and that is load-bearing
+//! `HarnessRuntime::data` is also redirected there, and that is load-bearing
 //! rather than tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s
 //! own data paths still resolved from the test process's real
 //! `HOME`/`XDG_DATA_HOME`. Before the override existed, running this suite
@@ -56,8 +56,8 @@
 mod fixtures;
 
 use anyhow::Result;
-use review::provider::{
-    Digest, Provider, ProviderCommand, ProviderCommands, ProviderResult, ProviderRuntime, invoke,
+use review::harness::{
+    Digest, Harness, HarnessCommand, HarnessCommands, HarnessResult, HarnessRuntime, invoke,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,14 +66,14 @@ use std::path::{Path, PathBuf};
 /// Assertion fields may be moved independently; the owner stays in this scope.
 struct FixtureRun {
     text: String,
-    outcome: review::provider::Outcome,
+    outcome: review::harness::Outcome,
     session_id: Option<String>,
     digest: Option<Digest>,
     leftovers: review::contained::Leftovers,
-    owner: ProviderResult,
+    owner: HarnessResult,
 }
 
-fn fixture_run(mut owner: ProviderResult) -> Result<FixtureRun> {
+fn fixture_run(mut owner: HarnessResult) -> Result<FixtureRun> {
     let turn = std::mem::replace(
         &mut owner.output,
         Err(anyhow::anyhow!("fixture extracted turn")),
@@ -90,7 +90,7 @@ fn fixture_run(mut owner: ProviderResult) -> Result<FixtureRun> {
 
 /// The flat persisted form of a run: its outcome over its forensics (or
 /// none), which is what the assertions below read the outcome facts from.
-fn summary_of(run: &FixtureRun) -> review::provider::DigestSummary {
+fn summary_of(run: &FixtureRun) -> review::harness::DigestSummary {
     match &run.digest {
         Some(d) => d.summary(&run.outcome),
         None => Digest::default().summary(&run.outcome),
@@ -264,8 +264,8 @@ rollout_started
 /// Fast timings: the whole watchdog cycle completes in well under a second,
 /// while preserving the ordering the production values encode (poll interval
 /// comfortably shorter than the quiet grace).
-fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
-    ProviderRuntime {
+fn fast_runtime(scratch: &Scratch) -> HarnessRuntime {
+    HarnessRuntime {
         claude_token: None,
         run_id: review::sessions::handoff::RunId::default(),
         reservation: None,
@@ -274,10 +274,10 @@ fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
         // thread may still have open for writing. The script path is argv[0]
         // from the shell's perspective; see `run_stub_with`.
         commands: {
-            let mut commands = ProviderCommands::default();
+            let mut commands = HarnessCommands::default();
             commands.set(
-                Provider::Codex,
-                ProviderCommand {
+                Harness::Codex,
+                HarnessCommand {
                     program: "/bin/sh".to_string(),
                     leading_args: Vec::new(),
                 },
@@ -333,7 +333,7 @@ async fn run_stub(scratch: &Scratch, script: String) -> Result<FixtureRun> {
 async fn run_stub_with(
     scratch: &Scratch,
     script: &str,
-    runtime: &ProviderRuntime,
+    runtime: &HarnessRuntime,
 ) -> Result<FixtureRun> {
     run_codex_stub(scratch, script, runtime, None, None).await
 }
@@ -361,15 +361,15 @@ export LAST_MSG
 async fn run_codex_stub(
     scratch: &Scratch,
     script: &str,
-    runtime: &ProviderRuntime,
+    runtime: &HarnessRuntime,
     resume: Option<&str>,
-    launched: Option<review::provider::LaunchSignal>,
+    launched: Option<review::harness::LaunchSignal>,
 ) -> Result<FixtureRun> {
     let shim = scratch.root.join("codex-argv.sh");
     std::fs::write(&shim, format!("{CODEX_STUB_ARGS}\n. \"$STUB_BODY\"\n"))
         .expect("write argv shim");
     let mut runtime = runtime.clone();
-    let mut command = runtime.commands.get(Provider::Codex).clone();
+    let mut command = runtime.commands.get(Harness::Codex).clone();
     // This scenario helper accepts a bare shell, or an invalid executable for
     // refusal tests. Arbitrary prefixes are exercised separately through invoke.
     assert!(
@@ -379,7 +379,7 @@ async fn run_codex_stub(
     command
         .leading_args
         .push(shim.to_string_lossy().into_owned());
-    runtime.commands.set(Provider::Codex, command);
+    runtime.commands.set(Harness::Codex, command);
     let env = BTreeMap::from([
         (
             "CODEX_HOME".into(),
@@ -396,16 +396,16 @@ async fn run_codex_stub(
         ),
     ]);
     let start = match resume {
-        Some(id) => review::provider::SessionStart::Resume(review::provider::SessionId::parse(id)?),
-        None => review::provider::SessionStart::Fresh { id: None },
+        Some(id) => review::harness::SessionStart::Resume(review::harness::SessionId::parse(id)?),
+        None => review::harness::SessionStart::Fresh { id: None },
     };
     fixture_run(
         invoke(
-            review::provider::LaunchSpec {
-                provider: Provider::Codex,
+            review::harness::LaunchSpec {
+                harness: Harness::Codex,
                 start,
                 settings: fixture_settings(
-                    Provider::Codex,
+                    Harness::Codex,
                     review::config::Profile {
                         env: Some(env),
                         ..Default::default()
@@ -984,7 +984,7 @@ exit 0
 ///     assuming the signal landed.
 ///
 ///     Split from 4a deliberately: that test exercises a leftover that dies on
-///     its first SIGTERM after the provider exited on its own, this one a
+///     its first SIGTERM after the harness exited on its own, this one a
 ///     terminate that has to escalate.
 #[tokio::test]
 async fn group_escalation_kills_a_sigterm_ignoring_descendant() {
@@ -1136,7 +1136,7 @@ while :; do sleep 0.05; done
 /// `review interrupt` would from another process. The owner's sidecar row -
 /// which `invoke` does not write itself - is appended when its run
 /// returns, as the fan-out task does.
-fn publish_stub_handoff(runtime: &ProviderRuntime, run: &FixtureRun) {
+fn publish_stub_handoff(runtime: &HarnessRuntime, run: &FixtureRun) {
     // These tests drive invoke without the app recording layer. Model the app's durable append
     // before publishing the exact invocation handoff, rather than fake a log
     // polling closure; app recording itself has an injected-domain test.
@@ -1147,7 +1147,7 @@ fn publish_stub_handoff(runtime: &ProviderRuntime, run: &FixtureRun) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     let row = serde_json::json!({
         "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
-        "audit_id": "a", "provider": run.owner.provider.as_str(), "archetype": "bare",
+        "audit_id": "a", "provider": run.owner.harness.as_str(), "archetype": "bare",
         "session_id": run.session_id, "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
     });
     use std::io::Write;
@@ -1362,15 +1362,15 @@ fn claude_stub_result(is_error: bool, extra: &str) -> String {
     )
 }
 
-/// The Claude-compatible providers, which share one runner and therefore
+/// The Claude-compatible harnesses, which share one runner and therefore
 /// every lifecycle scenario below; only their wire fixtures differ.
-const CLAUDE_COMPAT: [Provider; 2] = [Provider::Claude, Provider::Maki];
+const CLAUDE_COMPAT: [Harness; 2] = [Harness::Claude, Harness::Maki];
 
-/// Shell line printing `provider`'s answer `text`. maki answers only with
+/// Shell line printing `harness`'s answer `text`. maki answers only with
 /// `stop_reason: "end_turn"`.
-fn stub_answer(provider: Provider, text: &str) -> String {
-    match provider {
-        Provider::Maki => claude_stub_result(
+fn stub_answer(harness: Harness, text: &str) -> String {
+    match harness {
+        Harness::Maki => claude_stub_result(
             false,
             &format!(r#",\"result\":\"{text}\",\"stop_reason\":\"end_turn\""#),
         ),
@@ -1378,11 +1378,11 @@ fn stub_answer(provider: Provider, text: &str) -> String {
     }
 }
 
-/// Shell line printing `provider`'s stated failure `text`. maki's provider
+/// Shell line printing `harness`'s stated failure `text`. maki's harness
 /// failures carry `stop_reason: null` (probed: an API 402).
-fn stub_failure(provider: Provider, text: &str) -> String {
-    match provider {
-        Provider::Maki => claude_stub_result(
+fn stub_failure(harness: Harness, text: &str) -> String {
+    match harness {
+        Harness::Maki => claude_stub_result(
             true,
             &format!(r#",\"subtype\":\"error\",\"result\":\"{text}\",\"stop_reason\":null"#),
         ),
@@ -1390,20 +1390,20 @@ fn stub_failure(provider: Provider, text: &str) -> String {
     }
 }
 
-/// The exit status `provider` ends with after answering SIGINT itself:
+/// The exit status `harness` ends with after answering SIGINT itself:
 /// claude exits 0, maki 128+SIGINT.
-fn sigint_exit(provider: Provider) -> i32 {
-    match provider {
-        Provider::Maki => 130,
+fn sigint_exit(harness: Harness) -> i32 {
+    match harness {
+        Harness::Maki => 130,
         _ => 0,
     }
 }
 
-/// Shell fragment: on SIGINT, end the turn as `provider` does - print its
+/// Shell fragment: on SIGINT, end the turn as `harness` does - print its
 /// aborted result and exit - then wait for it.
-fn stub_await_sigint(provider: Provider) -> String {
-    let result = match provider {
-        Provider::Maki => claude_stub_result(
+fn stub_await_sigint(harness: Harness) -> String {
+    let result = match harness {
+        Harness::Maki => claude_stub_result(
             true,
             r#",\"subtype\":\"error\",\"stop_reason\":\"cancelled\""#,
         ),
@@ -1414,7 +1414,7 @@ fn stub_await_sigint(provider: Provider) -> String {
     };
     format!(
         "trap '{result}; exit {code}' INT\nwhile :; do sleep 0.05; done",
-        code = sigint_exit(provider)
+        code = sigint_exit(harness)
     )
 }
 
@@ -1423,25 +1423,25 @@ fn stub_await_sigint(provider: Provider) -> String {
 async fn run_claude_stub(
     scratch: &Scratch,
     body: &str,
-    runtime: &ProviderRuntime,
+    runtime: &HarnessRuntime,
     resume: Option<&str>,
 ) -> Result<FixtureRun> {
-    run_compat_stub(Provider::Claude, scratch, body, runtime, resume).await
+    run_compat_stub(Harness::Claude, scratch, body, runtime, resume).await
 }
 
-/// Run `body` as `provider` (claude or maki) through `invoke`.
+/// Run `body` as `harness` (claude or maki) through `invoke`.
 async fn run_compat_stub(
-    provider: Provider,
+    harness: Harness,
     scratch: &Scratch,
     body: &str,
-    runtime: &ProviderRuntime,
+    runtime: &HarnessRuntime,
     resume: Option<&str>,
 ) -> Result<FixtureRun> {
     let script = scratch.write_stub(&format!("{CLAUDE_STUB_PREAMBLE}\n{body}"));
     let mut runtime = runtime.clone();
     runtime.commands.set(
-        provider,
-        ProviderCommand {
+        harness,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec![script],
         },
@@ -1453,18 +1453,18 @@ async fn run_compat_stub(
     );
     fixture_run(
         invoke(
-            review::provider::LaunchSpec {
-                provider,
+            review::harness::LaunchSpec {
+                harness,
                 start: {
                     match resume {
-                        Some(id) => review::provider::SessionStart::Resume(
-                            review::provider::SessionId::parse(id)?,
+                        Some(id) => review::harness::SessionStart::Resume(
+                            review::harness::SessionId::parse(id)?,
                         ),
-                        None => review::provider::SessionStart::Fresh { id: None },
+                        None => review::harness::SessionStart::Fresh { id: None },
                     }
                 },
                 settings: fixture_settings(
-                    provider,
+                    harness,
                     review::config::Profile {
                         env: Some(env.clone()),
                         ..Default::default()
@@ -1494,22 +1494,22 @@ async fn a_claude_resume_reports_the_session_id_it_was_given() {
     assert_eq!(run.session_id.as_deref(), Some(sid));
 }
 
-/// The session id of the one `provider` run in flight under `scratch`, once
+/// The session id of the one `harness` run in flight under `scratch`, once
 /// its pid is offered for signalling - which is what `review interrupt` waits
 /// for.
-async fn compat_signalable(provider: Provider, scratch: &Scratch) -> String {
+async fn compat_signalable(harness: Harness, scratch: &Scratch) -> String {
     let data_root = scratch.data_root();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Some(m) = review::inflight::read_live(Some(&data_root))
             .into_iter()
-            .find(|m| m.provider == provider.as_str() && m.signal_ready)
+            .find(|m| m.harness == harness.as_str() && m.signal_ready)
         {
             return m.session_id.clone();
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{provider}'s pid never offered"
+            "{harness}'s pid never offered"
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -1517,20 +1517,20 @@ async fn compat_signalable(provider: Provider, scratch: &Scratch) -> String {
 
 /// Run `body` as the owner and `review interrupt` against it from "another
 /// process", appending the owner's sidecar row when its run returns, as the
-/// fan-out task does. The interrupt is sent once the provider's pid is offered.
+/// fan-out task does. The interrupt is sent once the harness's pid is offered.
 async fn compat_interrupt_stub(
-    provider: Provider,
+    harness: Harness,
     scratch: &Scratch,
     body: &str,
 ) -> (FixtureRun, Result<review::interrupt_cmd::Outcome>) {
-    compat_interrupt_stub_at(provider, scratch, body, true).await
+    compat_interrupt_stub_at(harness, scratch, body, true).await
 }
 
 /// As `compat_interrupt_stub`, but `after_pid: false` sends the interrupt as
 /// soon as the run is marked in flight - before the first event, as a second
 /// `review message` does when its launch lock hands over.
 async fn compat_interrupt_stub_at(
-    provider: Provider,
+    harness: Harness,
     scratch: &Scratch,
     body: &str,
     after_pid: bool,
@@ -1538,7 +1538,7 @@ async fn compat_interrupt_stub_at(
     let runtime = fast_runtime(scratch);
     let data_root = scratch.data_root();
     let owner = async {
-        let run = run_compat_stub(provider, scratch, body, &runtime, None)
+        let run = run_compat_stub(harness, scratch, body, &runtime, None)
             .await
             .expect("run completes");
         publish_stub_handoff(&runtime, &run);
@@ -1546,7 +1546,7 @@ async fn compat_interrupt_stub_at(
     };
     let interrupter = async {
         let sid = if after_pid {
-            compat_signalable(provider, scratch).await
+            compat_signalable(harness, scratch).await
         } else {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
@@ -1603,45 +1603,45 @@ async fn a_claude_run_launches_with_background_off_and_reports_its_answer() {
 
 #[tokio::test]
 async fn review_interrupt_ends_a_claude_compatible_turn_and_keeps_its_session() {
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
-        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(provider));
-        let (run, outcome) = compat_interrupt_stub(provider, &scratch, &body).await;
+        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(harness));
+        let (run, outcome) = compat_interrupt_stub(harness, &scratch, &body).await;
         let outcome = outcome.expect("the verb succeeds");
         assert!(
             outcome.interrupted,
-            "{provider}: the verb reports the interrupt"
+            "{harness}: the verb reports the interrupt"
         );
-        assert_eq!(outcome.provider, provider);
+        assert_eq!(outcome.harness, harness);
         let summary = summary_of(&run);
         let digest = run.digest.expect("digest");
-        assert!(summary.interrupted, "{provider}");
+        assert!(summary.interrupted, "{harness}");
         assert!(
             summary.turn_error.is_none(),
-            "{provider}'s complaint about the abort is not a stated failure"
+            "{harness}'s complaint about the abort is not a stated failure"
         );
         assert_eq!(
             digest.exit.code(),
-            Some(sigint_exit(provider)),
-            "{provider} answered SIGINT itself"
+            Some(sigint_exit(harness)),
+            "{harness} answered SIGINT itself"
         );
         assert!(
             summary
                 .terminated_by_review
                 .as_deref()
                 .is_some_and(|why| why.contains("operator interrupt")),
-            "{provider}: got {:?}",
+            "{harness}: got {:?}",
             summary.terminated_by_review
         );
         assert!(
             run.text.contains("interrupted"),
-            "{provider}: got {:?}",
+            "{harness}: got {:?}",
             run.text
         );
         let sid = run.session_id.expect("the session survives the interrupt");
         assert!(
             !review::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
-            "{provider}: the run consumed the request"
+            "{harness}: the run consumed the request"
         );
     }
 }
@@ -1651,88 +1651,88 @@ async fn review_interrupt_waits_for_a_claude_compatible_run_that_has_not_spoken_
     // A second `review message` meets a run in the second after it launched,
     // before the first event offers its pid. Refusing then lost the message;
     // the verb waits for the pid instead.
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let body = format!(
             "sleep 1\n{CLAUDE_STUB_INIT}\n{}",
-            stub_await_sigint(provider)
+            stub_await_sigint(harness)
         );
-        let (run, outcome) = compat_interrupt_stub_at(provider, &scratch, &body, false).await;
+        let (run, outcome) = compat_interrupt_stub_at(harness, &scratch, &body, false).await;
         assert!(
             outcome
                 .expect("the verb waits rather than refusing")
                 .interrupted,
-            "{provider}: and then interrupts"
+            "{harness}: and then interrupts"
         );
-        assert!(run.outcome.interrupted(), "{provider}");
+        assert!(run.outcome.interrupted(), "{harness}");
     }
 }
 
 #[tokio::test]
 async fn a_claude_compatible_answer_that_beats_the_interrupt_stands() {
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let body = format!(
             "{CLAUDE_STUB_INIT}\n{}\ntrap 'exit 0' INT\nwhile :; do sleep 0.05; done",
-            stub_answer(provider, "THE ANSWER")
+            stub_answer(harness, "THE ANSWER")
         );
-        let (run, outcome) = compat_interrupt_stub(provider, &scratch, &body).await;
-        assert_eq!(run.text, "THE ANSWER", "{provider}");
-        assert!(!run.outcome.interrupted(), "{provider}");
+        let (run, outcome) = compat_interrupt_stub(harness, &scratch, &body).await;
+        assert_eq!(run.text, "THE ANSWER", "{harness}");
+        assert!(!run.outcome.interrupted(), "{harness}");
         assert!(
             !outcome.expect("the verb succeeds").interrupted,
-            "{provider}: the verb says the run ended first"
+            "{harness}: the verb says the run ended first"
         );
     }
 }
 
 #[tokio::test]
 async fn a_stop_signal_ends_a_started_claude_compatible_turn_as_an_interrupt() {
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let runtime = fast_runtime(&scratch);
-        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(provider));
+        let body = format!("{CLAUDE_STUB_INIT}\n{}", stub_await_sigint(harness));
         let stopper = async {
-            compat_signalable(provider, &scratch).await;
+            compat_signalable(harness, &scratch).await;
             runtime.lifecycle.request_stop();
         };
         let (run, ()) = tokio::join!(
-            run_compat_stub(provider, &scratch, &body, &runtime, None),
+            run_compat_stub(harness, &scratch, &body, &runtime, None),
             stopper
         );
         let run = run.expect("run completes");
         let summary = summary_of(&run);
         let digest = run.digest.expect("digest");
-        assert!(summary.interrupted, "{provider}");
+        assert!(summary.interrupted, "{harness}");
         assert_eq!(
             digest.exit.code(),
-            Some(sigint_exit(provider)),
-            "{provider}: SIGINT, not a group kill"
+            Some(sigint_exit(harness)),
+            "{harness}: SIGINT, not a group kill"
         );
         assert!(
             summary
                 .terminated_by_review
                 .as_deref()
                 .is_some_and(|why| why.contains("signalled")),
-            "{provider}"
+            "{harness}"
         );
-        assert!(run.session_id.is_some(), "{provider}");
+        assert!(run.session_id.is_some(), "{harness}");
 
         // Once stopped, nothing new launches - a run waiting on the launch
         // lock must not start only to be killed.
-        let refused = run_compat_stub(provider, &scratch, &body, &runtime, None).await;
+        let refused = run_compat_stub(harness, &scratch, &body, &runtime, None).await;
         assert!(
             refused.is_err_and(|e| e.to_string().contains("not launched")),
-            "{provider}: a launch after the stop must be refused"
+            "{harness}: a launch after the stop must be refused"
         );
     }
 }
 
 #[tokio::test]
 async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session() {
-    // Killed before the provider could have written a session: recording one
+    // Killed before the harness could have written a session: recording one
     // would print a resume command for a session that does not exist.
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let runtime = fast_runtime(&scratch);
         let data_root = scratch.data_root();
@@ -1748,16 +1748,16 @@ async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session
         };
         let body = "while :; do sleep 0.05; done";
         let (run, ()) = tokio::join!(
-            run_compat_stub(provider, &scratch, body, &runtime, None),
+            run_compat_stub(harness, &scratch, body, &runtime, None),
             stopper
         );
         let Err(err) = run else {
-            panic!("{provider}: a run stopped before it started has no session to report");
+            panic!("{harness}: a run stopped before it started has no session to report");
         };
-        assert!(err.to_string().contains("not started"), "{provider}: {err}");
+        assert!(err.to_string().contains("not started"), "{harness}: {err}");
         assert!(
-            err.to_string().contains(provider.as_str()),
-            "{provider}: {err}"
+            err.to_string().contains(harness.as_str()),
+            "{harness}: {err}"
         );
         assert!(review::inflight::read_live(Some(&data_root)).is_empty());
     }
@@ -1767,28 +1767,28 @@ async fn a_claude_compatible_run_stopped_before_its_first_event_names_no_session
 async fn a_claude_compatible_run_that_dies_after_starting_keeps_its_session() {
     // Killed from outside or crashed after its first event: no result, but the
     // session may exist and is the turn most worth resuming.
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let body = format!("{CLAUDE_STUB_INIT}\nexit 3");
-        let run = run_compat_stub(provider, &scratch, &body, &fast_runtime(&scratch), None)
+        let run = run_compat_stub(harness, &scratch, &body, &fast_runtime(&scratch), None)
             .await
             .expect("a death after starting is not a launch failure");
         let summary = summary_of(&run);
         let digest = run.digest.expect("digest");
-        assert!(!summary.captured, "{provider}");
-        assert!(!summary.interrupted, "{provider}");
+        assert!(!summary.captured, "{harness}");
+        assert!(!summary.interrupted, "{harness}");
         assert!(
             summary.turn_error.is_none(),
-            "{provider} stated no reason, so this is a death, not a stated failure"
+            "{harness} stated no reason, so this is a death, not a stated failure"
         );
-        assert_eq!(digest.exit.code(), Some(3), "{provider}");
+        assert_eq!(digest.exit.code(), Some(3), "{harness}");
         assert!(
             run.session_id.is_some(),
-            "{provider}: the session id is kept"
+            "{harness}: the session id is kept"
         );
         assert!(
             run.text
-                .contains(&format!("{provider} ended without a result")),
+                .contains(&format!("{harness} ended without a result")),
             "got {:?}",
             run.text
         );
@@ -1798,14 +1798,14 @@ async fn a_claude_compatible_run_that_dies_after_starting_keeps_its_session() {
 #[tokio::test]
 async fn output_before_init_is_not_a_claude_compatible_start() {
     // A stray byte or diagnostic, then a crash, before the `init` event: the
-    // provider never reached the point of having a session, so none is kept.
-    for provider in CLAUDE_COMPAT {
+    // harness never reached the point of having a session, so none is kept.
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let body = "printf 'booting'\nexit 1";
-        let run = run_compat_stub(provider, &scratch, body, &fast_runtime(&scratch), None).await;
+        let run = run_compat_stub(harness, &scratch, body, &fast_runtime(&scratch), None).await;
         assert!(
             run.is_err(),
-            "{provider}: no init event, no session: a launch failure, not a death"
+            "{harness}: no init event, no session: a launch failure, not a death"
         );
     }
 }
@@ -1814,36 +1814,30 @@ async fn output_before_init_is_not_a_claude_compatible_start() {
 async fn a_stale_interrupt_request_does_not_mark_a_claude_compatible_resume_interrupted() {
     // Left by a `review` killed before it consumed it. A resume that then fails
     // for its own reason must report that reason, not an interrupt.
-    for provider in CLAUDE_COMPAT {
+    for harness in CLAUDE_COMPAT {
         let scratch = Scratch::new();
         let sid = "0c1a0000-0000-4000-8000-000000000001";
         std::fs::create_dir_all(scratch.data_root().join("review/inflight")).expect("dir");
         review::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
         let body = format!(
             "{CLAUDE_STUB_INIT}\n{}\nexit 1",
-            stub_failure(provider, "rate limited")
+            stub_failure(harness, "rate limited")
         );
-        let run = run_compat_stub(
-            provider,
-            &scratch,
-            &body,
-            &fast_runtime(&scratch),
-            Some(sid),
-        )
-        .await
-        .expect("run completes");
+        let run = run_compat_stub(harness, &scratch, &body, &fast_runtime(&scratch), Some(sid))
+            .await
+            .expect("run completes");
         let summary = summary_of(&run);
-        assert!(run.digest.is_some(), "{provider}: digest");
+        assert!(run.digest.is_some(), "{harness}: digest");
         assert!(
             !summary.interrupted,
-            "{provider}: the request was not aimed at this run"
+            "{harness}: the request was not aimed at this run"
         );
         assert!(
             summary
                 .turn_error
                 .as_deref()
                 .is_some_and(|e| e.contains("rate limited")),
-            "{provider}'s reason is kept: {:?}",
+            "{harness}'s reason is kept: {:?}",
             summary.turn_error
         );
     }
@@ -1856,10 +1850,10 @@ async fn a_maki_error_result_with_exit_zero_is_a_stated_failure() {
     let scratch = Scratch::new();
     let body = format!(
         "{CLAUDE_STUB_INIT}\n{}\nexit 0",
-        stub_failure(Provider::Maki, "API error (402): no credits")
+        stub_failure(Harness::Maki, "API error (402): no credits")
     );
     let run = run_compat_stub(
-        Provider::Maki,
+        Harness::Maki,
         &scratch,
         &body,
         &fast_runtime(&scratch),
@@ -1895,7 +1889,7 @@ async fn a_maki_cancelled_by_someone_else_is_a_stated_cancellation() {
         )
     );
     let run = run_compat_stub(
-        Provider::Maki,
+        Harness::Maki,
         &scratch,
         &body,
         &fast_runtime(&scratch),
@@ -1928,7 +1922,7 @@ async fn a_truncated_maki_answer_is_not_an_answer() {
         )
     );
     let run = run_compat_stub(
-        Provider::Maki,
+        Harness::Maki,
         &scratch,
         &body,
         &fast_runtime(&scratch),
@@ -1983,8 +1977,8 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
     );
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Claude,
-        ProviderCommand {
+        Harness::Claude,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec![scratch.write_stub(&body)],
         },
@@ -1997,16 +1991,16 @@ async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let data_root = scratch.data_root();
     let project = scratch.project();
-    let start = review::provider::SessionStart::Resume(
-        review::provider::SessionId::parse(sid).expect("test id"),
+    let start = review::harness::SessionStart::Resume(
+        review::harness::SessionId::parse(sid).expect("test id"),
     );
     let selection =
-        review::provider::ModelSpec::new(review::provider::Provider::Claude, None, None, &[]);
-    let launch = review::provider::LaunchSpec {
-        provider: Provider::Claude,
+        review::harness::ModelSpec::new(review::harness::Harness::Claude, None, None, &[]);
+    let launch = review::harness::LaunchSpec {
+        harness: Harness::Claude,
         start: start.clone(),
         settings: fixture_settings(
-            Provider::Claude,
+            Harness::Claude,
             review::config::Profile {
                 model: selection.model().map(str::to_owned),
                 effort: selection.effort().map(str::to_owned),
@@ -2161,14 +2155,14 @@ sleep 1
     );
 }
 
-/// A provider that cannot be executed fails the launch, with the reason.
+/// A harness that cannot be executed fails the launch, with the reason.
 #[tokio::test]
-async fn a_provider_that_cannot_exec_fails_the_launch() {
+async fn a_harness_that_cannot_exec_fails_the_launch() {
     let scratch = Scratch::new();
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Codex,
-        ProviderCommand {
+        Harness::Codex,
+        HarnessCommand {
             program: scratch
                 .root
                 .join("no-such-codex")
@@ -2217,7 +2211,7 @@ async fn claude_answer_with_nonzero_exit_keeps_answer_and_all_turn_usage() {
 
 #[tokio::test]
 async fn model_selection_arguments_and_record_share_the_prepared_spec() {
-    use review::provider::{Provider, SessionStart};
+    use review::harness::{Harness, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(&format!(
         "{CLAUDE_STUB_PREAMBLE}\n{CLAUDE_STUB_INIT}\n{}",
@@ -2225,8 +2219,8 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
     ));
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Claude,
-        ProviderCommand {
+        Harness::Claude,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec![script],
         },
@@ -2235,12 +2229,12 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
         "STUB_DIR".into(),
         scratch.root.to_string_lossy().into_owned(),
     )]);
-    let result = review::provider::invoke(
-        review::provider::LaunchSpec {
-            provider: Provider::Claude,
+    let result = review::harness::invoke(
+        review::harness::LaunchSpec {
+            harness: Harness::Claude,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
-                Provider::Claude,
+                Harness::Claude,
                 review::config::Profile {
                     model: Some("chosen-model".into()),
                     effort: Some("high".into()),
@@ -2268,14 +2262,14 @@ async fn model_selection_arguments_and_record_share_the_prepared_spec() {
 
 #[tokio::test]
 async fn invalid_model_selection_is_refused_before_a_session_launches() {
-    use review::provider::{Provider, SessionStart};
+    use review::harness::{Harness, SessionStart};
     let scratch = Scratch::new();
-    let result = review::provider::invoke(
-        review::provider::LaunchSpec {
-            provider: Provider::Codex,
+    let result = review::harness::invoke(
+        review::harness::LaunchSpec {
+            harness: Harness::Codex,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
-                Provider::Codex,
+                Harness::Codex,
                 review::config::Profile {
                     model: Some("chosen".into()),
                     effort: Some("high".into()),
@@ -2305,27 +2299,24 @@ async fn invalid_model_selection_is_refused_before_a_session_launches() {
 }
 
 #[test]
-fn command_prefix_defaults_and_replacement_cover_every_provider() {
-    let mut commands = ProviderCommands::default();
-    for &provider in Provider::all() {
-        assert_eq!(commands.get(provider).program, provider.binary());
-        assert!(commands.get(provider).leading_args.is_empty());
+fn command_prefix_defaults_and_replacement_cover_every_harness() {
+    let mut commands = HarnessCommands::default();
+    for &harness in Harness::all() {
+        assert_eq!(commands.get(harness).program, harness.binary());
+        assert!(commands.get(harness).leading_args.is_empty());
     }
     let original = commands.clone();
     commands.set(
-        Provider::Codex,
-        ProviderCommand {
+        Harness::Codex,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec!["fixture with spaces".into()],
         },
     );
+    assert_eq!(commands.get(Harness::Claude), original.get(Harness::Claude));
+    assert_eq!(commands.get(Harness::Grok), original.get(Harness::Grok));
     assert_eq!(
-        commands.get(Provider::Claude),
-        original.get(Provider::Claude)
-    );
-    assert_eq!(commands.get(Provider::Grok), original.get(Provider::Grok));
-    assert_eq!(
-        commands.get(Provider::Codex).leading_args,
+        commands.get(Harness::Codex).leading_args,
         ["fixture with spaces"]
     );
 }
@@ -2354,19 +2345,19 @@ exit 1
     ];
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Codex,
-        ProviderCommand {
+        Harness::Codex,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: prefix.clone(),
         },
     );
     let run = fixture_run(
         invoke(
-            review::provider::LaunchSpec {
-                provider: Provider::Codex,
-                start: review::provider::SessionStart::Fresh { id: None },
+            review::harness::LaunchSpec {
+                harness: Harness::Codex,
+                start: review::harness::SessionStart::Fresh { id: None },
                 settings: fixture_settings(
-                    Provider::Codex,
+                    Harness::Codex,
                     review::config::Profile {
                         env: Some(BTreeMap::from([(
                             "CODEX_HOME".into(),
@@ -2421,8 +2412,8 @@ async fn empty_command_program_fails_to_launch() {
     let scratch = Scratch::new();
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Codex,
-        ProviderCommand {
+        Harness::Codex,
+        HarnessCommand {
             program: String::new(),
             leading_args: Vec::new(),
         },
@@ -2439,7 +2430,7 @@ async fn empty_command_program_fails_to_launch() {
 
 #[tokio::test]
 async fn grok_prefix_drives_fresh_resume_and_stated_failure_through_invoke() {
-    use review::provider::{SessionId, SessionStart};
+    use review::harness::{SessionId, SessionStart};
     let scratch = Scratch::new();
     let script = scratch.write_stub(r#"
 [ "$1" = 'prefix with spaces' ] || exit 71
@@ -2474,8 +2465,8 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
 "#);
     let mut runtime = fast_runtime(&scratch);
     runtime.commands.set(
-        Provider::Grok,
-        ProviderCommand {
+        Harness::Grok,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec![script, "prefix with spaces".into()],
         },
@@ -2566,12 +2557,12 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
         ),
     ] {
         env.insert("STUB_STOP".into(), stop.into());
-        let result = review::provider::invoke(
-            review::provider::LaunchSpec {
-                provider: Provider::Grok,
+        let result = review::harness::invoke(
+            review::harness::LaunchSpec {
+                harness: Harness::Grok,
                 start,
                 settings: fixture_settings(
-                    Provider::Grok,
+                    Harness::Grok,
                     review::config::Profile {
                         model: Some("chosen-model".into()),
                         effort: Some("high".into()),
@@ -2638,14 +2629,14 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
     env.insert("STUB_WAKE".into(), "1".into());
     env.insert("STUB_STOP".into(), "end_turn".into());
     let wake_sid = "grok-wake-session";
-    let result = review::provider::invoke(
-        review::provider::LaunchSpec {
-            provider: Provider::Grok,
+    let result = review::harness::invoke(
+        review::harness::LaunchSpec {
+            harness: Harness::Grok,
             start: SessionStart::Fresh {
                 id: Some(SessionId::parse(wake_sid).expect("id")),
             },
             settings: fixture_settings(
-                Provider::Grok,
+                Harness::Grok,
                 review::config::Profile {
                     model: Some("chosen-model".into()),
                     effort: Some("high".into()),
@@ -2684,13 +2675,13 @@ printf '{"text":"fixture answer","stopReason":"%s","sessionId":"%s","numTurns":1
 
 // Fixture settings go through the same profile constructor as production.
 fn fixture_settings(
-    provider: Provider,
+    harness: Harness,
     profile: review::config::Profile,
-) -> review::provider::RunSettings {
-    review::provider::RunSettings::from_profile(
-        provider,
+) -> review::harness::RunSettings {
+    review::harness::RunSettings::from_profile(
+        harness,
         Some(&review::config::ProfileDef {
-            provider,
+            harness,
             profile,
             layer: review::config::Layer::Local,
             table: "[fixture]".into(),
@@ -2702,7 +2693,7 @@ fn fixture_settings(
 /// a pre-turn error. A merely requested or process-local grant is never a fact.
 #[tokio::test]
 async fn grok_prepared_trust_is_verified_even_after_returned_error() {
-    use review::provider::{LaunchSpec, SessionStart};
+    use review::harness::{LaunchSpec, SessionStart};
     for durable in [false, true] {
         let scratch = Scratch::new();
         let base = std::fs::canonicalize(&scratch.root).expect("canonical scratch");
@@ -2723,8 +2714,8 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
         );
         let mut runtime = fast_runtime(&scratch);
         runtime.commands.set(
-            Provider::Grok,
-            ProviderCommand {
+            Harness::Grok,
+            HarnessCommand {
                 program: "/bin/sh".into(),
                 leading_args: vec![script],
             },
@@ -2740,12 +2731,12 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
             ("TRUST_KEY".into(), key.to_string_lossy().into_owned()),
             ("DURABLE".into(), if durable { "1" } else { "0" }.into()),
         ]);
-        let result = review::provider::invoke(
+        let result = review::harness::invoke(
             LaunchSpec {
-                provider: Provider::Grok,
+                harness: Harness::Grok,
                 start: SessionStart::Fresh { id: None },
                 settings: fixture_settings(
-                    Provider::Grok,
+                    Harness::Grok,
                     review::config::Profile {
                         sandbox: Some(review::config::SandboxLevel::WorkspaceWrite),
                         env: Some(env),
@@ -2784,14 +2775,14 @@ printf '%s\n' '{"type":"error","message":"fixture auth failure after trust"}'
 
 #[tokio::test]
 async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
-    use review::provider::{LaunchSpec, SessionStart};
+    use review::harness::{LaunchSpec, SessionStart};
     let scratch = Scratch::new();
-    let result = review::provider::invoke(
+    let result = review::harness::invoke(
         LaunchSpec {
-            provider: Provider::Grok,
+            harness: Harness::Grok,
             start: SessionStart::Fresh { id: None },
             settings: fixture_settings(
-                Provider::Grok,
+                Harness::Grok,
                 review::config::Profile {
                     env: Some(BTreeMap::from([(
                         "GROK_HOME".into(),
@@ -2830,20 +2821,20 @@ async fn grok_invalid_home_is_refused_before_even_a_read_only_launch() {
 /// Every adapter still builds its entire argv and permission plan in invoke.
 fn protocol_fixture(
     scratch: &Scratch,
-    provider: Provider,
+    harness: Harness,
     resume: bool,
     level: Option<review::config::SandboxLevel>,
     mode: &str,
-) -> (review::provider::LaunchSpec, ProviderRuntime) {
-    let protocol = match provider {
-        Provider::Codex => {
+) -> (review::harness::LaunchSpec, HarnessRuntime) {
+    let protocol = match harness {
+        Harness::Codex => {
             r#"
 printf '%s\n' '{"type":"thread.started","thread_id":"01920000-0000-7000-8000-000000000001"}'
 [ "$STUB_MODE" != death ] || exit 7
 printf '%s' 'fixture answer' > "$out"
 "#
         }
-        Provider::Claude => {
+        Harness::Claude => {
             r#"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$sid"
 [ "$STUB_MODE" != death ] || exit 7
@@ -2851,7 +2842,7 @@ printf '{"type":"result","is_error":false,"result":"fixture answer","session_id"
 "#
         }
         // maki's stream is claude's shape, but only `end_turn` is an answer.
-        Provider::Maki => {
+        Harness::Maki => {
             r#"
 printf '{"type":"system","subtype":"init","session_id":"%s","model":"m"}\n' "$sid"
 [ "$STUB_MODE" != death ] || exit 7
@@ -2860,7 +2851,7 @@ printf '{"type":"result","subtype":"success","is_error":false,"result":"fixture 
         }
         // Grok has a single result, not an init stream. EOF before that object
         // establishes no turn; this intentionally differs from the other two.
-        Provider::Grok => {
+        Harness::Grok => {
             r#"
 [ "$STUB_MODE" != death ] || exit 7
 mkdir -p "$GROK_HOME/sessions/fixture/$sid"
@@ -2901,8 +2892,8 @@ fi
     ));
     let mut runtime = fast_runtime(scratch);
     runtime.commands.set(
-        provider,
-        ProviderCommand {
+        harness,
+        HarnessCommand {
             program: "/bin/sh".into(),
             leading_args: vec![script, "prefix with spaces".into()],
         },
@@ -2940,8 +2931,8 @@ fi
         ("STUB_BARRIER_BEAT".into(), "0.01".into()),
         ("PWD".into(), "/wrong-profile-pwd".into()),
     ]);
-    let config = match provider {
-        Provider::Codex if mode != "derived" => vec![
+    let config = match harness {
+        Harness::Codex if mode != "derived" => vec![
             "model=\"raw-model\"".into(),
             "model_reasoning_effort=\"low\"".into(),
             "sandbox_workspace_write.network_access=false".into(),
@@ -2952,25 +2943,25 @@ fi
                 )])
             ),
         ],
-        Provider::Codex | Provider::Claude | Provider::Grok | Provider::Maki => Vec::new(),
+        Harness::Codex | Harness::Claude | Harness::Grok | Harness::Maki => Vec::new(),
     };
     // maki refuses an effort it cannot honour, and a launch carrying one never
     // starts; every other adapter renders the profile's.
-    let effort = match provider {
-        Provider::Maki => None,
-        Provider::Codex | Provider::Claude | Provider::Grok => Some("high".into()),
+    let effort = match harness {
+        Harness::Maki => None,
+        Harness::Codex | Harness::Claude | Harness::Grok => Some("high".into()),
     };
-    let launch = review::provider::LaunchSpec {
-        provider,
+    let launch = review::harness::LaunchSpec {
+        harness,
         start: if resume {
-            review::provider::SessionStart::Resume(
-                review::provider::SessionId::parse(STUB_SESSION).expect("id"),
+            review::harness::SessionStart::Resume(
+                review::harness::SessionId::parse(STUB_SESSION).expect("id"),
             )
         } else {
-            review::provider::SessionStart::Fresh { id: None }
+            review::harness::SessionStart::Fresh { id: None }
         },
         settings: fixture_settings(
-            provider,
+            harness,
             review::config::Profile {
                 model: Some("chosen-model".into()),
                 effort,
@@ -2997,7 +2988,7 @@ fn observed_args(scratch: &Scratch) -> Vec<String> {
 
 /// Normalize only nondeterministic transport values, preserving every flag,
 /// argument boundary, duplication and precedence position in the oracle.
-fn normalized_args(scratch: &Scratch, result: &ProviderResult) -> Vec<String> {
+fn normalized_args(scratch: &Scratch, result: &HarnessResult) -> Vec<String> {
     let mut args = observed_args(scratch);
     let mut previous = String::new();
     for arg in &mut args {
@@ -3023,7 +3014,7 @@ async fn codex_launch_argv_table_covers_permissions_overrides_and_resume_output(
             let scratch = Scratch::new();
             let (launch, runtime) = protocol_fixture(
                 &scratch,
-                Provider::Codex,
+                Harness::Codex,
                 resume,
                 requested.clone(),
                 "answer",
@@ -3148,7 +3139,7 @@ async fn claude_launch_argv_table_keeps_permissions_and_session_modes_explicit()
             let scratch = Scratch::new();
             let (launch, runtime) = protocol_fixture(
                 &scratch,
-                Provider::Claude,
+                Harness::Claude,
                 resume,
                 requested.clone(),
                 "answer",
@@ -3195,13 +3186,8 @@ async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
     {
         for resume in [false, true] {
             let scratch = Scratch::new();
-            let (launch, runtime) = protocol_fixture(
-                &scratch,
-                Provider::Maki,
-                resume,
-                requested.clone(),
-                "answer",
-            );
+            let (launch, runtime) =
+                protocol_fixture(&scratch, Harness::Maki, resume, requested.clone(), "answer");
             let result = invoke(launch, None, &runtime, None).await;
             if resume {
                 assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
@@ -3213,7 +3199,7 @@ async fn maki_launch_argv_table_carries_no_permission_or_effort_flags() {
             assert!(result.writable_roots.is_empty());
             assert_eq!(
                 result.served,
-                review::provider::Served::default(),
+                review::harness::Served::default(),
                 "an unpriced zero and the requested model are not served facts"
             );
             let expected: Vec<_> = [
@@ -3244,13 +3230,8 @@ async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
         let level = requested.clone().unwrap_or_default();
         for resume in [false, true] {
             let scratch = Scratch::new();
-            let (launch, runtime) = protocol_fixture(
-                &scratch,
-                Provider::Grok,
-                resume,
-                requested.clone(),
-                "answer",
-            );
+            let (launch, runtime) =
+                protocol_fixture(&scratch, Harness::Grok, resume, requested.clone(), "answer");
             let result = invoke(launch, None, &runtime, None).await;
             if resume {
                 assert_eq!(result.session_id.as_deref(), Some(STUB_SESSION));
@@ -3362,11 +3343,11 @@ async fn grok_launch_argv_table_checks_generated_policy_and_prompt_transport() {
 #[tokio::test]
 async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
     use review::config::SandboxLevel;
-    for provider in Provider::all() {
+    for harness in Harness::all() {
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
             &scratch,
-            *provider,
+            *harness,
             true,
             Some(SandboxLevel::ReadOnly),
             "barrier",
@@ -3387,7 +3368,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
                 .expect("established turn")
                 .outcome
                 .failed(),
-            "{provider}"
+            "{harness}"
         );
         let marker = review::inflight::live_marker(STUB_SESSION, Some(&scratch.data_root()))
             .expect("pending");
@@ -3409,7 +3390,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
             .trim()
             .parse()
             .expect("numeric pid");
-        assert!(!pid_alive(pid), "keeper reaped {provider}");
+        assert!(!pid_alive(pid), "keeper reaped {harness}");
         assert!(result.leftovers.is_clean());
         assert!(runtime.lifecycle.unresolved().is_empty());
         drop(result);
@@ -3418,7 +3399,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
             &scratch,
-            *provider,
+            *harness,
             false,
             Some(SandboxLevel::ReadOnly),
             "answer",
@@ -3428,7 +3409,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         let result = invoke(launch, Some(tx), &runtime, None).await;
         assert!(
             result.output.is_err(),
-            "stopped {provider} must refuse before spawn"
+            "stopped {harness} must refuse before spawn"
         );
         assert!(rx.await.is_err());
         assert!(!scratch.root.join("child-pid").exists());
@@ -3438,14 +3419,14 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
         let scratch = Scratch::new();
         let (launch, runtime) = protocol_fixture(
             &scratch,
-            *provider,
+            *harness,
             false,
             Some(SandboxLevel::ReadOnly),
             "death",
         );
         let result = invoke(launch, None, &runtime, None).await;
-        match provider {
-            Provider::Codex | Provider::Claude | Provider::Maki => {
+        match harness {
+            Harness::Codex | Harness::Claude | Harness::Maki => {
                 let turn = result
                     .output
                     .as_ref()
@@ -3458,7 +3439,7 @@ async fn every_adapter_shares_launch_stop_pending_and_death_contracts() {
                 );
                 assert!(result.session_id.is_some());
             }
-            Provider::Grok => assert!(
+            Harness::Grok => assert!(
                 result.output.is_err(),
                 "EOF without its result established no Grok turn"
             ),
@@ -3474,7 +3455,7 @@ async fn codex_derived_roots_reach_both_the_process_and_record_projection() {
     let scratch = Scratch::new();
     let (launch, runtime) = protocol_fixture(
         &scratch,
-        Provider::Codex,
+        Harness::Codex,
         false,
         Some(review::config::SandboxLevel::WorkspaceWrite),
         "derived",

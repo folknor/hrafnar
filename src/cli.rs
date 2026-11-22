@@ -1,5 +1,5 @@
 //! The command line. `review` with no subcommand is the run itself (stdin to
-//! the providers), with the archetype as `-a`, the profile as `-p` and the
+//! the harnesses), with the archetype as `-a`, the profile as `-p` and the
 //! global `-C` selecting the project. The verbs are `message`, `interrupt`,
 //! `list`, `sessions`, `incidents`, `init` and `man`.
 //!
@@ -14,8 +14,8 @@
 //! The help text is what orchestrating agents read in place of the docs, so it
 //! states the rules they would otherwise trip on: profile precedence and the
 //! sandbox default, the digest fields, exit status, and resume's limits. The
-//! provider lists and stale cutoffs in it are filled in from
-//! `provider::Provider` at runtime, so they cannot drift. Change the behaviour,
+//! harness lists and stale cutoffs in it are filled in from
+//! `harness::Harness` at runtime, so they cannot drift. Change the behaviour,
 //! change the help.
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -24,7 +24,7 @@ const AFTER_HELP_TEMPLATE: &str = "\
 Instructions come on stdin. With no archetype they are sent unchanged; with
 -a, the archetype's priming prompt is prepended. `-a bare` also sends stdin
 unchanged, whether or not `bare` is in the config. Every run starts one fresh
-session on one provider, and the session ID is printed above the response so
+session on one harness, and the session ID is printed above the response so
 you can follow up with `review message <ID>` while the cache is warm. For
 several opinions, launch several `review` calls; launches on one host are
 spaced apart automatically to avoid rate limits.
@@ -55,14 +55,14 @@ never changes; -C picks the project. `review message` and `review sessions <ID>`
 take the project from the session itself, and -C there must agree with it.
 {PROJECT_REFUSALS} refuse -C.
 
-Profiles (-p): a profile is a [profiles.<name>] table naming its provider
-({PROVIDERS}) and that provider's model, effort, sandbox and env. Without -p
-the run uses [_defaults].profile. A provider that is not installed fails the
+Profiles (-p): a profile is a [profiles.<name>] table naming the harness it
+runs on ({HARNESSES}) and that harness's model, effort, sandbox and env. Without
+-p the run uses [_defaults].profile. A harness that is not installed fails the
 run before anything launches. A profile resolves to its first definition,
 looking in the project file before the global one, and that definition wins
 whole. Fields are never merged, so a project profile that leaves out `model`
 does not inherit the global profile's `model`, and a project profile may not
-name a different provider than the global one of the same name. `sandbox` defaults to read-only, so a profile has to
+name a different harness than the global one of the same name. `sandbox` defaults to read-only, so a profile has to
 ask for workspace-write before a codex or grok run may modify files. Claude
 and maki profiles must omit `sandbox`: what a claude run can touch is decided
 by Claude Code's own permission settings, and a maki run's by maki's
@@ -75,13 +75,13 @@ any run that changes git hooks or config is warned about at exit, by path
 may fail to authenticate, since Claude Code does not pass CLAUDE_CODE_OAUTH_TOKEN
 on; a global [_defaults].claude_token_command fixes that (`review man config`).
 
-Output: a `--- <provider> ---` header, then `session: <ID>`, then the
+Output: a `--- <harness> ---` header, then `session: <ID>`, then the
 response. Codex and grok runs also print a digest between the session
 line and the response:
-  exit / signal     the provider process's exit status
+  exit / signal     the harness process's exit status
   captured          true if a final answer was captured; false means the text
                     below is an interim note, not a conclusion
-  turn failed       the reason the provider gave for ending the turn
+  turn failed       the reason the harness gave for ending the turn
   review failed     review could not verify the run (grok background work);
                     the run fails even if an answer was captured
   terminated by review
@@ -105,7 +105,7 @@ more work there.
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
-  echo \"ask claude\" | review -p opus                   A profile on another provider
+  echo \"ask claude\" | review -p opus                   A profile on another harness
   echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
@@ -114,19 +114,19 @@ Examples:
 
 More depth on any of this: `review man` lists the bundled topics.";
 
-/// Help templates name providers through markers, filled from
-/// `provider::Provider` by `render`: `{INTERRUPTIBLE}` (`claude, codex or maki`),
-/// `{UNINTERRUPTIBLE}` (`grok`), `{PROVIDERS}` (`claude, codex, grok, maki`) and
-/// `{CUTOFFS}` (each provider's stale cutoff). Hand-written lists here drifted
-/// from the code that decides them, and a new provider would have been missing
+/// Help templates name harnesses through markers, filled from
+/// `harness::Harness` by `render`: `{INTERRUPTIBLE}` (`claude, codex or maki`),
+/// `{UNINTERRUPTIBLE}` (`grok`), `{HARNESSES}` (`claude, codex, grok, maki`) and
+/// `{CUTOFFS}` (each harness's stale cutoff). Hand-written lists here drifted
+/// from the code that decides them, and a new harness would have been missing
 /// from every one.
 fn render(template: &str) -> String {
-    use crate::provider::Provider;
+    use crate::harness::Harness;
     template
-        .replace("{INTERRUPTIBLE}", &Provider::interruptible_names())
-        .replace("{UNINTERRUPTIBLE}", &Provider::uninterruptible_names())
-        .replace("{PROVIDERS}", &Provider::supported())
-        .replace("{CUTOFFS}", &Provider::stale_cutoff_prose())
+        .replace("{INTERRUPTIBLE}", &Harness::interruptible_names())
+        .replace("{UNINTERRUPTIBLE}", &Harness::uninterruptible_names())
+        .replace("{HARNESSES}", &Harness::supported())
+        .replace("{CUTOFFS}", &Harness::stale_cutoff_prose())
         .replace("{PROJECT_REFUSALS}", &project_refusals())
 }
 
@@ -157,14 +157,14 @@ interrupted; the message is refused until it ends. A run already recording
 waits for its handoff. Active runs from older builds without handoff support
 must finish before continuation.
 
-The session must come from a run on this host: its provider is read from the
+The session must come from a run on this host: its harness is read from the
 record that run left (`review sessions` lists them), and an ID with no record
 is refused. The run continues in the project the session was started in,
 whatever the current directory; -C only asserts it. There is no -a or -p. Stdin is sent as-is, with no
 archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
-Continuing only pays off while the provider's prompt cache is warm, so a session
+Continuing only pays off while the model host's prompt cache is warm, so a session
 last touched more than {CUTOFFS}
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
@@ -194,9 +194,9 @@ merges the project's .review.toml with the global config, so reading
 .review.toml alone gives an incomplete and often wrong answer: profiles and
 archetypes may live in the global file.
 
-By default it lists the archetypes, and the profiles whose provider is
+By default it lists the archetypes, and the profiles whose harness is
 installed on this host with the default marked; profiles hidden for a missing
-provider are named. --all adds everything: the files consulted, provider
+harness are named. --all adds everything: the files consulted, harness
 availability, each value's source and any definition it shadows, and the
 remaining settings. Env vars are listed by name only, never by value. Outside
 a project it shows the global layer alone.";
@@ -204,7 +204,7 @@ a project it shows the global layer alone.";
 #[derive(Parser)]
 #[command(
     name = "review",
-    about = "Send a prompt to a fresh AI session on one of several providers",
+    about = "Send a prompt to a fresh AI session on one of several harnesses",
     override_usage = "echo <instructions> | review [OPTIONS]\n       review <COMMAND>",
     after_help = AFTER_HELP.as_str(),
     // Without this a subcommand name after a flag (`review -C bz config`) is
@@ -232,16 +232,16 @@ pub struct RunArgs {
     #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 
-    /// Profile to run: [profiles.<name>], naming the provider and its
+    /// Profile to run: [profiles.<name>], naming the harness and its
     /// model/effort/sandbox/env. Overrides [_defaults].profile. The first
     /// definition found wins whole; sandbox defaults to read-only
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Retired: the provider is part of the profile. Still accepted so the
+    /// Retired: the harness is part of the profile. Still accepted so the
     /// run can refuse it with the replacement rather than clap's diagnostic.
-    #[arg(long, hide = true, value_name = "NAME")]
-    pub provider: Option<String>,
+    #[arg(long = "provider", hide = true, value_name = "NAME")]
+    pub retired_provider: Option<String>,
 
     /// Print the assembled prompt instead of sending it
     #[arg(long)]
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn help_names_providers_from_the_table() {
+    fn help_names_harnesses_from_the_table() {
         // Every marker is filled: an unknown one would print literally.
         for help in [
             &*AFTER_HELP,
@@ -511,7 +511,7 @@ mod tests {
             assert!(!help.contains("{"), "unfilled marker in {help:?}");
         }
         let message = MESSAGE_AFTER_HELP.replace('\n', " ");
-        for p in crate::provider::Provider::all() {
+        for p in crate::harness::Harness::all() {
             let mins = p.stale_cutoff().as_secs() / 60;
             assert!(
                 message.contains(&format!("{mins} minutes ago (")),
@@ -519,7 +519,7 @@ mod tests {
             );
         }
         assert!(
-            message.contains(&crate::provider::Provider::stale_cutoff_prose()),
+            message.contains(&crate::harness::Harness::stale_cutoff_prose()),
             "{message}"
         );
     }
@@ -585,7 +585,7 @@ mod tests {
     fn retired_run_flags() {
         // --provider still parses, so the run can refuse it by name.
         assert_eq!(
-            parsed(&["--provider", "codex"]).provider.as_deref(),
+            parsed(&["--provider", "codex"]).retired_provider.as_deref(),
             Some("codex")
         );
         assert!(parse(&["--stagger", "0"]).is_err(), "retired with fan-out");

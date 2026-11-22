@@ -101,7 +101,7 @@ impl Lifecycle {
 
     // The only keeper admission authority: closure, spawn and registration
     // serialize under this mutex. A false stop snapshot cannot authorize a
-    // launch. This admits the keeper, not the later provider `go` operation.
+    // launch. This admits the keeper, not the later harness `go` operation.
     pub(crate) fn spawn(
         &self,
         cmd: &mut Command,
@@ -198,13 +198,13 @@ impl Lifecycle {
 
     /// Only interruptible turns owe a graceful-stop recording wait. Refusal
     /// after stop is safe: this same domain also refuses the ensuing spawn.
-    pub fn unrecorded_for(&self, provider: crate::provider::Provider) -> Option<Unrecorded> {
+    pub fn unrecorded_for(&self, harness: crate::harness::Harness) -> Option<Unrecorded> {
         let registry = self
             .0
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if registry.closed || !provider.interruptible() {
+        if registry.closed || !harness.interruptible() {
             return None;
         }
         self.0.unrecorded.fetch_add(1, Ordering::SeqCst);
@@ -216,7 +216,7 @@ impl Lifecycle {
     }
 }
 
-/// Held through sidecar recording, beyond provider teardown. Not clonable:
+/// Held through sidecar recording, beyond harness teardown. Not clonable:
 /// exactly one drop releases each registered recording obligation.
 pub struct Unrecorded(Lifecycle);
 
@@ -305,7 +305,7 @@ pub fn install_signal_supervisor(lifecycle: Lifecycle) {
         // completion or report unresolved teardown.
         let told = lifecycle.terminate_all();
         if told > 0 {
-            eprintln!("\n{name}: tearing down {told} running provider(s)");
+            eprintln!("\n{name}: tearing down {told} running harness(es)");
         }
         let bound = lifecycle
             .0

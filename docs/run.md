@@ -2,7 +2,7 @@
 
 `echo "<instructions>" | review [-a ARCHETYPE] [-p PROFILE]`
 
-Every run starts one **fresh session** on one provider. Nothing
+Every run starts one **fresh session** on one harness. Nothing
 carries over from an earlier run: if the new session needs context, the
 instructions have to state it. To continue a session instead, use
 `review message <ID>` while its cache is warm (see `review man message`).
@@ -37,10 +37,10 @@ still works with a warning.
 
 ## Profile
 
-The profile names the provider and its settings: `-p deep`, else
+The profile names the harness and its settings: `-p deep`, else
 `[_defaults].profile` in the config (see `review man profiles`). A run with
 neither, or naming a profile no file defines, errors before launching. So does
-a profile whose provider is not installed on this host; `review list --all` shows
+a profile whose harness is not installed on this host; `review list --all` shows
 which are installed. `--provider` was removed and is refused with that advice.
 
 ## Several sessions
@@ -49,17 +49,17 @@ One run is one session. For several archetypes or profiles, launch
 several `review` calls side by side, each with the same stdin. Runs on one host
 queue behind a host-wide launch lock, which each holds for a fixed spacing
 after launching (or until it ends, if sooner), so calls fired together reach
-their providers spaced apart rather than all at once. A long run never blocks
+their harnesses spaced apart rather than all at once. A long run never blocks
 other `review` calls beyond that spacing.
 
 ## Dry run
 
 `--dry-run` prints the assembled prompt and launches nothing. It warns, rather
-than fails, when the provider is not installed.
+than fails, when the harness is not installed.
 
 ## Output
 
-A `--- <provider> ---` header, the `session: <ID>` line, any digest, then the
+A `--- <harness> ---` header, the `session: <ID>` line, any digest, then the
 response. `review --help` lists the digest fields. The output ends with a
 `runtime:` line, which is wall clock including the wait for stdin and the
 launch lock.
@@ -71,7 +71,7 @@ immediately, on the same profile and session, with a short nudge to finish. If
 that produces an answer it is reported, prefixed
 `(auto-resumed after the initial run died without a final answer)`; if not,
 the original death is reported - unless the resume was itself interrupted, in
-which case the resume is reported, so its continue command is shown. A run whose provider stated why it failed, and
+which case the resume is reported, so its continue command is shown. A run whose harness stated why it failed, and
 a run that was interrupted, are never auto-resumed (see `review man failures`).
 
 ## Exit status
@@ -84,7 +84,7 @@ or its teardown could not be confirmed, whatever the answers were (see
 `review man failures`): it outranks `1`, because those processes may still be
 changing the tree and need checking first. `2` for invalid arguments, and
 for bare `review` with nothing on stdin. A run that failed still prints its session ID when the
-provider created one, so it can be inspected (`review sessions <ID>`) or
+harness created one, so it can be inspected (`review sessions <ID>`) or
 continued.
 
 ## Long runs

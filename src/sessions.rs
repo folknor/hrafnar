@@ -1,9 +1,9 @@
 //! The session log: one append-only JSONL sidecar per log family (public and
 //! private), one `SessionRow` per invocation. It is what `review message`
-//! inherits a session's provider and settings from, what `review sessions`
+//! inherits a session's harness and settings from, what `review sessions`
 //! lists, and what the stale-cache gate reads. Rows are historical evidence:
 //! they keep their fields as strings and defaults, so old rows, and rows
-//! naming a removed provider, still read. `query` resolves a session's state
+//! naming a removed harness, still read. `query` resolves a session's state
 //! from markers and rows; `handoff` passes one exact run's result between
 //! processes. Appends and tail repair go through `fsutil` under file locks.
 
@@ -92,7 +92,7 @@ impl Age {
 
     /// Build an age using the process-wide epoch clock.
     pub fn since_epoch(epoch_secs: Option<u64>) -> Self {
-        Self::at_epoch(epoch_secs, crate::provider::now_epoch_secs())
+        Self::at_epoch(epoch_secs, crate::harness::now_epoch_secs())
     }
 
     /// The elapsed seconds, or `None` when the timestamp was absent or zero.
@@ -120,7 +120,9 @@ pub struct SessionRow {
     pub project: String,
     pub hostname: String,
     pub audit_id: String,
-    pub provider: String,
+    /// On disk as `provider`, the key every existing row and query uses.
+    #[serde(rename = "provider")]
+    pub harness: String,
     pub archetype: String,
     pub session_id: String,
     /// The row kind, preserving historical and future string values.
@@ -128,7 +130,7 @@ pub struct SessionRow {
     pub kind: SessionKind,
     /// Selected launch source, absent on legacy rows and manual messages.
     #[serde(default)]
-    pub profile_origin: Option<crate::provider::ProfileOrigin>,
+    pub profile_origin: Option<crate::harness::ProfileOrigin>,
     /// Restored by InheritedSettings so a message uses the session's model.
     pub model: Option<String>,
     /// Absent on rows written before this was recorded, and on any run that
@@ -138,12 +140,12 @@ pub struct SessionRow {
     #[serde(default)]
     pub env_keys: Vec<String>,
     /// Sandbox level the run launched with; absent on rows written before this
-    /// was recorded, and on providers without a filesystem sandbox.
+    /// was recorded, and on harnesses without a filesystem sandbox.
     #[serde(default)]
     pub sandbox: Option<String>,
-    #[serde(default)]
-    pub provider_sandbox: Option<String>,
-    /// Writable roots granted beyond the provider's defaults.
+    #[serde(default, rename = "provider_sandbox")]
+    pub harness_sandbox: Option<String>,
+    /// Writable roots granted beyond the harness's defaults.
     #[serde(default)]
     pub writable_roots: Vec<String>,
     pub operator_prompt: String,
@@ -164,7 +166,7 @@ pub struct SessionRow {
     /// Present on codex rows written after digest persistence landed; `None` for
     /// claude rows and for older rows.
     #[serde(default)]
-    pub digest: Option<crate::provider::DigestSummary>,
+    pub digest: Option<crate::harness::DigestSummary>,
     /// Absent on rows written before Codex home persistence was added.
     #[serde(default)]
     pub codex_home: Option<String>,
@@ -314,14 +316,14 @@ mod compatibility_tests {
         });
         let mut row: SessionRow = serde_json::from_value(legacy).expect("historical row");
         assert_eq!(row.epoch_secs, None);
-        assert!(crate::provider::SessionId::parse(&row.session_id).is_err());
-        let inherited = crate::provider::InheritedSettings::from_record(
+        assert!(crate::harness::SessionId::parse(&row.session_id).is_err());
+        let inherited = crate::harness::InheritedSettings::from_record(
             Some(&row),
-            crate::provider::Provider::Codex,
+            crate::harness::Harness::Codex,
         );
         assert_eq!(inherited.model.as_deref(), Some("requested"));
         assert_eq!(row.served_model.as_deref(), Some("served-build"));
-        row.profile_origin = Some(crate::provider::ProfileOrigin {
+        row.profile_origin = Some(crate::harness::ProfileOrigin {
             layer: "local".into(),
             table: "[codex.read]".into(),
         });

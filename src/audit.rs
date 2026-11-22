@@ -10,15 +10,17 @@ struct AuditEntry {
     timestamp: String,
     project: String,
     archetype: String,
-    provider: String,
+    /// On disk as `provider`, the key every existing row uses.
+    #[serde(rename = "provider")]
+    harness: String,
     session: String,
     prompt: String,
     response: Option<String>,
     error: Option<String>,
     /// Flat run digest (codex): exit/signal/captured/turns/task_complete/usage.
-    /// Absent for providers without a machine-readable stream (claude).
+    /// Absent for harnesses without a machine-readable stream (claude).
     #[serde(skip_serializing_if = "Option::is_none")]
-    digest: Option<crate::provider::DigestSummary>,
+    digest: Option<crate::harness::DigestSummary>,
     /// What the run's processes left behind (see `contained::Leftovers`);
     /// absent when nothing was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,7 +51,7 @@ pub(crate) fn log_result(
         timestamp: row.timestamp.clone(),
         project: row.project.clone(),
         archetype: row.archetype.clone(),
-        provider: row.provider.clone(),
+        harness: row.harness.clone(),
         session: row.session_id.clone(),
         prompt: row.assembled_prompt.clone(),
         response: row.response.clone(),

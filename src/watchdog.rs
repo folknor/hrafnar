@@ -64,8 +64,8 @@ pub struct Verdict<E = String> {
 impl<E> Verdict<E> {
     /// The cause recorded for the kill. `reason` is the longer operator-facing
     /// explanation of the same verdict; this is its fixed, persisted name.
-    pub fn termination(&self) -> crate::provider::Termination {
-        use crate::provider::{Termination, WatchdogTermination};
+    pub fn termination(&self) -> crate::harness::Termination {
+        use crate::harness::{Termination, WatchdogTermination};
         Termination::Watchdog(match self.kind {
             Kind::Stranded => WatchdogTermination::Stranded,
             Kind::Stalled => WatchdogTermination::Stalled {
@@ -83,7 +83,7 @@ pub(crate) struct Evidence<A, E = String> {
 }
 
 /// A revision changes only when observed progress changes. Sources own that
-/// definition; the monitor owns elapsed patience, never provider decoding.
+/// definition; the monitor owns elapsed patience, never harness decoding.
 pub(crate) trait Source {
     type Answer;
     type Event: std::fmt::Display;
@@ -137,7 +137,7 @@ pub(crate) async fn monitor<S: Source>(
 }
 
 // Preserve the established caller seam; Codex owns rollout IO and verdict prose.
-pub use crate::provider::codex::watch::wait_for_stranded_completion;
+pub use crate::harness::codex::watch::wait_for_stranded_completion;
 
 #[cfg(test)]
 mod tests {

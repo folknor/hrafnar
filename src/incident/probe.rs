@@ -1,4 +1,4 @@
-//! Bounded, contained provider version capture for incident bundles.
+//! Bounded, contained harness version capture for incident bundles.
 
 use crate::contained::{Leftovers, Settings, spawn};
 

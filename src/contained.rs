@@ -1,4 +1,4 @@
-//! Provider invocation containment. Command-owned bookkeeping lives in
+//! Harness invocation containment. Command-owned bookkeeping lives in
 //! `supervisor::Lifecycle`; every handle retains its exact owner through drop.
 
 use crate::keeper::{self, Event, Outcome, Proc};
@@ -239,7 +239,7 @@ impl Events {
     }
 }
 
-/// Maximum retained physical event line, including its newline. Unlike provider
+/// Maximum retained physical event line, including its newline. Unlike harness
 /// output observers, keeper framing reports oversize, partial EOF and read errors
 /// as transport damage; they can never be silently skipped or accepted as JSON.
 const EVENT_LINE_MAX: usize = 64 << 10;
@@ -339,10 +339,10 @@ async fn read_event_stream<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-/// A provider running under its keeper. Use it as the provider's `Child`:
+/// A harness running under its keeper. Use it as the harness's `Child`:
 /// take its pipes from `child`, wait with `wait`, then `finish`.
 pub struct Contained {
-    /// The keeper process. Its stdio is the provider's.
+    /// The keeper process. Its stdio is the harness's.
     pub child: Child,
     keeper_pid: u32,
     lifecycle: Lifecycle,
@@ -358,13 +358,13 @@ pub struct Contained {
     finished: bool,
 }
 
-/// Launch `provider` under a keeper. The keeper starts nothing until `go`, so
-/// the caller can record its identity first. Provider stdout and stderr are
+/// Launch `harness` under a keeper. The keeper starts nothing until `go`, so
+/// the caller can record its identity first. Harness stdout and stderr are
 /// piped; stdin is the caller's choice.
 ///
 /// Keeper admission is delegated to the command's Lifecycle, which serializes
 /// refusal, spawn and registration with admission closure. There is no separate
-/// containment stop flag. Admission is not provider execution: an admitted keeper
+/// containment stop flag. Admission is not harness execution: an admitted keeper
 /// still awaits `go`, and remains owned if stop races with that later operation.
 pub fn spawn(
     lifecycle: &Lifecycle,
@@ -438,7 +438,7 @@ fn decode_status(done: Option<&keeper::Outcome<usize>>) -> crate::process::Exit 
 
 /// How a contained invocation ended.
 pub struct Finished {
-    /// The provider's own exit status. `Unknown` when it never ran, or its
+    /// The harness's own exit status. `Unknown` when it never ran, or its
     /// keeper's report did not arrive.
     pub status: crate::process::Exit,
     pub leftovers: Leftovers,
@@ -458,9 +458,9 @@ impl Contained {
         self.label = label;
     }
 
-    /// Let the keeper start the provider, then wait for its launch
-    /// acknowledgement (or failure). Returns the provider's pid. `Ok` does
-    /// not prove the provider exec'd (see `keeper::Event::Spawned`); its
+    /// Let the keeper start the harness, then wait for its launch
+    /// acknowledgement (or failure). Returns the harness's pid. `Ok` does
+    /// not prove the harness exec'd (see `keeper::Event::Spawned`); its
     /// wait status, from `wait`, does.
     pub async fn go(&mut self) -> Result<u32> {
         self.control
@@ -469,11 +469,11 @@ impl Contained {
         let rx = self
             .spawned
             .take()
-            .context("the provider was already launched")?;
+            .context("the harness was already launched")?;
         match rx.await {
             Ok(Ok(pid)) => Ok(pid),
             Ok(Err(reason)) => anyhow::bail!("failed to launch: {reason}"),
-            Err(_) => anyhow::bail!("the keeper exited before launching the provider"),
+            Err(_) => anyhow::bail!("the keeper exited before launching the harness"),
         }
     }
 
@@ -491,21 +491,21 @@ impl Contained {
         }
     }
 
-    /// Forward one SIGINT to the provider (the keeper ignores repeats).
+    /// Forward one SIGINT to the harness (the keeper ignores repeats).
     pub fn interrupt(&self) {
         let _ = self.control.send(keeper::Control::Interrupt.byte());
     }
 
-    /// Tear the provider and everything it started down now.
+    /// Tear the harness and everything it started down now.
     pub fn terminate(&self) {
         let _ = self.control.send(keeper::Control::Terminate.byte());
     }
 
-    /// Wait for the provider itself to exit (or the keeper, should it die
+    /// Wait for the harness itself to exit (or the keeper, should it die
     /// first). The run's teardown has not finished yet: follow with `wait`.
     /// Cancel-safe, so it can sit in a `select!` beside a watchdog, which must
-    /// judge the provider and not the teardown of what it left.
-    pub async fn wait_provider(&mut self) {
+    /// judge the harness and not the teardown of what it left.
+    pub async fn wait_harness(&mut self) {
         let mut exited = self.exited.clone();
         tokio::select! {
             _ = exited.wait_for(|e| *e) => {}
@@ -528,7 +528,7 @@ impl Contained {
         // `finished` is set only once the verdict is recorded: cancelled
         // before that, `Drop` records the run as unknown.
         //
-        // Bounded: the keeper has exited, but a provider stuck before its
+        // Bounded: the keeper has exited, but a harness stuck before its
         // exec still holds the inherited events pipe, and EOF would never
         // come. What was read by then is the report.
         if let Some(handle) = self.events.as_mut() {

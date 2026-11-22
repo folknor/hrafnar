@@ -1,14 +1,14 @@
 # review
 
-A Rust CLI that sends a prompt to a fresh AI session on one of several providers (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
+A Rust CLI that sends a prompt to a fresh AI session on one of several harnesses (Claude Code, Codex, Grok, maki) - for reviews, and with a write profile for fixes.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
 ## How it works
 
-You pipe your instructions via stdin. The tool starts one **fresh session** on one provider and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
+You pipe your instructions via stdin. The tool starts one **fresh session** on one harness and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
 
-Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. Every provider prints the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
+Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. Every harness prints the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
 
 ## Quick start
 
@@ -21,7 +21,7 @@ review init
 
 ### 2. Configure
 
-Settings shared by every project - the profiles naming which provider and
+Settings shared by every project - the profiles naming which harness and
 model serve which tier, and the default one - go once in the global
 `~/.config/review/config.toml`:
 
@@ -69,7 +69,7 @@ review init
 
 Instructions are piped via stdin (required, 20KB limit). Without `-a`, stdin is sent unchanged - no priming prompt.
 
-One run is one session. For several perspectives or providers, launch several `review` calls side by side; launches on one host are spaced apart automatically (see [Rate limits](#rate-limits)).
+One run is one session. For several perspectives or harnesses, launch several `review` calls side by side; launches on one host are spaced apart automatically (see [Rate limits](#rate-limits)).
 
 All output is plain text, for people and agents alike. There is no JSON mode.
 
@@ -82,12 +82,12 @@ Archetypes are optional named priming prompts defined under `[archetypes]` (name
 | Flag | Description |
 |------|-------------|
 | `-a, --archetype <name>` | Archetype to prime with, or `bare` (an unprimed run, even without a config entry). Omit to send stdin unchanged. |
-| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, naming the provider and its `model`/`effort`/`sandbox`/`env`. Project config first, then global. Overrides `[_defaults].profile`. |
+| `-p, --profile <name>` | The profile to run: `[profiles.<name>]`, naming the harness and its `model`/`effort`/`sandbox`/`env`. Project config first, then global. Overrides `[_defaults].profile`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 
-Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the provider. A profile whose provider is not installed on this machine fails the run before anything launches - `review list --all` shows which are installed.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. The profile, from `-p` or `[_defaults].profile`, decides the harness. A profile whose harness is not installed on this machine fails the run before anything launches - `review list --all` shows which are installed.
 
-How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every provider captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
+How each harness is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md), [reference/grok.md](reference/grok.md) and [reference/maki.md](reference/maki.md). Every harness captures the new session ID: claude, grok and maki get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one harness that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
 ### Upgrading from the positional archetype
 
@@ -95,7 +95,7 @@ The archetype used to be positional (`review security`) and resuming used `--ses
 
 ### Profiles
 
-A profile is a provider plus its `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
+A profile is a harness plus its `model`, `effort`, `sandbox`, and `env`, selected with `-p`/`--profile` or `[_defaults].profile`. They are `[profiles.<name>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
 
 ```toml
 [profiles.opus]
@@ -115,11 +115,11 @@ sandbox = "workspace-write"
 echo "audit the auth flow" | review -a security -p opus
 ```
 
-`-p opus` resolves `[profiles.opus]`: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox` - but it may not name a different provider. If no file defines the profile, the run errors naming every file it searched.
+`-p opus` resolves `[profiles.opus]`: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox` - but it may not name a different harness. If no file defines the profile, the run errors naming every file it searched.
 
 `sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare codex or grok run can never modify files. **Claude and maki profiles must omit it** -- each runs on its own permission configuration, a tool-approval policy on a different axis with no honest mapping. maki's default permissions let it edit the project; see `review man sandbox`.
 
-The levels are `review`'s own vocabulary, translated per provider at launch, because the providers do not agree on the names and grok *refuses to start* on one it cannot resolve:
+The levels are `review`'s own vocabulary, translated per harness at launch, because the harnesses do not agree on the names and grok *refuses to start* on one it cannot resolve:
 
 | `review` level | codex `--sandbox` | grok `--sandbox` |
 |---|---|---|
@@ -127,18 +127,18 @@ The levels are `review`'s own vocabulary, translated per provider at launch, bec
 | `workspace-write` | `workspace-write` | `workspace` |
 | `danger-full-access` | `danger-full-access` | `none` |
 
-A value `review` does not recognise is passed through to the provider verbatim, so a custom grok profile defined in `~/.grok/sandbox.toml` still works; the provider validates its own vocabulary and fails before running a turn if the name is wrong.
+A value `review` does not recognise is passed through to the harness verbatim, so a custom grok profile defined in `~/.grok/sandbox.toml` still works; the harness validates its own vocabulary and fails before running a turn if the name is wrong.
 
 ### Follow-up with `review resume`
 
-`review resume <id>` continues a specific provider session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
+`review resume <id>` continues a specific harness session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
 
 ```
 echo "what's the worst of those for a single-account user?" | \
   review resume 019deabc-0def-7000-8000-abcdef012345
 ```
 
-There is no `-p`: the sidecar records which provider owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
+There is no `-p`: the sidecar records which harness owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
 
 ```
 $ echo "follow up" | review resume 019deabc-...
@@ -149,7 +149,7 @@ Error: no record of session 019deabc-... on this host
 Other constraints:
 
 - No archetype and no profile - no prime and no profile overrides are applied. The sandbox level, writable roots, model and effort are inherited from the session's own recorded run instead.
-- Validation of the session ID itself is delegated to the provider.
+- Validation of the session ID itself is delegated to the harness.
 
 ### Sessions sidecar log
 
@@ -159,7 +159,7 @@ Each run that captures a session ID and each `review resume` appends a JSONL row
 - `audit_id`, `provider`, `archetype`, `session_id`
 - `kind` - `"run"` for fresh-session creation events, `"session"` for resume touches
 - `model`, `env_keys` (env-var *names* only - values are not recorded so secrets don't leak through the sidecar)
-- `operator_prompt` (raw stdin), `assembled_prompt` (what the provider actually saw)
+- `operator_prompt` (raw stdin), `assembled_prompt` (what the harness actually saw)
 - `response` or `error`
 - `review_version`
 
@@ -169,7 +169,7 @@ The sidecar drives two things:
 
 ```
 $ echo "follow up" | review resume 019deabc-...
-provider: claude (from the session record)
+harness: claude (from the session record)
 session last touched 14m ago
 --- claude ---
 <response>
@@ -206,7 +206,7 @@ $ review sessions
        opened:  check OAuth handling on the IMAP path
 ```
 
-Each block shows the age since the last touch, the provider/archetype/touch count, the session ID (copy-paste into `review resume <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
+Each block shows the age since the last touch, the harness/archetype/touch count, the session ID (copy-paste into `review resume <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
 
 For ad-hoc queries beyond what `review sessions` exposes, the JSONL works directly with `jq` and `grep`.
 
@@ -345,7 +345,7 @@ tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 profile = "high"                   # used when -p is omitted
 stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
 
-# Named profiles: a provider and its model/effort/sandbox/env, selected with
+# Named profiles: a harness and its model/effort/sandbox/env, selected with
 # -p/--profile.
 [profiles.opus]
 provider = "claude"
@@ -363,11 +363,11 @@ How the layers combine:
 
 - **Archetypes** are the union of both files; the project wins on a name clash.
 - **`[_defaults]` keys** come from the first file that sets them.
-- **Profiles** come from the first definition found, project file first, and win whole. A project profile may not name a different provider than the global one of the same name.
+- **Profiles** come from the first definition found, project file first, and win whole. A project profile may not name a different harness than the global one of the same name.
 
 ### `review list`
 
-Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles whose provider is installed on this machine with their model, effort and sandbox, the default marked. A profile hidden because its provider is not installed is named.
+Prints what a run in the current directory can use, computed by the same resolver a run uses: the archetypes, and the profiles whose harness is installed on this machine with their model, effort and sandbox, the default marked. A profile hidden because its harness is not installed is named.
 
 ```
 $ review list
@@ -379,7 +379,7 @@ profiles:
   write           gpt-6-luna, effort max, workspace-write
 ```
 
-`review list --all` prints the whole effective configuration: the files consulted, whether each provider is installed, every archetype with its source, and every profile with its provider, the table it came from and any definitions it shadows. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
+`review list --all` prints the whole effective configuration: the files consulted, whether each harness is installed, every archetype with its source, and every profile with its harness, the table it came from and any definitions it shadows. Env vars show by name only. `review list --projects` prints the `-C` registry. `review config` still works as a warning alias of `--all`.
 
 Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer on its own.
 
@@ -387,21 +387,21 @@ Anything that used to read `.review.toml` to find out what is available should c
 
 These now fail to parse, each with an error saying what replaced it:
 
-- `[<provider>.<name>]` profile tables, and legacy `[<host>.<provider>.<name>]` ones: move each to `[profiles.<name>]` with `provider = "<provider>"`.
+- `[<provider>.<name>]` profile tables, and legacy `[<host>.<provider>.<name>]` ones: move each to `[profiles.<name>]` with `provider = "<harness>"`.
 - `[_defaults].providers` or `[_defaults].provider`: write `profile = "<name>"` instead.
 - `[_groups]`: remove it. Launch one `review -a <name>` per member.
 - A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
 
-### Providers
+### Harnesses
 
-| Provider | Binary | Non-interactive | Resume | Model flag |
+| Harness | Binary | Non-interactive | Resume | Model flag |
 |----------|--------|----------------|--------|------------|
 | claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
 | codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
 | grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
 | maki | `maki` | `-p` | `--resume <id>` | `--model <provider/model-id>` |
 
-To run another provider, pick a profile that names it:
+To run another harness, pick a profile that names it:
 
 ```
 echo "ask claude" | review -a bugs -p opus
@@ -409,7 +409,7 @@ echo "ask claude" | review -a bugs -p opus
 
 ## Rate limits
 
-Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. 5 claude sessions) will trigger RPM limits.
+Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple harness sessions simultaneously (e.g. 5 claude sessions) will trigger RPM limits.
 
 A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once - enough to blow past most RPM budgets.
 
@@ -417,13 +417,13 @@ To avoid this, `review` calls fired together on one host are spaced apart automa
 
 ## Concurrency
 
-A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
+A global file lock (`/tmp/review.lock`) serializes harness **launches**, not
 whole runs. A fresh run holds it for its launch spacing, a `review message`
 until its single spawn, then releases it and lets the runs proceed
 concurrently. Additional invocations queue and wait for the launch window only.
 
 That distinction is deliberate. Holding the lock for a run's full duration
-meant one wedged provider froze every other `review` on the machine
+meant one wedged harness froze every other `review` on the machine
 indefinitely - a hung run should cost you that run, not the tool.
 
 Note: the lock is shared across all users on the machine. On shared dev

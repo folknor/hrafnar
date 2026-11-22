@@ -1,15 +1,15 @@
 //! A run's invocations, automatic recovery, and recording.
 
-use crate::{audit, provider, sessions};
+use crate::{audit, harness, sessions};
 
 /// The persisted summary of a run: its turn's outcome over its forensics,
 /// absent only for a clean answer with nothing to record.
-pub(super) fn summary_of(r: &provider::ProviderResult) -> Option<provider::DigestSummary> {
+pub(super) fn summary_of(r: &harness::HarnessResult) -> Option<harness::DigestSummary> {
     r.output.as_ref().ok()?.summary(r.digest.as_ref())
 }
 
 /// The outcome of a run that established a turn.
-fn outcome_of(r: &provider::ProviderResult) -> Option<&provider::Outcome> {
+fn outcome_of(r: &harness::HarnessResult) -> Option<&harness::Outcome> {
     r.output.as_ref().ok().map(|turn| &turn.outcome)
 }
 
@@ -20,18 +20,18 @@ pub(super) struct RecordCtx {
     pub(super) scope: crate::data::LogScope,
     pub(super) archetype: String,
     pub(super) env_keys: Vec<String>,
-    pub(super) profile_origin: Option<provider::ProfileOrigin>,
+    pub(super) profile_origin: Option<harness::ProfileOrigin>,
     pub(super) operator_prompt: String,
 }
 
 impl RecordCtx {
-    pub(super) fn record(&self, result: &provider::ProviderResult, prompt: &str) {
+    pub(super) fn record(&self, result: &harness::HarnessResult, prompt: &str) {
         let _ = self.record_as(result, sessions::SessionKind::Run, prompt);
     }
 
     pub(super) fn record_as(
         &self,
-        result: &provider::ProviderResult,
+        result: &harness::HarnessResult,
         kind: sessions::SessionKind,
         prompt: &str,
     ) -> bool {
@@ -42,14 +42,14 @@ impl RecordCtx {
         // must not refresh the cache clock, and a fresh session holding only
         // the refused prompt must not look resumable.
         let refused =
-            outcome_of(result).is_some_and(|o| o.auth == Some(provider::AuthFailure::BeforeWork));
+            outcome_of(result).is_some_and(|o| o.auth == Some(harness::AuthFailure::BeforeWork));
         let sidecar = !refused && (kind != sessions::SessionKind::Resume || result.output.is_ok());
         self.record_policy(result, kind, prompt, sidecar).1
     }
 
     fn record_policy(
         &self,
-        result: &provider::ProviderResult,
+        result: &harness::HarnessResult,
         kind: sessions::SessionKind,
         prompt: &str,
         sidecar: bool,
@@ -60,7 +60,7 @@ impl RecordCtx {
             project: self.project_root.to_string_lossy().into_owned(),
             hostname: crate::config::hostname(),
             audit_id: self.scope.id().as_str().to_owned(),
-            provider: result.provider.as_str().to_owned(),
+            harness: result.harness.as_str().to_owned(),
             archetype: self.archetype.clone(),
             session_id: result.session_id.clone().unwrap_or_default(),
             kind,
@@ -71,12 +71,12 @@ impl RecordCtx {
             sandbox: result
                 .permissions
                 .as_ref()
-                .and_then(provider::Permissions::recorded_level)
+                .and_then(harness::Permissions::recorded_level)
                 .map(str::to_owned),
-            provider_sandbox: result
+            harness_sandbox: result
                 .permissions
                 .as_ref()
-                .and_then(provider::Permissions::native_to_record)
+                .and_then(harness::Permissions::native_to_record)
                 .map(str::to_owned),
             writable_roots: result.writable_roots.clone(),
             served_model: result.served.model_label(),
@@ -136,21 +136,21 @@ impl RecordCtx {
     /// its audit row could not be written or its receipt could not be
     /// published, in which case the replacement must not launch: the
     /// abandoned attempt would be unaccounted for, or its waiters stuck.
-    fn settle_abandoned(&self, result: &provider::ProviderResult, prompt: &str) -> bool {
+    fn settle_abandoned(&self, result: &harness::HarnessResult, prompt: &str) -> bool {
         let (audited, _) = self.record_policy(result, sessions::SessionKind::Run, prompt, false);
         let published = self.publish(result, result, false);
         audited && published
     }
 
-    pub(super) fn record_message(&self, result: &provider::ProviderResult, prompt: &str) -> bool {
+    pub(super) fn record_message(&self, result: &harness::HarnessResult, prompt: &str) -> bool {
         // A launch failure never warmed the cache, so it must not become the
         // latest row used by the age gate or inheritance.
         self.record_as(result, sessions::SessionKind::Resume, prompt)
     }
     pub(super) fn publish(
         &self,
-        requested: &provider::ProviderResult,
-        final_run: &provider::ProviderResult,
+        requested: &harness::HarnessResult,
+        final_run: &harness::HarnessResult,
         sidecar_written: bool,
     ) -> bool {
         // No run id: no marker was ever published, so nothing waits on one.
@@ -160,7 +160,7 @@ impl RecordCtx {
         let handoff = sessions::handoff::Handoff {
             schema: sessions::handoff::PROTOCOL,
             requested: id.clone(),
-            interrupted: outcome_of(requested).is_some_and(provider::Outcome::interrupted),
+            interrupted: outcome_of(requested).is_some_and(harness::Outcome::interrupted),
             final_session: final_run.session_id.clone(),
             sidecar_written,
         };
@@ -181,32 +181,32 @@ impl RecordCtx {
 
 /// Scheduling and execution context around one complete launch request.
 pub(super) struct Launch {
-    pub(super) spec: provider::LaunchSpec,
-    pub(super) runtime: provider::ProviderRuntime,
+    pub(super) spec: harness::LaunchSpec,
+    pub(super) runtime: harness::HarnessRuntime,
 }
 
 impl Launch {
     async fn invoke(
         &self,
-        start: provider::SessionStart,
+        start: harness::SessionStart,
         prompt: &str,
         predecessor: Option<crate::sessions::handoff::RunId>,
-    ) -> provider::ProviderResult {
-        let spec = provider::LaunchSpec {
+    ) -> harness::HarnessResult {
+        let spec = harness::LaunchSpec {
             start,
             prompt: prompt.to_owned(),
             ..self.spec.clone()
         };
         // The run holds the launch lock for its spacing rather than until spawn,
         // and internal retries hold none, so no launch handshake is needed.
-        provider::invoke(spec, None, &self.runtime, predecessor).await
+        harness::invoke(spec, None, &self.runtime, predecessor).await
     }
 }
 
 /// One completed invocation and the exact prompt submitted to it. Recording
 /// order is independent of which invocation supplies the displayed result.
 struct RecordedInvocation {
-    result: provider::ProviderResult,
+    result: harness::HarnessResult,
     kind: sessions::SessionKind,
     prompt: String,
 }
@@ -220,7 +220,7 @@ pub(super) struct TaskOutcome {
 }
 
 impl TaskOutcome {
-    fn single(result: provider::ProviderResult, prompt: String) -> Self {
+    fn single(result: harness::HarnessResult, prompt: String) -> Self {
         Self {
             invocations: vec![RecordedInvocation {
                 result,
@@ -231,10 +231,10 @@ impl TaskOutcome {
             prerecorded: 0,
         }
     }
-    fn result(&self) -> &provider::ProviderResult {
+    fn result(&self) -> &harness::HarnessResult {
         &self.invocations[self.selected].result
     }
-    pub(super) fn into_result(mut self) -> provider::ProviderResult {
+    pub(super) fn into_result(mut self) -> harness::HarnessResult {
         self.invocations.swap_remove(self.selected).result
     }
 }
@@ -252,7 +252,7 @@ enum AfterRun {
     /// Its teardown left processes running, or could not say: a resume would
     /// run beside processes that may still hold the session or edit the tree.
     LeftRunning,
-    /// A death its provider recovers from (`provider::recovery`): resume this
+    /// A death its harness recovers from (`harness::recovery`): resume this
     /// session once with the given nudge, cache still warm.
     AutoResume {
         session: String,
@@ -261,31 +261,31 @@ enum AfterRun {
 }
 
 /// Whether to auto-resume a fresh run that has just ended, on the same
-/// profile. Whether an outcome is a recoverable death at all is the provider
-/// adapter's reading (`provider::recovery`; today only codex's mid-turn wedge
-/// qualifies). The vetoes here hold for every provider and are applied first:
+/// profile. Whether an outcome is a recoverable death at all is the harness
+/// adapter's reading (`harness::recovery`; today only codex's mid-turn wedge
+/// qualifies). The vetoes here hold for every harness and are applied first:
 /// an interrupted run, a stated reason for producing nothing, and a teardown
 /// that left processes running are left alone.
-fn after_run(first: &provider::ProviderResult) -> AfterRun {
+fn after_run(first: &harness::HarnessResult) -> AfterRun {
     let outcome = outcome_of(first);
-    if outcome.is_some_and(provider::Outcome::interrupted) {
+    if outcome.is_some_and(harness::Outcome::interrupted) {
         return AfterRun::Interrupted;
     }
     // A stated reason for producing nothing is a verdict on the request
     // itself: resending it buys the identical failure at full cost, and files
     // a second incident bundle that looks like a second death.
-    if let Some(why) = outcome.and_then(provider::Outcome::stated_failure) {
+    if let Some(why) = outcome.and_then(harness::Outcome::stated_failure) {
         return AfterRun::StatedFailure(why.to_string());
     }
-    let Some(nudge) = provider::recovery(first) else {
+    let Some(nudge) = harness::recovery(first) else {
         return AfterRun::Report;
     };
-    // Only a run its provider would resume has a resume to withhold.
+    // Only a run its harness would resume has a resume to withhold.
     if !first.leftovers.is_clean() {
         return AfterRun::LeftRunning;
     }
     match &first.session_id {
-        Some(sid) if provider::SessionId::parse(sid).is_ok() => AfterRun::AutoResume {
+        Some(sid) if harness::SessionId::parse(sid).is_ok() => AfterRun::AutoResume {
             session: sid.clone(),
             nudge,
         },
@@ -298,14 +298,14 @@ fn after_run(first: &provider::ProviderResult) -> AfterRun {
 /// the run the interrupt is about, and reporting the first run's death instead
 /// would hide the resume command.
 fn after_auto_resume(
-    first: provider::ProviderResult,
-    mut second: provider::ProviderResult,
+    first: harness::HarnessResult,
+    mut second: harness::HarnessResult,
     first_prompt: String,
     second_prompt: String,
 ) -> TaskOutcome {
-    let answered = outcome_of(&second).is_some_and(provider::Outcome::has_answer);
+    let answered = outcome_of(&second).is_some_and(harness::Outcome::has_answer);
     let selected =
-        usize::from(answered || outcome_of(&second).is_some_and(provider::Outcome::interrupted));
+        usize::from(answered || outcome_of(&second).is_some_and(harness::Outcome::interrupted));
     if answered && let Ok(turn) = second.output.as_mut() {
         // Existing application annotation is also persisted in the response;
         // it is independent of the actual submitted prompt retained below.
@@ -349,8 +349,8 @@ fn after_auto_resume(
 async fn claude_auth_retry(
     launch: &Launch,
     ctx: &RecordCtx,
-    first: provider::ProviderResult,
-) -> Result<TaskOutcome, Box<provider::ProviderResult>> {
+    first: harness::HarnessResult,
+) -> Result<TaskOutcome, Box<harness::HarnessResult>> {
     let Some(auth) = outcome_of(&first).and_then(|o| o.auth) else {
         return Err(Box::new(first));
     };
@@ -366,7 +366,7 @@ async fn claude_auth_retry(
         Some(
             "claude refused the CLAUDE_CODE_OAUTH_TOKEN it was given; not retrying with claude_token_command.",
         )
-    } else if auth != provider::AuthFailure::BeforeWork {
+    } else if auth != harness::AuthFailure::BeforeWork {
         Some(
             "claude failed to authenticate after it may have done work, or its output was not \
              fully read; not retrying, since a resend could repeat that work.",
@@ -420,8 +420,8 @@ async fn claude_auth_retry(
     eprintln!(
         "claude could not authenticate; retrying once as a new session with a token from claude_token_command"
     );
-    let spec = provider::LaunchSpec {
-        start: provider::SessionStart::Fresh { id: None },
+    let spec = harness::LaunchSpec {
+        start: harness::SessionStart::Fresh { id: None },
         settings: launch.spec.settings.clone().with_claude_token(token),
         ..launch.spec.clone()
     };
@@ -443,7 +443,7 @@ async fn claude_auth_retry(
         }
     };
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
-    let invoke = provider::invoke(
+    let invoke = harness::invoke(
         spec,
         Some(launched_tx),
         &launch.runtime,
@@ -487,14 +487,11 @@ async fn claude_auth_retry(
 pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
     // Held until the rows below are written, so a signalled `review` does not
     // exit with this session unrecorded (see `supervisor::install_signal_supervisor`).
-    let _unrecorded = launch
-        .runtime
-        .lifecycle
-        .unrecorded_for(launch.spec.provider);
-    let prov = launch.spec.provider;
+    let _unrecorded = launch.runtime.lifecycle.unrecorded_for(launch.spec.harness);
+    let prov = launch.spec.harness;
     let first = launch
         .invoke(
-            provider::SessionStart::Fresh { id: None },
+            harness::SessionStart::Fresh { id: None },
             &launch.spec.prompt,
             None,
         )
@@ -531,8 +528,8 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
             eprintln!("{prov} session {sid} died without a final answer - auto-resuming once");
             let second = launch
                 .invoke(
-                    provider::SessionStart::Resume(
-                        provider::SessionId::parse(&sid)
+                    harness::SessionStart::Resume(
+                        harness::SessionId::parse(&sid)
                             .expect("auto-resume identity validated before selection"),
                     ),
                     nudge,
@@ -555,10 +552,10 @@ pub(super) async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -
     if launch.runtime.lifecycle.stop_requested()
         && let (Some(sid), Some(true)) = (
             outcome.result().session_id.as_deref(),
-            outcome_of(outcome.result()).map(provider::Outcome::interrupted),
+            outcome_of(outcome.result()).map(harness::Outcome::interrupted),
         )
     {
-        eprintln!("{}", provider::resume_hint(prov, sid));
+        eprintln!("{}", harness::resume_hint(prov, sid));
     }
     outcome
 }
@@ -570,41 +567,41 @@ mod tests {
 
     /// A codex result with session `sid`: `answered` says whether `-o` captured
     /// a final answer; `interrupted` whether `review interrupt` ended it.
-    fn codex_run(sid: &str, answered: bool, interrupted: bool) -> provider::ProviderResult {
+    fn codex_run(sid: &str, answered: bool, interrupted: bool) -> harness::HarnessResult {
         let answer = if answered {
-            provider::Answer::Captured
+            harness::Answer::Captured
         } else {
-            provider::Answer::None
+            harness::Answer::None
         };
-        provider::ProviderResult {
+        harness::HarnessResult {
             credential: None,
             run_id: None,
             _reservation: None,
-            provider: provider::Provider::Codex,
-            output: Ok(provider::Turn {
+            harness: harness::Harness::Codex,
+            output: Ok(harness::Turn {
                 text: format!("text of {sid}"),
-                outcome: provider::Outcome::answered(answer).ended(interrupted, false, None),
+                outcome: harness::Outcome::answered(answer).ended(interrupted, false, None),
             }),
             session_id: Some(sid.into()),
             codex_home: None,
-            digest: Some(provider::Digest {
+            digest: Some(harness::Digest {
                 exit: crate::process::Exit::Code(i32::from(!answered)),
                 turns: 1,
-                ..provider::Digest::default()
+                ..harness::Digest::default()
             }),
             completed_epoch: 0,
             permissions: None,
             writable_roots: Vec::new(),
             model: None,
             effort: None,
-            served: provider::Served::default(),
+            served: harness::Served::default(),
             grok_trust: None,
             leftovers: contained::Leftovers::default(),
         }
     }
 
     fn auto_resume(sid: &str) -> AfterRun {
-        let nudge = provider::recovery(&codex_run(sid, false, false)).expect("codex recovers");
+        let nudge = harness::recovery(&codex_run(sid, false, false)).expect("codex recovers");
         AfterRun::AutoResume {
             session: sid.into(),
             nudge,
@@ -713,7 +710,7 @@ mod tests {
             )
             .expect("test fixture");
             assert_eq!(audit.lines().count(), 2);
-            let runtime = provider::ProviderRuntime::from_config(
+            let runtime = harness::HarnessRuntime::from_config(
                 crate::supervisor::Lifecycle::default(),
                 None,
                 None,
@@ -763,11 +760,11 @@ mod tests {
     }
 
     #[test]
-    fn only_a_provider_that_recovers_is_auto_resumed() {
+    fn only_a_harness_that_recovers_is_auto_resumed() {
         // The same dead outcome on claude is reported as it is: claude has no
         // mid-turn wedge for a resume to finish.
         let mut claude = codex_run("s", false, false);
-        claude.provider = provider::Provider::Claude;
+        claude.harness = harness::Harness::Claude;
         assert_eq!(after_run(&claude), AfterRun::Report);
         // And a claude death with leftovers has no resume to withhold.
         claude.leftovers.unknown = Some("keeper died".into());

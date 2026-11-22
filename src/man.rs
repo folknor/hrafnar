@@ -31,7 +31,7 @@ struct Topic {
 const TOPICS: &[Topic] = &[
     Topic {
         name: "run",
-        summary: "a fresh run: archetype, provider, dry runs, auto-resume, exit status",
+        summary: "a fresh run: archetype, profile, dry runs, auto-resume, exit status",
         path: "docs/run.md",
         content: include_str!("../docs/run.md"),
     },
@@ -49,7 +49,7 @@ const TOPICS: &[Topic] = &[
     },
     Topic {
         name: "sandbox",
-        summary: "what each sandbox level lets a run touch, per provider; writable roots",
+        summary: "what each sandbox level lets a run touch, per harness; writable roots",
         path: "docs/sandbox.md",
         content: include_str!("../docs/sandbox.md"),
     },
@@ -282,16 +282,16 @@ mod tests {
     }
 
     #[test]
-    fn the_stale_cutoff_table_states_every_providers_cutoff() {
+    fn the_stale_cutoff_table_states_every_harnesses_cutoff() {
         let rows = table(
             topic("message"),
-            "| Provider | Refused when last touched more than |",
+            "| Harness | Refused when last touched more than |",
         );
         let documented: BTreeSet<(String, String)> = rows
             .into_iter()
             .map(|r| (r[0].clone(), r[1].clone()))
             .collect();
-        let actual: BTreeSet<(String, String)> = crate::provider::Provider::all()
+        let actual: BTreeSet<(String, String)> = crate::harness::Harness::all()
             .iter()
             .map(|p| {
                 let secs = p.stale_cutoff().as_secs();
@@ -306,15 +306,15 @@ mod tests {
         assert_eq!(documented, actual);
     }
 
-    /// Pins the translation each provider receives and that claude records no
-    /// level. It does not prove the provider enforces the level - that is the
-    /// provider tests' and diagnostics' job - only that the table says what
+    /// Pins the translation each harness receives and that claude records no
+    /// level. It does not prove the harness enforces the level - that is the
+    /// harness tests' and diagnostics' job - only that the table says what
     /// `review` passes on.
-    /// One column per provider, so a new provider fails this until the table
+    /// One column per harness, so a new harness fails this until the table
     /// says what it does with each level.
     #[test]
-    fn the_sandbox_table_states_each_providers_level() {
-        use crate::provider::Provider;
+    fn the_sandbox_table_states_each_harnesses_level() {
+        use crate::harness::Harness;
         // Documentation remains an independent oracle. Derive only its
         // vocabulary/order from the header, not the expected permission cells.
         let header = topic("sandbox")
@@ -327,12 +327,12 @@ mod tests {
             .skip(1)
             .map(str::trim)
             .collect();
-        let mut documented: Vec<Provider> = columns
+        let mut documented: Vec<Harness> = columns
             .iter()
             .map(|name| name.parse().expect("documented provider"))
             .collect();
         documented.sort_unstable();
-        let mut all = Provider::all().to_vec();
+        let mut all = Harness::all().to_vec();
         all.sort_unstable();
         assert_eq!(
             documented, all,
@@ -350,10 +350,10 @@ mod tests {
         for r in &rows {
             assert_eq!(r.len(), columns.len() + 1, "one cell per provider: {r:?}");
             for (i, name) in columns.iter().enumerate() {
-                let p: Provider = name.parse().expect("a provider");
+                let p: Harness = name.parse().expect("a provider");
                 let cell = &r[i + 1];
                 let level = crate::config::SandboxLevel::from(r[0].as_str());
-                let permissions = crate::provider::Permissions::profile(p, Some(&level));
+                let permissions = crate::harness::Permissions::profile(p, Some(&level));
                 assert_eq!(
                     cell,
                     permissions.selector().unwrap_or("unsupported"),

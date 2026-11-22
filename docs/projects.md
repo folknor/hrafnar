@@ -6,7 +6,7 @@ another. It goes before or after the subcommand:
 `echo "check this" | review -C bz -a bugs`, `review list -C bz`.
 
 The current directory never changes. `-C` decides which `.review.toml`, audit
-id and project root the command uses; providers run in that project root.
+id and project root the command uses; harnesses run in that project root.
 
 ## Names and paths
 

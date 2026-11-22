@@ -1,7 +1,7 @@
 # review
 
 A Rust CLI (`review`) that hands code reviews and work to a fresh, headless AI
-session on one of several providers (Claude Code, Codex, Grok, maki), chosen
+session on one of several harnesses (Claude Code, Codex, Grok, maki), chosen
 by a named profile. It is a prompt builder: the agents fetch code themselves.
 Each run starts a clean session, optionally primed with an archetype's prompt,
 and is recorded so it can be messaged, interrupted or resumed while its cache
@@ -15,10 +15,10 @@ each value's source.
 Where to read further:
 
 - [reference/architecture.md](reference/architecture.md) - what each module owns.
-- [reference/design.md](reference/design.md) - the provider-agnostic design
+- [reference/design.md](reference/design.md) - the harness-agnostic design
   decisions and why, and the reserved words.
 - [reference/codex.md](reference/codex.md), [reference/claude.md](reference/claude.md),
-  [reference/grok.md](reference/grok.md) - how each provider is driven.
+  [reference/grok.md](reference/grok.md) - how each harness is driven.
 - [reference/sandbox.md](reference/sandbox.md) - permissions and writable roots.
 - [reference/teardown.md](reference/teardown.md) - the keeper every run runs under.
 - `docs/` - the `review man` topics: observable behaviour, and the binding
@@ -100,15 +100,15 @@ bz close 12 -m "fixed by ..."
 
 ### Where notes go
 
-- Provider-specific notes go in `reference/<provider>.md`; permission machinery
-  shared across providers in `reference/sandbox.md`; provider-agnostic design
+- Harness-specific notes go in `reference/<harness>.md`; permission machinery
+  shared across harnesses in `reference/sandbox.md`; harness-agnostic design
   in `reference/design.md`. This file keeps the rules and pointers only.
 
 ## Document folders
 
 | Folder | Contents | Rule |
 |---|---|---|
-| `reference/` | How the thing is built and why: architecture, design decisions, per-provider mechanism and evidence, invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `reference/` | How the thing is built and why: architecture, design decisions, per-harness mechanism and evidence, invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
 | `docs/` | How the thing is used: the `review man` topics, one file each, flat | Same must-be-true rule. |
 | `notes/` | Transient: plans, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
 | `plans/` | Retired | Plan documents go in `notes/`. |
@@ -121,12 +121,12 @@ bz close 12 -m "fixed by ..."
   follow it into) and states policy, not measurements. `--help` stays the
   complete short form; a topic adds depth, never a requirement to read it.
 - `scripts/` holds maintained diagnostics that keep a claim in `reference/`
-  re-testable against a provider that upgrades underneath us. They cost real
-  turns, so they are run deliberately after a provider upgrade, never from
+  re-testable against a harness that upgrades underneath us. They cost real
+  turns, so they are run deliberately after a harness upgrade, never from
   `brokkr check`. A one-off probe belongs in `notes/`.
-- `research/` holds gitignored checkouts of provider source (`research/codex`,
+- `research/` holds gitignored checkouts of harness source (`research/codex`,
   `research/grok-build`): not ours, not guaranteed present, but the authority on
-  provider behaviour when they are.
+  harness behaviour when they are.
 - Root-level convention files (`AGENTS.md`, `CLAUDE.md`, `README.md`,
   `LICENSE`, ...) stay at the root.
 - Avoid citing source line numbers in `notes/`, `docs/` and `reference/` - they

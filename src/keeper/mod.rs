@@ -1,9 +1,9 @@
-//! The keeper: one per provider invocation, between `review` and the provider,
+//! The keeper: one per harness invocation, between `review` and the harness,
 //! so that when a run ends nothing it started is left running.
 //!
 //! # Why a process of its own
 //!
-//! A provider's descendants do not stay in the process group `review` gives it.
+//! A harness's descendants do not stay in the process group `review` gives it.
 //! codex's Linux sandbox runs bwrap with `--new-session` and unified-exec
 //! shells `setsid()`, so a shell the agent started is in a session of its own,
 //! and when codex exits it is reparented to init. That is how two hung codemods
@@ -12,7 +12,7 @@
 //! making `review` itself a child subreaper cannot attribute one: with several
 //! runs in one `review`, an adopted orphan may belong to a run that is still
 //! going, and killing it destroys live work. So each invocation gets its own
-//! subreaper. Everything the provider starts, whatever it does to its session
+//! subreaper. Everything the harness starts, whatever it does to its session
 //! or group, stays a descendant of this process, and this process belongs to
 //! exactly one run.
 //!
@@ -41,11 +41,11 @@
 //! `review` spawns `review __keep <spec-fd>` with SIGINT, SIGTERM, SIGCHLD
 //! and SIGPIPE blocked, so no signal can take its default action before the
 //! keeper reads them from a signalfd. The spec is a sealed memfd, read and closed
-//! before any provider fork; argv carries only its descriptor number. Two pipes beyond stdio, whose numbers are
+//! before any harness fork; argv carries only its descriptor number. Two pipes beyond stdio, whose numbers are
 //! in the spec: control (review to keeper: `g` go, `i` interrupt, `t`
 //! terminate; EOF means `review` is gone) and events (keeper to review, one
 //! JSON `Event` per line). The keeper launches nothing before `g`, so `review`
-//! can record the keeper's identity first. Its own stdio is the provider's and
+//! can record the keeper's identity first. Its own stdio is the harness's and
 //! it never writes to it.
 
 mod launch;

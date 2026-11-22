@@ -129,7 +129,7 @@ impl Keeper {
         };
         let survivors = outcome.teardown.named();
         let line = serde_json::json!({
-            "epoch_secs": crate::provider::now_epoch_secs(),
+            "epoch_secs": crate::harness::now_epoch_secs(),
             "label": self.spec.label,
             "keeper_pid": self.me,
             "outcome": outcome,

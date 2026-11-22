@@ -119,7 +119,7 @@ pub struct TranscriptSummary {
 }
 
 /// Resolve the Codex home as the child sees it. Relative paths are based on
-/// the provider working directory, not the caller's current directory.
+/// the harness working directory, not the caller's current directory.
 pub(crate) fn codex_home(
     override_home: Option<&str>,
     home_override: Option<&str>,
@@ -217,7 +217,7 @@ pub fn find_transcript_path_lookup(
     session_id: &str,
     override_home: Option<&str>,
 ) -> Lookup<PathBuf> {
-    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+    let Ok(id) = crate::harness::SessionId::parse(session_id) else {
         return Lookup::Absent;
     };
     let Some(home) = codex_home(override_home, None, &PathBuf::new()) else {
@@ -244,14 +244,14 @@ pub(crate) fn find_transcript_path_in_home_lookup(
     session_id: &str,
     home: &Path,
 ) -> Lookup<PathBuf> {
-    let Ok(id) = crate::provider::SessionId::parse(session_id) else {
+    let Ok(id) = crate::harness::SessionId::parse(session_id) else {
         return Lookup::Absent;
     };
     find_transcript_path_checked_in_home(&id, home)
 }
 
 pub(crate) fn find_transcript_path_checked_in_home(
-    session_id: &crate::provider::SessionId,
+    session_id: &crate::harness::SessionId,
     home: &Path,
 ) -> Lookup<PathBuf> {
     find_session_path(session_id, home)
@@ -259,7 +259,7 @@ pub(crate) fn find_transcript_path_checked_in_home(
 
 // Suffixes only select candidates. Metadata supplies identity at discovery time;
 // a later path read is not pinned against replacement, nor confined by symlinks.
-fn find_session_path(session_id: &crate::provider::SessionId, home: &Path) -> Lookup<PathBuf> {
+fn find_session_path(session_id: &crate::harness::SessionId, home: &Path) -> Lookup<PathBuf> {
     let session_id = session_id.as_str();
     let sessions = home.join("sessions");
     let needle = format!("-{session_id}.jsonl");
@@ -399,7 +399,7 @@ pub(crate) fn summarize_lookup(path: &Path, scope: Scope) -> Lookup<TranscriptSu
 
 /// Current real turn, using the same evidence fold as the watchdog and bundles.
 fn parse(content: &str) -> TranscriptSummary {
-    crate::provider::codex::rollout::fold(content).current_turn
+    crate::harness::codex::rollout::fold(content).current_turn
 }
 
 /// Find and summarize the transcript for a codex session id, if one exists.
@@ -548,7 +548,7 @@ mod tests {
             "content": [{"type": "reasoning_text", "text": "thinking"}],
         });
         assert!(
-            crate::provider::codex::rollout::fold(
+            crate::harness::codex::rollout::fold(
                 &serde_json::json!({"payload": payload}).to_string()
             )
             .current_turn

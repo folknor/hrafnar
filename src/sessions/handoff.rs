@@ -16,7 +16,7 @@ impl Default for RunId {
 impl TryFrom<String> for RunId {
     type Error = anyhow::Error;
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        crate::provider::SessionId::parse(&value)?;
+        crate::harness::SessionId::parse(&value)?;
         Ok(Self(value))
     }
 }

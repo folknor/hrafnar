@@ -8,7 +8,7 @@
 //! system's patience was to grep for `Duration`.
 //!
 //! Collecting them does not change how they are *used*: `watchdog::Timings` and
-//! `provider::ProviderRuntime` are still the injection points, and tests still
+//! `harness::HarnessRuntime` are still the injection points, and tests still
 //! override them freely (see `tests/provider_runs.rs`, which drives 3-minute and
 //! 10-second behaviours in milliseconds). What lives here is only the default
 //! each of those structs starts from.
@@ -73,7 +73,7 @@ pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// signal, and a deliberately stubborn descendant may ignore it outright.
 pub const SIGKILL_ESCALATION: Duration = Duration::from_secs(10);
 
-/// How long processes a provider left behind, once it exited on its own, get
+/// How long processes a harness left behind, once it exited on its own, get
 /// to honour `SIGTERM` before the keeper starts killing them. Short: the run is
 /// over, and this only lets a cooperative process (codex's sandbox supervisor
 /// removing the placeholder files it made in the workspace) clean up.
@@ -87,7 +87,7 @@ pub const KILL_PHASE: Duration = Duration::from_secs(3);
 /// process a moment to reap a killed child before its own turn.
 pub const TEARDOWN_BEAT: Duration = Duration::from_millis(50);
 
-/// How long a provider may take to exec under its keeper before the launch is
+/// How long a harness may take to exec under its keeper before the launch is
 /// failed, so a stuck exec cannot hold the global launch lock.
 pub const VERSION_PROBE: Duration = Duration::from_secs(30);
 
@@ -109,9 +109,9 @@ pub const GRACEFUL_STOP: Duration = Duration::from_secs(15);
 pub const GRACEFUL_STOP_POLL: Duration = Duration::from_millis(100);
 
 /// How long since a session was last touched before `review resume` refuses to
-/// resume it, for providers without a cutoff of their own.
+/// resume it, for harnesses without a cutoff of their own.
 ///
-/// Past this the provider's prompt cache is cold (Anthropic's is 5 min by
+/// Past this the harness's prompt cache is cold (Anthropic's is 5 min by
 /// default, ~1h with the right env vars, so ~55 min is the realistic cap), and
 /// resuming means reprocessing the whole session prefix at full cost.
 /// `review resume` is the *warm* follow-up path; a cold resume should be a
@@ -122,7 +122,7 @@ pub const STALE_SESSION: Duration = Duration::from_secs(55 * 60);
 /// minutes short of that, for the same reason `STALE_SESSION` stops short of 1h.
 pub const STALE_SESSION_CODEX: Duration = Duration::from_secs(27 * 60);
 
-// Which provider gets which cutoff is `provider::Provider::stale_cutoff`.
+// Which harness gets which cutoff is `harness::Harness::stale_cutoff`.
 
 /// How often `review interrupt` checks whether the interrupted run has been
 /// recorded. codex winds a turn down in seconds, so this only sets how promptly
@@ -130,10 +130,10 @@ pub const STALE_SESSION_CODEX: Duration = Duration::from_secs(27 * 60);
 pub const INTERRUPT_POLL: Duration = Duration::from_millis(500);
 
 /// How long `review interrupt` waits for a run in flight to offer its pid - which
-/// it does once the provider has printed its first output, a second or two after
+/// it does once the harness has printed its first output, a second or two after
 /// launch. `review message` meets this window every time a second message
 /// follows a first: its launch lock hands over the moment the first run
-/// spawns. Past this the provider is taken to be stuck before output, and the
+/// spawns. Past this the harness is taken to be stuck before output, and the
 /// interrupt refused.
 pub const INTERRUPT_PID_WAIT: Duration = Duration::from_secs(60);
 
@@ -141,7 +141,7 @@ pub const INTERRUPT_PID_WAIT: Duration = Duration::from_secs(60);
 pub const INTERRUPT_PID_POLL: Duration = Duration::from_millis(100);
 
 /// How long a fresh run holds the host-wide launch lock after launching, so
-/// that `review` calls fired together on one host reach their providers spaced
+/// that `review` calls fired together on one host reach their harnesses spaced
 /// apart rather than all at once, to avoid rate limits. Not tunable: nobody
 /// ever set the old `--stagger` flag.
 pub const LAUNCH_SPACING: Duration = Duration::from_secs(30);
@@ -172,9 +172,9 @@ mod tests {
 
     #[test]
     fn codex_sessions_go_stale_sooner() {
-        use crate::provider::Provider;
-        assert_eq!(Provider::Codex.stale_cutoff(), Duration::from_secs(27 * 60));
-        assert_eq!(Provider::Claude.stale_cutoff(), STALE_SESSION);
-        assert_eq!(Provider::Grok.stale_cutoff(), STALE_SESSION);
+        use crate::harness::Harness;
+        assert_eq!(Harness::Codex.stale_cutoff(), Duration::from_secs(27 * 60));
+        assert_eq!(Harness::Claude.stale_cutoff(), STALE_SESSION);
+        assert_eq!(Harness::Grok.stale_cutoff(), STALE_SESSION);
     }
 }

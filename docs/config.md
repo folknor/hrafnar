@@ -7,8 +7,8 @@ in.
 
 **`review list` is the authoritative view.** It runs the same resolver a run
 uses. By default it shows what a run here can use: the archetypes, and the
-profiles whose provider is installed, with the default marked and any profile
-hidden for a missing provider named. `review list --all` shows every effective
+profiles whose harness is installed, with the default marked and any profile
+hidden for a missing harness named. `review list --all` shows every effective
 value with the file and table it came from, and what each one shadows;
 `review list --projects` the `-C` registry. Reading `.review.toml` alone gives
 an incomplete and often wrong answer, because profiles and archetypes may live
@@ -62,7 +62,7 @@ bz = "~/Programs/bz"
 
 - `[archetypes]`: name to priming prompt. The prompt owns the session's role
   and whether it should modify files; `review` adds nothing of its own.
-- `[profiles.<name>]`: a provider and its launch settings (see
+- `[profiles.<name>]`: a harness and its launch settings (see
   `review man profiles`).
 - `[_defaults]`: `profile` (the one used without `-p`), `stall_timeout_secs`,
   and, in the global file only, `claude_token_command`.
@@ -86,7 +86,7 @@ bz = "~/Programs/bz"
   them, each on its own.
 - **Profiles** resolve to their first definition and win whole, never merged
   field by field, and a project profile may not change a global profile's
-  provider (see `review man profiles`).
+  harness (see `review man profiles`).
 - **`[_audit]`** is the project's alone and is an error in the global file.
   **`[_projects]`** and **`claude_token_command`** are the global file's alone
   and are errors in a project: a command named by a project file would run

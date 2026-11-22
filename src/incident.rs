@@ -1,4 +1,4 @@
-//! Forensic capture for suspicious provider runs.
+//! Forensic capture for suspicious harness runs.
 //!
 //! When a codex run looks wrong (not captured / non-zero exit / signal) the
 //! live digest + transcript summary are not enough to explain *why* it died -
@@ -18,12 +18,12 @@ pub(crate) use probe::version_probe;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Everything known about a finished provider run, handed to the bundle writer.
-/// ProcessSpec, Outcome, Exit and the provider extension own independent rules.
+/// Everything known about a finished harness run, handed to the bundle writer.
+/// ProcessSpec, Outcome, Exit and the harness extension own independent rules.
 /// The remaining byte buffers and measurements are observations, not interchangeable
 /// policy selectors; wrapping each scalar would not add an invariant.
 pub struct Incident<'a> {
-    pub provider: crate::provider::Provider,
+    pub harness: crate::harness::Harness,
     /// The process as it was spawned: argv[0] and the args, the working
     /// directory and the env overrides (adapter defaults, profile, forced,
     /// `PWD`). The replay command and the env list are rendered from it, so
@@ -31,14 +31,14 @@ pub struct Incident<'a> {
     /// carry: the environment the child inherited from `review` (only the
     /// overrides are recorded), and the contents of runner-created temp files
     /// named in argv (codex's `-o` file, grok's prompt file).
-    pub process: &'a crate::provider::ProcessSpec,
+    pub process: &'a crate::harness::ProcessSpec,
     /// `<binary> <leading args> --version`, best-effort; deaths may be version-specific. It
-    /// probes the binary that actually ran, not the provider name: those differ
+    /// probes the binary that actually ran, not the harness name: those differ
     /// whenever the binary is overridden (the test harness runs a stub), and
     /// probing the name recorded the host's real codex for a stub run. Taken by
     /// the caller (`incident::version_probe`), so the probe is contained like
-    /// any provider process.
-    pub provider_version: Option<String>,
+    /// any harness process.
+    pub harness_version: Option<String>,
     pub session_id: Option<&'a str>,
     /// The prompt piped on the child's stdin - part of the invocation, so a
     /// replay is impossible without it.
@@ -52,24 +52,24 @@ pub struct Incident<'a> {
     pub duration_ms: u128,
     /// The invocation's immutable storage domain, also injected by tests.
     pub data: &'a crate::data::DataDir,
-    pub outcome: &'a crate::provider::Outcome,
+    pub outcome: &'a crate::harness::Outcome,
     pub turns: u32,
     pub forensics: Option<IncidentForensics<'a>>,
 }
 
-/// Provider-owned inputs, projected explicitly into the stable bundle schema.
+/// Harness-owned inputs, projected explicitly into the stable bundle schema.
 pub enum IncidentForensics<'a> {
     Codex(CodexIncident<'a>),
 }
 
-pub use crate::provider::codex::forensics::CodexIncident;
+pub use crate::harness::codex::forensics::CodexIncident;
 
 /// Keep the last MiB of the raw NDJSON stream - the death is at the end, and a
 /// long agentic run's stream can be tens of MiB.
 const STDOUT_TAIL_BYTES: usize = 1 << 20;
 const INCIDENT_SCHEMA: u32 = 1;
 
-// This is the schema-1 compatibility DTO, not the internal provider model.
+// This is the schema-1 compatibility DTO, not the internal harness model.
 // Historical writers omitted some fields; default omissions, but reject invalid
 // present values and unsupported schema versions. Both read and write use it.
 #[derive(Serialize, Deserialize, Default)]
@@ -77,10 +77,12 @@ const INCIDENT_SCHEMA: u32 = 1;
 pub struct Meta {
     pub schema: u32,
     pub timestamp: String,
-    pub provider: String,
+    /// Historical schema-1 key `provider`.
+    #[serde(rename = "provider")]
+    pub harness: String,
     pub session_id: Option<String>,
     pub review_version: String,
-    // Historical schema-1 key: keep it even though Incident uses provider_version.
+    // Historical schema-1 key: keep it even though Incident uses harness_version.
     pub codex_version: Option<String>,
     /// Full argv including argv[0] (the binary).
     pub argv: Vec<String>,
@@ -183,7 +185,7 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
             .unwrap_or_default();
         format!("{}-{nanos:09}", std::process::id())
     });
-    let dir = base.join(format!("{stamp}-{}-{sid}-{nonce}", inc.provider));
+    let dir = base.join(format!("{stamp}-{}-{sid}-{nonce}", inc.harness));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return BundleWriteOutcome::Incomplete {
             directory: Some(dir.clone()),
@@ -246,10 +248,10 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
     let meta = Meta {
         schema: INCIDENT_SCHEMA,
         timestamp,
-        provider: inc.provider.to_string(),
+        harness: inc.harness.to_string(),
         session_id: inc.session_id.map(str::to_string),
         review_version: env!("CARGO_PKG_VERSION").to_string(),
-        codex_version: inc.provider_version.clone(),
+        codex_version: inc.harness_version.clone(),
         argv: full_argv,
         command,
         cwd: inc.process.cwd.to_string_lossy().into_owned(),
@@ -258,8 +260,8 @@ pub fn write_bundle(inc: &Incident) -> BundleWriteOutcome {
         signal: inc.exit.signal_name(),
         stdin_write_error: inc.stdin_write_error.map(str::to_string),
         duration_ms: inc.duration_ms,
-        captured: inc.outcome.answer == crate::provider::Answer::Captured,
-        recovered_from_transcript: inc.outcome.answer == crate::provider::Answer::Recovered,
+        captured: inc.outcome.answer == crate::harness::Answer::Captured,
+        recovered_from_transcript: inc.outcome.answer == crate::harness::Answer::Recovered,
         turns: inc.turns,
         terminated_by_review: inc.outcome.termination().map(ToString::to_string),
         quiet_secs: codex.and_then(|c| c.quiet_secs),
@@ -515,10 +517,10 @@ fn read_incident_summary(dir: &Path) -> Result<Meta, IncidentFailure> {
             message: "unsupported incident metadata schema".to_string(),
         });
     }
-    if meta.provider.is_empty() || !is_utc_timestamp(&meta.timestamp) {
+    if meta.harness.is_empty() || !is_utc_timestamp(&meta.timestamp) {
         return Err(IncidentFailure {
             path: Some(path),
-            message: "incident metadata has no provider or a bad UTC timestamp".to_string(),
+            message: "incident metadata has no harness or a bad UTC timestamp".to_string(),
         });
     }
     Ok(meta)
@@ -719,7 +721,7 @@ mod tests {
 
     #[test]
     fn generic_bundle_and_codex_extension_both_use_the_same_schema() {
-        use crate::provider::{Outcome, ProcessSpec, Provider, Stdin};
+        use crate::harness::{Harness, Outcome, ProcessSpec, Stdin};
         let base = scratch_incident_dir();
         let process = ProcessSpec {
             program: "stub".into(),
@@ -738,9 +740,9 @@ mod tests {
         let baseline = std::fs::metadata(&rollout).unwrap().len();
         let path = rollout.as_path();
         let mut incident = Incident {
-            provider: Provider::Codex,
+            harness: Harness::Codex,
             process: &process,
-            provider_version: Some("stub version".into()),
+            harness_version: Some("stub version".into()),
             session_id: Some("session"),
             prompt: "request",
             exit: crate::process::Exit::Code(1),
@@ -808,7 +810,7 @@ mod tests {
         incident.forensics = Some(IncidentForensics::Codex(CodexIncident {
             transcript_path: None,
             scope: crate::transcript::Scope::From(crate::transcript::RolloutOffset(baseline)),
-            final_answer_present: crate::provider::codex::forensics::answer_presence(true, None),
+            final_answer_present: crate::harness::codex::forensics::answer_presence(true, None),
             quiet_secs: Some(3),
             last_rollout_event: None,
         }));

@@ -3,7 +3,7 @@
 use anyhow::Result;
 
 use super::selected_root;
-use crate::{config, incident, project, provider, sessions};
+use crate::{config, harness, incident, project, sessions};
 
 /// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
 /// dead run is triageable at a glance instead of buried under the incidents dir.
@@ -50,7 +50,7 @@ pub(super) fn run_incidents(limit: usize) -> Result<()> {
         let sid = m.session_id.as_deref().unwrap_or("no-session");
         println!(
             "{}  {} {sid}  exit={exit}{sig}  {verdict}{ver}",
-            m.timestamp, m.provider
+            m.timestamp, m.harness
         );
         println!("       {}", inc.dir.display());
     }
@@ -75,7 +75,7 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
         sessions::query::assert_project(session_id, &latest.project, selected.as_path(), sel)?;
     }
 
-    let now = provider::now_epoch_secs();
+    let now = harness::now_epoch_secs();
     // A bare `?` reads poorly in prose; the listing keeps it as its column.
     let age = sessions::Age::at_epoch(latest.epoch_secs, now);
     let last = match age.elapsed_secs() {
@@ -85,8 +85,8 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
 
     println!("session: {session_id}");
     println!(
-        "provider: {} / archetype: {} ({}) / {} touch(es), last {last}",
-        latest.provider,
+        "harness: {} / archetype: {} ({}) / {} touch(es), last {last}",
+        latest.harness,
         latest.archetype,
         latest.kind,
         records.len()
@@ -106,10 +106,10 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
     }
 
     if let Some(ref d) = latest.digest {
-        provider::print_digest_summary(d);
+        harness::print_digest_summary(d);
     }
 
-    let artifacts = provider::session_artifacts(latest);
+    let artifacts = harness::session_artifacts(latest);
     artifacts.print();
     let recovered = artifacts.final_answer();
     println!("--- response ---");
@@ -128,7 +128,7 @@ pub(super) fn run_session_show(session_id: &str, selector: Option<&str>) -> Resu
 }
 
 /// `review sessions` - aggregate sidecar records by session_id and print
-/// recent sessions with their age, provider, archetype, touch count, and the
+/// recent sessions with their age, harness, archetype, touch count, and the
 /// prompt that opened them. Filtered to the current project unless `--all`.
 pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> Result<()> {
     let project_filter: Option<std::path::PathBuf> = if all {
@@ -188,7 +188,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
             | sessions::query::State::Unknown => {}
         }
     }
-    let now = provider::now_epoch_secs();
+    let now = harness::now_epoch_secs();
     if !live.is_empty() {
         live.sort_by_key(|m| m.started_epoch);
         for m in &live {
@@ -196,12 +196,12 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
             if m.cleanup_pending() {
                 println!(
                     "[cleanup pending] {} / its review is gone; processes still being torn down",
-                    m.provider
+                    m.harness
                 );
             } else if m.phase == crate::inflight::Phase::HandoffPending {
-                println!("[recording] {} / waiting for the run handoff", m.provider);
+                println!("[recording] {} / waiting for the run handoff", m.harness);
             } else {
-                println!("[in flight] {} / turn in flight since {since}", m.provider);
+                println!("[in flight] {} / turn in flight since {since}", m.harness);
             }
             println!("       session: {}", m.session_id);
             if all {
@@ -271,7 +271,7 @@ pub(super) fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> R
         let touches_label = if row.touches == 1 { "touch" } else { "touches" };
         println!(
             "[{age}] {} / {} ({}) / {} {touches_label}",
-            row.opener.provider, row.opener.archetype, row.opener.kind, row.touches
+            row.opener.harness, row.opener.archetype, row.opener.kind, row.touches
         );
         println!("       session: {}", row.latest.session_id);
         let opened = first_line_truncated(&row.opener.operator_prompt, 80);
@@ -300,14 +300,14 @@ fn first_line_truncated(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    fn summary(v: serde_json::Value) -> provider::DigestSummary {
+    fn summary(v: serde_json::Value) -> harness::DigestSummary {
         serde_json::from_value(v).expect("summary parses")
     }
 
     /// The note lines (everything after the stated and diagnosed reasons)
     /// a persisted summary renders to.
-    fn notes(d: &provider::DigestSummary) -> Vec<String> {
-        provider::Outcome::interpret_summary(d)
+    fn notes(d: &harness::DigestSummary) -> Vec<String> {
+        harness::Outcome::interpret_summary(d)
             .lines(&d.status_facts())
             .into_iter()
             .filter(|l| l.starts_with("note:") || l.starts_with("terminated by review:"))
@@ -318,7 +318,7 @@ mod tests {
     fn an_answer_with_a_non_zero_exit_is_not_called_inconclusive() {
         // What grok and claude record for an answer from a process that then
         // exited non-zero: captured, with the observed exit code and no
-        // provider-stated `turn_error`.
+        // harness-stated `turn_error`.
         let d = summary(serde_json::json!({
             "exit_code": 1, "captured": true, "turns": 1,
             "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
@@ -334,7 +334,7 @@ mod tests {
             "turn_error": "claude exited non-zero after producing an answer",
         }));
         assert!(notes(&legacy).is_empty());
-        let outcome = provider::Outcome::interpret_summary(&legacy);
+        let outcome = harness::Outcome::interpret_summary(&legacy);
         assert!(!outcome.failed() && outcome.stated_failure().is_none());
     }
 

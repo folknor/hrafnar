@@ -1,49 +1,49 @@
-//! Provider-specific semantic checks after the shared profile schema is read.
-use super::{Profile, Provider};
-use crate::provider::{ModelSpec, Permissions};
+//! Harness-specific semantic checks after the shared profile schema is read.
+use super::{Harness, Profile};
+use crate::harness::{ModelSpec, Permissions};
 use anyhow::{Result, bail};
 
 impl Profile {
-    pub(super) fn validate(&self, provider: Provider) -> Result<()> {
-        match provider {
-            Provider::Claude => {
+    pub(super) fn validate(&self, harness: Harness) -> Result<()> {
+        match harness {
+            Harness::Claude => {
                 if self.sandbox.is_some() {
                     bail!(
                         "claude does not honour 'sandbox'; remove sandbox from this profile and configure permissions in Claude Code instead"
                     );
                 }
             }
-            Provider::Maki => {
+            Harness::Maki => {
                 if self.sandbox.is_some() {
                     bail!(
                         "maki does not honour 'sandbox'; remove sandbox from this profile and configure permissions in maki's permissions.toml instead"
                     );
                 }
             }
-            Provider::Codex | Provider::Grok => {}
+            Harness::Codex | Harness::Grok => {}
         }
         if !self.writable_roots.is_empty()
-            && !Permissions::profile(provider, self.sandbox.as_ref()).accepts_profile_roots()
+            && !Permissions::profile(harness, self.sandbox.as_ref()).accepts_profile_roots()
         {
-            match provider {
-                Provider::Claude => bail!(
+            match harness {
+                Harness::Claude => bail!(
                     "claude does not honour 'writable_roots'; remove writable_roots from this profile and configure permissions in Claude Code instead"
                 ),
-                Provider::Maki => bail!(
+                Harness::Maki => bail!(
                     "maki does not honour 'writable_roots'; remove writable_roots from this profile and configure permissions in maki's permissions.toml instead"
                 ),
-                Provider::Codex | Provider::Grok => bail!(
+                Harness::Codex | Harness::Grok => bail!(
                     "writable_roots are not honoured at this sandbox level; remove writable_roots or set sandbox = \"workspace-write\""
                 ),
             }
         }
         ModelSpec::new(
-            provider,
+            harness,
             self.model.as_deref(),
             self.effort.as_deref(),
             &self.config,
         )
-        .validate(provider)
+        .validate(harness)
     }
 }
 
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn unsupported_profile_fields_fail_in_every_layer() {
         for layer in [Layer::Local, Layer::Global] {
-            for (provider, field) in [
+            for (harness, field) in [
                 ("claude", "sandbox = 'read-only'"),
                 ("claude", "writable_roots = ['/srv/cache']"),
                 ("claude", "config = ['a=b']"),
@@ -71,7 +71,7 @@ mod tests {
                 ),
             ] {
                 let error = parse_file(
-                    &format!("[profiles.test]\nprovider = '{provider}'\n{field}"),
+                    &format!("[profiles.test]\nprovider = '{harness}'\n{field}"),
                     "source.toml",
                     layer,
                 )
@@ -86,29 +86,29 @@ mod tests {
 
     #[test]
     fn supported_profiles_and_harmless_empty_lists_still_load() {
-        for provider in Provider::all() {
+        for harness in Harness::all() {
             // maki honours a model but not an effort (see ModelSpec::validate).
-            let effort = match provider {
-                Provider::Maki => "",
-                Provider::Claude | Provider::Codex | Provider::Grok => "\neffort='high'",
+            let effort = match harness {
+                Harness::Maki => "",
+                Harness::Claude | Harness::Codex | Harness::Grok => "\neffort='high'",
             };
             parse_file(
                 &format!(
-                    "[profiles.test]\nprovider='{provider}'\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"
+                    "[profiles.test]\nprovider='{harness}'\nmodel='m'{effort}\nconfig=[]\nwritable_roots=[]"
                 ),
                 "source",
                 Layer::Local,
             )
             .expect("every provider applies its supported selectors");
         }
-        for (provider, level) in [
+        for (harness, level) in [
             ("codex", "workspace-write"),
             ("grok", "workspace-write"),
             ("grok", "workspace"),
         ] {
             parse_file(
                 &format!(
-                    "[profiles.test]\nprovider='{provider}'\nsandbox='{level}'\nwritable_roots=['/srv/cache']"
+                    "[profiles.test]\nprovider='{harness}'\nsandbox='{level}'\nwritable_roots=['/srv/cache']"
                 ),
                 "source",
                 Layer::Local,

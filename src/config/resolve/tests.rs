@@ -39,7 +39,7 @@ mod layering {
         // stated once per operator, not restated in every project.
         let cfg = layered("", "[profiles.deep]\nprovider = \"codex\"\nmodel = \"g\"\n").unwrap();
         let e = entry(&cfg, "deep");
-        assert_eq!(e.effective.provider, Provider::Codex);
+        assert_eq!(e.effective.harness, Harness::Codex);
         assert_eq!(e.effective.profile.model.as_deref(), Some("g"));
         assert_eq!(e.effective.layer, Layer::Global);
         assert_eq!(e.effective.table, "[profiles.deep]");
@@ -85,9 +85,9 @@ mod layering {
     }
 
     #[test]
-    fn a_project_profile_may_not_switch_the_provider() {
-        // `-p deep` must launch the same provider in every project; a project
-        // that redefined it on another provider would change that silently.
+    fn a_project_profile_may_not_switch_the_harness() {
+        // `-p deep` must launch the same harness in every project; a project
+        // that redefined it on another harness would change that silently.
         let err = layered(
             "[profiles.deep]\nprovider = \"claude\"\n",
             "[profiles.deep]\nprovider = \"codex\"\n",
@@ -116,7 +116,7 @@ mod layering {
             Some("l")
         );
         let fast = entry(&cfg, "fast");
-        assert_eq!(fast.effective.provider, Provider::Claude);
+        assert_eq!(fast.effective.harness, Harness::Claude);
         assert_eq!(fast.effective.profile.model.as_deref(), Some("gf"));
         assert!(fast.shadowed.is_empty());
     }

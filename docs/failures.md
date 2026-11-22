@@ -1,12 +1,12 @@
 # Why a run failed
 
-A run exits `1` when no provider produced an answer `review` could accept (none
+A run exits `1` when no harness produced an answer `review` could accept (none
 answered, or every answer came with a `review failed:` line), and `3` when something it
 started was left running (see the section below), whatever the answers were. Most failures still print
 a session ID and a digest, because the session exists and can be inspected or
 continued. Read the digest top down:
 
-- `turn failed: <reason>` - the provider **stated** why it ended the turn.
+- `turn failed: <reason>` - the harness **stated** why it ended the turn.
 - `review failed: <reason>` - `review`'s own verdict, for grok: background
   results it could not verify, a wake that could not launch, or the wake limit
   (see the end of this page). It fails the run even when an answer was
@@ -28,7 +28,7 @@ continued. Read the digest top down:
 
 ## A stated failure
 
-The provider refused or could not run the request: content flagged, a rate
+The harness refused or could not run the request: content flagged, a rate
 limit, an authentication failure, an unknown model. The reason is printed
 first, because the next move follows from it. A stated failure is **never
 retried** - resending the same request buys the same refusal. Fix the cause
@@ -71,7 +71,7 @@ filed. The session can be messaged to continue.
 
 `review message`, `review interrupt`, or a signal to `review` ended the turn.
 The digest is flagged interrupted, the run exits `1`, and it is never
-auto-resumed or filed as an incident. If the provider finished before the
+auto-resumed or filed as an incident. If the harness finished before the
 interrupt landed, the answer stands and the run succeeds.
 
 ## Processes left running
@@ -106,8 +106,8 @@ nothing is printed; the outcome is appended to `teardowns.jsonl` (or
 ## Before anything launched
 
 These fail the whole run with no session: no stdin, a config that does not
-parse, an unknown archetype, a profile missing for a launched provider, an
-unknown or uninstalled provider, a project that `-C` cannot resolve. The error
+parse, an unknown archetype, a profile missing for a launched harness, an
+unknown or uninstalled harness, a project that `-C` cannot resolve. The error
 says which, and nothing was sent.
 
 ## A run that cannot write

@@ -1,6 +1,6 @@
 //! File-format vocabulary and resolved configuration. Shared data types stay at
 //! this boundary; parsing, resolution, discovery and writing each have one owner.
-//! Native permissions belong to providers, registry rules to project::registry,
+//! Native permissions belong to harnesses, registry rules to project::registry,
 //! and random identifiers to the dependency-free ids module.
 mod error;
 pub(crate) mod load;
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub use crate::provider::Provider;
+pub use crate::harness::Harness;
 
 pub(crate) const CONFIG_FILENAME: &str = ".review.toml";
 
@@ -144,9 +144,9 @@ impl std::fmt::Display for StallTimeout {
 }
 
 /// A named settings profile: optional model, effort, sandbox, and env overrides
-/// applied to a provider invocation when selected via `--profile`. The
-/// provider it runs on is the table's required `provider` key, peeled off
-/// before this is deserialized and kept beside it (`ProfileDef::provider`).
+/// applied to a harness invocation when selected via `--profile`. The
+/// harness it runs on is the table's required `harness` key, peeled off
+/// before this is deserialized and kept beside it (`ProfileDef::harness`).
 ///
 /// Unknown keys are an error. A profile wins whole, so a project profile with a
 /// misspelled key (`modle = ...`) would otherwise parse as an empty profile and
@@ -155,21 +155,21 @@ impl std::fmt::Display for StallTimeout {
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     /// Free text for whoever picks a profile - what it is for, when to reach
-    /// for it. Never sent to a provider; `review list` shows it. A field
+    /// for it. Never sent to a harness; `review list` shows it. A field
     /// rather than a TOML comment because the parser discards comments, and
     /// `review list` renders only what the resolver produced.
     pub comment: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// Review's sandbox vocabulary, resolved into native permissions before
-    /// launch. Custom names reach the provider unchanged. Defaults to read-only
+    /// launch. Custom names reach the harness unchanged. Defaults to read-only
     /// when unset. Claude profiles must omit this field: it has no filesystem
     /// sandbox on this axis.
     pub sandbox: Option<SandboxLevel>,
     pub env: Option<BTreeMap<String, String>>,
     /// Extra codex `-c key=value` overrides, each passed verbatim as its own
     /// `-c`. Codex-only. Lets a profile force config the CLI doesn't expose - in
-    /// particular a custom HTTP-transport provider to dodge the websocket death
+    /// particular a custom HTTP-transport harness to dodge the websocket death
     /// path (`model_provider` + `model_providers.<name>`).
     #[serde(default)]
     pub config: Vec<String>,
@@ -180,7 +180,7 @@ pub struct Profile {
     /// directory, a sibling checkout, a generated-asset cache.
     ///
     /// Applied to codex workspace-write and fresh grok workspace-write runs.
-    /// Rejected in config for other levels and providers, because
+    /// Rejected in config for other levels and harnesses, because
     /// widening a `read-only` profile would contradict the only thing that
     /// profile promises. `~`, `$VAR` and `${VAR}` expand, which is what lets one
     /// profile serve hosts with different layouts.
@@ -195,8 +195,8 @@ pub struct ConfigFile {
     pub archetypes: BTreeMap<String, String>,
     pub audit: AuditConfig,
     pub defaults: DefaultsConfig,
-    /// `[profiles.<name>]`: name -> (provider, profile).
-    pub profiles: BTreeMap<String, (Provider, Profile)>,
+    /// `[profiles.<name>]`: name -> (harness, profile).
+    pub profiles: BTreeMap<String, (Harness, Profile)>,
     /// `[_projects.<host>]`: host -> project name -> path as written. Global
     /// file only, for `-C <name>` (see `project.rs`).
     pub projects: BTreeMap<String, BTreeMap<String, String>>,
@@ -215,15 +215,15 @@ pub struct Sourced<T> {
 /// One definition of a profile.
 #[derive(Debug, Clone)]
 pub struct ProfileDef {
-    pub provider: Provider,
+    pub harness: Harness,
     pub profile: Profile,
     pub layer: Layer,
     pub table: String,
 }
 
 /// Every definition of one profile name, in precedence order. All of them
-/// name the same provider: resolution refuses a project profile that would
-/// silently switch which provider `-p <name>` launches. The first wins **whole** - a winning profile replaces the
+/// name the same harness: resolution refuses a project profile that would
+/// silently switch which harness `-p <name>` launches. The first wins **whole** - a winning profile replaces the
 /// others outright rather than merging field by field, so no field of a run can
 /// come from a table that did not mention it. The rest are kept so `review
 /// config` can show what a stale override is hiding.

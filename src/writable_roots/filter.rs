@@ -230,7 +230,7 @@ mod tests {
         assert_eq!(grants[0].path, "/home/dev/project-other");
     }
 
-    /// Refuse surprising control-bearing derived paths even though a provider
+    /// Refuse surprising control-bearing derived paths even though a harness
     /// renderer can represent escaped controls in explicitly supplied config.
     #[test]
     fn a_control_character_in_a_path_is_refused() {

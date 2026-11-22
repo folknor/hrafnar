@@ -17,7 +17,7 @@ config. In an untrusted project the project's own `.maki` configuration can
 tighten maki's permissions but not loosen them; in a trusted one it can do
 both.
 
-The levels are `review`'s own names, translated per provider:
+The levels are `review`'s own names, translated per harness:
 
 | `sandbox` | codex | grok | claude | maki |
 |---|---|---|---|---|
@@ -25,8 +25,8 @@ The levels are `review`'s own names, translated per provider:
 | `workspace-write` | `workspace-write` | `workspace` | unsupported | unsupported |
 | `danger-full-access` | `danger-full-access` | `none` | unsupported | unsupported |
 
-Any other value is passed to the provider unchanged, for a provider that
-defines its own named profiles; the provider rejects a name it does not know
+Any other value is passed to the harness unchanged, for a harness that
+defines its own named profiles; the harness rejects a name it does not know
 before running a turn. These three names always mean the levels above.
 
 ## read-only
@@ -46,7 +46,7 @@ page assume a profile that does not.
 ## workspace-write
 
 The run can write inside the project directory, plus the roots below, plus
-whatever the provider itself always grants: temporary directories on both, and
+whatever the harness itself always grants: temporary directories on both, and
 on grok its own home. Codex also keeps some paths inside the project read-only
 on its own account (`.git`, `.agents`, `.codex`, `.aws`); `review` lifts that
 for `.git` only, so a codex write run can commit (see Git metadata below).
@@ -113,7 +113,7 @@ run.
 A writable `.git` lets a run leave behind something git later executes outside
 any sandbox, the next time anyone runs git in that repository: a hook, or a
 config entry naming a program. Claude and maki runs could always do this. So
-every run, on every provider and level, is checked: at launch `review` notes the
+every run, on every harness and level, is checked: at launch `review` notes the
 repository's `config`, `config.worktree` and hooks, plus any include file and
 `core.hooksPath` directory that config names, and the files that say where the
 git directory is (a `.git` pointer, `commondir`). At the end of the run it warns
@@ -157,14 +157,14 @@ it: a `workspace-write` session stays writable.
 ## When a write fails
 
 A run that reports a read-only filesystem was launched `read-only`, is writing
-outside its roots, or is writing a path the provider protects (such as `.codex`
+outside its roots, or is writing a path the harness protects (such as `.codex`
 on codex, or a `.git` the run was not granted - see Git metadata above).
 `review sessions <ID>` shows the level and roots it
 launched with. Then:
 
 - launched `read-only`: use a profile with `workspace-write`;
 - writing outside its roots: add the path to the profile's `writable_roots`;
-- writing a path the provider protects: `writable_roots` does not lift that
+- writing a path the harness protects: `writable_roots` does not lift that
   protection. `danger-full-access` or a deliberate codex permission override
   would, at the cost of the whole sandbox; usually do that step outside the
   agent instead.
